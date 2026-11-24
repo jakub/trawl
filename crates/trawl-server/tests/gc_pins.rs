@@ -2,16 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end pin garbage collection (#110): a real TLS server over a
-//! per-test data root, pins taken by real ingest and compaction, and the
-//! engine run both directly and over the route.
-//!
-//! Most tests build their own [`PinGc`] rather than reaching for
-//! `state.gc`, because the retention floor is the one input the harness
-//! cannot vary: the packaged default is 90 days, which floors every window
-//! a test would otherwise ask for. The tests that go through the route (or
-//! through the wired engine) therefore assert the floor and the report
-//! rather than a deletion.
+//! Most tests build their own [`PinGc`] rather than reaching for `state.gc`:
+//! the packaged default is 90 days, which floors every window a test would
+//! otherwise ask for.
 
 mod common;
 
@@ -39,7 +32,6 @@ fn catalog_ctx(server: &TestServer) -> CatalogContext {
     }
 }
 
-/// One `/metrics` scrape off the running server (unauthenticated route).
 async fn scrape_metrics(url: &str) -> String {
     common::harness_client_builder()
         .build()
@@ -55,8 +47,6 @@ async fn scrape_metrics(url: &str) -> String {
 
 /// An unlabelled counter's value, 0 when it has never been incremented
 /// (prometheus does not render a counter until something touches it).
-/// Counters render as integers, so a non-integer body is a rendering
-/// change worth failing on rather than rounding past.
 fn counter_value(scrape: &str, name: &str) -> u64 {
     scrape
         .lines()
@@ -67,8 +57,6 @@ fn counter_value(scrape: &str, name: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// A gauge's value, `None` when nothing has published it. Gauges render as
-/// f64, so this reads them that way rather than assuming an integer form.
 fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
     scrape.lines().find_map(|line| {
         let rest = line.strip_prefix(name)?.strip_prefix(' ')?;
@@ -76,10 +64,6 @@ fn gauge_value(scrape: &str, name: &str) -> Option<f64> {
     })
 }
 
-/// Wait for one of the engine's test signals to rise, or fail saying which.
-///
-/// Bounded polling, never a fixed sleep: the signal is the ordering proof,
-/// and the bound only turns a hang into a readable failure.
 async fn await_signal(mut ready: impl FnMut() -> bool, what: &str) {
     for _ in 0..1_000 {
         if ready() {
@@ -90,7 +74,6 @@ async fn await_signal(mut ready: impl FnMut() -> bool, what: &str) {
     panic!("timed out waiting for {what}");
 }
 
-/// Every `*.parquet` under a directory tree.
 fn walk_parquet(root: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![root.to_path_buf()];
@@ -128,7 +111,7 @@ async fn harness() -> Harness {
     let data_path = data_dir.to_str().unwrap().to_owned();
 
     let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
-    std::mem::forget(tmp); // outlives the server; OS cleans up
+    std::mem::forget(tmp);
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let query = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -142,8 +125,6 @@ async fn harness() -> Harness {
 }
 
 impl Harness {
-    /// One compaction tick with the catalog and the repin coordinator
-    /// wired, exactly as trawld's loop runs it.
     async fn compact_tick(&self) {
         let hot_buffer = self
             .server
@@ -185,8 +166,6 @@ impl Harness {
             .expect("ingest-enabled server has a repin coordinator")
     }
 
-    /// A gc engine over this server's catalog, with an explicit retention
-    /// floor.
     fn gc(&self, retention_floor_secs: Option<u64>) -> Arc<PinGc> {
         Arc::new(PinGc::new(
             self.server.state.storage.catalog.clone(),
@@ -198,9 +177,6 @@ impl Harness {
         ))
     }
 
-    /// Take a pin for `field` through the real ingest path, then delete the
-    /// parquet the batch published: a pin whose data is gone, which is the
-    /// shape gc exists for (a decommissioned sender whose files aged out).
     async fn pin_without_carrier(&self, service: &str, field: &str) {
         self.ingest_and_compact(&[event(service, &json!({ field: "v" }))])
             .await;
@@ -214,7 +190,6 @@ impl Harness {
         std::fs::remove_file(&published).expect("remove the published carrier");
     }
 
-    /// Count from a `| stats count()` query.
     async fn count(&self, dsl: &str) -> i64 {
         let result = self
             .query
@@ -234,8 +209,6 @@ impl Harness {
         self.server.state.query.field_catalog.get(field).is_some()
     }
 
-    /// Whether postgres still holds the pin (the cache can lag by design;
-    /// this is the authority).
     async fn pinned_in_store(&self, field: &str) -> bool {
         self.server
             .state
@@ -260,23 +233,15 @@ fn event(service: &str, extra: &serde_json::Value) -> serde_json::Value {
     base
 }
 
-/// The acceptance truth table over one synthetic corpus: a pin whose
-/// column a standing footer declares survives however long it has gone
-/// unobserved, a pin with neither observation nor carrier is reclaimed,
-/// and the envelope is never even a candidate.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_deletes_only_pins_with_no_observation_and_no_carrier() {
     let h = harness().await;
 
-    // A standing carrier: `kept` lives in a file nobody deleted.
     h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
         .await;
-    // No carrier: `dead`'s only file is gone.
     h.pin_without_carrier("gone", "dead").await;
     assert!(h.pinned("kept") && h.pinned("dead"));
 
-    // A zero window makes every observed pin old, so the footer axis is
-    // the only thing standing between a pin and deletion.
     let report = h
         .gc(None)
         .run(Some(Duration::ZERO), false, GcActor::default())
@@ -296,9 +261,6 @@ async fn gc_deletes_only_pins_with_no_observation_and_no_carrier() {
     assert!(!h.pinned_in_store("dead").await, "and left postgres");
     assert!(h.pinned("kept"), "a carried pin is never reclaimed");
 
-    // The envelope is trawl's contract, not a reclaimable slot — and it is
-    // filtered before the footer scan, so it never even appears as a
-    // candidate.
     for envelope in ["_severity", "_time", "_raw", "host", "service", "message"] {
         assert!(
             !names.contains(&envelope),
@@ -308,7 +270,6 @@ async fn gc_deletes_only_pins_with_no_observation_and_no_carrier() {
     }
 }
 
-/// A pin something wrote inside the window stays, carrier or no carrier.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_retains_a_pin_observed_inside_the_window() {
     let h = harness().await;
@@ -329,9 +290,6 @@ async fn gc_retains_a_pin_observed_inside_the_window() {
     assert!(h.pinned("fresh"));
 }
 
-/// The retention floor raises a shorter request, and the report says so —
-/// asserted through the engine `AppState` actually wires up, which reads
-/// the packaged 90-day retention window.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_floors_a_short_request_at_the_retention_window() {
     let h = harness().await;
@@ -366,17 +324,11 @@ async fn gc_floors_a_short_request_at_the_retention_window() {
     );
 }
 
-/// With per-env retention (#108), the floor is the LONGEST age any env
-/// keeps, not the shortest. A minimum would call a field dead over a span
-/// during which a long-retention env still stores its data on disk, and
-/// reclaim a pin whose carrier is right there.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_floors_at_the_longest_age_any_env_keeps() {
     let h = harness().await;
     h.pin_without_carrier("gone", "dead").await;
 
-    // Old enough for a seven-day cutoff to delete, but still inside prod's
-    // year. A fresh observation would survive either cutoff.
     let pool = common::app_pool(&h.server.app_db_url).await;
     let updated = sqlx::query(
         "UPDATE field_services SET first_seen = now() - interval '60 days',
@@ -389,8 +341,6 @@ async fn gc_floors_at_the_longest_age_any_env_keeps() {
     assert_eq!(updated.rows_affected(), 1);
     pool.close().await;
 
-    // lab ages out in a week, prod keeps a year: the corpus still reaches
-    // back a year.
     let mut per_env = trawl_server::config::RetentionConfig {
         max_age_days: 30,
         ..Default::default()
@@ -442,15 +392,12 @@ async fn gc_floors_at_the_longest_age_any_env_keeps() {
     assert!(!h.pinned_in_store("dead").await);
 }
 
-/// An empty parquet still declares its schema, and the schema is the
-/// evidence: a file with zero rows is a carrier.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_reads_an_empty_parquet_as_a_carrier() {
     let h = harness().await;
     h.ingest_and_compact(&[event("lonely", &json!({"rare": 1}))])
         .await;
 
-    // Empty the published file in place, keeping its schema.
     let file = walk_parquet(&h.data_dir)
         .into_iter()
         .find(|p| p.file_name().is_some_and(|n| n == "lonely.parquet"))
@@ -476,9 +423,6 @@ async fn gc_reads_an_empty_parquet_as_a_carrier() {
     assert!(h.pinned("rare"), "an empty file still names its columns");
 }
 
-/// Being wrong is survivable by construction: the purge is metadata only,
-/// so a field that comes back simply gets pinned again and queries answer
-/// across the old and new files.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_being_wrong_costs_only_a_clean_repin() {
     let h = harness().await;
@@ -494,8 +438,6 @@ async fn gc_being_wrong_costs_only_a_clean_repin() {
     assert_eq!(report.deleted, 1);
     assert!(!h.pinned("dur"));
 
-    // The sender returns. Compaction pins the field afresh and conforms
-    // the batch to it, with no conflict and no error.
     h.ingest_and_compact(&[event("gone", &json!({"dur": 42}))])
         .await;
     assert_eq!(
@@ -505,7 +447,6 @@ async fn gc_being_wrong_costs_only_a_clean_repin() {
     );
     assert_eq!(h.count("dur=42 last=1h | stats count()").await, 1);
 
-    // And a hot event on top of the cold file: the union still types.
     h.ingest
         .ingest(&[event("gone", &json!({"dur": 43}))])
         .await
@@ -513,9 +454,6 @@ async fn gc_being_wrong_costs_only_a_clean_repin() {
     assert_eq!(h.count("dur>=42 last=1h | stats count()").await, 2);
 }
 
-/// The corpus gate is what makes the footer proof binding: while a
-/// compaction batch holds the read side, gc cannot scan, so a file that
-/// batch publishes is part of the corpus gc reads.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
     let h = harness().await;
@@ -525,12 +463,9 @@ async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
         .into_iter()
         .find(|p| p.file_name().is_some_and(|n| n == "late.parquet"))
         .expect("late.parquet exists");
-    // Unpublished: the batch has not landed it yet.
     let stashed = h.data_dir.join("late.parquet.stash");
     std::fs::rename(&carrier, &stashed).unwrap();
 
-    // A batch in flight, exactly as compaction holds it around its
-    // pin-snapshot → conform → publish phase.
     let batch = h.coordinator().compaction_guard().await;
 
     let gc = h.gc(None);
@@ -557,16 +492,9 @@ async fn gc_waits_for_the_compaction_batch_and_sees_what_it_published() {
     assert!(h.pinned("slow"));
 }
 
-/// One run at a time. A second caller is refused immediately rather than
-/// queued behind a scan that holds the corpus gate — two operators on the
-/// route must not add up to an ingest stall.
-///
-/// Deterministic by construction: the first run is held at the corpus gate
-/// by a compaction batch, and the test waits on the engine's own
-/// admission-held signal before it asks again. Polling the route instead
-/// would deadlock under the opposite scheduler order — the polled call could
-/// be the one that took admission, and it would then block on the corpus
-/// gate this test is holding, awaited inline forever.
+/// Waits on `admission_held` rather than polling the route: a polled call
+/// could be the one that took admission, and it would then block on the
+/// corpus gate this test is holding.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_concurrent_gc_run_is_refused_immediately() {
     let h = harness().await;
@@ -575,8 +503,6 @@ async fn a_second_concurrent_gc_run_is_refused_immediately() {
     h.pin_without_carrier("gone", "dead").await;
     let gc = h.gc(None);
 
-    // A compaction batch holds the corpus gate, so the first run cannot get
-    // past it and cannot release the admission lock.
     let batch = h.coordinator().compaction_guard().await;
     let first = {
         let gc = Arc::clone(&gc);
@@ -587,8 +513,6 @@ async fn a_second_concurrent_gc_run_is_refused_immediately() {
     };
     await_signal(|| gc.admission_held(), "the first run takes admission").await;
 
-    // Admission is provably held by the spawned run, so this call is the
-    // second one and can only be refused; it never reaches the gate.
     let refusal = gc
         .run(Some(Duration::ZERO), true, GcActor::default())
         .await
@@ -612,7 +536,6 @@ async fn a_second_concurrent_gc_run_is_refused_immediately() {
         .expect("the first run finishes");
     assert_eq!(report.deleted, 1, "report: {report:?}");
 
-    // And the lock is released with the run: the next caller is admitted.
     let again = gc
         .run(Some(Duration::ZERO), true, GcActor::default())
         .await
@@ -620,11 +543,6 @@ async fn a_second_concurrent_gc_run_is_refused_immediately() {
     assert!(again.candidates.is_empty(), "report: {again:?}");
 }
 
-/// The report and the audit name what postgres deleted, never what the walk
-/// projected. A candidate whose row goes away underneath the run — a
-/// concurrent purge, an operator with psql — is not a pin this run
-/// reclaimed, and an audit record claiming otherwise is a lie in the one
-/// place an operator has to trust.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_report_names_only_the_pins_the_purge_returned() {
     let h = harness().await;
@@ -633,9 +551,6 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
     h.pin_without_carrier("gone", "dead").await;
     h.pin_without_carrier("also_gone", "deader").await;
 
-    // Park the run right after its candidate read. The engine's own hold,
-    // not a sleep: the concurrent purge below has to land after that read
-    // and before the gate, and a timer only makes that likely.
     let gc = h.gc(None);
     gc.arm_post_candidate_hold();
     let run = {
@@ -651,7 +566,6 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
     )
     .await;
 
-    // One candidate is reclaimed by somebody else while the run waits.
     h.server
         .state
         .storage
@@ -682,8 +596,6 @@ async fn the_report_names_only_the_pins_the_purge_returned() {
     assert!(!h.pinned_in_store("deader").await, "it is gone either way");
 }
 
-/// Every way a repin can own the data root refuses the same way, and
-/// deletes nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_repin_in_flight_refuses_gc_four_ways() {
     let h = harness().await;
@@ -726,7 +638,6 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
         remove();
     }
 
-    // The fourth: a claimed job row with no filesystem evidence yet.
     let job = h
         .server
         .state
@@ -753,7 +664,6 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
     assert!(err.to_string().contains(&job.to_string()), "{err}");
     assert!(h.pinned("dead"));
 
-    // With the job finished, the same request goes through.
     let finished = h
         .server
         .state
@@ -775,9 +685,6 @@ async fn a_repin_in_flight_refuses_gc_four_ways() {
     assert_eq!(report.deleted, 1);
 }
 
-/// A file gc cannot read is a file whose columns are unknown, and an
-/// unknown file cannot be part of a proof that nothing carries a field.
-/// The whole run refuses and mutates nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
     let h = harness().await;
@@ -808,8 +715,6 @@ async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
     assert!(h.pinned("dead"), "a refused run deletes nothing");
     assert!(h.pinned_in_store("dead").await);
 
-    // Move the offending file aside and the same request succeeds — the
-    // refusal was about the corpus, not about the candidate.
     std::fs::remove_file(&junk).unwrap();
     let report = h
         .gc(None)
@@ -819,14 +724,9 @@ async fn gc_refuses_the_whole_run_on_an_unreadable_parquet() {
     assert_eq!(report.deleted, 1);
 }
 
-/// A data root that is not there is UNKNOWN, never an empty corpus. Read as
-/// empty, no footer would disprove anything and the run would reclaim every
-/// candidate pin in the catalog — an unmounted volume or a mistyped
-/// `[data] path` turned into a mass delete.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_a_data_root_that_is_not_there() {
     let h = harness().await;
-    // A standing carrier, so `dead` is the only pin without one.
     h.ingest_and_compact(&[event("api", &json!({"kept": 1}))])
         .await;
     h.pin_without_carrier("gone", "dead").await;
@@ -847,8 +747,6 @@ async fn gc_refuses_a_data_root_that_is_not_there() {
         .expect_err("a missing data root fails the run closed");
     assert_eq!(err.error_class(), "conflict", "{err}");
     let msg = err.to_string();
-    // The refusal names the setting and the error kind, never the
-    // absolute root: its text reaches the wire and every record.
     assert!(
         msg.contains("cannot read the data root (entity not found)"),
         "the refusal names the root by its role: {msg}"
@@ -862,8 +760,6 @@ async fn gc_refuses_a_data_root_that_is_not_there() {
     assert!(h.pinned("dead"), "a refused run deletes nothing");
     assert!(h.pinned_in_store("dead").await);
 
-    // The same catalog over the real root reclaims exactly the dead pin, so
-    // the refusal was about the corpus and not about the candidate.
     let report = h
         .gc(None)
         .run(Some(Duration::ZERO), false, GcActor::default())
@@ -872,8 +768,6 @@ async fn gc_refuses_a_data_root_that_is_not_there() {
     assert_eq!(report.deleted, 1, "report: {report:?}");
 }
 
-/// A symlink under a live env is refused for the same reason: its target
-/// is a file trawl does not own.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_the_whole_run_on_a_symlink_under_a_live_env() {
@@ -893,11 +787,6 @@ async fn gc_refuses_the_whole_run_on_a_symlink_under_a_live_env() {
     assert!(h.pinned("dead"));
 }
 
-/// A `.parquet` that is not a regular file is refused, not opened. Opening
-/// a FIFO blocks until somebody writes the other end, and the walk runs
-/// with the corpus gate held, so that is an ingest stall with no timeout on
-/// it. The unix socket here stands in for the whole class (a FIFO, a device
-/// node): all of them fail the same lstat check.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_refuses_a_parquet_that_is_not_a_regular_file() {
@@ -926,7 +815,6 @@ async fn gc_refuses_a_parquet_that_is_not_a_regular_file() {
     assert!(h.pinned("dead"), "a refused run deletes nothing");
     assert!(h.pinned_in_store("dead").await);
 
-    // Removed, the same request goes through.
     std::fs::remove_file(&odd).unwrap();
     let report = h
         .gc(None)
@@ -937,7 +825,6 @@ async fn gc_refuses_a_parquet_that_is_not_a_regular_file() {
 }
 
 mod capture {
-    //! Minimal tracing capture: every event's fields as strings.
 
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
@@ -953,13 +840,9 @@ mod capture {
     }
 
     impl Capture {
-        /// Every captured event carrying `event_type = ty` AND the given
-        /// actor name.
-        ///
         /// The subscriber is process-global, so it sees every gc run in the
         /// binary, including sibling tests' spawned tasks. The actor is the
-        /// per-run identity that separates them; an unfiltered count would
-        /// be a count of whatever else happened to be running.
+        /// per-run identity that separates them.
         pub fn of_type(&self, ty: &str, actor: &str) -> Vec<Captured> {
             let actor = format!("{actor:?}");
             self.events
@@ -1001,10 +884,6 @@ mod capture {
     }
 }
 
-/// The dry run is the safety, so it must mutate nothing at all: no rows,
-/// no cache generation, no metric, no audit record. Execution then emits
-/// exactly one `catalog_pin_gc` per pin it deleted, and a second run over
-/// the same corpus is a no-op.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one narrative: dry run, execution, repeat
 async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
@@ -1017,9 +896,6 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
     // Global, not thread-local: the run happens on another tokio worker.
     tracing::subscriber::set_global_default(subscriber).expect("no prior global subscriber");
 
-    // Every run in this test signs its events with one name no other test
-    // uses, because the subscriber above is process-global and sees the gc
-    // runs of every test in the binary.
     let actor_name = format!(
         "gc-audit-{}",
         chrono::Utc::now()
@@ -1096,10 +972,6 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
         counter_value(&after_purge, "trawl_catalog_pins_gc_total"),
         metric_before + 2
     );
-    // The fill gauge follows the eviction, published from the count the
-    // purge transaction returned. Nothing fallible sits between the commit
-    // and the eviction, so the operator's headroom reflects the reclaim as
-    // soon as the run answers.
     assert_eq!(
         gauge_value(&after_purge, "trawl_catalog_pinned_fields"),
         Some(pinned_gauge_before - 2.0),
@@ -1122,7 +994,6 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
     assert!(summary.last().unwrap().fields.contains_key("gate_held_ms"));
     assert!(summary.last().unwrap().fields.contains_key("files_scanned"));
 
-    // A repeat run has nothing left to reclaim.
     let again = gc
         .run(Some(Duration::ZERO), false, actor())
         .await
@@ -1154,11 +1025,6 @@ async fn gc_dry_run_mutates_nothing_and_execution_audits_every_deleted_pin() {
     );
 }
 
-/// The route reports the server's own three window numbers, and a
-/// `schema_write` key is what reaches it. This one goes through the real
-/// wired engine, so the packaged 90-day retention floor applies: nothing
-/// in a freshly started test is 90 days unobserved, and the honest answer
-/// is a report with no candidates.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_pins_route_reports_the_window_the_server_decided() {
     let h = harness().await;
@@ -1181,8 +1047,6 @@ async fn gc_pins_route_reports_the_window_the_server_decided() {
         dry.decided_at
     );
 
-    // The default window is the server's, not the client's: an omitted
-    // `older_than_secs` still comes back floored and named.
     let real = ops
         .schema_gc_pins(false, None)
         .await
@@ -1194,8 +1058,6 @@ async fn gc_pins_route_reports_the_window_the_server_decided() {
     assert!(h.pinned("dead"), "nothing was 90 days unobserved");
 }
 
-/// The engine's refusals reach the wire as 409s carrying the server's own
-/// sentence, because that sentence is the operator's instruction.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_pins_route_surfaces_a_refusal_as_a_409() {
     let h = harness().await;
@@ -1217,7 +1079,6 @@ async fn gc_pins_route_surfaces_a_refusal_as_a_409() {
     }
     assert!(h.pinned("dead"), "a refusal deletes nothing");
 
-    // Cleared, the same request is served again.
     std::fs::remove_file(&marker).unwrap();
     ops.schema_gc_pins(true, Some(0))
         .await

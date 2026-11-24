@@ -14,7 +14,6 @@
       preference = stored.theme;
     }
   } catch (_) {
-    // Read failures and malformed storage keep System without repairing storage.
   }
   let dark = preference === 'dark';
   if (preference === 'system') {

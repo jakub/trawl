@@ -7,33 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# `atmosphere` is default-OFF on purpose (ADR-0012). The backdrop binds its
-# vendored bundle with `#[wasm_bindgen(module = "/vendor/…")]`, a path-shaped
-# specifier wasm-bindgen treats as a compile-time LOCAL SNIPPET: linking that
-# extern block emits the 142 KB bundle into the consumer's dist and
-# modulepreloads it from index.html, whether or not anything mounts it. So the
-# extern block — and the component over it — are opt-in, and only a consumer
-# that actually mounts `Atmosphere` pays the bytes. Enable it on the fleet-ui
-# dep (`features = ["atmosphere"]`) or, for a Trunk app, via
-# `data-cargo-features` on the `rel="rust"` link. `atmosphere::palette` stays
-# unconditional: pure native data, no snippet, and the parity tests name it
-# under default features.
+# `atmosphere` is default-OFF on purpose (ADR-0012).
 [features]
 atmosphere = []
 
-# fleet-ui is primarily wasm-only — leptos / web-sys / gloo only enter the
-# graph under cfg(target_arch = "wasm32"), matching the trawl-web-ui gating
-# pattern. The exceptions are the pure contract modules (`theme::prefs`,
-# `atmosphere::palette`, the geometry/state/tone helpers), which build and
-# test natively so their contracts are exercised by
-# `cargo nextest run --workspace`.
 [dependencies]
-# chrono backs the native-tested `time` module; `wasmbind` only kicks in
-# on wasm32, where Utc::now (the calendar fallback + shared clock tick)
-# needs the js Date bridge (same shape as trawl-web-ui's dep).
+# `wasmbind` only kicks in on wasm32, where Utc::now needs the js Date bridge.
 chrono = { workspace = true, features = ["wasmbind"] }
-# Reuse the workspace's existing serde package for the preference-key visitor.
-# Raw values preserve unrelated JSON without changing Value's number semantics.
 serde = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 

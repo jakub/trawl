@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Modal dialog family.
-//!
-//! - [`shell`] — the `<Modal/>` primitive: scrim + panel + header/body/
-//!   footer slots, window-level Escape / Cmd-Ctrl+Enter, NodeRef-based
-//!   outside-click dismissal. Every dialog in the fleet composes it.
-//! - [`confirm`] — `<ConfirmModal/>`, the confirm/cancel dialog built
-//!   on the shell.
-//! - [`confirm_reason`] — `<ConfirmWithReasonModal/>`, confirm plus a
-//!   required reason textarea.
-//! - [`confirm_state`] — the pure [`ConfirmState`] open/close payload
-//!   state, replacing a per-page `RwSignal<Option<T>>`. Builds on every
-//!   target so the lifecycle is natively unit-tested; the components
-//!   above stay wasm-only.
 
 pub mod confirm_state;
 

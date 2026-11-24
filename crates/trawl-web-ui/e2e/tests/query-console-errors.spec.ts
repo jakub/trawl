@@ -2,37 +2,20 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Query errors (ADR-0039): what the page says when a query is wrong.
-//
-// Two owners, never crossed. The server's verdict on a SENT query is the
-// query error notice in the results region; it quotes the effective text
-// that request carried. The local parser's verdict on the DRAFT is the
-// draft diagnostic under the editor. Every case here asserts on one of
-// the two, and the identity cases assert the notice never quotes a text
-// other than the one the failing request sent.
+// Query errors (ADR-0039).
 
 import { readFileSync } from 'node:fs';
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 import type { Page, Route } from '@playwright/test';
 
-/// A query error body under harness/wire/. Each is the envelope the server
-/// writes for the text its case sends; e2e_wire_fixture_contract.rs checks
-/// the parse bodies against the parser and the validation bodies against
-/// the emitter.
 const wire = (name: string) =>
   JSON.parse(readFileSync(`${__dirname}/../harness/wire/${name}.json`, 'utf8'));
 
-/// The issue's sample, as typed into the editor. The local parser's first
-/// error is at byte 34, the `h` of `host`.
 const SAMPLE = 'service=kubelet | stats count( by host';
-/// What the page sends for SAMPLE under the 15-minute range: the text the
-/// server's span indexes.
 const SAMPLE_SENT = 'last=15m service=kubelet | stats count( by host';
 const SAMPLE_URL = `/search?q=${encodeURIComponent(SAMPLE)}&r=15m`;
 
-/// Park every POST /api/v1/query until the case releases it, recording
-/// the text each carried. `release(i, body)` answers the i-th request.
 async function holdQueries(page: Page) {
   const parked: { route: Route; sent: string }[] = [];
   await page.route('**/api/v1/query', route => {
@@ -45,10 +28,6 @@ async function holdQueries(page: Page) {
   };
 }
 
-/// Record, from now on, whether a query error notice was ever put in the
-/// page, however briefly. A notice that renders and is replaced within a
-/// frame is still a notice the reader was shown.
-///
 /// The observer reads each record's added nodes, not the document: by the
 /// time its callback runs, a notice mounted and removed in the same task
 /// is no longer in the page, but the record still holds the node and its
@@ -66,10 +45,8 @@ async function watchForNotice(page: Page) {
   return () => page.evaluate(() => (window as unknown as { __noticeSeen: boolean }).__noticeSeen);
 }
 
-/// The query error notice in the results region.
 const notice = (page: Page) => page.locator(SEL.queryErrorNotice);
 
-/// Answer every query with `body` at `status`, recording what each sent.
 async function answerQueries(page: Page, status: number, body: unknown) {
   const sent: string[] = [];
   await page.route('**/api/v1/query', route => {
@@ -80,8 +57,7 @@ async function answerQueries(page: Page, status: number, body: unknown) {
 }
 
 /// How far, in CSS pixels, the caret line's first `^` sits from the
-/// quoted line's glyph at string index `at`. Both are measured as laid
-/// out, through a Range over each text node.
+/// quoted line's glyph at string index `at`.
 async function caretDrift(excerpt: ReturnType<Page['locator']>, at: number) {
   return excerpt.locator(SEL.queryErrorText).evaluate((pre, at) => {
     const textChild = (parent: Node, match: (t: string) => boolean) =>
@@ -98,27 +74,20 @@ async function caretDrift(excerpt: ReturnType<Page['locator']>, at: number) {
   }, at);
 }
 
-/// Assert one excerpt block quotes `sent` with its caret under the
-/// character at string index `at`, and nothing else.
 async function expectExcerpt(block: ReturnType<Page['locator']>, sent: string, at: number) {
   const excerpt = block.locator(SEL.queryErrorExcerpt);
   await expect(excerpt).toHaveCount(1);
   await expect(excerpt.locator(SEL.queryErrorCaption)).toHaveText(COPY.queryErrorCaption);
   const caret = excerpt.locator(SEL.queryErrorCaret);
   await expect(caret).toHaveAttribute('aria-hidden', 'true');
-  // The caret line opens with the text before the span, laid out and
-  // not shown, then the carets.
   const pad = excerpt.locator(SEL.queryErrorCaretPad);
   expect(await pad.evaluate(el => el.textContent)).toBe(sent.slice(0, at));
   await expect(pad).toHaveCSS('visibility', 'hidden');
-  // The quoted line is the sent text, then the caret line under it.
   const text = await excerpt.locator(SEL.queryErrorText).evaluate(pre => pre.textContent);
   expect(text).toBe(`${sent}\n${sent.slice(0, at)}^`);
   expect(Math.abs(await caretDrift(excerpt, at))).toBeLessThanOrEqual(1);
 }
 
-/// Assert a lone-detail notice reads in repair order: the verdict alone,
-/// then the excerpt, then the server's message, then the next step.
 async function expectExcerptFirst(alert: ReturnType<Page['locator']>, verdict: string, diagnostic: RegExp | string) {
   await expect(alert.locator(SEL.queryErrorLead)).toHaveText(verdict);
   await expect(alert.locator(SEL.queryErrorDiagnostic)).toHaveCount(1);
@@ -147,12 +116,10 @@ test.describe('draft diagnostic', () => {
     const line = page.locator(SEL.draftDiagnosticFirst);
     await expect(line).toBeVisible();
     await expect(line).toHaveText(/^Line 1:35 — found 'h', expected /);
-    // Full text: the rendered line is not clipped by an ellipsis.
     const clipped = await line.evaluate(el => el.scrollWidth > el.clientWidth);
     expect(clipped).toBe(false);
     await expect(line).not.toHaveAttribute('aria-live');
     await expect(page.locator(SEL.draftDiagnostic).locator('[aria-live]')).toHaveCount(0);
-    // One error: no disclosure.
     await expect(page.locator(SEL.draftDiagnosticMore)).toHaveCount(0);
     await page.locator(SEL.draftDiagnostic).locator('xpath=..').screenshot({
       path: testInfo.outputPath('draft-diagnostic.png'),
@@ -166,7 +133,6 @@ test.describe('draft diagnostic', () => {
     await page.goto('/search?r=15m');
     await typeDraft(page, 'f=#a,#b');
 
-    // Two local errors, one per unquoted `#`.
     const more = page.locator(SEL.draftDiagnosticMore);
     await expect(page.locator(SEL.draftDiagnosticFirst)).toHaveText(/^Line 1:3 — '#' inside an unquoted value/);
     await expect(more).toBeVisible();
@@ -184,7 +150,6 @@ test.describe('draft diagnostic', () => {
       path: testInfo.outputPath('draft-diagnostic-more-open.png'),
     });
 
-    // An edit that keeps the errors closes the disclosure.
     await page.locator(SEL.cmContent).click();
     await page.keyboard.press('End');
     await page.keyboard.type(' ');
@@ -206,14 +171,11 @@ test.describe('draft diagnostic', () => {
     await expect(page.locator(SEL.dslEditor)).toMatchAriaSnapshot(`
       - img "${COPY.lintMarkerName}"
     `);
-    // Line numbers stay out of the tree.
     const lineNumbersHidden = await page
       .locator(`${SEL.dslEditor} .cm-lineNumbers`)
       .evaluate(el => el.closest('[aria-hidden="true"]') !== null);
     expect(lineNumbersHidden).toBe(true);
 
-    // The cursor sits at the end after typing; F8 wraps to the first
-    // diagnostic and selects its span, the `h` of `host`.
     await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('');
     await page.keyboard.press('F8');
     await expect.poll(() => page.evaluate(() => window.getSelection()?.toString())).toBe('h');
@@ -221,10 +183,6 @@ test.describe('draft diagnostic', () => {
 });
 
 test.describe('query error identity', () => {
-  // The guard the next case leans on. A notice mounted and removed before
-  // the observer's callback runs is gone from the document by then, so
-  // the guard has to read what each mutation added, not the page as it
-  // stands afterwards.
   test('the notice guard sees a notice mounted and removed before it looks', async ({ page }) => {
     await page.goto('/search?r=15m');
 
@@ -238,7 +196,6 @@ test.describe('query error identity', () => {
     await settled(page);
     expect(await bare()).toBe(true);
 
-    // The notice inside a subtree mounted as one node.
     const nested = await watchForNotice(page);
     await page.evaluate(() => {
       const wrap = document.createElement('div');
@@ -249,7 +206,6 @@ test.describe('query error identity', () => {
     await settled(page);
     expect(await nested()).toBe(true);
 
-    // And nothing mounted reads as nothing seen.
     const quiet = await watchForNotice(page);
     await page.evaluate(() => {
       const el = document.createElement('div');
@@ -274,8 +230,6 @@ test.describe('query error identity', () => {
     await page.keyboard.press('Control+Enter');
     const noticeSeen = await watchForNotice(page);
 
-    // The first answer lands after the second Haul was asked for, so it
-    // is not the second Haul's verdict and must not be shown as one.
     await queries.release(0, 400, wire('query-parse-error'));
     await expect.poll(queries.count).toBe(2);
     expect(queries.sent(1)).toBe(SAMPLE_SENT);
@@ -297,11 +251,8 @@ test.describe('query error notice', () => {
     await expect(alert).toBeVisible();
     expect(sent).toEqual([SAMPLE_SENT]);
     await expect(alert).toHaveAttribute('role', 'alert');
-    // One detail with an excerpt: the verdict stands alone, the excerpt
-    // follows, and the server's message comes after it, whole.
     await expectExcerptFirst(alert, "Couldn't run the query", wire('query-parse-error').error.details[0].message);
     await expect(alert.locator(SEL.queryErrorBlock)).toHaveCount(1);
-    // The message sits under the excerpt, so the block is the excerpt only.
     await expect(alert.locator(SEL.queryErrorMessage)).toHaveCount(0);
     await expectExcerpt(alert.locator(SEL.queryErrorBlock), SAMPLE_SENT, 43);
     expect(SAMPLE_SENT[43]).toBe('h');
@@ -445,7 +396,6 @@ test.describe('query error identity, edits', () => {
     await expect.poll(queries.count).toBe(1);
     expect(queries.sent(0)).toBe(SAMPLE_SENT);
 
-    // B is typed, not Hauled, while A is still out.
     const b = 'service=kubelet | stats count() by pod';
     await typeDraft(page, b);
     await queries.release(0, 400, wire('query-parse-error'));
@@ -454,7 +404,6 @@ test.describe('query error identity, edits', () => {
     await expect(alert).toBeVisible();
     await expectExcerpt(alert.locator(SEL.queryErrorBlock), SAMPLE_SENT, 43);
     await expect(alert).not.toContainText('pod');
-    // The draft is B; the draft diagnostic is about B, which parses.
     await expect(page.locator(SEL.draftDiagnostic)).toHaveCount(0);
     expect(queries.count()).toBe(1);
   });

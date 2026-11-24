@@ -292,9 +292,6 @@ class OperationalAlerts(unittest.TestCase):
                 self.assertEqual(outcomes, {False, True})
 
     def test_promtool_timelines_for_both_packs(self):
-        # Counter plateaus model no further observations, not an application setting.
-        # The exact expression oracle above proves these rules contain no ingest gate;
-        # backend idle/disable tests cover the actual producer behavior separately.
         result = command([PROMTOOL, "check", "rules", str(PLAIN)])
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for name, pack in [("plain", self.plain), ("helm", self.helm["spec"])]:
@@ -337,7 +334,6 @@ class OperationalAlerts(unittest.TestCase):
                 for family in FAMILIES:
                     probe = self.firing_probe(family)
                     case = self.timeline(probe, target, family)
-                    # Both decoys match. Only the selected namespace AND Service may fire.
                     for key in ["namespace", "service"]:
                         decoy = self.timeline({**probe, "checks": []}, {**target, key: "unrelated"}, family)
                         case["input_series"].extend(decoy["input_series"])

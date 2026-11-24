@@ -3,7 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Coordinates canonical Parquet publication with readers in this process.
-//! External writers and exactly-once ingestion require separate guarantees.
 //!
 //! # Rollup markers
 //!
@@ -24,29 +23,6 @@
 //! disk therefore leaves the marker registered and refusing reads. A marker
 //! the gate already held when the call came, such as one that recovery
 //! retries, was established before this writer and never goes in flight.
-//!
-//! [`PublicationGate::read`] and every query that gets a read guard forget
-//! the markers whose files are gone, then report the rest. A query that
-//! takes no guard while a writer holds the lock or waits for it forgets
-//! nothing and reads no file: it reports every marker that is not in flight.
-//! [`PublicationGate::pending_rollup_markers`] may run without a guard, so
-//! it neither forgets nor lists a marker in flight.
-//!
-//! # Removal syncs owed
-//!
-//! A marker's unlink is durable only once its day directory is fsynced, so
-//! a missing marker file does not prove that the marker will stay gone
-//! after a crash. A writer records the obligation with
-//! [`PublicationGate::owe_removal_sync`] before it unlinks a marker, and
-//! the obligation ends only when a fsync of the day directory succeeds
-//! after the unlink. The gate keeps these obligations apart from the
-//! markers: nothing that forgets a marker on path absence touches them,
-//! and they never refuse reads, because the files the rollup left are
-//! complete. While one is owed, the writers that would replace the day's
-//! files consult it ([`PublicationGate::removal_sync_owed`],
-//! [`PublicationGate::any_removal_sync_owed`],
-//! [`PublicationGate::removal_sync_owed_days`]). The obligations are held in
-//! memory and do not survive a restart.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -75,7 +51,6 @@ pub enum CorpusUnsettled {
 }
 
 impl CorpusUnsettled {
-    /// Every reason, for consumers that enumerate (gauges, zero-init).
     pub const ALL: [Self; 2] = [Self::RollupPending, Self::RestartBacklog];
 
     /// The fixed `snake_case` literal this reason is reported as: the
@@ -99,7 +74,6 @@ pub struct UnsettledReasons {
 }
 
 impl UnsettledReasons {
-    /// Whether `reason` holds.
     #[must_use]
     pub const fn contains(self, reason: CorpusUnsettled) -> bool {
         match reason {
@@ -108,8 +82,6 @@ impl UnsettledReasons {
         }
     }
 
-    /// The reason a refusal or the health check names: `RollupPending`
-    /// when both hold, `None` when the corpus is settled.
     #[must_use]
     pub const fn first(self) -> Option<CorpusUnsettled> {
         if self.rollup_pending {
@@ -158,14 +130,12 @@ struct CorpusState {
     restart: Restart,
     /// Marker unlinks whose day-directory fsync has not succeeded yet. Only
     /// [`PublicationGate::owe_removal_sync`], a [`RemovalSync`] and
-    /// [`PublicationGate::retry_removal_syncs`] change it; see the
-    /// [module documentation](self).
+    /// [`PublicationGate::retry_removal_syncs`] change it.
     unsynced_removals: HashMap<PathBuf, Removal>,
     /// Numbers each obligation, so a retry ends only the one it synced for.
     removal_generation: u64,
 }
 
-/// One owed removal sync.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Removal {
     generation: u64,
@@ -209,8 +179,6 @@ impl CorpusState {
 }
 
 impl CorpusState {
-    /// End the obligation of `marker` if it is still the one numbered
-    /// `generation`.
     fn end_removal(&mut self, marker: &Path, generation: u64) {
         if self
             .unsynced_removals
@@ -513,20 +481,16 @@ impl PublicationGate {
         }
     }
 
-    /// Whether the unlink of `marker` still owes its day-directory fsync.
     #[must_use]
     pub fn removal_sync_owed(&self, marker: &Path) -> bool {
         self.corpus.lock().unsynced_removals.contains_key(marker)
     }
 
-    /// Whether any marker unlink still owes its day-directory fsync.
     #[must_use]
     pub fn any_removal_sync_owed(&self) -> bool {
         !self.corpus.lock().unsynced_removals.is_empty()
     }
 
-    /// The day directories of every marker whose unlink still owes its
-    /// fsync.
     #[must_use]
     pub fn removal_sync_owed_days(&self) -> HashSet<PathBuf> {
         self.corpus
@@ -986,9 +950,6 @@ mod tests {
         assert!(gate.read().await.is_ok());
     }
 
-    /// A failed scan refuses reads until a later complete scan clears it
-    /// (ADR-0041 slice 2). Reads and failed rescans in between are the
-    /// same failure episode, counted once.
     #[tokio::test]
     async fn scan_failure_stays_closed() {
         use crate::metrics::test_support::sample;
@@ -1079,7 +1040,6 @@ mod tests {
     /// `(level, event_type)` of one recorded event.
     type Recorded = (tracing::Level, Option<String>);
 
-    /// Every event recorded while installed.
     #[derive(Clone, Default)]
     struct Capture(Arc<Mutex<Vec<Recorded>>>);
 
@@ -1116,7 +1076,6 @@ mod tests {
         }
     }
 
-    /// Run `f` with every event it logs on this thread captured.
     fn capturing<T>(f: impl FnOnce(&Capture) -> T) -> T {
         use tracing_subscriber::layer::SubscriberExt as _;
         let capture = Capture::default();
@@ -1239,8 +1198,6 @@ mod tests {
         });
     }
 
-    /// Only overhang left by a finished hydration awaits a coverage proof: a
-    /// starting gate is overhang too, but has nothing to prove yet.
     #[test]
     fn only_overhang_awaits_a_coverage_proof() {
         assert!(!PublicationGate::new().awaits_coverage_proof());
@@ -1318,12 +1275,6 @@ mod tests {
         ));
     }
 
-    /// A rollup registers its marker before it writes the marker file. A
-    /// query that takes no guard, inside that window, neither forgets the
-    /// marker nor reports it. If the rollup then fails with its marker on
-    /// disk, the marker is reported from the moment its registration
-    /// drops, while the writer still holds the lock, and reads refuse
-    /// `rollup_pending` (ADR-0026, ADR-0041).
     #[tokio::test]
     async fn a_lock_free_query_inside_a_rollup_keeps_its_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -1364,12 +1315,6 @@ mod tests {
         assert!(gate.read().await.is_ok());
     }
 
-    /// A compaction pass lists the pending markers before it takes the
-    /// write guard. Inside a rollup's window, between its registration and
-    /// its marker file, that listing neither forgets the marker nor lists
-    /// it: the marker is a live writer's, not one to recover. If the rollup
-    /// then fails with its marker on disk, the marker refuses reads beside
-    /// its own writer and after it, and recovery lists it.
     #[tokio::test]
     async fn listing_pending_markers_inside_a_rollup_keeps_its_marker() {
         let dir = tempfile::tempdir().unwrap();
@@ -1404,10 +1349,6 @@ mod tests {
         assert_eq!(gate.pending_rollup_markers(), vec![marker]);
     }
 
-    /// A normal rollup, as health, `/metrics`, the scheduler and a manual
-    /// run see it without a guard: the corpus reads the same from
-    /// `mark_rollup` to the marker's removal, so none of them flaps. A
-    /// restart backlog is still reported throughout.
     #[test]
     fn a_normal_rollup_never_moves_a_lock_free_query() {
         for overhang in [false, true] {
@@ -1438,14 +1379,6 @@ mod tests {
         }
     }
 
-    /// Consecutive writers with no evaluation between them. Writer A's
-    /// rollup fails with its marker on disk, and writer B takes the lock
-    /// before any query takes a guard. A lock-free query beside B reports
-    /// A's marker, so the scheduler does not claim a run that `read` would
-    /// refuse. B retrying the marker does not hide it, because the gate
-    /// held it before B registered it. Once B has removed it and a guarded
-    /// evaluation runs, the corpus is settled, and the next normal
-    /// rollup's in-flight marker is not reported.
     #[test]
     fn a_failed_rollups_marker_is_reported_beside_the_next_writer() {
         let dir = tempfile::tempdir().unwrap();
@@ -1484,11 +1417,6 @@ mod tests {
         assert_eq!(gate.unsettled(), None, "file written");
     }
 
-    /// A rollup that fails before it writes its marker file leaves a
-    /// registered marker with no file. A query without a guard reads no
-    /// file, so beside the next writer the marker still reads as pending:
-    /// the stale answer refuses rather than admits. The next guarded
-    /// evaluation forgets it.
     #[test]
     fn a_marker_without_a_file_reads_pending_until_a_guarded_evaluation() {
         let dir = tempfile::tempdir().unwrap();
@@ -1506,8 +1434,6 @@ mod tests {
         assert!(gate.corpus.lock().markers.is_empty());
     }
 
-    /// A failed marker scan is no writer's marker: a lock-free query
-    /// reports it while a writer holds the lock as well.
     #[test]
     fn a_failed_scan_is_reported_while_a_writer_holds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1558,8 +1484,6 @@ mod tests {
         assert!(gate.read_rollups_only().await.is_ok());
     }
 
-    /// A complete rescan clears a failed scan and registers the markers it
-    /// finds; those still refuse until they resolve (ADR-0041 slice 2).
     #[tokio::test]
     async fn rollup_boot_recovery_rescan_registers_what_the_complete_scan_finds() {
         let dir = tempfile::tempdir().unwrap();
@@ -1623,10 +1547,6 @@ mod tests {
         out
     }
 
-    /// A rollup marker under an env child that is not a canonical date is
-    /// found, refuses corpus reads with a 503 `corpus_recovering` whose
-    /// cause is `rollup_pending`, and outlives boot recovery with every
-    /// file beside it byte-identical (ADR-0041, amendment of 2026-11-08).
     /// Under a canonical date, its identities would promote the tmp and
     /// retire the input.
     #[test]
@@ -1705,8 +1625,6 @@ mod tests {
         ));
     }
 
-    /// A gate whose scan did not fail never rescans: a marker that appears
-    /// on disk behind its back is a writer's to register.
     #[tokio::test]
     async fn rollup_boot_recovery_rescan_leaves_a_healthy_gate_alone() {
         let dir = tempfile::tempdir().unwrap();

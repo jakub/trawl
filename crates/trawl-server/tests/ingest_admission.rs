@@ -4,13 +4,11 @@
 
 //! HTTP ingest is admitted against hot-buffer capacity (ADR-0043).
 //!
-//! Every test boots a real server with small hot-buffer caps and fills it
-//! over HTTP. The fixture runs no compaction loop, so nothing drains and the
+//! The fixture runs no compaction loop, so nothing drains and the
 //! buffer holds exactly what the test acknowledged.
 //!
 //! Its own test binary because it installs the production subscriber as
-//! the global one, as `http_failure.rs` does, to count the WARN lines a
-//! refusal produces. Tests tell their lines apart by request id.
+//! the global one. Tests tell their lines apart by request id.
 
 mod common;
 
@@ -30,8 +28,6 @@ use trawl_server::telemetry::{self, LogSinks};
 /// so a `Retry-After` equal to it came from the config.
 const INTERVAL_SECS: u64 = 37;
 
-/// Room for `max_events` events and bytes enough that only the event
-/// dimension binds.
 fn event_caps(max_events: usize) -> HotBufferKnobs {
     HotBufferKnobs {
         max_events,
@@ -40,9 +36,6 @@ fn event_caps(max_events: usize) -> HotBufferKnobs {
     }
 }
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -65,8 +58,6 @@ impl<'a> MakeWriter<'a> for Stdout {
     }
 }
 
-/// The production subscriber under the default directives, installed once
-/// for the whole binary, writing to a captured stdout.
 fn stdout() -> &'static Stdout {
     static STDOUT: OnceLock<Stdout> = OnceLock::new();
     STDOUT.get_or_init(|| {
@@ -85,7 +76,6 @@ fn stdout() -> &'static Stdout {
     })
 }
 
-/// Every stdout line that mentions `request_id`.
 fn lines_for(request_id: &str) -> Vec<String> {
     let bytes = stdout().0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -96,8 +86,6 @@ fn lines_for(request_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// A field's value on a formatted stdout line: `name="quoted"` or
-/// `name=bare`.
 fn field(line: &str, name: &str) -> Option<String> {
     let at = line.find(&format!(" {name}="))? + name.len() + 2;
     let rest = &line[at..];
@@ -108,7 +96,6 @@ fn field(line: &str, name: &str) -> Option<String> {
     }
 }
 
-/// The level a formatted stdout line was logged at.
 fn level(line: &str) -> &'static str {
     ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
         .into_iter()
@@ -116,7 +103,6 @@ fn level(line: &str) -> &'static str {
         .unwrap_or("none")
 }
 
-/// The WARN and ERROR lines one request produced.
 fn loud_lines_for(request_id: &str) -> Vec<String> {
     lines_for(request_id)
         .into_iter()
@@ -124,15 +110,10 @@ fn loud_lines_for(request_id: &str) -> Vec<String> {
         .collect()
 }
 
-// -- requests -----------------------------------------------------------------
-
-/// `count` ndjson events for `service`, with ids `{prefix}-{n}`, and those
-/// ids.
 fn events(service: &str, prefix: &str, count: usize) -> (Vec<u8>, Vec<String>) {
     events_padded(service, prefix, count, 0)
 }
 
-/// Like [`events`], each carrying a `pad` field of `pad` bytes.
 fn events_padded(service: &str, prefix: &str, count: usize, pad: usize) -> (Vec<u8>, Vec<String>) {
     let padding = "p".repeat(pad);
     let mut body = Vec::new();
@@ -152,7 +133,6 @@ fn events_padded(service: &str, prefix: &str, count: usize, pad: usize) -> (Vec<
     (body, ids)
 }
 
-/// POST `body` to the ingest endpoint as the fixture's ingest key.
 async fn post(server: &TestServer, body: Vec<u8>, gzip: bool) -> reqwest::Response {
     let mut request = common::harness_client_builder()
         .build()
@@ -166,7 +146,6 @@ async fn post(server: &TestServer, body: Vec<u8>, gzip: bool) -> reqwest::Respon
     request.body(body).send().await.unwrap()
 }
 
-/// POST `body` and require a 200 that accepted every event in it.
 async fn acknowledge(server: &TestServer, body: Vec<u8>, expected: usize) {
     let response = post(server, body, false).await;
     assert_eq!(response.status(), 200, "{:?}", response.text().await);
@@ -185,8 +164,6 @@ fn request_id_of(response: &reqwest::Response) -> String {
         .to_owned()
 }
 
-/// Read a refusal: its status, its `Retry-After`, its error code and its
-/// request id.
 async fn refusal(response: reqwest::Response) -> (u16, Option<String>, String, String) {
     let status = response.status().as_u16();
     let request_id = request_id_of(&response);
@@ -222,7 +199,6 @@ fn wal_dir(server: &TestServer) -> PathBuf {
         .to_path_buf()
 }
 
-/// Every path under `dir`, recursively, with its size.
 fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64)> {
     let mut out = BTreeSet::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -242,9 +218,6 @@ fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64)> {
     out
 }
 
-/// Fill a buffer whose event cap is `max_events` to exactly the HTTP
-/// ceiling with `service` events in batches of `batch`, and return the
-/// acknowledged ids.
 async fn fill_to_ceiling(
     server: &TestServer,
     max_events: usize,
@@ -269,7 +242,6 @@ async fn fill_to_ceiling(
     acked
 }
 
-/// Every `id` a query for `service` returns.
 async fn searchable_ids(server: &TestServer, service: &str) -> Vec<String> {
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let result = client
@@ -293,11 +265,6 @@ async fn searchable_ids(server: &TestServer, service: &str) -> Vec<String> {
         .collect()
 }
 
-// -- AC2 ------------------------------------------------------------------------
-
-/// Filling the buffer over HTTP ends in refusals, never in eviction: every
-/// event any request was acknowledged for stays searchable, and nothing
-/// from a refused request is.
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_ingest_keeps_every_acknowledged_event_searchable() {
     stdout();
@@ -323,12 +290,10 @@ async fn refused_ingest_keeps_every_acknowledged_event_searchable() {
             refused.extend(ids);
         }
     }
-    // What still fits is admitted: exactly the ceiling.
     let (body, ids) = events(service, "tail", 4);
     acknowledge(&server, body, 4).await;
     acked.extend(ids);
     assert_eq!(hot(&server).charged().events, 60);
-    // Then nothing is, and the refusal comes before any parsing.
     let (body, ids) = events(service, "late", 1);
     let (status, _, code, _) = refusal(post(&server, body, false).await).await;
     assert_eq!((status, code.as_str()), (503, "hot_buffer_full"));
@@ -343,11 +308,6 @@ async fn refused_ingest_keeps_every_acknowledged_event_searchable() {
     }
 }
 
-// -- AC4 ------------------------------------------------------------------------
-
-/// A request that fits the ceiling but not the free space is 503
-/// `hot_buffer_full` with `Retry-After` equal to the configured compaction
-/// interval, and it writes nothing to the WAL.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_buffer_is_503_with_retry_after_and_writes_nothing() {
     stdout();
@@ -384,9 +344,6 @@ async fn full_buffer_is_503_with_retry_after_and_writes_nothing() {
     assert_eq!(listing(&wal_dir(&server)), before, "the WAL is unchanged");
 }
 
-// -- AC5 ------------------------------------------------------------------------
-
-/// The `ingest_batch_too_large` series on `/metrics`.
 async fn too_large_rejections(server: &TestServer) -> u64 {
     let body = common::harness_client_builder()
         .build()
@@ -408,9 +365,6 @@ async fn too_large_rejections(server: &TestServer) -> u64 {
         })
 }
 
-/// A request larger than the HTTP ceiling is 413 `ingest_batch_too_large`
-/// with no `Retry-After`, on an empty buffer, on either dimension. Its
-/// valid events count under that reason, and nothing is written.
 #[tokio::test(flavor = "multi_thread")]
 async fn oversized_request_is_413_without_retry_after_on_either_dimension() {
     stdout();
@@ -426,7 +380,6 @@ async fn oversized_request_is_413_without_retry_after_on_either_dimension() {
     assert_eq!(hot(&server).charged(), Charge::ZERO, "the buffer was empty");
     assert_eq!(listing(&wal_dir(&server)), before, "nothing was written");
     assert_eq!(too_large_rejections(&server).await - counted, 16);
-    // One event fewer fits.
     let (body, _) = events("adm-ac5", "fits", 15);
     acknowledge(&server, body, 15).await;
 
@@ -450,17 +403,12 @@ async fn oversized_request_is_413_without_retry_after_on_either_dimension() {
     acknowledge(&server, body, 1).await;
 }
 
-// -- AC6 ------------------------------------------------------------------------
-
-/// With no free space, a body is refused before it is decompressed: a
-/// broken gzip stream is 503, not the 400 its decompression would earn.
 #[tokio::test(flavor = "multi_thread")]
 async fn full_buffer_refuses_before_decompression() {
     const BROKEN: &[u8] = b"\x1f\x8bnot-gzip";
     stdout();
     let server = setup_with_hot_buffer(event_caps(64)).await;
 
-    // On an empty buffer the same body is a decompression 400.
     let response = post(&server, BROKEN.to_vec(), true).await;
     assert_eq!(response.status(), 400, "{:?}", response.text().await);
 
@@ -470,11 +418,6 @@ async fn full_buffer_refuses_before_decompression() {
     assert_eq!(retry_after, Some(INTERVAL_SECS.to_string()));
 }
 
-// -- AC7 ------------------------------------------------------------------------
-
-/// A refusal never waits on the publication gate: with the gate's write
-/// side held, as compaction holds it to drain, both refusal points answer
-/// within two seconds, while an admissible request provably waits on it.
 #[tokio::test(flavor = "multi_thread")]
 async fn refusal_does_not_wait_on_the_publication_gate() {
     stdout();
@@ -505,7 +448,6 @@ async fn refusal_does_not_wait_on_the_publication_gate() {
                 .unwrap()
         }
     });
-    // Wait until it has reserved, then watch it stay parked on the gate.
     tokio::time::timeout(Duration::from_secs(10), async {
         while hot(&server).charged().events < 57 {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -552,11 +494,6 @@ async fn refusal_does_not_wait_on_the_publication_gate() {
     drop(held);
 }
 
-// -- AC8 ------------------------------------------------------------------------
-
-/// Each 503 is exactly one WARN, the failure observer's `http_failure`
-/// with `cause_kind` `hot_buffer_full`, and the handler adds no line of
-/// its own. A 413 is the client's error and logs no WARN at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_503_is_one_warn_http_failure_and_a_413_is_none() {
     stdout();
@@ -599,7 +536,6 @@ async fn each_503_is_one_warn_http_failure_and_a_413_is_none() {
         );
     }
 
-    // A 413, on a buffer small enough that one request cannot fit.
     let small = setup_with_hot_buffer(event_caps(16)).await;
     let (body, _) = events("adm-ac8", "oversized", 16);
     let (status, _, code, request_id) = refusal(post(&small, body, false).await).await;
@@ -608,11 +544,6 @@ async fn each_503_is_one_warn_http_failure_and_a_413_is_none() {
     assert!(loud.is_empty(), "a 413 logs no WARN: {loud:#?}");
 }
 
-// -- AC9 (HTTP half) ----------------------------------------------------------
-
-/// The self-telemetry reserve is entitled by the code path, never by the
-/// event: HTTP events that call themselves `service=trawld` stop at the
-/// HTTP ceiling, with the reserve still free.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_trawld_service_name_over_http_gets_no_reserve() {
     stdout();
@@ -630,8 +561,6 @@ async fn a_trawld_service_name_over_http_gets_no_reserve() {
         "the reserve stays free for self-telemetry: {charged:?}"
     );
 
-    // A spoofed request that would fit only inside the reserve is refused
-    // too, from a partly filled buffer.
     let server = setup_with_hot_buffer(event_caps(64)).await;
     let (body, _) = events("trawld", "partial", 58);
     acknowledge(&server, body, 58).await;

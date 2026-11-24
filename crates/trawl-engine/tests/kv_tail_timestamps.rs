@@ -5,13 +5,6 @@
 //! The kv batch tail compares a column the SQL step returns as a TIMESTAMP
 //! as an instant, unless a pin for its name says otherwise (ADR-0011,
 //! amended 2026-11-09), against real `DuckDB` and real parquet.
-//!
-//! The SQL step hands the tail `DuckDB`'s cast text, such as
-//! `2026-11-01 06:30:00`. Read as a string, that text sorts below an RFC
-//! 3339 bound like `2026-11-01T06:00:00Z`, because a space sorts below
-//! `T`. Every parity test here compares the tail query against the same
-//! query without `extract kv`, and against a hard-coded answer, by the
-//! sorted `seq` of the rows kept, never by scan order.
 
 use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_engine::executor::Executor;
@@ -35,9 +28,6 @@ fn parquet(select: &str) -> (tempfile::TempDir, String) {
     (dir, path.display().to_string())
 }
 
-/// Six rows around the bound, written out of `seq` order: one before it,
-/// one on it, one a microsecond past it, one well past it, one at
-/// `infinity` and one NULL.
 fn timestamp_source() -> (tempfile::TempDir, String) {
     parquet(
         "SELECT * FROM (VALUES \
@@ -62,7 +52,6 @@ fn run(dsl: &str, glob: &str) -> QueryResult {
     run_with(dsl, glob, &FieldTypes::new())
 }
 
-/// The `seq` of every row kept, sorted.
 fn kept(result: &QueryResult) -> Vec<i64> {
     let at = result
         .columns
@@ -81,8 +70,6 @@ fn kept(result: &QueryResult) -> Vec<i64> {
     seqs
 }
 
-/// The tail query keeps `expected`, and so does the same query without
-/// `extract kv`.
 fn assert_parity(tail: &str, sql: &str, glob: &str, expected: &[i64]) {
     let sql_kept = kept(&run(sql, glob));
     assert_eq!(sql_kept, expected, "the all-SQL lane: {sql}");
@@ -110,8 +97,6 @@ fn a_tail_compares_a_sql_timestamp_as_an_instant() {
         &glob,
         &[3, 4, 5],
     );
-    // 06:00:00.000001 and 06:30 truncate to 06:00, which is not past the
-    // bound; infinity stays infinity.
     assert_parity(
         &format!(
             "* | let t = date_trunc(\"hour\", _time) | extract kv | where t > {BOUND} | table seq"
@@ -233,11 +218,6 @@ fn a_mixed_case_timestamp_column_compares_as_an_instant() {
     );
 }
 
-/// A TIMESTAMPTZ and a `TIMESTAMP_NS` column behind `extract kv` compare
-/// their cast text as a string, so neither row passes the bound. These
-/// types are outside the fill because the all-SQL lane types them
-/// differently from a Timestamp pin (a TIMESTAMPTZ applies a literal's
-/// offset, a `TIMESTAMP_NS` keeps nanoseconds the pin truncates).
 #[test]
 fn timestamptz_and_timestamp_ns_columns_get_no_fill() {
     let (_dir, glob) = parquet(

@@ -43,12 +43,9 @@ import { SEL, TIMING } from '../selectors';
 type Ctl = import('@playwright/test').APIRequestContext;
 type Pg = import('@playwright/test').Page;
 
-/** The field the scripted job belongs to. */
 const FIELD_A = 'duration';
-/** A second field, for the drawer-to-drawer teardown. */
 const FIELD_B = 'status';
 
-/** Bounded wait for something that must NOT happen. */
 const QUIET_MS = 500;
 
 type RepinState = {
@@ -64,9 +61,6 @@ async function repinState(request: Ctl): Promise<RepinState> {
   return state.repin as RepinState;
 }
 
-/** Poll until the stub reports `what`, or throw naming the last state it
- * actually saw. A bare Playwright timeout here would say "waiting for
- * condition" and leave the reader guessing which half was wrong. */
 async function waitForRepinState(
   request: Ctl,
   pred: (s: RepinState) => boolean,
@@ -85,7 +79,6 @@ async function waitForRepinState(
   }
 }
 
-/** Wait until status read `n` is the one parked open by the stub. */
 async function waitForHeldStatusRead(request: Ctl, n: number): Promise<RepinState> {
   return waitForRepinState(
     request,
@@ -94,12 +87,9 @@ async function waitForHeldStatusRead(request: Ctl, n: number): Promise<RepinStat
   );
 }
 
-/** The drawer is up, it adopted the running job, and its poll is live.
- *
- * Read 1 is the mount probe, read 2 the immediate `poll_once` the
- * adoption starts. The stub parks read 2, so the poll's in-flight guard
- * makes every later tick a no-op — which is why the hit count stays at 2
- * for the rest of the test and the interval is a separate observable. */
+/** Read 1 is the mount probe, read 2 the immediate `poll_once` that
+ * adopting the running job starts. The stub parks read 2, so the in-flight guard makes
+ * every later tick a no-op and the hit count stays at 2. */
 async function expectPollStarted(page: Pg, request: Ctl) {
   await expect(page.locator(SEL.fieldCase)).toBeVisible();
   await expect(
@@ -113,17 +103,11 @@ async function expectPollStarted(page: Pg, request: Ctl) {
   ).toBe(1);
 }
 
-/** Open a case file by deep link and wait for its poll to be live. */
 async function openCaseFile(page: Pg, request: Ctl, url: string) {
   await page.goto(url);
   await expectPollStarted(page, request);
 }
 
-/** Everything the poll must have stopped doing, once the drawer is gone.
- *
- * Each assertion names the mechanism it is about, because they fail for
- * different reasons and a shared message would send the reader to the
- * wrong one. */
 async function expectPollStopped(page: Pg, request: Ctl, baselineHits: number) {
   expect(
     await intervalCount(page, TIMING.repinPollMs),
@@ -131,8 +115,6 @@ async function expectPollStopped(page: Pg, request: Ctl, baselineHits: number) {
       '(on_cleanup did not drop the StoredValue)',
   ).toBe(0);
 
-  // Real time, past one whole poll period plus slack. A leaked timer
-  // that ticks even once inside this window is a defect either way.
   await page.waitForTimeout(TIMING.repinPollMs + 1_000);
 
   expect(
@@ -144,10 +126,6 @@ async function expectPollStopped(page: Pg, request: Ctl, baselineHits: number) {
     'timer leak: a repin poll Interval reappeared after the drawer was gone',
   ).toBe(0);
 
-  // The parked read is answered NOW, with a succeeded job. Two facts in
-  // one call: the response was still pending (so the client never
-  // abandoned the read — that is what the alive latch guards), and the
-  // dead continuation gets a terminal job to react to.
   const released = await request.post('/__ctl/repin/release');
   const body = await released.json();
   expect(
@@ -190,9 +168,8 @@ test('Escape back to the service context stops the repin poll', async ({ page, r
   await trackToasts(page);
   await scriptRepinStatus(request, FIELD_A);
 
-  // With `svc=` present the drawer's `on_escape` override takes the BACK
-  // branch rather than the close one, so this is a different teardown
-  // path than the X above, not a second spelling of it.
+  // With `svc=` present `on_escape` takes the BACK branch rather than the
+  // close one, so this is a different teardown path than the X above.
   await openCaseFile(page, request, `/search/schema?field=${FIELD_A}&svc=nginx&stab=fields`);
 
   await page.keyboard.press('Escape');
@@ -210,9 +187,6 @@ test('browser Back out of a case file stops its repin poll', async ({ page, requ
   await scriptRepinStatus(request, FIELD_A);
 
   await page.goto('/search/schema');
-  // Tag `window` so a full reload (which replaces it) is detectable: the
-  // point of this test is an SPA unmount, and a document reload would
-  // stop the poll for a reason that proves nothing about `on_cleanup`.
   await page.evaluate(() => {
     (window as any).__e2e_marker = true;
   });
@@ -257,14 +231,11 @@ test('navigating from one case file to another stops the first one\'s poll', asy
     },
     [FIELD_A, FIELD_B],
   );
-  // Back lands on A, which is the entry the router observes first.
   await page.goBack();
   await expectPollStarted(page, request);
 
-  // Forward unmounts A and mounts B in one router update. B runs its own
-  // mount probe, which is status read 3: the succeeded job, still
-  // stamped with A's field. B must read that as another field's receipt
-  // — no adoption, no poll, no toast.
+  // B's mount probe is status read 3: the succeeded job, still stamped
+  // with A's field, which B must not adopt.
   await page.goForward();
   await expect(page.locator(SEL.drawerTitle)).toContainText(FIELD_B);
   await expect(page.locator(SEL.drawerTitle)).not.toContainText(FIELD_A);

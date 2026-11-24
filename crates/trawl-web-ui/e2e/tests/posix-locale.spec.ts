@@ -2,15 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A browser can report a language that is not a BCP 47 tag. Chromium on
-// the ubuntu-24.04-arm runner reported `en-US@posix`, the POSIX locale
-// spelling, and `new Intl.NumberFormat('en-US@posix')` throws a
-// RangeError. uPlot built its number formatter from `navigator.language`
-// while its module loaded, so the error stopped the SPA before the sign-in
-// form rendered. The vendor build now routes that language through
-// `vendor/src/uplot-navigator.ts`.
+// A browser can report a language that is not a BCP 47 tag, and
+// `new Intl.NumberFormat('en-US@posix')` throws a RangeError. The vendor
+// build routes that language through `vendor/src/uplot-navigator.ts`.
 //
-// Playwright's `locale` sets `navigator.language` to exactly that string.
 // Each test first checks that the page sees the invalid tag, so the test
 // cannot pass because the browser corrected the tag. The contract fixture
 // fails the test on any page error.
@@ -53,8 +48,7 @@ test('a chart formats its values under a POSIX language tag', async ({ page }) =
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.locator('.chart canvas')).toHaveCount(1);
   // The legend value is uPlot's own number formatter. Without a valid
-  // tag, that formatter uses the browser's default locale, the same one
-  // the bar chart tooltip's `toLocaleString()` uses.
+  // tag, that formatter uses the browser's default locale.
   const expected = await page.evaluate(v => new Intl.NumberFormat().format(v), value);
   const plot = await page.locator('.chart .u-over').boundingBox();
   await page.mouse.move(plot!.x + plot!.width / 2, plot!.y + plot!.height / 2);

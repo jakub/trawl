@@ -2,54 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `/search` — query workspace.
-//!
-//! Layout (top to bottom inside `.search-col`, the page's one sheet):
-//! `h1` → query console (header + draft state + `DslEditor` + date
-//! range + Haul + tools + the executed-scope strip)
-//! → tabs (Events / Visualization · trailing Truncated / Stop live /
-//!   View / Export / Send to investigation)
-//! → degraded-field notice (hidden unless the execution reported one)
-//! → tab body (Events: histogram + results table | Visualization: chart)
-//!   — or, on either tab, the query error notice when the server refused
-//!   the text the current request sent (ADR-0039)
-//!
-//! Two skip links open the page ahead of the filter rail, because the
-//! rail's value controls stay in the tab order on purpose: one focuses
-//! the editor, one the results region (audit finding A03).
-//!
-//! State split:
-//! - `query_text` — in-progress editor buffer (not URL-synced).
-//! - `executed_q` / `filters` / `range` — URL-driven memos (canonical).
-//! - `effective_q` — derived from the triple AND the mode; what actually
-//!   hits the server. A snapshot folds the range in, a live stream never
-//!   does (ADR-0027, amended 2026-09-21), and `mode_query` is the one
-//!   place that decides. `export_q` is its always-snapshot twin, because a
-//!   download from a live page is still asking for the URL's range.
-//!   Filter chips in the scope strip and the date-range popover mutate
-//!   state by navigating; URL drives memos drives resource.
-//! - `draft_dirty` — the console header's own comparison of the two.
-//!   It reads both and writes neither, so saying "unsent changes"
-//!   cannot itself become a navigation (ADR-0027).
-//! - `selected` / `result_gen` — the docked inspector's selection, a
-//!   `(response generation, ORIGINAL row index)` pair. Sorting re-orders
-//!   the rows on screen but never the pair, so a re-sort keeps the same
-//!   event open; a new response, a page turn or a new effective query
-//!   bumps the generation, which closes the panel.
-//!
-//! Both reading modes (`View`) default off and apply to SNAPSHOT raw
-//! results only: a live ring evicts rows every frame, so a selection in
-//! it would be cleared continuously (ADR-0032).
-//!
-//! "Send to investigation" sends the accepted snapshot execution, never
-//! the draft, into an open investigation as a capture the server runs
-//! (ADR-0059). It is offered only to a session that writes
-//! investigations ([`crate::perms::can_write_investigations`]), on an
-//! accepted response with execution facts, and never in live or for a
-//! `from saved` search ([`crate::send_investigation::offers_send`]). A
-//! moving range is pinned to that execution's server start and run again
-//! before anything is sent ([`SendToInvestigation`]).
-
 use leptos::prelude::*;
 use leptos::web_sys;
 use trawl_api::value::QueryResult;
@@ -100,20 +52,12 @@ use crate::state::stream_session::{
     start_stream,
 };
 
-/// Move keyboard focus to the first element matching `selector`, and
-/// report whether anything took it.
-///
-/// Both skip links are real anchors, so the browser already moves the
-/// document to the target; neither target takes focus from an `href`
-/// alone — `.cm-content` is `CodeMirror`'s own contenteditable, and the
-/// results tab is a `tabindex="0"` control — so the handler supplies it.
-///
-/// The return value is what keeps the link honest. A missing target is
-/// a real case: the results header is absent while the malformed banner
-/// is up (ADR-0027). Swallowing the default there left the link inert —
-/// it prevented the navigation AND focused nothing — so the caller
-/// prevents the default only when the focus landed, and otherwise lets
-/// the browser move the document the way an anchor always does.
+/// Neither skip-link target takes focus from an `href` alone —
+/// `.cm-content` is `CodeMirror`'s own contenteditable, and the results
+/// tab is a `tabindex="0"` control — so the handler supplies it. A missing
+/// target is a real case: the results header is absent while the malformed
+/// banner is up, so the caller prevents the default only when the focus
+/// landed.
 fn focus_search_control(selector: &str) -> bool {
     web_sys::window()
         .and_then(|window| window.document())
@@ -122,12 +66,6 @@ fn focus_search_control(selector: &str) -> bool {
         .is_some_and(|element| element.focus().is_ok())
 }
 
-/// Results-area tab. The typed enum is search-page semantics rather than
-/// design-system chrome, so it stays app-side while the strip itself is
-/// `fleet_ui::Tabs`.
-///
-/// Patterns and Statistics from the design are deferred — we don't
-/// have pattern detection or pre-aggregated stats yet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ResultsTab {
     Events,
@@ -152,7 +90,7 @@ impl ResultsTab {
 }
 
 #[component]
-#[allow(clippy::too_many_lines)] // the search page markup is one cohesive view tree
+#[allow(clippy::too_many_lines)]
 pub fn Search() -> impl IntoView {
     let shell_status = use_context::<ShellStatus>().expect("ShellStatus context");
     let bus = expect_context::<ToastBus>();
@@ -179,34 +117,10 @@ pub fn Search() -> impl IntoView {
     // would produce the same link.
     let draft_dirty = Memo::new(move |_| query_text.get().trim() != executed_q.get().trim());
 
-    // Whether this link's structured state could be read at all.
-    //
-    // A link that could not be read runs nothing and rewrites nothing
-    // (ADR-0027): while this is true the banner's repair is the ONLY
-    // control that navigates. That is structural, not a property of the
-    // blanked query below — every callback in this component returns
-    // early on it, and every control that reaches one of them is
-    // rendered `disabled` (or, where a span has no disabled state, not
-    // rendered). Blanking `effective_q` alone was not the gate it looked
-    // like: the export modal read that empty string and posted it, and
-    // an empty query is `SELECT *` with no WHERE to the server's
-    // emitter, so a refused link exported the whole corpus.
-    //
-    // Every reader of `rows` below is gated on it too, because refusing
-    // to RUN a link is not the same as refusing to PAINT one: a response
-    // already in flight when the URL turned unreadable (Back,
-    // mid-request) still lands in the resource, and rows under a banner
-    // that says the link was not run are a straight contradiction. That
-    // the resource keeps the in-flight request is a residual outside
-    // this slice; what it shows is not.
     let unreadable = Signal::derive(move || malformed.with(Option::is_some));
 
-    // The DSL this MODE runs. A snapshot folds the URL's range in; a live
-    // stream never does (ADR-0027, amended 2026-09-21): the stream lane
-    // evaluates `last=` per event against the server clock, so a folded
-    // range silently dropped every event older than the window while the
-    // page still said Live. `mode.get()` is read here, not outside: the
-    // mode flip alone is what changes this value when q, f and r all stand.
+    // `mode.get()` is read here, not outside: the mode flip alone is what
+    // changes this value when q, f and r all stand.
     let effective_q = Memo::new(move |_| {
         if unreadable.get() {
             return String::new();
@@ -214,9 +128,6 @@ pub fn Search() -> impl IntoView {
         mode_query(mode.get(), &executed_q.get(), &filters.get(), &range.get())
     });
 
-    // Whether the stream, not the snapshot resource, is the active
-    // result source. `mode=live` is a claim the page keeps true
-    // (ADR-0027, amended 2026-09-12).
     let live = Signal::derive(move || mode.get() == Mode::Live);
 
     // What the snapshot resource runs: nothing at all while live. The
@@ -262,17 +173,9 @@ pub fn Search() -> impl IntoView {
     let on_submit = {
         let goto = goto.clone();
         Callback::new(move |()| {
-            // The gate, at every door that navigates. The Haul button
-            // carries `disabled` as well; this is what makes the
-            // editor's own Ctrl+Enter obey the same rule.
             if unreadable.get_untracked() {
                 return;
             }
-            // The other half of the gate: a link this app cannot read
-            // back is not written at all. The editor keeps its text and
-            // the address bar keeps its query, so a query too long to
-            // share is a toast and an edit away from working, not a
-            // banner over an editor the page just emptied.
             // Hauling the query the URL already carries writes the same
             // link, and the memos behind the resource do not notify on an
             // unchanged value — so a snapshot Haul would be silent just
@@ -358,11 +261,6 @@ pub fn Search() -> impl IntoView {
                 return;
             }
             current.push(f);
-            // The producer asks the reader's own rules before it
-            // navigates: a link this app builds must be one it can read
-            // back, so a set that busts a cap is refused out loud here
-            // rather than becoming the malformed banner one navigation
-            // later (ADR-0027).
             if let Err(reason) = admit_filters(&current) {
                 bus.push(ToastKind::Error, refusal_copy(reason), None);
                 return;
@@ -433,10 +331,6 @@ pub fn Search() -> impl IntoView {
                 return Err("This search link could not be read.".to_string());
             }
             let new_range = crate::search_url::normalize_dialog_range(picked)?;
-            // Committing a range is a bounded question, so it leaves
-            // live even when it names the range already selected — the
-            // short-circuit is for a selection that changes nothing at
-            // all, and in live the mode is the change.
             if range.get_untracked() == new_range && !live.get_untracked() {
                 return Ok(());
             }
@@ -452,25 +346,17 @@ pub fn Search() -> impl IntoView {
         })
     };
 
-    // The repair the banner offers: the link as it stands with ONE
-    // parameter replaced, built by `search_url::repair_url` off the
-    // query map. Rebuilding it from the memos instead would write every
-    // parameter's fallback, so repairing an unreadable `f` also
-    // silently dropped an unreadable `r` beside it and ran the default
-    // window. `replace` so the broken link does not become a Back
-    // destination.
+    // `r.href` comes from `search_url::repair_url` off the query map: built
+    // from the memos it would write every parameter's fallback. `replace` so
+    // the broken link does not become a Back destination.
     let repair_to = replace_navigator();
     let on_repair = Callback::new(move |()| {
         let Some(r) = repair.get_untracked() else {
             return;
         };
-        // Every repair keeps `q` as it stands (a named one carries it
-        // verbatim; "Start over" lands on an empty one, and an unread
-        // link's `executed_q` is ALREADY empty), so the effect that
-        // syncs the editor to the executed query never fires across a
-        // repair, and whatever was typed into the still-editable editor
-        // would sit above results from the query that actually ran.
-        // Reset the buffer here, to the query the repaired link runs.
+        // No repair changes the executed query (an unreadable link's is
+        // already empty), so the effect that syncs the editor to it never
+        // fires across one. Reset the buffer here, to the query it runs.
         query_text.set(executed_q.get_untracked());
         report_refusal(bus, repair_to(&r.href));
     });
@@ -523,9 +409,6 @@ pub fn Search() -> impl IntoView {
         )
     };
 
-    // Leaving live is a navigation, not a local pause: the same query,
-    // page 0 and the URL's filters and range, with `mode` elided. Push,
-    // so Back returns to the stream.
     let on_stop_live = {
         let goto = goto.clone();
         Callback::new(move |()| {
@@ -557,12 +440,7 @@ pub fn Search() -> impl IntoView {
     let stream_query = RwSignal::new(String::new());
     let lagged = RwSignal::new(None::<u64>);
     let stream_failure = RwSignal::new(None::<&'static str>);
-    // The caps the open stream's latest snapshot reported (ADR-0001).
-    // Its own signal, apart from the failure and the lag: a disconnect
-    // or a lag notice says nothing about what the aggregation dropped.
     let live_capped = RwSignal::new(Vec::<trawl_api::stream::SnapshotCap>::new());
-    // Aggregation frames this session accepted — the footer's `Updates`
-    // count. The ring's own `epoch` is the raw twin (`Received`).
     let frames = RwSignal::new(0_u64);
     // Each stream this page opens gets a session number, and the stream
     // marks `stream_opened_at` with it once it opens or delivers an event.
@@ -623,36 +501,17 @@ pub fn Search() -> impl IntoView {
         }
     });
 
-    // --- sync search status to shell status bar -----------------------
     let active_tab = RwSignal::new(ResultsTab::Events);
-    // fleet_ui::Tabs speaks &'static str ids; the typed ResultsTab enum
-    // stays app-side (ADR-0002) with a two-line id <-> enum map here.
     let tabs_active = Signal::derive(move || active_tab.get().id().to_string());
     let on_tab_change = Callback::new(move |id: String| active_tab.set(ResultsTab::from_id(&id)));
-    // Every "open Events" control on the Visualization tab — a
-    // refusal's alternative and the caption's route to the rows the
-    // chart left out — goes through the tablist's own setter.
     let open_events =
         Callback::new(move |()| on_tab_change.run(ResultsTab::Events.id().to_string()));
 
-    // The exact table's sort column and direction, owned here rather
-    // than inside the table: the bars beside it slice the SAME sorted
-    // list, and a sort that lived privately in the table would put the
-    // two on different orders the moment a page turned. A page turn
-    // under a fetched-whole aggregation keeps it, since the rows on
-    // screen are still that result.
-    //
-    // Reset on the RESPONSE's identity, not on the pending query. The
-    // rows on screen during a round trip belong to the previous
-    // response, and resetting when the next query is submitted made
-    // them visibly shuffle back to server order for the whole flight,
-    // under a sort control that still claimed the old column. They hold
-    // their order until their replacement lands.
-    //
-    // The executed query alone, not the response generation: a
-    // same-query Haul re-runs the identical query, so its rows are the
-    // same rows and the sort survives it (the C4 contract). Keying on
-    // the generation would reset on every refetch instead.
+    // Owned here rather than inside the table: the bars beside it slice the
+    // SAME sorted list. Reset on the RESPONSE's identity, not on the pending
+    // query: the rows on screen during a round trip belong to the previous
+    // response. The executed query alone, not the response generation: a
+    // same-query Haul re-runs the identical query, so the sort survives it.
     let sort = RwSignal::new(None::<(usize, bool)>);
     Effect::new(move |prev: Option<Option<String>>| {
         let previous = prev.flatten();
@@ -697,20 +556,9 @@ pub fn Search() -> impl IntoView {
         }
         rows.get().and_then(Result::ok)
     });
-    // The query error notice, when the failure on screen is the server
-    // refusing the text of the CURRENT request (ADR-0039). The resource
-    // keeps a failure while the next request is in flight, so identity
-    // decides, not presence: a failure whose intent or generation is not
-    // the latest is an older request's verdict — the query before an
-    // edit, or the same text before a Haul re-sent it — and quoting it
-    // would describe text that is not what ran last. The excerpt is the
-    // text that request sent, never the draft or today's `effective_q`.
-    //
-    // In live, the browser cannot read why a stream closed. A stream that
-    // closed before it ever opened, on text the local parser also refuses,
-    // gets the live syntax notice, quoting the text that stream was opened
-    // with. Any other live failure — a stream that opened and then closed,
-    // or a text that parses — keeps the generic copy and its Retry.
+    // The resource keeps a failure while the next request is in flight, so
+    // identity decides, not presence: a failure whose intent or generation is
+    // not the latest is an older request's verdict.
     let query_notice = Memo::new(move |_| -> Option<NoticeModel> {
         if unreadable.get() {
             return None;
@@ -734,13 +582,6 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // The recovering notice, when the failure on screen is the CURRENT
-    // request refused as `corpus_recovering` (ADR-0041): the server
-    // cannot yet count every stored event once, which is neither an
-    // empty result nor a fault. Identity decides, as for the query error
-    // notice: an older request's refusal describes a request that is no
-    // longer the one on screen. Live reads the stream, which this
-    // refusal never touches, so live shows no such notice.
     let recovering_notice = Memo::new(move |_| -> Option<String> {
         if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
             return None;
@@ -755,13 +596,6 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // The resource notice, when the failure on screen is the CURRENT
-    // request answered with `query_resource_exhausted` (ADR-0056): the
-    // query used up the memory or scratch space trawld gives queries.
-    // The text is fine and nothing ran to completion, so this is neither
-    // a query error nor an empty result. Identity decides, as for the
-    // notices above. Live reads the stream, which never answers with
-    // this code, so live shows no such notice.
     let resource_notice = Memo::new(move |_| -> Option<String> {
         if unreadable.get() || live.get() || snapshot_q.get().trim().is_empty() || loading.get() {
             return None;
@@ -776,13 +610,9 @@ pub fn Search() -> impl IntoView {
             _ => None,
         })
     });
-    // A named refusal (a query error, the corpus recovering, or the
-    // query's resources exhausted) the resource still holds after a newer
-    // request superseded it: the same text re-sent, or new text not yet
-    // answered. The tables would render it as "Couldn't load results"
-    // with a Retry, which a query error and an exhausted query never
-    // offer and which would misname a recovering server, so the region
-    // waits for the new answer instead.
+    // A query-error, recovering or exhausted refusal the resource still
+    // holds after a newer request superseded it. The tables would render it
+    // as "Couldn't load results" with a Retry, so the region waits instead.
     let refusal_superseded = Signal::derive(move || {
         query_notice.get().is_none()
             && recovering_notice.get().is_none()
@@ -805,10 +635,6 @@ pub fn Search() -> impl IntoView {
             .get()
             .and_then(|response| response.response.execution)
     });
-    // The accepted execution as "Send to investigation" would send it:
-    // the query state that response ran and the server's start instant.
-    // None for a response without execution facts, and for a `from
-    // saved` search, which takes no bounds.
     let send_source = Memo::new(move |_| {
         let response = accepted_snapshot.get()?;
         let started_at = response.response.execution.as_ref()?.started_at.clone();
@@ -819,8 +645,6 @@ pub fn Search() -> impl IntoView {
             started_at,
         })
     });
-    // Whether the current snapshot request ended in a failure: a pinned
-    // search the send dialog waits on did not run.
     let snapshot_failed_now = Signal::derive(move || {
         !live.get()
             && !snapshot_q.get().trim().is_empty()
@@ -837,21 +661,12 @@ pub fn Search() -> impl IntoView {
         }) && send_source.with(Option::is_some)
     });
 
-    // The rows on screen, from whichever source the mode makes active:
-    // the snapshot page, the live ring, or the latest aggregation frame.
-    // The tab count, the footer count and the filter rail all read this
-    // and nothing else (ADR-0027, amended 2026-09-12).
     let active_rows = Memo::new(move |_| {
         if unreadable.get() {
-            // Nothing ran, and the banner is the results pane: no source
-            // to describe, so no count either.
             return LoadState::Loading;
         }
         if live.get() {
             return if is_chart_query.get() {
-                // Before the first frame the stream has delivered no
-                // rows, which is a count of zero rather than a pending
-                // request.
                 LoadState::Ready(live_snapshot.get().unwrap_or_else(QueryResult::empty))
             } else {
                 LoadState::Ready(ring_result.get())
@@ -879,9 +694,6 @@ pub fn Search() -> impl IntoView {
     // the frame it takes the empty query to resolve.
     let snapshot_ran = Signal::derive(move || !snapshot_q.get().trim().is_empty());
 
-    // Drive the shell's status bar from search-specific state. Both
-    // derivations are pure (`search_status.rs`): the footer describes
-    // the active result source, and nothing else on the page.
     let snapshot_failed = Signal::derive(move || rows.get().is_some_and(|r| r.is_err()));
     let snapshot_recovering = Signal::derive(move || {
         rows.with(
@@ -899,10 +711,6 @@ pub fn Search() -> impl IntoView {
         }));
     });
     Effect::new(move |_| {
-        // Each mode's count names its own source: the rows the last
-        // snapshot returned, the events delivered since the stream
-        // opened (including those that rolled off the ring), or the
-        // aggregation frames it accepted.
         let count = if !unreadable.get() && live.get() {
             if is_chart_query.get() {
                 FooterCount {
@@ -988,8 +796,6 @@ pub fn Search() -> impl IntoView {
         }
         send_snapshot.set(send_source.get_untracked());
     });
-    // Pinning runs the same query state again on the pinned absolute
-    // range, through the shared codec, as a new history entry.
     let on_pin = {
         let goto = goto.clone();
         Callback::new(move |pinned: crate::query_merge::RangeSpec| {
@@ -1007,9 +813,6 @@ pub fn Search() -> impl IntoView {
             .map_err(|reason| refusal_copy(reason).to_string())
         })
     };
-    // A modal opened on a readable link must close if Back reaches a
-    // malformed one. Discard the pending Save snapshot with it, so the
-    // refusal banner is the only remaining action context, ADR-0027.
     Effect::new(move |_| {
         if unreadable.get() {
             save_query.set(None);
@@ -1021,8 +824,6 @@ pub fn Search() -> impl IntoView {
 
     let malformed_sig = Signal::derive(move || malformed.get());
     let repair_sig = Signal::derive(move || repair.get());
-    // The chip strip's own admission that the filters on screen are not
-    // the filters in the link.
     let filters_unreadable = Signal::derive(move || {
         malformed.with(|m| m.as_ref().is_some_and(|m| m.param == Param::Filters))
     });
@@ -1042,7 +843,6 @@ pub fn Search() -> impl IntoView {
             })
         }
     });
-    // Field provenance follows the active result source, never the editor.
     let facet_capabilities =
         Signal::derive(move || crate::result_actions::Capabilities::for_query(&facet_query.get()));
     // A pending URL can hide stale row-derived groups, but its filter count
@@ -1055,21 +855,10 @@ pub fn Search() -> impl IntoView {
                     .and_then(Result::ok)
                     .is_some_and(|r| r.query.effective != effective_q.get()))
     });
-    // What the filter rail shows, and whether the page is countable,
-    // decided once per settled answer (ADR-0044). The rail renders its
-    // groups from this and never counts the same answer again.
-    //
-    // Only a settled answer moves it. While a snapshot request is
-    // pending, `active_rows` is `Loading` and the memo holds its last
-    // value, so a page turn, a same-query Haul or a tab switch leaves
-    // the rail where it was. `loading` compares the response's query,
-    // plan, generation and intent with the current request's, so
-    // `Ready` here is always the answer to the request on screen.
-    //
     // Idle is decided before the rows are read: with no snapshot query
-    // `loading` is false, and `rows` still holds the previous response
-    // until the synthetic empty one lands (or nothing at all on a first
-    // mount), so reading it would count a page that is no longer asked for.
+    // `loading` is false, and `rows` still holds any previous response
+    // until the synthetic empty one lands, so reading it would count a page
+    // that is no longer asked for.
     let rail_page = Memo::new(move |held: Option<&Option<RailPage>>| {
         if unreadable.get() {
             return Some(RailPage::NothingToCount);
@@ -1080,7 +869,6 @@ pub fn Search() -> impl IntoView {
         active_rows.with(|state| match state {
             LoadState::Loading => held.cloned().flatten(),
             LoadState::Ready(result) => Some(facets::rail_page(&facet_query.get(), result)),
-            // A failed or refused query has nothing on screen to count.
             LoadState::Error(_) | LoadState::Missing => Some(RailPage::NothingToCount),
         })
     });
@@ -1089,9 +877,6 @@ pub fn Search() -> impl IntoView {
     let rail_countable =
         Memo::new(move |_| rail_page.with(|page| page.as_ref().map(RailPage::is_countable)));
 
-    // --- reading modes ------------------------------------------------
-    // Both default off (ADR-0032): with the defaults in force the
-    // results DOM is exactly what it was before this slice.
     let prefs = use_context::<UiPrefs>();
     let details = Signal::derive(move || prefs.map_or(Details::Inline, |p| p.details().get()));
     let rows_mode = Signal::derive(move || prefs.map_or(Rows::Compact, |p| p.rows().get()));
@@ -1114,8 +899,6 @@ pub fn Search() -> impl IntoView {
         }
     });
 
-    // The reader's chart type, shared by both lanes and kept for the
-    // session only — never in the search URL (ADR-0027, ADR-0038).
     // `None` follows the result's shape; a stored choice that does not
     // fit the result on screen is kept, not overwritten.
     let chart_type = RwSignal::new(None::<ChartType>);
@@ -1125,13 +908,8 @@ pub fn Search() -> impl IntoView {
     let view_btn = NodeRef::<leptos::html::Button>::new();
     let close_view = Callback::new(move |()| view_open.set(false));
 
-    // The inspector's selection. Owned here rather than in the table,
-    // because only this component sees the three things that invalidate
-    // it: a fresh response, a page turn and a new effective query.
     let selected = RwSignal::new(None::<(u64, usize)>);
-    // The detail views' null-field disclosure. Owned here, not in the
-    // table: the table is rebuilt for every response, and the choice
-    // lasts for the life of the results view (not stored in the URL).
+    // Owned here, not in the table: the table is rebuilt for every response.
     let show_nulls = RwSignal::new(false);
     let result_gen = RwSignal::new(0_u64);
     Effect::new(move |_| {
@@ -1145,16 +923,10 @@ pub fn Search() -> impl IntoView {
     });
     let generation = Signal::derive(move || result_gen.get());
 
-    // The categorical shape of the snapshot aggregate on screen, if it
-    // has one. Read off the executed query and the response together:
-    // only the `stats … by <field>` stage knows which column is the
-    // group, and a chart drawn without it would label the wrong axis.
     let cat_shape: Memo<Option<CatShape>> = Memo::new(move |_| {
-        // The resource holds the PREVIOUS response while the next
-        // request is in flight, and `effective_q` follows the URL at
-        // once, so detection would read an old result through a new
-        // query and label the wrong axis. No chart while pending — the
-        // same rule the histogram caption follows.
+        // The resource holds the PREVIOUS response while the next request is in
+        // flight, and `effective_q` follows the URL at once, so detection would
+        // read an old result through a new query.
         if loading.get() {
             return None;
         }
@@ -1189,8 +961,6 @@ pub fn Search() -> impl IntoView {
                 on_clear=on_clear_filters
             />
             <div class="search-col">
-                // The page's one h1 (A06). The topbar crumb already
-                // shows the name, so the heading is for assistive tech.
                 <h1 class="sr-only">"Search"</h1>
                 <div class="console">
                     <EditorWrap
@@ -1205,10 +975,6 @@ pub fn Search() -> impl IntoView {
                         on_save=on_save
                         on_live=on_live
                     />
-                    // The strip under the editor describes the EXECUTED
-                    // query, not the buffer above it. Timing and row count
-                    // belong to the accepted response; chips and mode come
-                    // from the URL (ADR-0027).
                     <MetaStrip
                         execution=execution
                         filters=filters_sig
@@ -1229,10 +995,6 @@ pub fn Search() -> impl IntoView {
                     label="Results"
                     active=tabs_active
                     on_change=on_tab_change
-                    // Buttons, not spans: an unreadable link disables
-                    // both. Export posts the effective query, which is
-                    // the blanked sentinel then, and the server reads
-                    // an empty query as every row (ADR-0027).
                     trailing=Box::new(move || view! {
                         <Show when=move || live.get()>
                             <button
@@ -1243,11 +1005,6 @@ pub fn Search() -> impl IntoView {
                                 on:click=move |_| on_stop_live.run(())
                             >"Stop live"</button>
                         </Show>
-                        // The reading-mode disclosure. A button plus a
-                        // popover rather than two segmented strips in the
-                        // header: the header is a 36-40px row and the
-                        // modes are read rarely, so they are one press
-                        // away instead of permanently spending its width.
                         <div class="view-wrap" node_ref=view_wrap>
                             <button
                                 type="button"
@@ -1286,16 +1043,7 @@ pub fn Search() -> impl IntoView {
                         </Show>
                     }.into_any())
                 />
-                // Above the results body, not inside it: a zero-row
-                // answer is exactly when "some values are missing" is
-                // worth reading, and the Visualization tab is drawn from
-                // the same incomplete rows.
                 <DegradedNotice query=effective_q fields=degraded_fields/>
-                // The live twin, for a stream whose aggregation dropped
-                // input past a cap. Above the results for the same
-                // reason: the rows under it are the partial ones, on
-                // either tab. Only a live stream sets it, and starting
-                // any stream, or leaving Live, clears it.
                 <LiveCapNotice capped=live_capped/>
                 <Show when=move || !unreadable.get()
                     && mode.get() == Mode::Live
@@ -1309,12 +1057,8 @@ pub fn Search() -> impl IntoView {
                     </div>
                 </Show>
                 {move || if unreadable.get() {
-                    // The banner above IS the results pane while the
-                    // link cannot be read.
                     ().into_any()
                 } else if mode.get() == Mode::Snapshot && !snapshot_ran.get() {
-                    // Both tabs start here. Examples use the picker and filters
-                    // just like Haul, and only change the editor after admission.
                     let goto = goto.clone();
                     view! { <SearchQuickStart on_run=Callback::new(move |query: &'static str| {
                         if unreadable.get_untracked() {
@@ -1333,39 +1077,24 @@ pub fn Search() -> impl IntoView {
                         report_refusal(bus, outcome);
                     })/> }.into_any()
                 } else if let Some(model) = query_notice.get() {
-                    // A query error takes the region on either tab, in
-                    // place of the table or the chart: neither the
-                    // tables' "Couldn't load results" nor the chart's
-                    // failure copy mounts, and neither Retry does, since
-                    // the same text earns the same verdict (ADR-0039).
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <QueryErrorNotice model=model/>
                         </div>
                     }.into_any()
                 } else if let Some(message) = recovering_notice.get() {
-                    // The corpus is not settled, on either tab: neither
-                    // the empty table nor "Couldn't load results" mounts,
-                    // since both would misname the state. Retry sends the
-                    // same request again, the way a Haul does.
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <RecoveringNotice message=message on_retry=Callback::new(move |()| rerun_request())/>
                         </div>
                     }.into_any()
                 } else if let Some(message) = resource_notice.get() {
-                    // The query used up its resources, on either tab:
-                    // no underline, no empty table, and no Retry, since
-                    // the same request spends the same budget again. The
-                    // server's sentence says what helps.
                     view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
                             <ResourceNotice message=message/>
                         </div>
                     }.into_any()
                 } else if refusal_superseded.get() {
-                    // Each tab's own waiting copy, without the table or
-                    // chart that would read the superseded failure.
                     let waiting = if active_tab.get() == ResultsTab::Visualization {
                         view! { <p class="results-empty" role="status">"Loading snapshot visualization…"</p> }.into_any()
                     } else {
@@ -1378,11 +1107,6 @@ pub fn Search() -> impl IntoView {
                     }.into_any()
                 } else {
                     match (active_tab.get(), mode.get()) {
-                    // An aggregation answers in exact numbers, so the
-                    // table drops the expansion column and offers a
-                    // search only on the fields the query grouped by
-                    // (F02). The chart beside it is decoration over the
-                    // same numbers, which is why it is aria-hidden.
                     (ResultsTab::Events, Mode::Snapshot) if is_chart_query.get() => view! {
                         <>
                             <div class="agg-split" class:has-chart=move || cat_shape.get().is_some()>
@@ -1395,13 +1119,10 @@ pub fn Search() -> impl IntoView {
                                     on_add_filter=on_result_filter
                                 />
                                 {move || {
-                                    // The shape — and with it the scale every
-                                    // bar is measured against — is detected
-                                    // over the WHOLE fetched result, so a bar
-                                    // keeps its width from page to page. The
-                                    // bars themselves draw the page the table
-                                    // is showing, through the same sorted
-                                    // index list the table cut it with.
+                                    // The shape — and with it the scale every bar is
+                                    // measured against — is detected over the WHOLE
+                                    // fetched result, so a bar keeps its width from page
+                                    // to page.
                                     let shape = cat_shape.get()?;
                                     let resp = rows.get()?.ok()?;
                                     let whole = resp.response.result;
@@ -1452,18 +1173,10 @@ pub fn Search() -> impl IntoView {
                         } else {
                             match rows.get() {
                                 Some(Ok(resp)) => {
-                                    // The measured window this response
-                                    // arrived in. The chart draws a whole
-                                    // result or says why not (ADR-0037),
-                                    // and only these three numbers can
-                                    // tell it which it has.
                                     let coverage = resp.pagination.clone();
                                     let result = resp.result.clone();
-                                    // The query THIS response was run
-                                    // with, not the one in the URL: the
-                                    // resource holds the previous
-                                    // response while the next request
-                                    // is in flight.
+                                    // The query THIS response was run with, not
+                                    // the one in the URL.
                                     let executed = resp.query.effective.clone();
                                     view! {
                                         <Chart
@@ -1484,9 +1197,6 @@ pub fn Search() -> impl IntoView {
                     },
                     (ResultsTab::Visualization, Mode::Live) if is_chart_query.get() => view! {
                         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
-                            // A live stream asks for no window, so there
-                            // is no coverage to judge: every frame is the
-                            // whole of what the server aggregated.
                             <Chart
                                 snapshot=live_snapshot
                                 query=stream_query
@@ -1534,25 +1244,14 @@ pub fn Search() -> impl IntoView {
     }
 }
 
-/// The reading-mode popover behind the result header's "View" button.
-///
-/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`), so it
-/// arbitrates Escape against whatever else is open without taking focus.
-/// The chord IS silenced while it is open: `has_layers()` counts layers
-/// and ignores their focus policy, so the command palette treats this
-/// popover like any other overlay. It closes on Escape while topmost —
-/// returning focus to the trigger — and on any mousedown outside its
-/// wrapper.
+/// A `FocusPolicy::None` overlay layer (`fleet_ui::overlay`). The command
+/// palette chord IS silenced while it is open: `has_layers()` counts
+/// layers and ignores their focus policy.
 #[component]
 fn ViewPanel(
     #[prop(into)] details: Signal<Details>,
     #[prop(into)] rows_mode: Signal<Rows>,
-    /// Aggregation-shaped results always render the plain table, so the
-    /// Rows group states that instead of offering a choice it would not
-    /// honour (ADR-0025: nothing advertises a capability that does not
-    /// exist).
-    #[prop(into)]
-    aggregate: Signal<bool>,
+    #[prop(into)] aggregate: Signal<bool>,
     on_details: Callback<String>,
     on_rows: Callback<String>,
     on_close: Callback<()>,
@@ -1624,7 +1323,6 @@ fn ViewPanel(
     }
 }
 
-/// Simple table rendering for the ring-buffered raw-event live feed.
 #[component]
 fn LiveRawTable(
     #[prop(default = "Streaming — waiting for first event…")] waiting: &'static str,
@@ -1632,9 +1330,6 @@ fn LiveRawTable(
     #[prop(into)] failure: Signal<Option<&'static str>>,
 ) -> impl IntoView {
     view! {
-        // Same region contract as the snapshot tables: "Skip to results"
-        // reaches live mode too, so the container must be able to hold
-        // focus and name itself.
         <div id="search-results" class="results" role="region" aria-label="Search results" tabindex="0">
             {move || {
                 let r = result.get();

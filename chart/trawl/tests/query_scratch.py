@@ -111,7 +111,6 @@ class QueryScratch(unittest.TestCase):
         rendered = objects()
         scratch = effective_scratch(server_config(rendered))
         self.assertNotEqual(mount_covering(trawld(rendered), scratch)["name"], "tmp")
-        # The /tmp emptyDir stays for the read-only root filesystem.
         spec = rendered["statefulset"]["spec"]["template"]["spec"]
         tmp = next(v for v in spec["volumes"] if v["name"] == "tmp")
         self.assertEqual(tmp["emptyDir"]["sizeLimit"], "512Mi")

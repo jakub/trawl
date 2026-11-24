@@ -1,6 +1,6 @@
 # List rows carry one stretched control: links for places, buttons for commands, and a pointer-blocking popover is a trap dialog
 
-status: accepted (2026-09-07) — prep ruling record for #100 slice D2
+status: accepted (2026-09-07) — prep ruling record for #100 slice D2; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 trawl-web-ui shipped 29 clickable elements that were not controls: five
 list tables whose whole `div.tbl-row` or `<tr>` opened, expanded or reran
@@ -105,3 +105,9 @@ replaces the theme-specific command and accessible-name rule above. Remove
 the footer control, its handler and theme-specific label code while
 preserving the footer's other content and keyboard order. Other command
 names and exclusive-choice controls keep this ADR's existing rules.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Correction. Selecting or closing a run on the Runs page replaces the history entry, the same as the schema and nets drawers.** The Runs row link in `pages/runs.rs` sets `prop:replace=true`, and `push_run` navigates with `replace: true`, so reading down the list does not add a history entry per row. The receipt's Open net pushes, as ADR-0032 states. Run query again also pushes when the search navigator accepts the query. This corrects "the Runs page keeps its push" in the Decision.

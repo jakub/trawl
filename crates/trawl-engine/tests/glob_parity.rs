@@ -5,31 +5,18 @@
 //! A search-stage glob matches in the live lane and the kv batch tail as
 //! the bundled `DuckDB`'s `GLOB` matches it in batch SQL (ADR-0001's
 //! amendment of 2026-11-09).
-//!
-//! Over an alphabet that holds every glob metacharacter, a two-byte
-//! character and the class punctuation, the test compares `DuckDB`'s answer
-//! with [`Pattern::is_match`] for every glob of up to three symbols
-//! against every input of up to two symbols without `*` and `?`, then for
-//! a fixed-seed sample of longer pairs. The named boundary rows live in
-//! `duckdb_probe.rs` (`glob_lane_semantics_probe`).
 
 use duckdb::{Connection, params};
 use trawl_core::pattern::{Pattern, PatternKind, Preparer};
 
-/// The glob alphabet. Each symbol is a whole character, so `é` is one
-/// symbol of two bytes.
 const ALPHABET: &[&str] = &["a", "4", "é", "^", "!", "-", "\\", "[", "]", "*", "?"];
 
-/// The input alphabet: [`ALPHABET`] without `*` and `?`.
 const INPUTS: &[&str] = &["a", "4", "é", "^", "!", "-", "\\", "[", "]"];
 
-/// The seed of the sampled pairs.
 const SEED: u64 = 0x0330_6c0b_9e37_79b9;
 
-/// How many sampled pairs the test compares.
 const SAMPLES: usize = 10_000;
 
-/// splitmix64, as `trawl-core/tests/filter_parity.rs` has it.
 struct Rng {
     state: u64,
 }
@@ -47,7 +34,6 @@ impl Rng {
         usize::try_from(self.next_u64() % u64::try_from(n).expect("fits")).expect("below n")
     }
 
-    /// Up to `max` symbols drawn from `alphabet`.
     fn word(&mut self, alphabet: &[&str], max: usize) -> String {
         let len = self.below(max + 1);
         (0..len)
@@ -56,7 +42,6 @@ impl Rng {
     }
 }
 
-/// Every word of `0..=max` symbols from `alphabet`, shortest first.
 fn words(alphabet: &[&str], max: usize) -> Vec<String> {
     let mut all = vec![String::new()];
     let mut last = vec![String::new()];
@@ -78,14 +63,11 @@ fn live(glob: &str) -> Pattern {
         .unwrap_or_else(|e| panic!("{} builds: {e}", shown(glob)))
 }
 
-/// `text` quoted with its escapes, and its bytes in hex.
 fn shown(text: &str) -> String {
     let hex: Vec<String> = text.bytes().map(|b| format!("{b:02x}")).collect();
     format!("{text:?} [{}]", hex.join(" "))
 }
 
-/// Fill table `name` (`id INTEGER`, then one VARCHAR per column) with
-/// `rows`, and check no value arrived as NULL.
 fn fill(conn: &Connection, name: &str, columns: &[&str], rows: &[Vec<&str>]) {
     let defs: Vec<String> = columns.iter().map(|c| format!("{c} VARCHAR")).collect();
     conn.execute_batch(&format!(
@@ -121,13 +103,10 @@ fn fill(conn: &Connection, name: &str, columns: &[&str], rows: &[Vec<&str>]) {
     assert_eq!(null, 0, "{name}: an empty string must stay text");
 }
 
-/// `words` as rows of one text column.
 fn one_column(words: &[String]) -> Vec<Vec<&str>> {
     words.iter().map(|w| vec![w.as_str()]).collect()
 }
 
-/// The answers of `sql`, whose rows are `(id, matched)` in id order, and
-/// whose ids must run `0..n`.
 fn answers(conn: &Connection, sql: &str, n: usize) -> Vec<bool> {
     let mut stmt = conn.prepare(sql).expect("prepare");
     let rows: Vec<(i64, bool)> = stmt
@@ -147,7 +126,6 @@ fn glob_matches_duckdb_glob() {
     let conn = Connection::open_in_memory().expect("open DuckDB");
     let mut mismatches = Vec::new();
 
-    // Every glob of up to 3 symbols against every input of up to 2.
     let globs = words(ALPHABET, 3);
     let inputs = words(INPUTS, 2);
     assert_eq!(globs.len(), 1 + 11 + 121 + 1331);
@@ -183,7 +161,6 @@ fn glob_matches_duckdb_glob() {
     assert_eq!(compared, exhaustive);
     let exhaustive_hits = batch.iter().filter(|m| **m).count();
 
-    // A fixed-seed sample of globs up to 8 symbols and inputs up to 4.
     let mut rng = Rng { state: SEED };
     let pairs: Vec<(String, String)> = (0..SAMPLES)
         .map(|_| (rng.word(ALPHABET, 8), rng.word(ALPHABET, 4)))
@@ -209,7 +186,6 @@ fn glob_matches_duckdb_glob() {
     assert_eq!(compared, SAMPLES);
     let sampled_hits = batch.iter().filter(|m| **m).count();
 
-    // Both halves must hold matches and misses, or they prove nothing.
     for (part, hits, total) in [
         ("exhaustive", exhaustive_hits, exhaustive),
         ("sampled", sampled_hits, SAMPLES),

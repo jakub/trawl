@@ -1,6 +1,6 @@
 # Two-valued text containment: negated text search is total
 
-status: accepted (2026-08-18) — prep ruling record for #103
+status: accepted (2026-08-18) — prep ruling record for #103; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 A bare or quoted search term asks "does this event contain the text" over
 `message` OR `_raw`. The DSL has two negation spellings a user reads as
@@ -54,3 +54,9 @@ reading for a search predicate.
   both-absent events under each spelling.
 - `docs/reference/dsl.md`: the `NOT <bare term>` sentence in the
   three-valued-logic section moves here.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Every in-memory reading of text containment, the live filter (`CompiledFilter`) and `sightings` attribution (`correlate::contains_ci`), folds case with `trawl_core::text::fold_ci`, which reads a committed copy of the bundled DuckDB's `lower()` mapping in `text/duckdb_lower.rs`.** The batch lane matches with `ILIKE`, and `ILIKE` folds through that mapping: one code point to one, with no context rule, so `İ` folds to `i` and `Σ` to `σ` wherever it stands. Rust's `to_lowercase` disagrees on some characters, and a live matcher built on it would fire on events the batch query drops. `tests/fold_table.rs` holds the committed table, `ILIKE` and `fold_ci` to the bundled DuckDB, so a DuckDB bump that changes the mapping fails that test until `cargo test -p trawl-core --test fold_table -- --ignored regenerate` rewrites the table.

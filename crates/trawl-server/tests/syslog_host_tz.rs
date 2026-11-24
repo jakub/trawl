@@ -6,16 +6,7 @@
 //!
 //! The host zone is per process, so each reading happens in a CHILD
 //! PROCESS: this test binary re-executes itself with the ignored
-//! [`syslog_host_tz_child`] test selected and `TZ` set. The child resolves
-//! the packaged syslog settings, where `default_timezone` is unset, parses
-//! fixed frames at fixed arrivals, and writes the instants to a file the
-//! parent owns. The parent runs one child under `America/Chicago` and one
-//! under `Asia/Kolkata` and asserts both read every frame as UTC.
-//!
-//! Each child also reports `chrono::Local`'s offset at each arrival, and the
-//! parent asserts it is the zone `TZ` names. Without that control a runner
-//! with no zone database would read both children as UTC and the test would
-//! pass without proving anything.
+//! [`syslog_host_tz_child`] test selected and `TZ` set.
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,18 +17,14 @@ use trawl_server::config::SyslogConfig;
 use trawl_server::syslog::SyslogPeers;
 use trawl_server::syslog::parse::parse_syslog;
 
-/// Set only in the child: the file the child writes its readings to.
 const CHILD_OUT: &str = "SYSLOG_HOST_TZ_CHILD_OUT";
 
-/// The dynamic loader's search path, the one part of the parent's
-/// environment the child keeps.
 const LOADER_PATH: [&str; 3] = [
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
     "DYLD_FALLBACK_LIBRARY_PATH",
 ];
 
-/// The peer every frame comes from. No setting names it.
 const PEER: &str = "192.0.2.10";
 
 /// (frame, arrival, the instant its wall clock denotes in UTC). Winter and
@@ -71,10 +58,6 @@ fn instant(s: &str) -> DateTime<Utc> {
 
 /// The subprocess entry point. Without [`CHILD_OUT`] it does nothing, so a
 /// run with `--run-ignored` passes it untouched.
-///
-/// Writes one line per frame: the host's `chrono::Local` offset in seconds
-/// at the arrival, the instant the frame stored, and the zone it was read
-/// in.
 #[test]
 #[ignore = "entry point for the host-TZ child process; the test below runs it"]
 fn syslog_host_tz_child() {
@@ -103,7 +86,6 @@ fn syslog_host_tz_child() {
     std::fs::write(out, lines).expect("write the child's readings");
 }
 
-/// Run the child under `tz` and return its readings, one per frame.
 fn readings_under(tz: &str, dir: &Path) -> Vec<(i32, String, String)> {
     let out = dir.join(tz.replace('/', "_"));
     let mut command = Command::new(std::env::current_exe().expect("locate this test binary"));

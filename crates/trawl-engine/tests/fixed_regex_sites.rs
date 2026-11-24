@@ -2,38 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The batch lane's RE2 allowance counts every regex call `DuckDB` binds
-//! and runs for a statement (ADR-0063): the query's own patterns, bound
-//! as parameters, and the patterns the emitter writes itself
-//! (`trawl_core::conform::FIXED_REGEXES`), which `sev()` and the hot
-//! branch's `SEVERITY` conform carry.
-//!
-//! Each shape below is emitted as a query lane emits it, and its calls
-//! are read off `DuckDB`'s own plans with `json_serialize_plan`: the
-//! bound plan, before the optimizer runs, and the optimized one, whose
-//! calls each compile an RE2 on every thread that runs the statement.
-//! Each call is read as the kind of allowance it takes: `fixed` when its
-//! function and pattern are one of `FIXED_REGEXES`, `extract` for any
-//! other `regexp_extract`, and `matching` for every other call.
-//!
-//! A plan's count is what one thread can hold at once. A thread runs one
-//! branch of a `UNION` at a time, so a union counts its heaviest branch,
-//! kind by kind, and every other operator counts its own calls and all
-//! of its children's (`trawl_core::emitter::regex_calls` cites the
-//! `DuckDB` source and the measurement). The invariant: no kind is
-//! charged less than either plan's count of it, so no branch is charged
-//! less than it holds.
+//! The batch lane's RE2 allowance counts the regex calls one thread of
+//! a statement holds, as `DuckDB` binds and runs them (ADR-0063).
 //!
 //! `json_serialize_plan` needs constants, so each statement runs with its
 //! parameters inlined, and it cannot serialize a `read_json` scan, so the
 //! hot branch reads the parquet fixture through the same projection. A
 //! dynamic pivot gets the threshold's worth of values, its worst case.
-//!
-//! Two more tests hold the counter's tables against the bundled
-//! `DuckDB`'s catalog, so an upgrade that adds a regex function or a macro
-//! copying its argument fails here: `emitter::is_re2_function` must name
-//! every regex function, and `emitter::macro_copies` must cover every
-//! copy a built-in macro's body makes.
 
 mod common;
 
@@ -47,16 +22,12 @@ use trawl_core::emitter::{self, EmittedQuery, InputColumns, SqlValue};
 use trawl_core::pattern::memory::RegexSites;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
-/// Which source a shape reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
-    /// The parquet corpus alone.
     Cold,
-    /// The hot+cold union, the hot branch conforming a `SEVERITY` pin.
     Hot,
 }
 
-/// What one shape binds and runs, and what the emitter charged it.
 #[derive(Debug)]
 struct Reading {
     bound: RegexSites,
@@ -96,7 +67,6 @@ fn emit(dsl: &str, lane: Lane) -> EmittedQuery {
     .unwrap_or_else(|error| panic!("{dsl} emits: {error}"))
 }
 
-/// `sql` with every placeholder replaced by its value as a literal.
 fn inline(sql: &str, params: &[SqlValue]) -> String {
     let mut out = String::with_capacity(sql.len());
     let mut params = params.iter();
@@ -128,9 +98,6 @@ fn inline(sql: &str, params: &[SqlValue]) -> String {
     out
 }
 
-/// The statement `json_serialize_plan` can read: parameters inlined, the
-/// hot branch reading the parquet fixture, and a dynamic pivot over the
-/// threshold's worth of values.
 fn plannable(emitted: &EmittedQuery, lane: Lane) -> String {
     let mut sql = inline(&emitted.sql, &emitted.params);
     if lane == Lane::Hot {
@@ -169,11 +136,6 @@ fn heavier(a: RegexSites, b: RegexSites) -> RegexSites {
     }
 }
 
-/// The regex calls in a plan node that one thread can hold at once. A
-/// `UNION`'s branches run one at a time on a thread (see
-/// `trawl_core::emitter::regex_calls`), so a union holds its heaviest
-/// branch, kind by kind; every other node holds its own calls and all of
-/// its children's.
 fn count(node: &serde_json::Value) -> RegexSites {
     match node {
         serde_json::Value::Object(map) => {
@@ -220,8 +182,6 @@ fn count(node: &serde_json::Value) -> RegexSites {
     }
 }
 
-/// The regex calls one thread can hold at once in `sql`'s bound plan, or
-/// its optimized one.
 fn plan_calls(sql: &str, optimize: bool) -> RegexSites {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let plan: String = conn
@@ -251,11 +211,8 @@ fn read(dsl: &str, lane: Lane) -> Reading {
     }
 }
 
-/// Three `sev()` calls nothing downstream reads: they cost their own
-/// calls on any source, beside whatever the source's conform costs.
 const FEW_SEV: &str = "service=fresh | let a = sev(message), b = sev(host), c = sev(service)";
 
-/// Every shape the allowance has to cover.
 const SHAPES: &[(&str, Lane, &str)] = &[
     ("sev", Lane::Cold, "* | let s = sev(message)"),
     // `query_resources.rs` holds the server to this shape's charge.
@@ -356,8 +313,6 @@ const SHAPES: &[(&str, Lane, &str)] = &[
         Lane::Hot,
         "* | extract \"(?P<w>[a-z]+)\" from message | where w == \"abc\"",
     ),
-    // A projection reads the columns it names: neither shape copies the
-    // call beneath it.
     (
         "matches read by later lets",
         Lane::Cold,
@@ -387,9 +342,6 @@ const SHAPES: &[(&str, Lane, &str)] = &[
     ),
 ];
 
-/// The invariant, shape by shape and kind by kind: no kind of call is
-/// charged less than one thread can hold of it in `DuckDB`'s bound plan
-/// or its optimized plan.
 #[test]
 fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
     let mut failures = Vec::new();
@@ -435,9 +387,6 @@ fn the_allowance_counts_every_regex_call_duckdb_binds_and_runs() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
-/// The control: the plans hold the calls the invariant compares, so a
-/// shape that binds none of the emitter's regexes reads zero and one that
-/// does reads them.
 #[test]
 fn the_plan_count_sees_the_emitters_regexes() {
     let plain = read("* | where host == \"web01\"", Lane::Cold);
@@ -469,9 +418,8 @@ fn the_plan_count_sees_the_emitters_regexes() {
             fixed: 0,
         }
     );
-    // A union holds its heaviest branch, kind by kind; a join holds both
-    // sides. The patterns are no literal, which the optimizer would
-    // rewrite into `contains`.
+    // The patterns are no literal, which the optimizer would rewrite into
+    // `contains`.
     let source = format!("read_parquet('{}')", parquet_file());
     let one = format!("SELECT regexp_matches(message, '[ab]+c') AS \"m\" FROM {source}");
     let two = format!(
@@ -501,9 +449,6 @@ fn the_plan_count_sees_the_emitters_regexes() {
     }
 }
 
-/// Every function the bundled `DuckDB` registers under a regex name, or
-/// as an alias of one, and its `~` operator: the calls whose pattern
-/// compiles an RE2 program.
 #[test]
 fn every_regex_function_duckdb_registers_counts() {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -537,7 +482,6 @@ fn every_regex_function_duckdb_registers_counts() {
     }
 }
 
-/// One scalar macro the bundled `DuckDB` defines.
 struct Macro {
     schema: String,
     name: String,
@@ -575,10 +519,8 @@ fn scalar_macros() -> Vec<Macro> {
         .expect("every macro reads")
 }
 
-/// The words of a macro body that decide where an argument is copied.
 #[derive(Debug, PartialEq, Eq)]
 enum Lexeme {
-    /// A bare or quoted name, folded to lower case.
     Name(String),
     Dot,
     Open,
@@ -591,8 +533,6 @@ fn lex(body: &str) -> Vec<Lexeme> {
     let chars: Vec<char> = body.chars().collect();
     let mut out = Vec::new();
     let mut i = 0;
-    // A quoted run ending at the next unescaped `quote`, from just past
-    // the opening one; returns the text and the index past the close.
     let quoted = |mut i: usize, quote: char| {
         let mut text = String::new();
         while i < chars.len() {
@@ -645,9 +585,6 @@ fn lex(body: &str) -> Vec<Lexeme> {
     out
 }
 
-/// How many copies of its argument at `position` the macro `name` makes,
-/// the most over the overloads taking `arity` arguments, or over every
-/// overload when `arity` is `None`: one when none takes one there.
 fn macro_copies(
     macros: &[Macro],
     schema: Option<&str>,
@@ -669,7 +606,6 @@ fn macro_copies(
         .unwrap_or(1)
 }
 
-/// The arguments the call opening at `open` passes.
 fn arity(lexemes: &[Lexeme], open: usize) -> usize {
     let mut nesting = 0_usize;
     let mut commas = 0;
@@ -689,9 +625,6 @@ fn arity(lexemes: &[Lexeme], open: usize) -> usize {
     }
 }
 
-/// The copies `m`'s body makes of `param`: each unqualified reference,
-/// times what every macro call around it copies of the argument it sits
-/// in.
 fn references(macros: &[Macro], m: &Macro, param: &str, depth: usize) -> u64 {
     let lexemes = lex(&m.body);
     let is_reference = |k: usize| {
@@ -731,9 +664,6 @@ fn references(macros: &[Macro], m: &Macro, param: &str, depth: usize) -> u64 {
         .sum()
 }
 
-/// The emitter's macro table against the macros the bundled `DuckDB`
-/// defines: no argument position copies more than the table says. The
-/// control pins two copies the bound plan shows directly.
 #[test]
 fn the_macro_table_covers_every_copy_a_builtin_macro_makes() {
     let macros = scalar_macros();

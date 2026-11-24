@@ -103,10 +103,6 @@ impl App {
     }
 
     /// Manifest process name of this app's browser-facing backend.
-    ///
-    /// The single source of truth for the convention: manifest validation
-    /// requires the process to exist and map the shared session key, and the
-    /// plan uses it to classify processes.
     #[must_use]
     pub const fn web_process_name(self) -> &'static str {
         match self {
@@ -115,7 +111,6 @@ impl App {
         }
     }
 
-    /// Runtime environment variable carrying this app's API bind address.
     #[must_use]
     pub const fn bind_variable(self) -> &'static str {
         match self {

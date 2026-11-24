@@ -10,14 +10,6 @@
 //! fail loudly in the browser: it either renders an empty state or the
 //! `Loaded` error arm, and the spec reading it reports something other
 //! than what it meant to test.
-//!
-//! This test decodes each fixture into that struct with `serde_json`. It
-//! proves the shape only. Whether the CONTENT is the case a spec wants
-//! (a running job, a succeeded twin) is asserted below as well, because a
-//! `status` typo would keep the fixture decodable and make the poll spec
-//! silently test nothing.
-//!
-//! When this test fails, fix the FIXTURE. The wire type is the authority.
 
 use trawl_api::{
     CatalogFieldResponse, ListSavedResponse, RepinStatusResponse, SavedQueryResponse,
@@ -32,7 +24,6 @@ const SERVICE_SCHEMA_POPULATED: &str =
     include_str!("../e2e/harness/wire/service-schema-populated.json");
 const SAVED_QUERIES: &str = include_str!("../e2e/harness/wire/saved-queries.json");
 
-/// Decode or fail with the serde message, which names the offending key.
 fn decode<T: serde::de::DeserializeOwned>(name: &str, text: &str) -> T {
     match serde_json::from_str::<T>(text) {
         Ok(v) => v,
@@ -46,9 +37,6 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str, text: &str) -> T {
 #[test]
 fn catalog_field_fixture_decodes() {
     let resp: CatalogFieldResponse = decode("catalog-field.json", CATALOG_FIELD);
-    // `data_type` is serde-renamed to `type` on the wire; decoding a
-    // non-empty string here is what proves the fixture spells the key
-    // the SPA reads rather than the field name.
     assert!(
         !resp.data_type.is_empty(),
         "catalog-field.json carries no `type` — the key is serde-renamed \
@@ -93,9 +81,6 @@ fn repin_status_fixtures_decode_as_a_running_job_and_its_twin() {
 #[test]
 fn service_schema_fixture_decodes() {
     let resp: ServiceSchemaResponse = decode("service-schema.json", SERVICE_SCHEMA);
-    // `cached` has no serde default: the pre-wire fixture omitted it, so
-    // every /schema/services read failed to decode and the schema page
-    // rendered its error arm.
     assert!(!resp.cached);
     assert!(
         resp.services.is_empty(),
@@ -124,8 +109,6 @@ fn the_populated_scenario_carries_one_service_and_one_net() {
     assert_eq!(saved.queries[0].id, 1);
 }
 
-// ---- the `corpus` scenario -------------------------------------------------
-
 use trawl_api::{
     HistoryResponse, ListAllRunsResponse, ListReportRunsResponse, QueryResponse, ReportRunResponse,
     RunsStatsResponse,
@@ -142,11 +125,8 @@ const RUN_RESULT: &str = include_str!("../e2e/harness/wire/run-result.json");
 const RUNS_ALL: &str = include_str!("../e2e/harness/wire/runs-all.json");
 const RUNS_STATS: &str = include_str!("../e2e/harness/wire/runs-stats.json");
 
-/// The harness's shape dispatch, and the source it claims to mirror.
 const HARNESS_FIXTURES: &str = include_str!("../e2e/harness/fixtures.mjs");
 const SEARCH_URL_SRC: &str = include_str!("../../trawl-search-url/src/search_url.rs");
-/// The overview histogram's query is written inline here, not in
-/// `drawer_query.rs`, so the third shape is pinned by grepping this.
 const SERVICE_DRAWER_SRC: &str = include_str!("../src/components/service_drawer.rs");
 
 /// The DSL builders themselves, not a copy of them. `trawl-web-ui` is a
@@ -230,10 +210,6 @@ fn the_corpus_drawer_fixtures_decode() {
     // these two fixtures are one contract: the cardinality answer has to
     // have exactly one column per column of `service-schema-corpus.json`,
     // named `c0..c{n-1}`, or the decoder refuses the whole response.
-    //
-    // So the expectation is DERIVED from the builder rather than typed
-    // out: ask it what it would send for the corpus service, and hold the
-    // fixture to the answer.
     let corpus: ServiceSchemaResponse = decode("service-schema-corpus.json", SERVICE_SCHEMA_CORPUS);
     let columns: Vec<String> = corpus.services[0]
         .columns
@@ -289,8 +265,7 @@ fn the_corpus_timechart_fixture_lands_on_the_drawer_grid() {
 
     // The reader's own column rule, mirrored: the time column is one of
     // four accepted names and the count column is `count` or a name
-    // starting with it. Asserting the names above is not enough on its
-    // own, and this is what says WHY those two names.
+    // starting with it.
     assert!(matches!(
         names[0],
         "_time" | "time" | "timestamp" | "@timestamp"
@@ -361,7 +336,7 @@ fn the_corpus_service_schema_marks_one_column_degraded() {
     assert_eq!(case.name, svc.degraded_fields[0]);
 
     // `_time`'s sample is what the server writes for compaction's
-    // non-UTC microsecond column (issue 238): fixed-width, six fraction
+    // non-UTC microsecond column: fixed-width, six fraction
     // digits, no `Z`. `field-presentation.spec.ts` reads these back.
     for schema in [&corpus, &populated] {
         let time = schema.services[0]
@@ -409,9 +384,6 @@ fn the_corpus_history_fixture_carries_an_over_bound_query() {
         "a multi-byte char would make the byte length disagree with the char count a spec reads"
     );
 
-    // `MAX_SEARCH_BYTES` lives in the binary crate, so this test cannot
-    // import it. Pinning its SPELLING is the next best thing: change the
-    // constant and this fails, naming the fixture that has to follow.
     assert!(
         SEARCH_URL_SRC.contains("pub const MAX_SEARCH_BYTES: usize = 32 * 1024;"),
         "MAX_SEARCH_BYTES is no longer 32 * 1024 — history.json's 32769-byte entry \
@@ -558,8 +530,6 @@ fn assert_dashboard_measurement_metadata_is_required(dashboard: &trawl_api::Dash
     }
 }
 
-/// The base snapshot carries a complete capacity object (ADR-0042): the
-/// daemon always sends one, and the snapshot refuses to decode without it.
 fn assert_dashboard_carries_capacity(dashboard: &trawl_api::DashboardSnapshot) {
     assert_eq!(
         dashboard.capacity.headroom.measurement.status,
@@ -574,8 +544,7 @@ fn assert_dashboard_carries_capacity(dashboard: &trawl_api::DashboardSnapshot) {
 
 /// The ingest-refusal chip and Warn badge (ADR-0043) are built on refusal
 /// ALONE degrading the report; any other failed check would make the
-/// spec test a different case. The daemon ships `ingest_capacity` in
-/// every report, so the healthy fixtures carry it too.
+/// spec test a different case.
 #[test]
 fn ingest_refusing_fixture_degrades_on_ingest_capacity_alone() {
     let ok: trawl_api::HealthResponse = decode(
@@ -703,12 +672,10 @@ fn health_page_fixtures_decode_and_exercise_permissions_and_failures() {
     }
 }
 
-/// Every Disk and retention case (ADR-0042) loads one capacity fixture
-/// over the base snapshot. Each is a slice of `DashboardSnapshot`: the
+/// A capacity fixture is a slice of `DashboardSnapshot`: the
 /// capacity object with the Parquet and WAL fields it was assembled
 /// beside, because the card reads the Parquet measurement and the
-/// producer derives reach from both measurements. Each field is the
-/// snapshot field of the same name and type, and nothing else rides along.
+/// producer derives reach from both measurements.
 #[derive(serde::Deserialize, serde::Serialize)]
 #[serde(deny_unknown_fields)]
 struct CapacitySnapshotPart {
@@ -721,7 +688,6 @@ struct CapacitySnapshotPart {
     capacity: trawl_api::Capacity,
 }
 
-/// The fields `CapacitySnapshotPart` takes from a whole snapshot.
 const CAPACITY_PART_FIELDS: [&str; 7] = [
     "parquet_files",
     "parquet_bytes",
@@ -776,13 +742,10 @@ fn capacity_fixture(name: &str) -> CapacitySnapshotPart {
     decode(name, text)
 }
 
-/// Every capacity fixture, and the base snapshot's capacity slice, decodes
-/// as the snapshot fields of the same names with nothing left over, and a
-/// withheld reach carries its reason and no number. The fixtures are
+/// The fixtures are
 /// producer output (`src/metrics/capacity_fixtures.rs` in trawl-server
 /// fails when one differs from what `capacity::assemble` emits), so the states
-/// themselves are not modelled here; this checks what the wire promises
-/// the page, and the pins below check the state each case relies on.
+/// themselves are not modelled here.
 #[test]
 fn health_capacity_fixtures_decode_as_the_wire_types() {
     let base: serde_json::Value =
@@ -820,9 +783,6 @@ fn health_capacity_fixtures_decode_as_the_wire_types() {
     }
 }
 
-/// A complete sample with a floor: two rows, a completed sweep, three
-/// projected envs sharing one fraction per end, keep-forever growth, and
-/// one env left out of the growth for want of history.
 #[test]
 fn health_capacity_complete_fixture_carries_every_projected_form() {
     use trawl_api::{
@@ -905,10 +865,7 @@ fn health_capacity_complete_fixture_carries_every_projected_form() {
     assert_eq!(complete.growth_excluded, ["k8s"]);
 }
 
-/// The headroom attempt failed after a complete sample with a deficit:
-/// the rows are kept with their age, and every reach is withheld as
-/// measurement unavailable, the rate-less k8s included, so nothing is
-/// excluded. The edge env's only partition is dated after the fixture's
+/// The edge env's only partition is dated after the fixture's
 /// today, as a fast agent clock writes one: its oldest date is still the
 /// one on disk.
 #[test]
@@ -962,9 +919,6 @@ fn health_capacity_failed_retained_fixture_withholds_every_reach() {
     );
 }
 
-/// Both samples are complete, but the headroom attempt saw a repin: every
-/// reach is withheld as retention suppressed, the rate-less k8s included,
-/// and retention's last sweep stood down.
 #[test]
 fn health_capacity_repin_suppressed_fixture_withholds_every_reach() {
     use trawl_api::{Reach, StorageMeasurementStatus, SweepOutcome, WithheldReason};
@@ -999,9 +953,6 @@ fn health_capacity_repin_suppressed_fixture_withholds_every_reach() {
     assert!(suppressed.growth_excluded.is_empty());
 }
 
-/// A floor of 0 turns pressure deletion off: at the largest observed day
-/// the disk fills first for every projected env, and at the mean day
-/// every one keeps its full policy.
 #[test]
 fn health_capacity_floor_zero_fixture_turns_pressure_deletion_off() {
     use trawl_api::{DeletionFloor, Reach, ReachEnd, WithheldReason};
@@ -1041,7 +992,6 @@ fn health_capacity_floor_zero_fixture_turns_pressure_deletion_off() {
     assert_eq!(off.growth_excluded, ["fresh"]);
 }
 
-/// Under pressure the sweep ran out of candidates below the floor.
 /// Pressure deletion spares only today's partition, so every env holds
 /// today alone, none has a rate, and every finite one is excluded.
 #[test]
@@ -1096,9 +1046,6 @@ fn health_capacity_pressure_fixture_carries_the_evidence() {
     assert_eq!(pressure.growth_excluded, ["lab", "prod"]);
 }
 
-/// No environments, and no complete Parquet scan to establish that: one
-/// case before the first scan, one after a scan that failed with nothing
-/// retained. Neither may read as a measured empty list (ADR-0033).
 #[test]
 fn health_capacity_unmeasured_fixtures_carry_no_complete_scan() {
     use trawl_api::StorageMeasurementStatus;
@@ -1240,8 +1187,6 @@ fn created_saved_query_fixture_preserves_the_editor_text() {
     assert!(saved.schedule.is_none());
 }
 
-// ---- the `schedule` scenario -----------------------------------------------
-
 const SAVED_QUERIES_WINDOWED: &str =
     include_str!("../e2e/harness/wire/saved-queries-windowed.json");
 const SCHEDULE_SAVED: &str = include_str!("../e2e/harness/wire/schedule-saved.json");
@@ -1251,18 +1196,9 @@ const RUN_RESULT_PAGED: &str = include_str!("../e2e/harness/wire/run-result-page
 const RUN_STARTED: &str = include_str!("../e2e/harness/wire/run-started.json");
 const RUN_REFUSED: &str = include_str!("../e2e/harness/wire/run-refused.json");
 
-/// The `schedule` scenario's saved list: the unscheduled net and one net
-/// per schedule mode, decoded through the SAME type the `populated` list
-/// uses.
-///
-/// Every net is part of the contract. The windowed net is what the form
-/// opens showing, and `lag` and `lag_secs` have to agree, because
+/// `lag` and `lag_secs` have to agree, because
 /// `WindowDraft::from_schedule` reads the SECONDS to decide whether a lag
-/// is real and prints the STRING — a fixture where those two disagree
-/// would make the form show a value the spec cannot explain. Run now is
-/// offered on every scheduled net, whatever its mode, and on no other:
-/// the unscheduled net is the control, and the fixed-span and paused
-/// query-mode nets are the modes a window-only reading would miss.
+/// is real and prints the STRING.
 #[test]
 fn the_schedule_scenario_carries_every_schedule_mode_and_an_unscheduled_net() {
     let saved: ListSavedResponse = decode("saved-queries-windowed.json", SAVED_QUERIES_WINDOWED);
@@ -1324,20 +1260,8 @@ fn the_schedule_scenario_carries_every_schedule_mode_and_an_unscheduled_net() {
     assert!(!query_schedule.enabled);
 }
 
-/// What Run now answers: the claimed run and the refusal the stub arms.
-///
-/// The claimed run is a MANUAL run of the tiling net whose window starts
-/// at that net's watermark, which is what a `since_last` manual run covers
-/// (ADR-0018 as amended on 2026-09-23). Its text carries the spliced
-/// bounds, as the run row stores them. The refusal is a 409's envelope
-/// whose message the toast quotes, so the message is the contract.
 const SAVED_QUERIES_SPENT: &str = include_str!("../e2e/harness/wire/saved-queries-spent.json");
 
-/// The `schedule-spent` scenario's saved list, which `e2e/fixtures.ts`
-/// `SPENT` names: a capped net under its cap (Run now enabled), a net
-/// spent past a lowered cap (`spent 5/3`), and a `max_runs = 0` net that
-/// never ran (`spent 0/0`, no pending wording). `exhausted` agrees with
-/// `total_runs >= max_runs` on every net, as the server derives it.
 #[test]
 fn the_spent_scenario_carries_a_capped_net_and_two_spent_ones() {
     let saved: ListSavedResponse = decode("saved-queries-spent.json", SAVED_QUERIES_SPENT);
@@ -1415,8 +1339,6 @@ fn the_run_now_fixtures_carry_a_manual_window_and_a_refusal() {
         "the refusal mirrors trawl-server's empty-window sentence",
     );
 
-    // Recorded runs carry their origin too: the scheduled history rows
-    // say so, and carry no Manual marker.
     let history: ListReportRunsResponse = decode("schedule-net-runs.json", SCHEDULE_NET_RUNS);
     assert!(
         history
@@ -1426,7 +1348,7 @@ fn the_run_now_fixtures_carry_a_manual_window_and_a_refusal() {
     );
 }
 
-/// The two schedule PUT answers. Shape only for the success, because no
+/// Shape only for the success, because no
 /// spec reads it: the assertion a schedule spec makes is about the
 /// request. The refusal's MESSAGE is the contract, since the form renders
 /// it verbatim.
@@ -1439,9 +1361,7 @@ fn the_schedule_put_fixtures_decode_as_their_wire_types() {
     assert_eq!(refusal.error.code, trawl_api::ErrorCode::BadRequest);
     // `ServerError::WindowPolicy` answers 400 with an envelope carrying
     // `WindowPolicyError::TimeClause`'s own sentence
-    // (`crates/trawl-server/src/report_window.rs`). Mirrored, not
-    // invented: the spec asserts the form shows it character for
-    // character, which is only worth asserting if it is the real one.
+    // (`crates/trawl-server/src/report_window.rs`).
     assert_eq!(
         refusal.error.message,
         "schedule window \"since_last\" conflicts with the saved query's \
@@ -1449,8 +1369,6 @@ fn the_schedule_put_fixtures_decode_as_their_wire_types() {
     );
 }
 
-/// The long run and the list that offers it.
-///
 /// `row_count` is the run's own stored count and `rows.len()` is what the
 /// response carried. They are EQUAL here on purpose: the preview's cap
 /// line appears only when they differ, and the paging spec overrides the
@@ -1520,8 +1438,6 @@ fn the_paged_run_fixture_carries_more_rows_than_one_preview_page() {
     assert!(NET_DRAWER_SRC.contains("NonZeroUsize::new(20)"));
 }
 
-/// The net drawer's own source, for the one constant the paging spec
-/// mirrors.
 const NET_DRAWER_SRC: &str = include_str!("../src/components/net_drawer.rs");
 
 #[test]
@@ -1559,11 +1475,6 @@ fn result_actions_fixture_has_numeric_and_null_aggregate_cells() {
 const QUERY_FIELD_PRESENTATION: &str =
     include_str!("../e2e/harness/wire/query-field-presentation.json");
 
-/// `field-presentation.spec.ts` and `facets.spec.ts` read this page as
-/// the cases issue 238 names: one-off `_time` and sender `timestamp`
-/// columns, the raw event and its ingest instant, a repeating `level`, a
-/// distinct `host` that is not a time, an event with no null field, and
-/// a sparse one with seven.
 #[test]
 fn field_presentation_fixture_carries_one_off_times_and_a_sparse_event() {
     use std::collections::HashSet;
@@ -1643,7 +1554,6 @@ fn field_presentation_fixture_carries_one_off_times_and_a_sparse_event() {
     assert_eq!(nulls(&rows[1]), 7, "event 2 is the sparse one");
 }
 
-/// Every query fixture the stub serves, decoded as the wire type.
 const QUERY_FIXTURES: [(&str, &str); 10] = [
     ("query-rows", QUERY_ROWS),
     ("query-cardinality", QUERY_CARDINALITY),
@@ -1672,8 +1582,6 @@ const QUERY_FIXTURES: [(&str, &str); 10] = [
     ),
 ];
 
-/// Each fixture is a whole result: its `total` is the count the
-/// execution produced, and no window was cut from it.
 #[test]
 fn query_fixtures_report_the_whole_result_they_carry() {
     for (name, body) in QUERY_FIXTURES {
@@ -1766,16 +1674,6 @@ fn wide_result_capture_fixture_has_full_width_rows_and_local_pages() {
     );
     assert_eq!(result.columns[6].name, "trace_id");
 }
-
-// ---- query errors (ADR-0039) ---------------------------------------------
-//
-// The query error bodies the notice specs fulfil the query route with.
-// Each is the envelope the server writes for the text the spec sends: the
-// parse fixtures carry exactly the details the parser reports for that
-// effective text (the server's parse arm copies them one for one), and the
-// validation fixtures carry the emitter's own message, hint and summary.
-// A parser message that moves fails here, not as a spec asserting on a
-// message the server no longer writes.
 
 const QUERY_PARSE_ERROR: &str = include_str!("../e2e/harness/wire/query-parse-error.json");
 const QUERY_PARSE_ERRORS_TWO: &str =
@@ -1919,12 +1817,8 @@ fn the_query_resource_exhausted_fixture_is_the_budget_refusal() {
     assert!(body.error.details.is_empty());
 }
 
-// ---- the live aggregate cap ------------------------------------------------
-
 const LIVE_SNAPSHOT_CAPPED: &str = include_str!("../e2e/harness/wire/live-snapshot-capped.json");
 
-/// The frame reports the group cap with the limit trawl-core enforces,
-/// and trawl-core does report that cap once a new group arrives past it.
 /// The second half ties the fixture to its producer: a server that
 /// stopped marking the cap would leave the spec testing a frame trawld
 /// can no longer send.
@@ -1934,10 +1828,6 @@ fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
     use trawl_api::value::{Column, ColumnType};
     use trawl_core::stream::{AggregationCap, StreamPlan, compile_stream_plan};
 
-    // The frame `live-aggregate-capped.spec.ts` broadcasts, decoded by
-    // the type the SPA's snapshot listener decodes it with. Re-encoding
-    // gives back the fixture byte for byte as JSON, so it carries nothing
-    // the frame does not.
     let frame: SnapshotFrame = decode("live-snapshot-capped.json", LIVE_SNAPSHOT_CAPPED);
     assert_eq!(
         serde_json::to_value(&frame).unwrap(),
@@ -1984,10 +1874,6 @@ fn the_live_snapshot_capped_fixture_is_what_an_overflowing_stats_reports() {
     assert_eq!(aggregation.capped(), vec![AggregationCap::Groups]);
 }
 
-// ---- the typed result wire (ADR-0035, amended 2026-10-22) -----------------
-
-/// Which result type a wire file holds, by its name: a query answer, a
-/// stored run, a live aggregate snapshot, or one raw live event.
 enum ResultBody {
     Query,
     Run,
@@ -2028,17 +1914,10 @@ fn result_part(body: &serde_json::Value) -> Option<&serde_json::Value> {
     }
 }
 
-/// Every `harness/wire/` body that carries a result decodes through the
-/// typed result codec the SPA decodes it with (ADR-0035, amended
-/// 2026-10-22): each column has a type, integers are canonical decimal
-/// strings, timestamps are RFC 3339. A partly converted body is refused
+/// A partly converted body is refused
 /// whole by the SPA, far from the cause, so this reads the directory
 /// rather than a list: a new fixture with columns is held to the wire
 /// the day it lands, and one this test cannot classify fails by name.
-///
-/// Re-encoding the decoded cells gives back the fixture's own `columns`
-/// and `rows`, so every cell is already in the encoder's canonical
-/// spelling, not just one the decoder tolerates.
 #[test]
 fn every_result_fixture_decodes_through_the_typed_result_codec() {
     use trawl_api::stream::SnapshotFrame;
@@ -2090,7 +1969,6 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
         );
         checked.push(name.as_str());
     }
-    // The sweep reached the bodies the specs are written against.
     for expected in [
         "live-data-tick",
         "live-snapshot-capped",
@@ -2108,8 +1986,6 @@ fn every_result_fixture_decodes_through_the_typed_result_codec() {
     }
 }
 
-// ---- the investigation pages (ADR-0059) ------------------------------------
-
 use trawl_api::investigations::{
     EntryPayload, InvestigationList, InvestigationRead, StepOutcomeKind,
 };
@@ -2120,12 +1996,6 @@ const INVESTIGATION_READ: &str = include_str!("../e2e/harness/wire/investigation
 const RESULT_PAGE_EVIDENCE: &str = include_str!("../e2e/harness/wire/result-page-evidence.json");
 const RESULT_GONE: &str = include_str!("../e2e/harness/wire/result-gone.json");
 
-/// The investigation fixtures decode, and hold the cases
-/// `investigations.spec.ts` reads: two findings, one citing two rows of
-/// the readable result and one citing a row of the pruned result, three
-/// steps of which one was interrupted, and one note. The read is
-/// internally consistent the way the server writes it, so a page that
-/// trusts the sequence fields reads it as a real one.
 #[test]
 fn the_investigation_fixtures_are_one_consistent_board() {
     let list: InvestigationList = decode("investigations-list.json", INVESTIGATIONS_LIST);
@@ -2165,7 +2035,6 @@ fn the_investigation_fixtures_are_one_consistent_board() {
     sorted.sort();
     assert_eq!(order, sorted, "the list is in the server's order");
 
-    // Entries arrive in `updated_seq` order and reach `through_seq`.
     let updated: Vec<u64> = read.entries.iter().map(|e| e.updated_seq).collect();
     let mut ascending = updated.clone();
     ascending.sort_unstable();
@@ -2230,12 +2099,7 @@ const INVESTIGATION_READ_MANY: &str =
 
 /// The board the evidence queue is tested against: four findings citing
 /// 32 rows each, 128 references that a page reading them all at once
-/// would send past the reader's interactive rate limit. They cite 32
-/// results, each the capture of a step in the same log and each served
-/// as the three-row evidence page, so every reference names a row the
-/// page holds. The fourth finding cites exactly the first finding's rows:
-/// 96 distinct rows, so the page reads each once however many findings
-/// cite it.
+/// would send past the reader's interactive rate limit.
 #[test]
 fn the_many_references_board_is_consistent_and_cites_96_distinct_rows() {
     let read: InvestigationRead = decode("investigation-read-many.json", INVESTIGATION_READ_MANY);
@@ -2348,8 +2212,7 @@ const PAGED_SEARCH_PATH: &str = "/search?q=service%3Dbilling%20status%3E%3D500%2
 /// three at a time, as trawld serves `[capture] page_max_rows`, whose
 /// bounds lie in January, long before the board was opened and before
 /// anything the stub's corpus answers, so its rows exist only as
-/// captured. It carries #214 typed cells (a timestamp with a fraction, a
-/// `u64::MAX` integer, a null) and belongs to the board's investigation.
+/// captured.
 #[test]
 fn the_paged_result_is_seven_kept_rows_from_before_the_corpus() {
     let page: ResultPage = decode("result-page-paged.json", RESULT_PAGE_PAGED);
@@ -2407,10 +2270,7 @@ const SERVER_ERRORS_SRC: &str = include_str!("../../trawl-server/src/error.rs");
 
 /// The two 409s a board write meets, as the stub answers them
 /// (`harness/server.mjs` fills the numbers of a stale PATCH from the
-/// request). A stale overwrite carries `conflict` and trawld's text for
-/// those numbers; a write to a closed investigation carries neither
-/// numbers nor `conflict`. The texts are trawld's own (`error.rs`), so a
-/// spec that reads them reads what an operator would.
+/// request).
 #[test]
 fn the_write_conflicts_are_trawlds_409s() {
     let stale: trawl_api::ErrorResponse =
@@ -2462,14 +2322,6 @@ fn the_write_conflicts_are_trawlds_409s() {
 
 const CAPTURE_ATTACHED: &str = include_str!("../e2e/harness/wire/capture-attached.json");
 
-/// The answer to Send to investigation, as the stub fills it
-/// (`harness/server.mjs` `captureAttached`): a capture attached to the
-/// served board whose rows are the `query-send-rows` events inside its
-/// window, the same events Search answers inside its range. The stub pages
-/// those rows under this result's metadata, so its columns are the rows'
-/// columns, in order and type, and each column has its facts; its counts
-/// are the whole fixture's here, and the kept count once the stub has cut
-/// the window from it.
 #[test]
 fn the_attached_capture_keeps_the_rows_search_showed() {
     let capture: trawl_api::results::CaptureResponse =
@@ -2530,17 +2382,8 @@ fn the_capabilities_fixture_is_the_wire_type_at_the_capture_defaults() {
     );
 }
 
-/// Every canned `histogram` the stub and the specs serve decodes as part
-/// of a `QueryResponse` and meets the invariants against that response's
-/// `pagination.total`, the check the strip makes before it draws. The
-/// stub counts nothing, so a fixture whose count could not come from
+/// The stub counts nothing, so a fixture whose count could not come from
 /// trawld would test a strip trawld never sends.
-///
-/// A fixture that carries its whole result (`total` equal to its rows) is
-/// also counted again here by the server's rule: integer microsecond
-/// bins of `ceil(max(1 s, max - min + 1 µs) / 48)` from the earliest
-/// usable `_time`, errors at `_severity` 17 or above. So the batch5
-/// tooltip tests and the paged spec read bins their own rows land in.
 #[test]
 fn every_canned_histogram_meets_its_invariants() {
     use trawl_api::EventHistogram;

@@ -12,53 +12,31 @@
 //! snapshot whose aggregation dropped input past a cap also carries
 //! `capped`, one [`SnapshotCap`] per cap that dropped something since the
 //! stream started (ADR-0001). The field is omitted when nothing was
-//! dropped, and reaching a cap exactly drops nothing. A cap stays on every
-//! later snapshot of the stream, because the dropped input never comes
-//! back.
+//! dropped.
 
 use serde::{Deserialize, Serialize};
 
 use crate::value::QueryResult;
 
-/// One `snapshot` frame: the aggregation's whole result so far, and the
-/// caps that dropped input on the way to it.
-///
-/// On the wire the result's `columns` and `rows` sit beside `capped` in
-/// one object.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotFrame {
-    /// The rows so far, typed as the batch result wire types them.
     #[serde(flatten)]
     pub result: QueryResult,
-    /// The caps that dropped input since the stream started. Empty, and
-    /// omitted on the wire, when nothing was dropped.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capped: Vec<SnapshotCap>,
 }
 
-/// Which bound of a live aggregation dropped input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotCapKind {
-    /// A new group arrived while the group map was full. A `timechart`
-    /// holds one map per bucket.
     Groups,
-    /// A `dc()` or `values()` accumulator was full and the value was unseen.
     DistinctValues,
-    /// A `median` or percentile accumulator was full and the event carried a
-    /// number.
     ExactValues,
 }
 
-/// One cap a snapshot's aggregation passed, with the bound it passed.
-///
-/// The limit travels with the name so a client never hard-codes it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct SnapshotCap {
-    /// The cap that dropped input.
     pub cap: SnapshotCapKind,
-    /// Its bound: groups per aggregation (per bucket for a `timechart`), or
-    /// values per accumulator.
     pub limit: u64,
 }
 
@@ -67,9 +45,6 @@ mod tests {
     use super::*;
     use crate::value::{Column, ColumnType, Value};
 
-    /// A snapshot frame is the result wire plus `capped`, which stays off
-    /// the wire while nothing was dropped; an integer past `i64` lands as
-    /// the exact `UInt` it was.
     #[test]
     fn snapshot_frame_wire_spelling() {
         let frame = SnapshotFrame {
@@ -117,8 +92,6 @@ mod tests {
         );
     }
 
-    /// A snapshot is decoded by the result codec, so a cell its column
-    /// type refuses fails the whole frame, naming the column.
     #[test]
     fn snapshot_frame_refuses_a_cell_its_column_refuses() {
         let err = serde_json::from_str::<SnapshotFrame>(

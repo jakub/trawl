@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `investigation` over a recording backend (ADR-0059, #310): the request
-//! each action sends, the session's `seen_seq` bookkeeping, activity
-//! printed exactly once under the response budget, the board renderer it
-//! shares with `read`, and the refusals.
+//! `investigation` over a recording backend (ADR-0059).
 //!
 //! The real two-principal run through `trawl mcp` against a trawld lives
 //! in `crates/trawl-cli/tests/mcp_investigation.rs`: this crate never
@@ -53,7 +50,6 @@ fn id() -> InvestigationId {
     InvestigationId::parse(INVESTIGATION_ID).unwrap()
 }
 
-/// The JSON body a recorded call sent, after its method and id.
 fn sent(call: &str) -> Json {
     let body = &call[call.find('{').expect("a body")..];
     serde_json::from_str(body).expect("a JSON body")
@@ -63,8 +59,6 @@ fn appended(entry: LogEntry, activity: Option<Activity>) -> AppendResponse {
     AppendResponse { entry, activity }
 }
 
-/// trawld's answer to a `PATCH` that left the investigation at `header`:
-/// the agent's status entry at the header's seq, and `activity`.
 fn patched(header: Investigation, activity: Option<Activity>) -> PatchResponse {
     PatchResponse {
         entry: LogEntry {
@@ -78,7 +72,6 @@ fn patched(header: Investigation, activity: Option<Activity>) -> PatchResponse {
     }
 }
 
-/// trawld's answers to the appends, in order.
 fn answers(responses: Vec<AppendResponse>) -> Option<Handler<AppendResponse>> {
     each(responses.into_iter().map(Ok).collect())
 }
@@ -92,7 +85,6 @@ fn activity(entries: Vec<LogEntry>, more: bool) -> Activity {
     }
 }
 
-/// The mirror's activity block, or the board, at `part`.
 fn block<'a>(result: &'a CallToolResult, part: &str) -> &'a Json {
     &result.structured_content.as_ref().expect("a mirror")[part]
 }
@@ -100,8 +92,6 @@ fn block<'a>(result: &'a CallToolResult, part: &str) -> &'a Json {
 fn assert_ok(result: &CallToolResult) {
     assert_ne!(result.is_error, Some(true), "{}", text_of(result));
 }
-
-// -- the tool ---------------------------------------------------------------------
 
 #[test]
 fn the_tool_is_listed_last_with_honest_annotations() {
@@ -154,7 +144,6 @@ async fn create_mints_an_id_prints_it_first_and_starts_the_session_there() {
     let minted = InvestigationId::parse(&minted).unwrap();
     assert_eq!(seen.lock().await.get(&minted), Some(0));
 
-    // Another create mints another id.
     let backend_again = Fake {
         create_investigation: ok((true, investigation(0))),
         ..Fake::default()
@@ -271,8 +260,6 @@ async fn a_field_the_action_does_not_take_is_refused_by_name_before_any_request(
     assert!(backend.calls().is_empty(), "{:?}", backend.calls());
 }
 
-// -- requests and seen_seq ----------------------------------------------------------
-
 #[tokio::test]
 async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
     let backend = Fake {
@@ -341,8 +328,6 @@ async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
         assert_ok(&call(&backend, &seen, arguments).await);
     }
     let calls = backend.calls();
-    // The first touch sends no seen_seq; the session then starts at the
-    // entry it wrote.
     assert_eq!(
         sent(&calls[0]),
         json!({"kind": "note", "text": "first"}),
@@ -364,18 +349,12 @@ async fn every_write_sends_its_request_and_the_sessions_seen_seq() {
         sent(&calls[3]),
         json!({"expected_seq": 3, "seen_seq": 1, "status": "refuted"})
     );
-    // PATCH changes status alone, one field per request; seen_seq is
-    // bookkeeping beside it.
     assert_eq!(
         sent(&calls[4]),
         json!({"expected_seq": 4, "seen_seq": 1, "status": "closed"})
     );
-    // Nothing other keys wrote was printed, so seen stays at the first
-    // touch.
     assert_eq!(seen.lock().await.get(&id()), Some(1));
 }
-
-// -- exactly once -------------------------------------------------------------------
 
 #[tokio::test]
 async fn activity_prints_the_other_keys_entries_exactly_once_per_session() {
@@ -491,8 +470,6 @@ async fn a_cut_activity_counts_only_what_it_printed_and_continues_from_there() {
     );
     assert_eq!(seen.lock().await.get(&id()), Some(through));
 
-    // The continuation prints the rest: a read from there moves seen past
-    // the rest, so the next write carries none of them again.
     let read = call(
         &backend,
         &seen,
@@ -580,8 +557,6 @@ async fn a_refused_write_moves_nothing() {
     assert_eq!(seen.lock().await.get(&id()), Some(1));
 }
 
-/// The `seq` of every entry by the other key that `result`'s text printed,
-/// in the order printed.
 fn theirs_printed(result: &CallToolResult) -> Vec<u64> {
     text_of(result)
         .lines()
@@ -591,13 +566,6 @@ fn theirs_printed(result: &CallToolResult) -> Vec<u64> {
         .collect()
 }
 
-/// #319: `status` and `finding_status` carry the session's `seen_seq` and
-/// print what other keys wrote since, each entry once. The first touch
-/// starts at the entry the call wrote, never at the investigation's
-/// header. After that, `seen` moves only through the activity a fitted
-/// reply printed. An empty activity, an answer without activity, the
-/// budget's drops, a 409 and a transport error leave the rest unseen, and
-/// the next write prints exactly that rest.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one session's writes, each step asserted in order
 async fn overwrites_print_unseen_activity_once() {
@@ -640,7 +608,6 @@ async fn overwrites_print_unseen_activity_once() {
                 entry: status_entry(5, agent(), InvestigationStatus::Open),
                 activity: None,
             }),
-            // The close: nothing new from other keys since #7.
             Ok(patched(
                 header(10, InvestigationStatus::Closed),
                 Some(Activity {
@@ -672,8 +639,6 @@ async fn overwrites_print_unseen_activity_once() {
     let seen_now = async || seen.lock().await.get(&id());
     let mut fitted = Vec::new();
 
-    // 1. The first touch: no seen_seq, the first-touch note, and seen
-    // starts at the entry written.
     let reopened = call(
         &backend,
         &seen,
@@ -693,7 +658,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(5));
     fitted.push(reopened);
 
-    // 2. A finding_status prints the other key's #6 and #7.
     let supported = call(
         &backend,
         &seen,
@@ -711,7 +675,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(7));
     fitted.push(supported);
 
-    // 3. An answer without activity says so and moves nothing.
     let refuted = call(
         &backend,
         &seen,
@@ -728,8 +691,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(7));
     fitted.push(refuted);
 
-    // 4. A close with an empty activity prints none and moves nothing,
-    // not even to the activity's through_seq.
     let closed = call(
         &backend,
         &seen,
@@ -746,7 +707,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(7));
     fitted.push(closed);
 
-    // 5. A 409 and 6. a transport error move nothing.
     let stale = call(
         &backend,
         &seen,
@@ -771,9 +731,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(lost.is_error, Some(true));
     assert_eq!(seen_now().await, Some(7));
 
-    // 7. At the minimum budget the activity prints its first entries and
-    // drops the rest; seen moves through the last one printed and no
-    // further.
     let cut = call(
         &backend,
         &seen,
@@ -800,8 +757,6 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(printed_through));
     fitted.push(cut);
 
-    // Each overwrite sent the session's seen_seq as it stood when the
-    // call began, and the first touch sent none.
     let calls = backend.calls();
     assert_eq!(
         calls.iter().map(|call| sent(call)).collect::<Vec<_>>(),
@@ -817,7 +772,6 @@ async fn overwrites_print_unseen_activity_once() {
         "{calls:?}"
     );
 
-    // 8. The next append prints exactly the entries still unseen.
     let unseen: Vec<LogEntry> = late
         .iter()
         .filter(|entry| entry.updated_seq > printed_through)
@@ -848,14 +802,10 @@ async fn overwrites_print_unseen_activity_once() {
     assert_eq!(seen_now().await, Some(21));
     fitted.push(noted);
 
-    // Across every reply, each of the other key's entries printed once,
-    // in change order.
     let printed: Vec<u64> = fitted.iter().flat_map(theirs_printed).collect();
     let expected: Vec<u64> = [6, 7].into_iter().chain(11..=21).collect();
     assert_eq!(printed, expected);
 }
-
-// -- refusals ---------------------------------------------------------------------
 
 fn conflict(expected: u64, current: u64) -> ClientError {
     ClientError::Server {
@@ -869,7 +819,6 @@ fn conflict(expected: u64, current: u64) -> ClientError {
     }
 }
 
-/// Each refusal case: the backend, the call, and what its text must say.
 fn refusal_cases() -> Vec<(Fake, Json, Vec<String>)> {
     let status_call = json!({"action": "status", "id": INVESTIGATION_ID, "status": "closed",
                              "expected_seq": 4});
@@ -985,8 +934,6 @@ async fn each_refusal_names_trawlds_code_and_the_way_back() {
         assert_eq!(seen.lock().await.get(&id()), None);
     }
 }
-
-// -- the board ----------------------------------------------------------------------
 
 fn every_kind() -> Vec<LogEntry> {
     let entry = |seq: u64, updated_seq: u64, payload: EntryPayload| LogEntry {
@@ -1165,9 +1112,7 @@ async fn a_board_read_prints_every_entry_kind_on_its_own_line() {
     let lines: Vec<&str> = text.lines().collect();
     assert_eq!(lines, expected, "{text}");
     assert!(!text.contains('\u{1b}'));
-    // The whole board read from the start counts as seen.
     assert_eq!(seen.lock().await.get(&id()), Some(9));
-    // The mirror carries each entry as trawld spells it.
     assert_eq!(
         block(&result, "entries")["entries"][1]["payload"]["kind"],
         json!("step")
@@ -1224,8 +1169,6 @@ async fn the_read_tool_reads_a_board_with_the_same_renderer_and_continues_in_rea
     assert_eq!(seen.lock().await.get(&id()), Some(9));
 }
 
-/// Read investigation `INVESTIGATION_ID` from `since` through `investigation
-/// action=read`, or through `read action=investigation` when `via_read`.
 async fn read_board(backend: &Fake, seen: &Seen, via_read: bool, since: u64) -> CallToolResult {
     if via_read {
         let arguments = json!({
@@ -1242,10 +1185,6 @@ async fn read_board(backend: &Fake, seen: &Seen, via_read: bool, since: u64) -> 
     }
 }
 
-/// A read that printed every entry trawld sent, none of them here, with
-/// nothing past them has seen the board through its `through_seq`: the
-/// session's next append sends it as `seen_seq`, so the reply prints what
-/// another key wrote after the read. Through both read paths.
 #[tokio::test]
 async fn reading_an_empty_board_records_the_sessions_cursor_at_its_through_seq() {
     for via_read in [false, true] {
@@ -1286,11 +1225,6 @@ async fn reading_an_empty_board_records_the_sessions_cursor_at_its_through_seq()
     }
 }
 
-/// An empty board read that leaves something unseen moves nothing: one
-/// whose trawld answer holds more past it, and one that starts past the
-/// session's `seen`. An empty board fits every budget
-/// (`an_empty_board_with_maximal_metadata_reads_at_every_budget`), so no
-/// empty read drops anything to fit.
 #[tokio::test]
 async fn an_empty_board_read_that_leaves_entries_unseen_moves_nothing() {
     for via_read in [false, true] {
@@ -1328,9 +1262,6 @@ async fn an_empty_board_read_that_leaves_entries_unseen_moves_nothing() {
     }
 }
 
-/// A board entry no budget fits prints as its header and a marker, and the
-/// read still counts it as seen: the marker names the call that prints it
-/// whole, or says that no response can.
 #[tokio::test]
 async fn a_board_entry_too_long_for_the_budget_prints_abbreviated_and_the_read_advances() {
     let marker_at_the_hard_cap =
@@ -1389,11 +1320,6 @@ async fn a_board_entry_too_long_for_the_budget_prints_abbreviated_and_the_read_a
     }
 }
 
-/// A board whose first entry does not fit even abbreviated, its
-/// attribution larger than any response, answers an error naming the
-/// investigation and the entry and the read that steps past it, never a
-/// success that prints no entry and proposes the same read again; the
-/// read past it prints the next entry.
 #[tokio::test]
 async fn a_board_entry_that_cannot_print_is_an_error_naming_it_and_the_read_past_it() {
     let huge = Actor {
@@ -1489,10 +1415,6 @@ async fn a_board_entry_that_cannot_print_is_an_error_naming_it_and_the_read_past
     );
 }
 
-// -- trawld's paging and the budget's drops ----------------------------------------
-
-/// Notes #`from` to #`to` by `actor`, each holding `bytes` of text after
-/// its sequence.
 fn notes_by(actor: &Actor, from: u64, to: u64, bytes: usize) -> Vec<LogEntry> {
     (from..=to)
         .map(|seq| {
@@ -1505,14 +1427,10 @@ fn notes_by(actor: &Actor, from: u64, to: u64, bytes: usize) -> Vec<LogEntry> {
         .collect()
 }
 
-/// The human key's notes #`from` to #`to`, each holding `bytes` of text
-/// after its sequence.
 fn human_notes(from: u64, to: u64, bytes: usize) -> Vec<LogEntry> {
     notes_by(&human(), from, to, bytes)
 }
 
-/// trawld's answer to a read of `board` after `since`: at most `page`
-/// entries in change order, with `more` when it holds others past them.
 fn trawld_read(board: &[LogEntry], since: u64, page: usize) -> InvestigationRead {
     let after: Vec<LogEntry> = board
         .iter()
@@ -1535,12 +1453,6 @@ fn trawld_read(board: &[LogEntry], since: u64, page: usize) -> InvestigationRead
     }
 }
 
-/// What the entries block at `part` of `result` says about paging, after
-/// checking the rule every block keeps: trawld's paging is
-/// `trawld_holds_more` and never `more`, and `continuation` is present
-/// exactly when trawld holds more or the budget dropped some. Returns
-/// `trawld_holds_more`, `entries_dropped_to_fit`, the `updated_seq` of
-/// each printed entry, and the continuation.
 fn paging_facts(
     result: &CallToolResult,
     part: &str,
@@ -1577,9 +1489,6 @@ fn paging_facts(
     (holds, dropped, printed, continuation)
 }
 
-/// Follow `next` and every continuation after it as a model would, its
-/// arguments as proposed, each read answered by [`trawld_read`] at `page`;
-/// the `updated_seq` of every entry the reads printed, in order.
 async fn follow_continuations(
     seen: &Seen,
     mut next: Option<Json>,
@@ -1622,9 +1531,6 @@ async fn follow_continuations(
     printed
 }
 
-/// A board read for [`activity_paging_and_budget_drops_are_independent`]:
-/// what trawld holds and how it pages, the read, and what its first reply
-/// must show.
 struct BoardCase {
     label: &'static str,
     board: Vec<LogEntry>,
@@ -1639,10 +1545,6 @@ struct BoardCase {
     none_printed: bool,
 }
 
-/// Read `case`'s board through `investigation action=read`, or through
-/// `read action=investigation` when `via_read`, check its first reply, and
-/// follow its continuations to the end: every entry after `since` prints
-/// once, in change order.
 async fn read_paged_board(case: &BoardCase, via_read: bool) {
     let label = format!("{}, via_read={via_read}", case.label);
     let backend = Fake {
@@ -1682,12 +1584,6 @@ async fn read_paged_board(case: &BoardCase, via_read: bool) {
     assert_eq!(printed, expected, "{label}");
 }
 
-/// A note written while another key's `theirs` entries are unseen, trawld
-/// carrying them as activity in pages of `page`, at the minimum budget:
-/// the other key's name, which no entry prints shorter, makes each of its
-/// entries larger than the budget leaves beside the acknowledgement, so
-/// the activity prints none of them. Checks the reply and follows its
-/// continuation to the end: every entry prints once, in change order.
 async fn write_with_unprintable_activity(label: &str, theirs: u64, page: usize, holds: bool) {
     let long_named = Actor {
         name: "n".repeat(2000),
@@ -1726,12 +1622,6 @@ async fn write_with_unprintable_activity(label: &str, theirs: u64, page: usize, 
     assert_eq!(printed, expected, "{label}");
 }
 
-/// #373: trawld's paging and the budget's drops are two facts. Every
-/// combination of the two, blocks printing no entry among them, says
-/// trawld's paging as `trawld_holds_more` and has no `more` key; it
-/// proposes a continuation exactly when either is set; and following the
-/// continuations from the first reply prints every entry after its
-/// `since` once, in change order.
 #[tokio::test]
 async fn activity_paging_and_budget_drops_are_independent() {
     let case = |label, board, since, pages, max_bytes, facts: (bool, bool, bool)| BoardCase {
@@ -1892,10 +1782,6 @@ async fn every_reply_validates_against_the_output_schema() {
 
 use trawl_client::Investigation;
 
-// -- a write trawld accepted is acknowledged at every budget ------------------------
-
-/// The budgets every acknowledgement must fit: the minimum, the default,
-/// the hard cap.
 const BUDGETS: [u32; 3] = [4096, 16384, 32768];
 
 /// `bytes` of `fill`: `x`, or U+0001, which prints escaped to six bytes.
@@ -1903,8 +1789,6 @@ fn filled(fill: char, bytes: usize) -> String {
     fill.to_string().repeat(bytes / fill.len_utf8())
 }
 
-/// An investigation at `seq` whose title, question and scope are as long
-/// as trawld takes, each byte `fill`.
 fn maximal_investigation(fill: char, seq: u64) -> Investigation {
     use trawl_api::investigations::{QUESTION_MAX_BYTES, SCOPE_MAX_BYTES, TITLE_MAX_BYTES};
     Investigation {
@@ -1936,7 +1820,6 @@ fn validate_against(tool: &str, result: &CallToolResult) {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-/// This key's entry #4 holding `payload`.
 fn mine(payload: EntryPayload) -> LogEntry {
     LogEntry {
         payload,
@@ -1944,8 +1827,6 @@ fn mine(payload: EntryPayload) -> LogEntry {
     }
 }
 
-/// Two of the other key's entries as long as a note may be, each byte
-/// `fill`.
 fn maximal_activity(fill: char) -> Activity {
     use trawl_api::investigations::NOTE_MAX_BYTES;
     activity(
@@ -1957,7 +1838,6 @@ fn maximal_activity(fill: char) -> Activity {
     )
 }
 
-/// A backend that appends `entry`, answering [`maximal_activity`].
 fn appends(entry: LogEntry, fill: char) -> Fake {
     Fake {
         append_entry: ok(appended(entry, Some(maximal_activity(fill)))),
@@ -1965,9 +1845,6 @@ fn appends(entry: LogEntry, fill: char) -> Fake {
     }
 }
 
-/// Every write action with the largest payload trawld accepts, each text
-/// byte `fill`: its arguments, the backend that accepts it, and the seq of
-/// the entry it writes (0 for create).
 fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
     use trawl_api::investigations::{
         FINDING_MAX_COUNTEREVIDENCE, FINDING_MAX_REFERENCES, FINDING_STATEMENT_MAX_BYTES,
@@ -2058,10 +1935,6 @@ fn maximal_writes(fill: char) -> Vec<(Json, Fake, u64)> {
     ]
 }
 
-/// R1: every write trawld accepted is acknowledged, with the
-/// investigation's id and the written seq, at every budget and for every
-/// payload trawld takes; an echo too long for the budget prints
-/// abbreviated, its marker naming the read that prints it.
 #[tokio::test]
 async fn every_accepted_write_keeps_its_acknowledgement_at_every_budget() {
     for fill in ['x', '\u{1}'] {
@@ -2108,9 +1981,6 @@ async fn every_accepted_write_keeps_its_acknowledgement_at_every_budget() {
     }
 }
 
-/// F2: a create at the minimum budget with the longest title, question and
-/// scope trawld takes prints the minted id on its first line, and the
-/// session follows it from seq 0 only once the reply fitted.
 #[tokio::test]
 async fn a_create_with_maximal_metadata_at_the_minimum_prints_the_id_first() {
     for fill in ['x', '\u{1}'] {
@@ -2139,11 +2009,6 @@ async fn a_create_with_maximal_metadata_at_the_minimum_prints_the_id_first() {
     }
 }
 
-/// F3/R2: the board header is fitted like an entry. An empty board whose
-/// title, question and scope are as long as trawld takes reads at the
-/// minimum and at the hard cap, through both tools; the cut texts are
-/// prefixes of the whole ones in the mirror, each with a marker, and the
-/// id, status, seq, retention and attribution stay whole.
 #[tokio::test]
 async fn an_empty_board_with_maximal_metadata_reads_at_every_budget() {
     for fill in ['x', '\u{1}'] {
@@ -2213,8 +2078,6 @@ async fn an_empty_board_with_maximal_metadata_reads_at_every_budget() {
                         "scope" => &board.scope,
                         other => panic!("{other} is not a header text"),
                     };
-                    // The mirror carries each control as the escape the
-                    // text prints for it.
                     let whole = whole.replace('\u{1}', "\\u0001");
                     let printed = view[name].as_str().unwrap();
                     assert!(
@@ -2236,8 +2099,6 @@ async fn an_empty_board_with_maximal_metadata_reads_at_every_budget() {
     }
 }
 
-/// F1: the board read the abbreviated echo of a maximal finding names
-/// renders it at every budget, abbreviated itself when it must be.
 #[tokio::test]
 async fn the_read_an_abbreviated_echo_names_prints_the_entry_at_every_budget() {
     use trawl_api::investigations::{
@@ -2288,10 +2149,6 @@ async fn the_read_an_abbreviated_echo_names_prints_the_entry_at_every_budget() {
     }
 }
 
-/// R3: the session's bookkeeping moves only on a fitted success. A reply
-/// that cannot fit, here because trawld names an actor longer than any
-/// response, is an error that names the accepted write and leaves `seen`
-/// where it was: unset on a first touch, and at its cursor after one.
 #[tokio::test]
 async fn seen_moves_only_after_a_fitted_success() {
     let huge = Actor {
@@ -2363,7 +2220,6 @@ async fn seen_moves_only_after_a_fitted_success() {
             assert_eq!(seen.lock().await.get(&id()), cursor, "{arguments}");
         }
     }
-    // The same create with printable fields fits, and only then moves seen.
     let backend = Fake {
         create_investigation: ok((true, investigation(0))),
         ..Fake::default()
@@ -2382,11 +2238,6 @@ async fn seen_moves_only_after_a_fitted_success() {
 
 use trawl_api::investigations::Actor;
 
-// -- format characters -------------------------------------------------------------
-
-/// A right-to-left override (it reorders the text after it), a zero-width
-/// space (it hides text) and a soft hyphen (invisible): characters another
-/// principal chose, in text the board prints into an agent's context.
 const FORMAT_CHARS: &str = "\u{202e}\u{200b}\u{00ad}";
 
 fn assert_no_raw_format_char(text: &str) {
@@ -2403,20 +2254,14 @@ fn hostile(label: &str) -> String {
     format!("{label}{FORMAT_CHARS}tail")
 }
 
-/// `label` as the text block prints it: a JSON string, each format
-/// character its `\uXXXX` escape, as a control character is.
 fn printed(label: &str) -> String {
     format!("\"{}\"", mirrored(label))
 }
 
-/// `label` as the mirror carries it: the very characters the text block
-/// prints between the quotes, each format character its `\uXXXX` escape.
 fn mirrored(label: &str) -> String {
     format!("{label}\\u202e\\u200b\\u00adtail")
 }
 
-/// The mirror's serialization, which a client may show the model in place
-/// of the text, holds no raw format character.
 fn assert_mirror_escaped(result: &CallToolResult) {
     let mirror = result.structured_content.as_ref().expect("a mirror");
     assert_no_raw_format_char(&mirror.to_string());
@@ -2491,8 +2336,6 @@ async fn a_board_prints_format_characters_in_stored_text_escaped_in_the_text_and
             .any(|line| line.ends_with(&format!("the title is now {}", printed("retitled")))),
         "{text}"
     );
-    // The mirror carries the same escapes, so a client that shows the
-    // model the mirror shows what the text block prints.
     assert_mirror_escaped(&result);
     let mirror = result.structured_content.as_ref().expect("a mirror");
     for (path, label) in [
@@ -2606,8 +2449,6 @@ async fn a_create_echo_prints_a_title_with_format_characters_escaped() {
     );
 }
 
-/// The fitter counts a format character as the six bytes `\uXXXX` it
-/// prints, so a cut keeps what the budget holds.
 #[test]
 fn the_fitter_counts_a_format_character_as_its_escape() {
     use trawl_mcp::render::activity::cut_escaped;

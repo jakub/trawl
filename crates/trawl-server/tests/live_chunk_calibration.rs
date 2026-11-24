@@ -2,35 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The live chunk calibration of issue #336 (ADR-0063, plan ruling R14).
-//!
-//! Ignored: `scripts/evidence/issue-336/live-chunk.sh` runs it in release
-//! and writes `docs/evidence/issue-336/live-chunk.txt`. It drives the real
-//! live driver (`trawl_server::live`) over an in-process bus with a plan
-//! the real preparer built, at chunk sizes 1, 4, 16, 64 and 256 events,
-//! each with the driver's 256 KiB string-payload cap.
-//!
-//! Two workloads. Mostly rejected: short log lines, 1 in 100 matching one
-//! regex. Long subjects: 65,536-character values, each searched by three
-//! admitted heavy regexes, every one of which scans to the value's end.
-//!
-//! Three phases a workload, each size in turn:
-//! - throughput: a backlog is published and the bus closed, and the
-//!   stream is read to its end. Events/s is the median of the rounds, and
-//!   each job's duration is pooled over them.
-//! - latency: batches are published on a fixed schedule at half the
-//!   workload's throughput plateau for a fixed time, and each data frame's
-//!   arrival is timed against its event's publish.
-//! - stop: with a backlog under way, the stream is dropped, and the time
-//!   until its SSE slot comes back (its job has exited) is measured.
-//!
-//! It prints the table, and writes it to the file `LIVE_CHUNK_REPORT`
-//! names when that is set, and applies the rule: the smallest size within 10%
-//! of the throughput plateau on both workloads, whose p99 job time is at
-//! most 5 ms on mostly rejected events and whose publish-to-frame p95 is at
-//! most 250 ms on long subjects. With no such size it names the bounds
-//! each size failed, and the size is 64. The run fails, after it writes the
-//! report, when that size is not `LIVE_CHUNK_EVENTS`.
+//! The live chunk calibration (ADR-0063).
 
 #![allow(
     clippy::cast_precision_loss,
@@ -63,7 +35,6 @@ const LATENCY_FOR: Duration = Duration::from_secs(2);
 const DRAIN_FOR: Duration = Duration::from_secs(10);
 const STOP_TRIALS: usize = 10;
 
-/// R14's size when no size meets every bound.
 const FALLBACK: usize = 64;
 
 const PLATEAU_SHARE: f64 = 0.9;
@@ -79,11 +50,8 @@ const HEAVY: [&str; 3] = [r"\w{20}", r"(?i)\w{20}", r"\w{19}\w"];
 struct Workload {
     name: &'static str,
     dsl: String,
-    /// Distinct batches, published in turn, cyclically.
     pool: Vec<Arc<IngestBatch>>,
-    /// The matching events of each pool batch.
     matches: Vec<usize>,
-    /// Batches a throughput run publishes.
     backlog: usize,
 }
 
@@ -105,7 +73,6 @@ impl Workload {
     }
 }
 
-/// A deterministic word source.
 struct Words(u64);
 
 impl Words {
@@ -116,7 +83,6 @@ impl Words {
         self.0
     }
 
-    /// A word of `len` letters and digits.
     fn word(&mut self, len: usize) -> String {
         const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
         (0..len)
@@ -138,7 +104,6 @@ fn object(value: &Value) -> Map<String, Value> {
     value.as_object().cloned().expect("an object")
 }
 
-/// Short log lines in batches of 50, the 100th of every 100 matching.
 fn mostly_rejected() -> Workload {
     let mut words = Words(0x9e37_79b9_7f4a_7c15);
     let (batches, per_batch) = (400, 50);
@@ -181,7 +146,6 @@ fn mostly_rejected() -> Workload {
 
 /// 65,536-character values of words of 1 to 19 characters, ending in one
 /// of 20, so each heavy regex scans to the end and every event matches.
-/// Batches of 4 events.
 fn long_subjects() -> Workload {
     let mut words = Words(0x2545_f491_4f6c_dd1d);
     let (batches, per_batch) = (16, 4);
@@ -221,8 +185,6 @@ fn long_subjects() -> Workload {
     }
 }
 
-/// `dsl` prepared as a live stream's setup prepares it: one ledger under
-/// the run's stop.
 fn prepare(dsl: &str) -> (CompiledFilter, StreamPlan, Stop) {
     let stop = Stop::new();
     let query = trawl_core::parser::parse(dsl).expect("the query parses");
@@ -235,8 +197,6 @@ fn prepare(dsl: &str) -> (CompiledFilter, StreamPlan, Stop) {
     (filter, plan, stop)
 }
 
-/// A stream of `workload` at `size` events a job over `bus`, holding a
-/// slot of `slots`.
 fn open(
     workload: &Workload,
     bus: &LocalEventBus,
@@ -328,7 +288,6 @@ async fn latency(workload: &Workload, size: usize, plateau: f64) -> Latency {
         arrivals
     });
 
-    // Every publish due by now goes out on each 1 ms tick.
     let mut published = Vec::with_capacity(batches);
     let mut tick = tokio::time::interval(Duration::from_millis(1));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -372,8 +331,6 @@ async fn latency(workload: &Workload, size: usize, plateau: f64) -> Latency {
     }
 }
 
-/// Stop-to-exit over `STOP_TRIALS` streams, each dropped part way through
-/// a backlog.
 async fn stop_to_exit(workload: &Workload, size: usize, throughput: f64) -> Vec<Duration> {
     let backlog_for = workload.events_of(workload.backlog) as f64 / throughput;
     let mut exits = Vec::with_capacity(STOP_TRIALS);
@@ -508,7 +465,6 @@ fn table(out: &mut String, workload: &Workload, rows: &[Row]) {
     let _ = writeln!(out);
 }
 
-/// The bounds `size` fails, by name.
 fn failures(rejected: &Row, long: &Row, rejected_plateau: f64, long_plateau: f64) -> Vec<String> {
     let mut failed = Vec::new();
     if rejected.throughput.events_per_s < PLATEAU_SHARE * rejected_plateau {
@@ -526,8 +482,6 @@ fn failures(rejected: &Row, long: &Row, rejected_plateau: f64, long_plateau: f64
     failed
 }
 
-/// Whether the run passes: the rule chose `constant`, or chose no size
-/// while `constant` is the fallback. The error says why not.
 fn verdict(chosen: Option<usize>, constant: usize) -> Result<(), String> {
     match chosen {
         Some(size) if size == constant => Ok(()),
@@ -541,8 +495,6 @@ fn verdict(chosen: Option<usize>, constant: usize) -> Result<(), String> {
     }
 }
 
-/// The run fails when the rule rejects `LIVE_CHUNK_EVENTS`: it chose
-/// another size, or chose none while the constant is not the fallback.
 #[test]
 fn the_run_fails_when_the_rule_rejects_the_constant() {
     assert_eq!(verdict(Some(256), 256), Ok(()));

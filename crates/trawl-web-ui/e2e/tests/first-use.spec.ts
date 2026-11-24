@@ -25,7 +25,6 @@ const EXAMPLES = [
   ['Chart web warnings and errors', 'service=web _severity>=warn | timechart span=5m count()'],
 ] as const;
 
-/** The next step a zero-match first page gives under its outcome line. */
 const NEXT_STEP = 'Widen the time range or remove a filter, then Haul again.';
 
 for (const [title, query] of EXAMPLES) {

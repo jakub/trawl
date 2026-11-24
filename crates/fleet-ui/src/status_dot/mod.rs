@@ -4,11 +4,6 @@
 
 //! Typed `<StatusDot tone=StatusTone>` — the one dot family every
 //! health/outcome indicator renders (ADR-0003).
-//!
-//! Split into two layers, mirroring [`crate::button`]:
-//! - [`tone`] — the pure [`StatusTone`] enum and its CSS-class
-//!   contract, natively unit-tested.
-//! - [`component`] — the wasm-only `<StatusDot>` component.
 
 pub mod tone;
 

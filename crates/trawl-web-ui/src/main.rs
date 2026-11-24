@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawl-web-ui`: Leptos SPA entry point.
-
 // Pure modules that don't touch Leptos/web-sys — keep them ungated so
 // their tests run under plain `cargo test` on native.
 mod api_error;
@@ -63,9 +61,8 @@ mod interop;
 #[cfg(target_arch = "wasm32")]
 mod pages;
 
-// `state` is ungated: its `app_mode` + `section` submodules carry pure
-// `&'static` data whose contracts are exercised by native `cargo test`;
-// the leptos-backed submodules inside it stay wasm32-gated.
+// `state` is ungated: its `app_mode` + `section` submodules are exercised
+// by native `cargo test`; the leptos-backed submodules stay wasm32-gated.
 mod state;
 
 #[cfg(target_arch = "wasm32")]

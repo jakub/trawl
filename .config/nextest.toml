@@ -1,30 +1,4 @@
 # Postgres admission: ONE group, one width (ADR-0021 ruling 4).
-#
-# Every pg-touching test binary in the workspace runs here. nextest is
-# process-per-test and sqlx pools are process-local, so without a bound the
-# workspace can open more connections than the postgres server allows. The
-# CI service container runs the stock max_connections of 100 (GH Actions
-# cannot override the postgres command line), which is
-# `common::CI_MAX_CONNECTIONS`.
-#
-# Worst case, by shape (the shape table lives in connection_budget.rs):
-#   WORST_TEST_CONNECTION_CEILING (10: a full server plus a test-side app
-#   pool, http_api's schedule cases) * max-threads (8) = 80
-#   80 + derived headroom (15: superuser reserve + per-thread admin
-#   transients + sqlx master churn) = 95 <= CI_MAX_CONNECTIONS (100)
-# The consts live in crates/trawl-server/tests/common/mod.rs and
-# connection_budget.rs fails the build if this arithmetic stops holding.
-#
-# Why 8: the retired `server-integration` group capped full-server tests at
-# 4, and duckdb memory per booted trawld is the practical floor, not
-# postgres. The conductor ruling is to start at 8, let the pg soak workflow
-# validate it, and raise it here in one line if the soak stays green.
-#
-# Membership is derived, not trusted: `cargo xtask pg-admission-guard`
-# recomputes the pg-touching set from the sources and fails if one of them
-# resolves outside this group. connection_budget is in the group only
-# because it shares the fixture module (it opens no connection at all);
-# a one-test binary costs nothing here.
 
 [test-groups.postgres]
 max-threads = 8
@@ -42,13 +16,9 @@ filter = 'package(trawl-server) & binary(startup_pg)'
 threads-required = 2
 
 [[profile.default.overrides]]
-# The pg-touching set. trawl-server's LIBRARY tests are in it too — the
-# retired config missed them entirely, so `from_saved`'s and `scheduler`'s
-# `#[sqlx::test]` cases ran unbounded. Only the listed Postgres modules belong
-# here: the other library unit tests open no connection and capping them would
-# serialize a suite that has no reason to be serial. A pool-constructing case
-# in an otherwise pure module moves to a sibling `pg_tests` module, as
-# `store::catalog` and `ingest::compaction` do, so only that module is listed.
+# Of trawl-server's library tests, only the listed Postgres modules belong
+# here: the others open no connection. A pool-constructing case in an
+# otherwise pure module moves to a sibling `pg_tests` module.
 filter = '''
   (package(trawl-server) & kind(lib)
     & (test(/^from_saved::/) | test(/^scheduler::/)
@@ -79,15 +49,12 @@ filter = '''
 test-group = 'postgres'
 # A hung pg test must become a NAMED failure before anything upstream (the
 # soak runner's heartbeat, a CI job timeout) kills the process without a
-# log line. 60s marks slow (the heaviest repin tests run ~55s in a loaded
-# CI), 5 periods = a 5-minute hard cap. Termination is not a retry: the
-# test fails, once, by name.
+# log line. The heaviest repin tests run ~55s in a loaded CI.
 slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.default.overrides]]
 # Both tests assert wall-clock windows (executor reclaim via TEST_QUERY_DELAY_MS;
 # token-bucket 429 timing) and flake only when the machine is saturated (e.g.
-# both pre-push suites running). One retry absorbs scheduler jitter without
-# masking real regressions; the durable fix is porting them to tokio paused time.
+# both pre-push suites running).
 filter = 'test(pool_executor_reclaimed_after_timeout) | test(rate_limit_returns_429)'
 retries = 1

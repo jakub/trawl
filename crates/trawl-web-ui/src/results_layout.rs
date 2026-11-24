@@ -2,68 +2,33 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure layout decisions for the snapshot results table's reading modes.
-//!
-//! At the crate root rather than under `components/`, which is wasm-gated:
-//! these answers are asked on every render of the results table, and
-//! wrong ones address the wrong event, so their tests run on native
-//! `cargo nextest run -p trawl-web-ui`.
-//!
-//! On native, only the tests consume these items — `#[allow(dead_code)]`
-//! at module scope silences the bin-crate dead-code warning. Matches the
-//! `facets.rs` pattern.
-
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::display::{timestamp_cell_text, value_to_string};
 use trawl_api::value::{ColumnType, Value};
 
-/// A result cell as the grids print it.
-///
-/// A `timestamp` cell (or a list of them) shows as
-/// `2024-01-15 10:00:00.120`: the UTC wall clock the server sent, without
-/// the `T` or the `Z`. The CLI and the TUI drop the fraction's trailing
-/// zeros ([`timestamp_cell_text`]); the browser pads the fraction to at
-/// least milliseconds instead, so the digits line up down a column. Finer precision the wire carries stays.
-/// Whether a cell is a timestamp is the column's type, never the cell's
-/// spelling, so a `string` column holding RFC 3339 text shows as sent.
-/// A column the grid has no type for (a short `types` list) shows like
-/// any other cell.
-///
-/// Display only: a filter built from a cell keeps the wire text, which
-/// names the instant exactly.
+/// A `timestamp` column's fraction is padded to at least milliseconds, so
+/// the digits line up down a column; the CLI and the TUI drop its trailing
+/// zeros ([`timestamp_cell_text`]). Display only: a filter built from a
+/// cell keeps the wire text, which names the instant exactly.
 #[must_use]
 pub fn cell_text(ty: Option<&ColumnType>, value: &Value) -> String {
     ty.and_then(|ty| millis_cell_text(ty, value))
         .unwrap_or_else(|| value_to_string(value))
 }
 
-/// The clock a column's instants are printed in, for its header and its
-/// detail key: `UTC` for a `timestamp` column, `None` for any other.
-///
-/// The browser requests results without a zone, so every timestamp cell
-/// reads in UTC and the cell text itself names no offset. Once ADR-0051's
-/// zone preference ships, this unit must follow the display zone (or give
-/// way to the per-instant offset that ADR prints).
 #[must_use]
 pub fn zone_unit(ty: Option<&ColumnType>) -> Option<&'static str> {
     matches!(ty, Some(ColumnType::Timestamp)).then_some("UTC")
 }
 
-/// The calendar date every `_time` cell on a compact page shares, which
-/// the table states once in the `_time` header so each cell can print
-/// only its clock.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SharedDate {
-    /// The `_time` column's index into the response's columns.
     pub col: usize,
-    /// The date as the cells print it: `2026-11-05`.
     pub date: String,
 }
 
 impl SharedDate {
-    /// A `_time` cell's text without the shared date: `10:00:00.120`.
-    /// Text that does not start with the date comes back whole.
     #[must_use]
     pub fn clock(&self, shown: &str) -> String {
         shown
@@ -74,14 +39,6 @@ impl SharedDate {
     }
 }
 
-/// The date the page's `_time` cells share, or `None` when the cells
-/// must keep their full text.
-///
-/// Only a `timestamp`-typed column named `_time` qualifies, and only
-/// when every row holds a wire timestamp that [`cell_text`] formats on
-/// the same date. A page that spans dates, an empty page, a NULL, or
-/// text the grid shows as sent keeps every cell whole. The answer reads
-/// the page's rows, not their order, so sorting cannot change it.
 #[must_use]
 pub fn shared_date(
     columns: &[String],
@@ -115,7 +72,6 @@ pub fn shared_date(
     date.map(|date| SharedDate { col, date })
 }
 
-/// `YYYY-MM-DD`, digits only.
 fn is_iso_date(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 10
@@ -128,7 +84,6 @@ fn is_iso_date(s: &str) -> bool {
         })
 }
 
-/// `HH:MM:SS` with an optional `.fraction`, digits only.
 fn is_clock(s: &str) -> bool {
     let (whole, fraction) = s.split_once('.').unwrap_or((s, ""));
     let b = whole.as_bytes();
@@ -143,8 +98,6 @@ fn is_clock(s: &str) -> bool {
         && fraction.bytes().all(|c| c.is_ascii_digit())
 }
 
-/// [`timestamp_cell_text`] with each timestamp's fraction padded to
-/// milliseconds; `None` where that returns `None`.
 fn millis_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
     match (ty, value) {
         (ColumnType::List { items }, Value::Array(elements)) => {
@@ -169,8 +122,6 @@ fn millis_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
     }
 }
 
-/// Right-pad a shortened timestamp's fraction to three digits:
-/// `…:28.31` → `…:28.310`, `…:28` → `…:28.000`. Never rounds.
 fn pad_millis(mut shown: String) -> String {
     let digits = if let Some((_, fraction)) = shown.split_once('.') {
         fraction.len()
@@ -184,19 +135,13 @@ fn pad_millis(mut shown: String) -> String {
     shown
 }
 
-/// One event's detail rows, split for the null-field disclosure: column
-/// indices, each list in wire order.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct DetailFields {
-    /// Fields with a value, shown while the disclosure is closed.
     pub shown: Vec<usize>,
-    /// Null fields, folded behind "Show N null fields".
     pub null: Vec<usize>,
 }
 
 impl DetailFields {
-    /// The rows to render, in wire order: the fields with a value while
-    /// the disclosure is closed, every field in its place once it opens.
     #[must_use]
     pub fn visible(&self, open: bool) -> Vec<usize> {
         if open {
@@ -207,8 +152,6 @@ impl DetailFields {
     }
 }
 
-/// The null-field disclosure's label: "Show 3 null fields", "Hide 1 null
-/// field".
 #[must_use]
 pub fn null_fields_label(open: bool, count: usize) -> String {
     let verb = if open { "Hide" } else { "Show" };
@@ -216,13 +159,8 @@ pub fn null_fields_label(open: bool, count: usize) -> String {
     format!("{verb} {count} null {noun}")
 }
 
-/// Partition a row's cells into the fields it holds and its null fields.
-///
-/// Both detail presentations (the inline expansion and the docked
-/// inspector) ask here, so they agree on N. Only [`Value::Null`] is a
-/// null field: an empty string, `0`, `false`, an empty array and the
-/// text `"NULL"` are values the event carries. The display text is never
-/// consulted, because it cannot tell `"NULL"` the string from a NULL.
+/// The display text is never consulted, because it cannot tell `"NULL"`
+/// the string from a NULL.
 #[must_use]
 pub fn partition_detail_fields(row: &[Value]) -> DetailFields {
     let mut out = DetailFields::default();
@@ -236,15 +174,10 @@ pub fn partition_detail_fields(row: &[Value]) -> DetailFields {
     out
 }
 
-/// The row index the docked inspector describes, if any.
-///
-/// A selection is a `(generation, original row index)` pair, and this is
-/// the arbitration between the two halves. The index alone is not enough:
-/// a new response, a page turn or a new effective query bumps the
+/// A new response, a page turn or a new effective query bumps the
 /// generation, and index 2 of the page that just arrived is a different
 /// event from index 2 of the page that was on screen when the reader
-/// clicked. A stale generation reads as "nothing selected", which closes
-/// the inspector rather than repointing it.
+/// clicked.
 #[must_use]
 pub fn inspector_selection(generation: u64, selected: Option<(u64, usize)>) -> Option<usize> {
     selected
@@ -254,11 +187,6 @@ pub fn inspector_selection(generation: u64, selected: Option<(u64, usize)>) -> O
 
 /// The columns a message-first row shows, by their ORIGINAL index into
 /// the response's column list.
-///
-/// Everything not named here is still in the event — it is read in the
-/// inline detail or the docked inspector — but it is off the row, which
-/// is the whole point of the mode: one wide message instead of a dozen
-/// truncated cells.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MessageFirst {
     pub time: Option<usize>,
@@ -268,9 +196,6 @@ pub struct MessageFirst {
 }
 
 impl MessageFirst {
-    /// The original column indices this layout renders, left to right:
-    /// time, severity, message. The header row and the data cells read
-    /// the same list, so the two cannot drift apart.
     #[must_use]
     pub fn header_indices(&self) -> Vec<usize> {
         let mut out = Vec::with_capacity(3);
@@ -281,27 +206,16 @@ impl MessageFirst {
     }
 }
 
-/// The columns `message` / `msg` may be called, lower-cased.
 const MESSAGE_NAMES: [&str; 2] = ["message", "msg"];
 
-/// The secondary line's fields, in the order they are read.
 const META_NAMES: [&str; 3] = ["service", "host", "latency_ms"];
 
-/// Plan a message-first layout for these columns, or `None` when the
-/// response has no message to lead with.
-///
-/// `None` is not a failure: the table falls back to the compact column
-/// layout, which is the only honest rendering of a result whose rows are
-/// not events. Aggregation-shaped results take that path for the same
-/// reason, and never reach here at all.
 #[must_use]
 pub fn message_first(columns: &[String], severity_cols: &[usize]) -> Option<MessageFirst> {
     let message = columns
         .iter()
         .position(|c| MESSAGE_NAMES.contains(&c.to_ascii_lowercase().as_str()))?;
     let time = columns.iter().position(|c| c == "_time");
-    // The response declares which columns render as severity; the first
-    // is the one the row shows as its pill.
     let severity = severity_cols.first().copied();
     let meta = META_NAMES
         .iter()
@@ -365,8 +279,6 @@ mod tests {
 
     #[test]
     fn message_first_needs_a_message_column() {
-        // No message to lead with: the table stays compact rather than
-        // promoting an arbitrary column to the wide slot.
         assert_eq!(
             message_first(&cols(&["_time", "host", "status"]), &[]),
             None
@@ -403,15 +315,12 @@ mod tests {
         let full = message_first(&cols(&["_time", "_severity", "message"]), &[1, 2]).unwrap();
         assert_eq!(full.header_indices(), vec![0, 1, 2]);
 
-        // The corpus shape: a time and a message, no declared severity.
         let plain = message_first(&cols(&["_time", "host", "status", "message"]), &[]).unwrap();
         assert_eq!(plain.header_indices(), vec![0, 3]);
     }
 
     #[test]
     fn message_first_meta_is_the_subset_that_exists_in_a_fixed_order() {
-        // Declaration order in the response is irrelevant: the secondary
-        // line always reads service, host, latency.
         let plan = message_first(
             &cols(&["message", "latency_ms", "host", "status", "service"]),
             &[],
@@ -429,18 +338,15 @@ mod tests {
     #[test]
     fn zone_unit_names_utc_for_timestamp_typed_columns_only() {
         assert_eq!(zone_unit(Some(&ColumnType::Timestamp)), Some("UTC"));
-        // A date has no clock, and text that looks like a time stays text.
         for ty in [ColumnType::Date, ColumnType::Time, ColumnType::String] {
             assert_eq!(zone_unit(Some(&ty)), None, "{ty:?}");
         }
-        // A column the grid has no type for gets no unit.
         assert_eq!(zone_unit(None), None);
     }
 
     #[test]
     fn cell_text_pads_timestamp_typed_cells_to_milliseconds() {
         let ts = |wire: &str| cell_text(Some(&ColumnType::Timestamp), &Value::String(wire.into()));
-        // Finer precision than milliseconds stays as the wire carries it.
         assert_eq!(
             ts("2026-10-22T12:34:56.123450-07:00"),
             "2026-10-22 12:34:56.12345"
@@ -450,12 +356,10 @@ mod tests {
             "2026-10-22 12:34:56.123456"
         );
         assert_eq!(ts("2026-10-22T12:34:56.123000Z"), "2026-10-22 12:34:56.123");
-        // Shorter fractions pad, never round.
         assert_eq!(ts("2026-10-22T05:58:28.310000Z"), "2026-10-22 05:58:28.310");
         assert_eq!(ts("2026-10-22T06:00:29.900000Z"), "2026-10-22 06:00:29.900");
         assert_eq!(ts("2026-10-22T12:34:56.000000Z"), "2026-10-22 12:34:56.000");
         assert_eq!(ts("2026-10-22T12:34:56Z"), "2026-10-22 12:34:56.000");
-        // Text that is not a wire timestamp shows as sent.
         assert_eq!(ts("infinity"), "infinity");
         assert_eq!(ts("2026-10-22 12:34:56"), "2026-10-22 12:34:56");
     }
@@ -463,8 +367,6 @@ mod tests {
     #[test]
     fn cell_text_shortens_timestamp_typed_cells_only() {
         let wire = Value::String("2026-10-22T12:34:56.123450-07:00".into());
-        // The column type decides, never the spelling: RFC 3339 text in a
-        // string column, or with no type at all, shows as sent.
         assert_eq!(
             cell_text(Some(&ColumnType::String), &wire),
             "2026-10-22T12:34:56.123450-07:00"
@@ -538,16 +440,13 @@ mod tests {
         assert_eq!(shared.date, "2026-11-05");
         let clock = |w: &str| shared.clock(&cell_text(Some(&ColumnType::Timestamp), &wire(w)));
         assert_eq!(clock("2026-11-05T10:00:00.120000Z"), "10:00:00.120");
-        // Finer precision than milliseconds stays.
         assert_eq!(clock("2026-11-05T23:59:59.123456Z"), "23:59:59.123456");
         assert_eq!(clock("2026-11-05T00:00:00Z"), "00:00:00.000");
-        // Text on another date is never cut.
         assert_eq!(clock("2026-11-06T00:00:00Z"), "2026-11-06 00:00:00.000");
     }
 
     #[test]
     fn shared_date_keeps_full_cells_when_any_row_disagrees() {
-        // A page across midnight.
         assert_eq!(
             time_page(&[
                 wire("2026-11-05T23:59:59.900000Z"),
@@ -555,7 +454,6 @@ mod tests {
             ]),
             None
         );
-        // A NULL, text the grid shows as sent, or a non-string value.
         for odd in [
             Value::Null,
             wire("infinity"),
@@ -568,25 +466,21 @@ mod tests {
                 "{odd:?}"
             );
         }
-        // A short row with no `_time` cell.
         assert_eq!(
             shared_date(&cols(&["_time"]), &[ColumnType::Timestamp], &[vec![]]),
             None
         );
-        // An empty page has no date to state.
         assert_eq!(time_page(&[]), None);
     }
 
     #[test]
     fn shared_date_needs_a_timestamp_typed_time_column() {
         let rows = vec![vec![wire("2026-11-05T10:00:00Z")]];
-        // RFC 3339 text in a string column stays literal.
         assert_eq!(
             shared_date(&cols(&["_time"]), &[ColumnType::String], &rows),
             None
         );
         assert_eq!(shared_date(&cols(&["_time"]), &[], &rows), None);
-        // Another timestamp column is not the event's time.
         assert_eq!(
             shared_date(&cols(&["_ingested"]), &[ColumnType::Timestamp], &rows),
             None
@@ -629,8 +523,6 @@ mod tests {
 
     #[test]
     fn inspector_selection_drops_a_stale_generation() {
-        // The row the reader clicked is gone; index 3 of the new page is
-        // a different event, so the inspector closes instead of moving.
         assert_eq!(inspector_selection(8, Some((7, 3))), None);
         assert_eq!(inspector_selection(7, Some((8, 3))), None);
     }

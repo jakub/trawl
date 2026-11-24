@@ -8,8 +8,7 @@
 //!
 //! Every capture here names an explicit window over the capture corpus
 //! (`common::captured::corpus`), so a test can move the results clock
-//! freely to order or expire captures. The binary is in the ADR-0021
-//! `postgres` nextest group.
+//! freely to order or expire captures.
 
 mod common;
 
@@ -23,7 +22,6 @@ use trawl_api::value::{Value, wire_cell_text};
 use trawl_config::CaptureConfig;
 use trawl_server::config::RateLimitConfig;
 
-/// Seconds a temporary capture stays readable in these tests.
 const TTL_SECS: u64 = 600;
 
 async fn boot() -> TestServer {
@@ -37,7 +35,6 @@ async fn boot() -> TestServer {
     .await
 }
 
-/// Capture `query` over the whole corpus as `token`, at `clock`.
 async fn capture_at(server: &TestServer, token: &str, clock: &str, query: &str) -> CapturedResult {
     server.results_clock.set(at(clock));
     let body = json!({
@@ -50,7 +47,6 @@ async fn capture_at(server: &TestServer, token: &str, clock: &str, query: &str) 
     captured::captured(server, token, &body).await.result
 }
 
-/// The corpus's events, captured as `token` at 10:30.
 async fn events(server: &TestServer, token: &str) -> CapturedResult {
     let captured = capture_at(
         server,
@@ -82,8 +78,6 @@ fn assert_status(answer: &captured::Answer, status: StatusCode, code: &str, what
     assert_eq!(answer.2["error"]["code"], code, "{what}: {}", answer.2);
 }
 
-/// The list holds the caller's unexpired captures, newest first, and none
-/// of another key's.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_list_is_the_callers_live_captures_newest_first() {
     let server = boot().await;
@@ -124,14 +118,9 @@ async fn the_list_is_the_callers_live_captures_newest_first() {
     );
 }
 
-/// `columns` selects by display name: the page answers the selected
-/// positions ascending, whatever order the names came in; a name two
-/// columns share selects both; an unknown name is a 400.
-///
 /// No query makes two columns of one name, so the shared-name capture
 /// holds a suffixed copy of `host` under its own name, recorded as
-/// `host` ([`captured::rename_column`]). Each shared position answers its
-/// own cell ([`captured::assert_own_cells`]).
+/// `host` ([`captured::rename_column`]).
 #[tokio::test(flavor = "multi_thread")]
 async fn columns_select_positions_by_display_name() {
     let server = boot().await;
@@ -194,9 +183,6 @@ async fn columns_select_positions_by_display_name() {
     );
 }
 
-/// A cell read in ranges reassembles, byte for byte, into the page cell's
-/// wire JSON. A range that would end inside a character is cut back to
-/// the boundary, and a range may not start inside one.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cell_read_in_ranges_reassembles_the_page_cell() {
     let server = boot().await;
@@ -262,8 +248,6 @@ async fn a_cell_read_in_ranges_reassembles_the_page_cell() {
     );
 }
 
-/// Indexes past the capture and a page larger than the page limit are
-/// refused with 400 before any file is read.
 #[tokio::test(flavor = "multi_thread")]
 async fn reads_past_the_capture_are_refused() {
     let server = boot().await;
@@ -311,13 +295,11 @@ async fn reads_past_the_capture_are_refused() {
         assert_status(answer, StatusCode::BAD_REQUEST, "bad_request", what);
     }
 
-    // The end itself is a page with no rows.
     let page = page_ok(&server, &result.id, &format!("?offset={rows}")).await;
     assert!(page.page.rows.is_empty());
     assert_eq!(page.pagination.total, captured::ROWS);
 }
 
-/// Every read needs the `query` permission.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_read_needs_the_query_permission() {
     let server = boot().await;
@@ -339,7 +321,6 @@ async fn every_read_needs_the_query_permission() {
     }
 }
 
-/// Another key's capture reads as one that does not exist.
 #[tokio::test(flavor = "multi_thread")]
 async fn another_keys_capture_is_not_found() {
     let server = boot().await;

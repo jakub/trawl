@@ -24,17 +24,13 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use crate::backend::Backend;
 use crate::server::TrawlServer;
 
-/// Why [`serve_stdio`] ended with an error.
 #[derive(Debug, thiserror::Error)]
 pub enum ServeError {
-    /// The session never started: the client closed the pipe, or its first
-    /// message was neither `initialize` nor a valid inline request. The
-    /// text names the class of failure, never a byte of the stream: rmcp's
-    /// own error quotes the whole first message, so it is only logged, at
-    /// debug level.
+    /// The text names the class of failure, never a byte of the stream:
+    /// rmcp's own error quotes the whole first message, so it is only
+    /// logged, at debug level.
     #[error("the MCP session did not start: {0}")]
     Start(StartFailure),
-    /// The task running the session panicked or was aborted.
     #[error("the MCP session task failed: {0}")]
     Task(#[from] tokio::task::JoinError),
     /// Reading stdin or writing stdout failed after the session started.
@@ -44,25 +40,18 @@ pub enum ServeError {
     Transport(String),
 }
 
-/// Why the session never started, by class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum StartFailure {
-    /// The client closed the pipe before it sent `initialize`.
     #[error("the client closed the connection before initializing")]
     Closed,
-    /// The client's first message was not one the handshake accepts.
     #[error("the client's first message was not an initialize request")]
     NotInitialize,
-    /// The server refused the client's `initialize` request.
     #[error("the initialize request was refused")]
     Refused,
-    /// Writing a handshake response failed.
     #[error("the transport failed during the handshake")]
     Transport,
-    /// The handshake was cancelled.
     #[error("the handshake was cancelled")]
     Cancelled,
-    /// A failure rmcp reports that has no class of its own here.
     #[error("the handshake failed")]
     Other,
 }
@@ -80,22 +69,12 @@ impl From<&ServerInitializeError> for StartFailure {
     }
 }
 
-/// Serve `server` over this process's standard input and output until the
-/// client closes the session.
-///
 /// stdout carries protocol frames and nothing else, so the caller must
 /// send every log line to stderr before calling this: the CLI configures
 /// tracing with a stderr writer and starts no TUI. When both streams are
 /// pipes, as an MCP client launches a stdio server, rmcp drives them
 /// through Tokio's non-blocking pipe driver; otherwise it falls back to
 /// the blocking handles. Must run inside a Tokio runtime with IO enabled.
-///
-/// # Errors
-///
-/// [`ServeError::Start`] when the handshake failed, [`ServeError::Task`]
-/// when the session task panicked, and [`ServeError::Transport`] when a
-/// read or a write failed during the session, even though rmcp ended it as
-/// closed.
 pub async fn serve_stdio<B: Backend + 'static>(server: TrawlServer<B>) -> Result<(), ServeError> {
     let failure = Failure::default();
     let (reader, writer) = stdio_pipes();
@@ -123,28 +102,21 @@ pub async fn serve_stdio<B: Backend + 'static>(server: TrawlServer<B>) -> Result
     }
 }
 
-/// The [`ServeError`] for a session that never started: its class, with
-/// rmcp's error, which can quote the client's message, logged at debug
-/// level only.
 fn start_error(error: &ServerInitializeError) -> ServeError {
     tracing::debug!(%error, "MCP handshake failed");
     ServeError::Start(StartFailure::from(error))
 }
 
-/// Which side of the pipe pair failed.
 #[derive(Debug, Clone, Copy)]
 enum Direction {
     Read,
     Write,
 }
 
-/// The first transport error either side saw, as the text
-/// [`ServeError::Transport`] carries.
 #[derive(Debug, Clone, Default)]
 struct Failure(Arc<Mutex<Option<String>>>);
 
 impl Failure {
-    /// Remember `error` unless an earlier one is already remembered.
     fn record(&self, direction: Direction, error: &io::Error) {
         let mut first = self.0.lock().unwrap_or_else(PoisonError::into_inner);
         if first.is_none() {
@@ -164,8 +136,6 @@ impl Failure {
     }
 }
 
-/// One half of the pipe pair, recording its first error into a shared
-/// [`Failure`] and otherwise passing every call through.
 struct Recording<T> {
     inner: T,
     failure: Failure,
@@ -173,7 +143,6 @@ struct Recording<T> {
 }
 
 impl<T> Recording<T> {
-    /// `poll`, with an error it returns recorded.
     fn noted<V>(&self, poll: Poll<io::Result<V>>) -> Poll<io::Result<V>> {
         if let Poll::Ready(Err(error)) = &poll {
             self.failure.record(self.direction, error);
@@ -238,7 +207,6 @@ mod tests {
 
     use super::*;
 
-    /// A writer whose every write fails with `kind`.
     struct Broken(io::ErrorKind);
 
     impl AsyncWrite for Broken {
@@ -276,13 +244,10 @@ mod tests {
         assert_eq!(first, "writing stdout failed: broken pipe");
     }
 
-    /// A handler with rmcp's defaults, enough to run the handshake.
     struct Bare;
 
     impl rmcp::ServerHandler for Bare {}
 
-    /// A notification before `initialize` ends the handshake, and the
-    /// error names that class without echoing the client's message.
     #[tokio::test]
     async fn a_failed_start_is_reported_by_class_without_the_message() {
         let (client, server) = tokio::io::duplex(1 << 16);

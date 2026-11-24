@@ -2,13 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The captured-result methods (ADR-0057) on the wire: the request each
-//! sends and the answer each decodes.
-//!
-//! Each test serves one connection from a rustls listener on `127.0.0.1`
-//! whose self-signed certificate the client pins as its CA, as
-//! `upload_cut_off.rs` does. The listener records the request it read and
-//! writes one canned success body, serialised from a trawl-api value.
+//! The captured-result methods (ADR-0057) on the wire.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -33,25 +27,20 @@ use trawl_client::{
 
 const TOKEN: &str = "flt_resultsroutestesttoken";
 
-/// A result id the client accepts.
 const RESULT_ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(30);
 
-/// What the listener read: the request head and its body.
 struct Seen {
     head: String,
     body: Vec<u8>,
 }
 
 impl Seen {
-    /// The request line: method, target and version.
     fn request_line(&self) -> &str {
         self.head.lines().next().expect("a request line")
     }
 
-    /// The value of header `name`, matched case-insensitively.
     fn header(&self, name: &str) -> Option<&str> {
         self.head
             .lines()
@@ -62,8 +51,6 @@ impl Seen {
     }
 }
 
-/// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
-/// pin, and the server identity.
 fn self_signed() -> (
     Vec<u8>,
     Vec<CertificateDer<'static>>,
@@ -78,7 +65,6 @@ fn self_signed() -> (
     )
 }
 
-/// A client that pins `pem` and addresses `address`.
 fn client_for(address: SocketAddr, pem: Vec<u8>) -> HttpClient {
     HttpClient::with_trust(
         format!("https://{address}"),
@@ -88,9 +74,6 @@ fn client_for(address: SocketAddr, pem: Vec<u8>) -> HttpClient {
     .expect("client")
 }
 
-/// Serve one connection: read the request, answer `200 OK` with `body`.
-/// Returns a client that trusts the listener's certificate as its pinned
-/// CA, and the serving task, which hands back what it read.
 async fn serve_one(body: Vec<u8>) -> (HttpClient, JoinHandle<Seen>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (pem, chain, key) = self_signed();
@@ -133,8 +116,6 @@ async fn serve_one(body: Vec<u8>) -> (HttpClient, JoinHandle<Seen>) {
     (client_for(address, pem), served)
 }
 
-/// Read up to the end of the request head. Returns the head and the body
-/// bytes that arrived with it.
 async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, Vec<u8>) {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -149,7 +130,6 @@ async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, Vec<u8>)
     }
 }
 
-/// The request's declared body length; zero without one.
 fn content_length(head: &str) -> usize {
     head.lines()
         .filter_map(|line| line.split_once(':'))
@@ -159,8 +139,6 @@ fn content_length(head: &str) -> usize {
         })
 }
 
-/// Run `call` against the listener, both bounded by [`EXCHANGE`]. Returns
-/// the call's answer and what the listener read.
 async fn exchange<T>(
     call: impl std::future::Future<Output = Result<T, ClientError>>,
     served: JoinHandle<Seen>,
@@ -172,7 +150,6 @@ async fn exchange<T>(
     (result.expect("the call succeeds"), seen)
 }
 
-/// Assert the request carried the client's bearer token.
 fn assert_bearer(seen: &Seen) {
     assert_eq!(
         seen.header("authorization"),
@@ -182,7 +159,6 @@ fn assert_bearer(seen: &Seen) {
     );
 }
 
-/// A captured result with two columns of the same name.
 fn captured() -> CapturedResult {
     CapturedResult {
         id: RESULT_ID.to_owned(),
@@ -237,8 +213,6 @@ fn captured() -> CapturedResult {
     }
 }
 
-/// `capture` posts the request as JSON to `/api/v1/results` and decodes
-/// the capture response.
 #[tokio::test]
 async fn capture_posts_the_request() {
     let answer = CaptureResponse {
@@ -269,7 +243,6 @@ async fn capture_posts_the_request() {
     assert_eq!(decoded, answer);
 }
 
-/// A correlation response for `correlation`, made by a read of `kind`.
 fn correlation_answer(kind: CaptureKind, correlation: Correlation) -> CorrelationResponse {
     CorrelationResponse {
         result: CapturedResult {
@@ -283,8 +256,6 @@ fn correlation_answer(kind: CaptureKind, correlation: Correlation) -> Correlatio
     }
 }
 
-/// `context` posts its request to its route and decodes the correlation
-/// response.
 #[tokio::test]
 async fn context_posts_to_its_route() {
     let context = ContextRequest {
@@ -330,8 +301,6 @@ async fn context_posts_to_its_route() {
     assert_eq!(decoded, answer);
 }
 
-/// `sightings` posts its request to its route and decodes the
-/// correlation response.
 #[tokio::test]
 async fn sightings_posts_to_its_route() {
     let sightings = SightingsRequest {
@@ -381,8 +350,6 @@ async fn sightings_posts_to_its_route() {
     assert_eq!(decoded, answer);
 }
 
-/// `compare` posts its request to its route and decodes the correlation
-/// response.
 #[tokio::test]
 async fn compare_posts_to_its_route() {
     let compare = CompareRequest {
@@ -427,9 +394,6 @@ async fn compare_posts_to_its_route() {
     assert_eq!(decoded, answer);
 }
 
-/// Each correlation route sends the request's attachment (ADR-0059) as
-/// the nested `investigation` object and decodes the attached answer's
-/// `step_seq` and `activity` beside the kept result.
 #[tokio::test]
 async fn the_correlation_routes_send_the_attachment_and_decode_step_seq_and_activity() {
     let attach = Attach {
@@ -514,7 +478,6 @@ async fn the_correlation_routes_send_the_attachment_and_decode_step_seq_and_acti
     assert_eq!(decoded, answer);
 }
 
-/// `list_results` reads `/api/v1/results` and decodes the list.
 #[tokio::test]
 async fn list_results_reads_the_list() {
     let answer = ResultList {
@@ -553,8 +516,6 @@ fn page() -> ResultPage {
     }
 }
 
-/// `result_page` sends the window and the comma-joined projection as query
-/// parameters, never in the path, and decodes the page.
 #[tokio::test]
 async fn result_page_sends_the_projection_as_one_parameter() {
     let answer = page();
@@ -572,8 +533,6 @@ async fn result_page_sends_the_projection_as_one_parameter() {
     assert_eq!(decoded, answer);
 }
 
-/// Without a projection, no `columns` parameter is sent; a name with
-/// reserved characters is percent-encoded.
 #[tokio::test]
 async fn result_page_without_a_projection_sends_no_columns() {
     let (client, served) = serve_one(serde_json::to_vec(&page()).unwrap()).await;
@@ -606,8 +565,6 @@ fn cell() -> ResultCell {
     }
 }
 
-/// `result_cell` addresses the cell in the path and sends `offset` and
-/// `length` only when given.
 #[tokio::test]
 async fn result_cell_sends_the_range_only_when_given() {
     let answer = cell();
@@ -639,8 +596,6 @@ async fn result_cell_sends_the_range_only_when_given() {
     );
 }
 
-/// A malformed id is refused before any connection: the listener sees
-/// nothing.
 #[tokio::test]
 async fn a_malformed_id_is_refused_before_any_connection() {
     let _ = rustls::crypto::ring::default_provider().install_default();

@@ -2,12 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration test for the full hot buffer pipeline.
-//!
-//! Verifies that events inserted into the hot buffer are immediately
-//! visible to queries, and that compaction drains the buffer without
-//! introducing duplicates.
-
 mod common;
 
 use std::sync::Arc;
@@ -48,8 +42,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // --- set up infrastructure ---
-
     let hot_buffer = Arc::new(HotBuffer::new(HotBufferConfig {
         max_events: 10_000,
         max_bytes: 10_000_000,
@@ -57,13 +49,11 @@ async fn hot_buffer_makes_events_immediately_queryable() {
 
     let pool = ExecutorPool::for_test(
         data_dir.to_str().unwrap().to_owned(),
-        1,    // single executor for test
-        1000, // max result rows
+        1,
+        1000,
         Some(Arc::clone(&hot_buffer)),
     )
     .unwrap();
-
-    // --- ingest events ---
 
     let events: Vec<Map<String, Value>> = vec![
         make_event("nginx", "request handled ok"),
@@ -71,13 +61,11 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         make_event("postgres", "checkpoint complete"),
     ];
 
-    // Write to WAL.
     let wal_writer = WalWriter::new(wal_dir.clone());
     wal_writer.ensure_dir().unwrap();
     let ndjson = events_to_ndjson(&events);
     let wal_path = wal_writer.write("prod", "nginx", &ndjson).unwrap();
 
-    // Insert directly into hot buffer (simulating what the ingest handler does).
     // `{env}/{stem}` — must match what compaction derives from the env dir.
     let batch_id: Arc<str> =
         format!("prod/{}", wal_path.file_stem().unwrap().to_str().unwrap()).into();
@@ -89,8 +77,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         events: events.clone(),
     });
     hot_buffer.insert_for_test(batch);
-
-    // --- query BEFORE compaction → events should be visible from hot buffer ---
 
     let result = pool
         .execute(
@@ -110,13 +96,11 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         query_result.rows.len()
     );
 
-    // --- compact WAL → parquet, drain hot buffer ---
-
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,
         &data_dir,
-        Duration::ZERO, // no min age — compact immediately
-        false,          // no daily rollup
+        Duration::ZERO,
+        false,
         Some(&hot_buffer),
         500,
         "2GB",
@@ -135,8 +119,6 @@ async fn hot_buffer_makes_events_immediately_queryable() {
         !wal_path.exists(),
         "WAL file should be deleted after compaction"
     );
-
-    // --- query AFTER compaction → same events now from parquet ---
 
     let result_after = pool
         .execute(
@@ -180,8 +162,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     )
     .unwrap();
 
-    // --- first batch: ingest + compact ---
-
     let batch1_events = vec![
         make_event("nginx", "batch one alpha"),
         make_event("nginx", "batch one beta"),
@@ -200,7 +180,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     });
     hot_buffer.insert_for_test(batch1);
 
-    // Compact batch 1 → parquet.
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,
         &data_dir,
@@ -214,8 +193,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     .await
     .expect("compaction 1 should succeed");
 
-    // --- second batch: ingest but DON'T compact (stays in hot buffer) ---
-
     let batch2_events = vec![make_event("nginx", "batch two gamma")];
     let ndjson2 = events_to_ndjson(&batch2_events);
     let _wal2 = wal_writer.write("prod", "nginx", &ndjson2).unwrap();
@@ -227,8 +204,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
         events: batch2_events,
     });
     hot_buffer.insert_for_test(batch2);
-
-    // --- query → should see both batches without duplicates ---
 
     let result = pool
         .execute(
@@ -249,11 +224,6 @@ async fn hot_buffer_and_parquet_produce_no_duplicates() {
     );
 }
 
-/// Hot/cold agreement through the real pin plumbing: a compaction tick
-/// with the catalog wired seeds the pin, a later conflicting event sits in
-/// a `HotBuffer` sharing the same `FieldCatalog`, and the query returns
-/// every cold row with the hot value nulled, so the pins travel buffer to
-/// snapshot to pool to emitter without a test-side shortcut.
 #[sqlx::test]
 async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) {
     use trawl_server::catalog::{CatalogContext, FieldCatalog};
@@ -285,8 +255,6 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
     )
     .unwrap();
 
-    // Cold batch: integer durations, compacted with the catalog wired —
-    // the tick seeds the BIGINT pin.
     let cold: Vec<Map<String, Value>> = (0..2)
         .map(|i| {
             let mut m = make_event("nginx", &format!("cold{i}"));
@@ -316,7 +284,6 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
         "the compaction tick must seed the pin"
     );
 
-    // Conflicting hot event — never compacted.
     let mut hot = make_event("nginx", "hot-conflict");
     hot.insert("duration".into(), json!("n/a"));
     hot_buffer.insert_for_test(Arc::new(IngestBatch {
@@ -363,19 +330,6 @@ async fn hot_conflict_after_pin_seeding_keeps_all_cold_rows(pool: sqlx::PgPool) 
     );
 }
 
-// NOTE: there is deliberately no hot-buffer case-variant test here. Every
-// producer enters `envelope::canonicalize`, the one door that ASCII-folds
-// field names, so a hot buffer carrying a mixed-case spelling of a pinned
-// field cannot be produced by the wired system. The end-to-end proofs are
-// `case_variant_field_names_fold_to_one_column_across_services` in
-// tests/field_catalog.rs and `syslog_mixed_case_sd_param_lands_folded_and_
-// pins_folded` below.
-
-/// The syslog producer routes through `envelope::canonicalize`, so it
-/// inherits that door's fold instead of carrying a listener-local one at
-/// SD-key construction (ADR-0013). The whole journey: a mixed-case RFC
-/// 5424 SD param reaches the hot buffer folded, and compaction pins it
-/// under the folded name.
 #[sqlx::test]
 async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgPool) {
     use indexmap::IndexMap;
@@ -441,7 +395,6 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
         1
     );
 
-    // The hot snapshot carries the folded key and no unfolded spelling.
     let scratch = trawl_server::hot_buffer::TestScratch::new();
     let snap = hot_buffer
         .snapshot(&scratch)
@@ -458,7 +411,6 @@ async fn syslog_mixed_case_sd_param_lands_folded_and_pins_folded(pool: sqlx::PgP
          lives in _raw's value, correctly): {content}"
     );
 
-    // Compaction pins under the folded name, never the wire spelling.
     let ctx = CatalogContext {
         store: CatalogStore::new(pool),
         cache: Arc::clone(&catalog),
@@ -493,11 +445,9 @@ async fn query_works_without_hot_buffer() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // Pool without hot buffer.
     let pool =
         ExecutorPool::for_test(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
-    // Write WAL and compact directly (no bus, no hot buffer).
     let events = vec![make_event("nginx", "standalone event")];
     let wal_writer = WalWriter::new(wal_dir.clone());
     wal_writer.ensure_dir().unwrap();
@@ -540,10 +490,7 @@ async fn query_works_without_hot_buffer() {
 
 #[tokio::test]
 async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours() {
-    // End to end through the real plumbing (compute_source, pool,
-    // executor): one service's data in one hour partition, sibling hour
-    // directories owned by another service, and no hot buffer to paper over
-    // it. DuckDB rejects a list source wholesale when a single element
+    // DuckDB rejects a list source wholesale when a single element
     // matches nothing, so an hour directory in range that holds no nginx
     // file must be resolved away before the read.
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -555,8 +502,6 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     let pool =
         ExecutorPool::for_test(data_dir.to_str().unwrap().to_owned(), 1, 1000, None).unwrap();
 
-    // One nginx event, timestamped now so it lands in the current hour
-    // partition and inside a `last=6h` window.
     let now = chrono::Utc::now();
     let stamp = now.to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let mut event = make_event("nginx", "sibling-hour survivor");
@@ -581,8 +526,6 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     .await
     .expect("compaction should succeed");
 
-    // The other service owns the preceding hours: their directories exist and
-    // hold a file, but never nginx's.
     for back in 1..=5_i64 {
         let dt = now - chrono::Duration::hours(back);
         let hour_dir = data_dir
@@ -617,11 +560,6 @@ async fn service_scoped_query_without_hot_buffer_survives_sibling_service_hours(
     );
 }
 
-/// Pinned `| where`/`| let` end to end through the real query plumbing
-/// (catalog, pool, emitter): over the hot buffer, then over parquet after
-/// compaction, plus the SSE plan lane over the same events with the single
-/// snapshot the handler feeds it. The scope shapes ride along: a rename
-/// remaps the pin, a bare-alias let copies it, a computed let kills it.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one linear end-to-end narrative
 async fn pinned_where_let_hot_cold_and_stream_agree() {
@@ -636,8 +574,6 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // A VARCHAR pin, seeded straight into the in-process cache the pool
-    // and the stream both read.
     let catalog = Arc::new(FieldCatalog::new());
     catalog.merge([(
         "status".to_string(),
@@ -660,7 +596,6 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     .unwrap()
     .with_field_catalog(Arc::clone(&catalog));
 
-    // Three events: numeric-text, below-threshold, and no-reading.
     let events: Vec<Map<String, Value>> = [("404", "a"), ("200", "b"), ("accepted", "c")]
         .into_iter()
         .map(|(status, msg)| {
@@ -699,26 +634,19 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         }
     };
 
-    // (dsl, expected rows) — the SSE plan below must agree on each.
     let cases: [(&'static str, usize); 4] = [
         // '404' has the only reading above 400; 'accepted' is UNKNOWN.
         ("* | where status > 400", 1),
         // NOT does not invert UNKNOWN: only '200' answers FALSE→TRUE.
         ("* | where not (status > 400)", 1),
-        // rename remaps the pin to the new name.
         ("* | rename status as st | where st > 400", 1),
-        // a bare-alias let copies the pin — a broken walk would emit the
-        // literal-driven comparison here, which throws over 'accepted'.
         ("* | let s2 = status | where s2 > 400", 1),
     ];
 
-    // Hot lane (pre-compaction).
     for (dsl, expected) in cases {
         assert_eq!(run(dsl).await, expected, "hot: {dsl}");
     }
 
-    // The SSE plan lane: one snapshot feeds filter + plan, exactly as
-    // stream_query wires it.
     let stream_matches = |dsl: &str| -> usize {
         let ast = trawl_core::parser::parse(dsl).expect("parses");
         let pins = catalog.all();
@@ -731,10 +659,6 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
         events
             .iter()
             .filter(|event| {
-                // The handler's own shape: one instant per event, one
-                // door owning both the filter and the stages (ADR-0017
-                // §3). A test that sampled two clocks would stop
-                // mirroring the lane it exists to mirror.
                 let ctx = trawl_core::context::EvalContext::capture();
                 matches!(
                     trawl_core::stream::accept_event(&filter, &mut stages, event, &ctx)
@@ -747,15 +671,12 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     for (dsl, expected) in cases {
         assert_eq!(stream_matches(dsl), expected, "stream: {dsl}");
     }
-    // The computed-let kill, observable stream-side without an error
-    // channel: the derived value is literal-driven, so nothing matches.
     assert_eq!(
         stream_matches("* | let status = lower(status) | where status > 400"),
         0,
         "a computed let kills the pin"
     );
 
-    // Cold lane (post-compaction): same answers off parquet.
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,
         &data_dir,
@@ -774,13 +695,6 @@ async fn pinned_where_let_hot_cold_and_stream_agree() {
     }
 }
 
-/// The SEVERITY pin answers identically hot and cold, and in the stream
-/// lane, over the whole token vocabulary (ADR-0013 §6).
-///
-/// The vocabulary is the point: a band token, an `OTel` exact short name,
-/// an integer, an ordered comparison, an IN list and a glob over the
-/// canonical text all bind through one rule table, so a divergence here
-/// is a missed lane rather than a missed case.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one linear end-to-end narrative
 async fn severity_pin_agrees_hot_cold_and_stream() {
@@ -793,9 +707,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
     std::fs::create_dir_all(&wal_dir).unwrap();
     std::fs::create_dir_all(&data_dir).unwrap();
 
-    // The declared seed pins `_severity` SEVERITY on day one; here it is
-    // seeded straight into the in-process cache the pool and the stream
-    // both read.
     let catalog = Arc::new(FieldCatalog::new());
     catalog.merge([(
         trawl_core::schema::SEVERITY.to_string(),
@@ -818,7 +729,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
     .unwrap()
     .with_field_catalog(Arc::clone(&catalog));
 
-    // One row per band edge, plus the game-server row that derives none.
     let events: Vec<Map<String, Value>> = [
         (Some(17), "error-lo"),
         (Some(20), "error-hi"),
@@ -868,7 +778,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         }
     };
 
-    // (dsl, expected rows)
     let cases: [(&'static str, usize); 8] = [
         ("_severity=error", 3),
         ("_severity=error2", 1),
@@ -887,7 +796,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         assert_eq!(run(dsl).await, expected, "hot: {dsl}");
     }
 
-    // The live lane, over the same single snapshot the handler feeds it.
     let stream_matches = |dsl: &str| -> usize {
         let ast = trawl_core::parser::parse(dsl).expect("parses");
         let pins = catalog.all();
@@ -905,8 +813,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
         assert_eq!(stream_matches(dsl), expected, "stream: {dsl}");
     }
 
-    // Cold lane: same answers off parquet, after conformance wrote the
-    // column as the physical BIGINT the pin names.
     trawl_server::ingest::compaction::compact_once(
         &wal_dir,
         &data_dir,
@@ -925,8 +831,6 @@ async fn severity_pin_agrees_hot_cold_and_stream() {
     }
 }
 
-/// Write one `nginx` event whose `k` is the number 5 through the WAL and
-/// compact it to parquet, draining it from `hot_buffer`.
 async fn compact_one_event_with_k(
     wal_dir: &std::path::Path,
     data_dir: &std::path::Path,
@@ -960,13 +864,6 @@ async fn compact_one_event_with_k(
     assert_eq!(hot_buffer.event_count(), 0, "compaction drained the batch");
 }
 
-/// A hot key whose every buffered value is JSON `null` reads as a typed
-/// NULL, not as `DuckDB`'s inferred JSON column (ADR-0062). `k` has a cold
-/// carrier (compacted as BIGINT, no catalog pin), so the hot rows read as
-/// a BIGINT NULL and the cold number still compares as a number. `gone`
-/// is null-only in the hot buffer with no carrier anywhere, so it reads
-/// as absent: `*` does not grow a column for it, as compaction would not
-/// store one.
 #[tokio::test]
 async fn hot_null_only_key_reads_as_typed_null() {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
@@ -989,7 +886,6 @@ async fn hot_null_only_key_reads_as_typed_null() {
 
     compact_one_event_with_k(&wal_dir, &data_dir, &hot_buffer).await;
 
-    // Hot: two events whose `k` and `gone` are JSON null.
     let hot_events: Vec<Map<String, Value>> = (0..2)
         .map(|i| {
             let mut e = make_event("nginx", &format!("hot {i}"));
@@ -1059,7 +955,6 @@ async fn hot_null_only_key_reads_as_typed_null() {
     );
 }
 
-/// One open live stream, read frame by frame off the socket.
 struct LiveFrames {
     resp: reqwest::Response,
     buf: Vec<u8>,
@@ -1083,8 +978,6 @@ impl LiveFrames {
         }
     }
 
-    /// The next named frame, as its event name and its `data` payload.
-    /// Keep-alive comments are skipped. Panics after 30 s.
     async fn next_frame(&mut self) -> (String, String) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -1118,16 +1011,10 @@ impl LiveFrames {
     }
 }
 
-/// Live matching runs off the reactor (ADR-0063, #336). On a
+/// Live matching runs off the reactor (ADR-0063). On a
 /// current-thread runtime the test thread is the only reactor thread, and
 /// the server runs on it, so a regex search counted on this thread would
 /// have run on the reactor.
-///
-/// A pass-through stream matches each event with a regex in its search
-/// stage, and an aggregate stream matches its snapshot rows with a regex
-/// in a post-stage. Both write the frames their events call for, in event
-/// order, while no regex search runs on this thread. Each stream has at
-/// most one live job outstanding at any time.
 #[tokio::test(flavor = "current_thread")]
 async fn live_matching_runs_off_the_reactor() {
     let server = common::setup().await;
@@ -1141,7 +1028,6 @@ async fn live_matching_runs_off_the_reactor() {
     )
     .await;
 
-    // Every fourth event matches.
     let events: Vec<Value> = (0..40)
         .map(|i| {
             let message = if i % 4 == 0 {

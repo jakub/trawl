@@ -2,10 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! History detail pane (right side of horizontal split).
-//!
-//! Shows metadata and syntax-highlighted query for the selected history entry.
-
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
@@ -17,7 +13,6 @@ use trawl_core::sanitize::sanitize_display_text;
 use crate::tui::App;
 use crate::tui::highlight::Highlighter;
 
-/// Render the detail pane for the selected history entry.
 pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
     let selected = app.panel.history_selected;
@@ -32,7 +27,6 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // -- status badge --
     let (status_label, status_color) = match entry.status {
         trawl_client::QueryStatus::Success => ("success", theme.status_success),
         trawl_client::QueryStatus::Error => ("error", theme.status_error),
@@ -45,7 +39,6 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
             .add_modifier(Modifier::BOLD),
     )));
 
-    // -- separator --
     #[allow(clippy::cast_possible_truncation)]
     let sep_width = area.width.min(35) as usize;
     lines.push(Line::from(Span::styled(
@@ -53,7 +46,6 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
         Style::default().fg(theme.text_muted),
     )));
 
-    // -- metadata --
     let label_style = Style::default().fg(theme.text_muted);
     let value_style = Style::default().fg(theme.text_primary);
     lines.push(Line::from(vec![
@@ -74,7 +66,6 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
 
     lines.push(Line::default());
 
-    // -- syntax-highlighted query (line by line) --
     for query_line in entry.query.lines() {
         lines.push(highlighter.highlight_line(query_line));
     }
@@ -83,7 +74,6 @@ pub fn render_detail_pane(app: &App, frame: &mut Frame<'_>, area: Rect) {
     frame.render_widget(p, area);
 }
 
-/// Format milliseconds into a human-readable duration.
 fn format_duration_ms(ms: u64) -> String {
     if ms >= 60_000 {
         format!("{}m {}s", ms / 60_000, (ms % 60_000) / 1000)
@@ -94,8 +84,6 @@ fn format_duration_ms(ms: u64) -> String {
     }
 }
 
-/// A wire timestamp in `zone`, with its offset and any fraction. Text that is
-/// not a wire timestamp shows as sent, sanitized, rather than guessed at.
 fn format_full_timestamp(wire: &str, zone: DisplayZone) -> String {
     present_human(wire, zone).unwrap_or_else(|| sanitize_display_text(wire))
 }
@@ -154,8 +142,6 @@ mod tests {
         );
     }
 
-    /// Text that is not a wire timestamp shows as sent, with no guessed
-    /// instant, and cannot drive the terminal.
     #[test]
     fn full_timestamp_malformed_fallback() {
         assert_eq!(format_full_timestamp("garbage", zone("+05:30")), "garbage");

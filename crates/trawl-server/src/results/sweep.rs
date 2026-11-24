@@ -4,29 +4,6 @@
 
 //! Keeping the results root and its rows in agreement (ADR-0057).
 //!
-//! [`reconcile_at_boot`] runs once, before the server answers anything,
-//! while this process holds the root's lock and so no capture is in flight.
-//! It removes what a process that was killed, or stopped mid-commit, left
-//! in the root, marks rows whose files are gone, expires the temporary
-//! captures that came due while the server was down, prunes the kept
-//! evidence whose investigation's retention ended meanwhile (ADR-0059), and
-//! prunes the oldest temporary captures of anyone over a quota an operator
-//! lowered. A failure stops the boot.
-//!
-//! [`sweep`] runs on the scheduler's hourly retention tick, the one that
-//! prunes report runs (ADR-0018, amended by ADR-0057), or, with the
-//! scheduler disabled, on the standalone tick described below. It expires due
-//! temporary captures and unlinks their files, prunes the kept evidence
-//! whose investigation's retention ended and unlinks its files (ADR-0059),
-//! deletes tombstones past
-//! their lifetime, and removes published files that no live row names and
-//! no capture in flight owns, once the capture deadline has passed. A
-//! failure is logged and counted, never fatal: the next tick tries again.
-//!
-//! An installation with `[scheduler] enabled = false` has no retention
-//! tick, so [`spawn_sweep`] runs the same sweep on its own cadence
-//! ([`sweep_interval`]); `trawld` spawns it only in that case.
-//!
 //! Neither logs a capture's id: the counts say what happened, and an id is
 //! a key's private handle.
 
@@ -45,10 +22,8 @@ use crate::config::CaptureConfig;
 use crate::error::{CauseKind, join_failure_text};
 use crate::store::{ExpiredFile, StoreError};
 
-/// What [`reconcile_at_boot`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Reconciled {
-    /// Staged files removed: no row ever names one.
     pub stages: usize,
     /// Published files removed because no live row names them: a crash, or
     /// a shutdown, between publish and the row's commit, or a retired row
@@ -57,8 +32,7 @@ pub struct Reconciled {
     /// Live rows newly marked `file_missing`: they name a file and none is
     /// there.
     pub missing: usize,
-    /// Temporary rows already past their deadline, marked `expired`: the
-    /// server was down when they came due.
+    /// Temporary rows already past their deadline, marked `expired`.
     pub expired: usize,
     /// Temporary rows pruned to bring a key, then the installation, within
     /// the `[capture]` quotas.
@@ -68,7 +42,6 @@ pub struct Reconciled {
     pub evidence_pruned: usize,
 }
 
-/// What one [`sweep`] did.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Sweep {
     /// Temporary rows past their deadline marked `expired`.
@@ -78,30 +51,15 @@ pub struct Sweep {
     pub evidence_pruned: usize,
     /// Files of the expired and the pruned rows unlinked.
     pub unlinked: usize,
-    /// Tombstones deleted.
     pub tombstones: u64,
     /// Published files no live row names, older than the capture deadline,
     /// unlinked.
     pub orphans: usize,
-    /// Steps or unlinks that failed; each was logged.
     pub errors: usize,
 }
 
 /// Reconcile the results root with the metadata rows, before the server
-/// answers anything. Both boot doors call it (`boot::prepare_corpus`).
-///
-/// In order: every staged file goes; every published file no `temporary`
-/// or `kept` row names goes; every such row that names a file
-/// (`file_bytes > 0`) and has none is marked `file_missing`; every
-/// temporary row past its deadline expires and its file goes; every kept
-/// row whose investigation's `retain_until` passed is pruned
-/// ([`crate::store::ResultsStore::prune_evidence`]) and its file goes; then
-/// each key
-/// over `per_key_results` or `per_key_bytes`, and after that the
-/// installation over `installation_results` or `installation_bytes`, loses
-/// its oldest temporary captures ([`crate::store::ResultsStore::prune_oldest`],
-/// [`crate::store::ResultsStore::prune_oldest_installation`]) and their
-/// files. One `results_reconcile` event logs the counts.
+/// answers anything.
 ///
 /// The root's lock is the authority for removing files here, as the scratch
 /// lock is for clearing scratch (ADR-0056): this process holds it, so no
@@ -131,16 +89,8 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         .map_err(|e| fail("reading the live captures", &e))?;
 
     // No capture is in flight and no fence or commit grace runs across a
-    // restart (`service::COMMIT_GRACE`): the process that published these
-    // files has ended, and with it every connection its inserts ran on. A
-    // process that ended before a capture's commit was decided, killed or
-    // shut down with the commit task pending, left that capture's file
-    // here, since its row may have committed: a row committed by now keeps
-    // the file, and a file no live row names goes. A backend could still
-    // commit one of these rows after this pass only if it stalled in one of
-    // the capture's inserts across the restart. A running process leaves
-    // the same gap only to an insert whose fence failed too and whose
-    // commit outlives the grace. Either row reads as `file_missing`.
+    // restart (`service::COMMIT_GRACE`): a row committed by now keeps the
+    // file, and a file no live row names goes.
     let live_ids: HashSet<&str> = live.iter().map(|(id, _)| id.as_str()).collect();
     let orphans: Vec<String> = files
         .iter()
@@ -166,9 +116,8 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         }
     }
 
-    // After downtime a due row would otherwise wait for the first sweep or
-    // a read; expiring before the prunes also keeps a dead capture from
-    // counting against a quota.
+    // Expiring before the prunes keeps a dead capture from counting against
+    // a quota.
     let expired = store
         .expire_due(now)
         .await
@@ -178,8 +127,6 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
         .await
         .map_err(|e| fail("removing expired captures' files", &e))?;
 
-    // Evidence whose investigation's retention ended while the server was
-    // down goes before the first attached capture or write can join it.
     let evidence_rows = prune_evidence_at_boot(results, now, &fail).await?;
 
     let capture = &results.capture;
@@ -232,9 +179,6 @@ pub async fn reconcile_at_boot(results: &ResultsState) -> Result<Reconciled, Str
     Ok(reconciled)
 }
 
-/// The evidence step of [`reconcile_at_boot`]: prune every kept result whose
-/// investigation's `retain_until` is at or before `now` and unlink its
-/// file. Returns how many rows it pruned; a failure is `fail`'s text.
 async fn prune_evidence_at_boot(
     results: &ResultsState,
     now: DateTime<Utc>,
@@ -252,16 +196,6 @@ async fn prune_evidence_at_boot(
     Ok(rows)
 }
 
-/// Retire what is due at `now`: expire every temporary capture past its
-/// deadline and unlink its file, prune every kept result whose
-/// investigation's `retain_until` is at or before `now` and unlink its file
-/// ([`crate::store::ResultsStore::prune_evidence`]), delete the tombstones
-/// that became
-/// unreadable `tombstone_secs` or more before `now`, and unlink every
-/// published file that no `temporary` or `kept` row names, that no capture
-/// in flight owns ([`super::InFlight`]), and that was last written
-/// `deadline_secs` or more before `now`.
-///
 /// A capture between its publish and its row's commit is in flight, and
 /// its insert runs past the capture deadline when the store is slow, so no
 /// age makes its file an orphan; the in-flight set does. A capture whose
@@ -270,10 +204,6 @@ async fn prune_evidence_at_boot(
 /// file whose row still could not be read when the grace ended, the
 /// deadline before it is judged. A file whose row is a tombstone goes too,
 /// since nothing can read it.
-///
-/// A failed step or unlink is logged at warn, counted in
-/// [`Sweep::errors`], and the rest still runs. One `results_sweep` event
-/// logs the counts.
 pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     let mut outcome = Sweep::default();
     let store = &results.store;
@@ -289,11 +219,6 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
         Err(e) => outcome.errors += warn_store("expiring due captures", &e),
     }
 
-    // Evidence whose investigation's retention ended. The order against
-    // the tombstone pass does not matter: a pruned kept row keeps its
-    // investigation, and tombstones are only rows with none
-    // ([`crate::store::ResultsStore::delete_tombstones`]), so neither pass
-    // ever selects a row the other wrote.
     match store.prune_evidence(now).await {
         Ok(pruned) => {
             outcome.evidence_pruned = pruned.len();
@@ -348,23 +273,10 @@ pub async fn sweep(results: &ResultsState, now: DateTime<Utc>) -> Sweep {
     outcome
 }
 
-/// How often [`spawn_sweep`] should sweep under `capture`: every
-/// `ttl_secs`, at most hourly (the cadence of the scheduler's retention
-/// tick it stands in for), and at least every second. A short TTL sweeps
-/// sooner, so a capture's file does not outlive its deadline by much more
-/// than the TTL itself.
 pub fn sweep_interval(capture: &CaptureConfig) -> Duration {
     Duration::from_secs(capture.ttl_secs.clamp(1, 3600))
 }
 
-/// Sweep on a task of its own: [`sweep`] at the results clock's now, every
-/// `interval`, the first one `interval` after the call (boot has just
-/// reconciled). Stops when `shutdown_rx` changes or its sender drops.
-///
-/// This is the sweep for an installation whose scheduler is disabled; with
-/// the scheduler on, its retention tick (ADR-0018 as amended by ADR-0057)
-/// already sweeps and a second task would only repeat the work. A sweep in
-/// progress finishes before the task stops.
 pub fn spawn_sweep(
     results: Arc<ResultsState>,
     interval: Duration,
@@ -394,8 +306,6 @@ pub fn spawn_sweep(
     })
 }
 
-/// `now` less `secs` seconds, or the earliest instant when that is out of
-/// range, so a huge setting selects nothing.
 fn before(now: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
     i64::try_from(secs)
         .ok()
@@ -404,8 +314,6 @@ fn before(now: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
         .unwrap_or(DateTime::<Utc>::MIN_UTC)
 }
 
-/// The ids of the retired results that have a file: a zero-column capture
-/// has none.
 fn with_files(retired: Vec<ExpiredFile>) -> Vec<String> {
     retired
         .into_iter()
@@ -414,9 +322,6 @@ fn with_files(retired: Vec<ExpiredFile>) -> Vec<String> {
         .collect()
 }
 
-/// Log a failed filesystem step of the sweep at warn, by its closed cause:
-/// the error's text goes to DEBUG only (ADR-0040, amended 2026-11-09).
-/// Returns 1, the error it counts.
 fn warn(step: &str, error: &dyn std::fmt::Display, cause_kind: CauseKind) -> usize {
     tracing::debug!(
         event_type = "results_sweep_error",
@@ -433,10 +338,9 @@ fn warn(step: &str, error: &dyn std::fmt::Display, cause_kind: CauseKind) -> usi
     1
 }
 
-/// Log a failed store step of the sweep at warn, the error by its closed
-/// class only: its text can carry the backend's diagnostics, and the
-/// event lands in the retained `service=trawld` corpus. Returns 1, the
-/// error it counts.
+/// The error is logged by its closed class only: its text can carry the
+/// backend's diagnostics, and the event lands in the retained
+/// `service=trawld` corpus.
 fn warn_store(step: &str, error: &StoreError) -> usize {
     tracing::warn!(
         event_type = "results_sweep_error",
@@ -447,8 +351,6 @@ fn warn_store(step: &str, error: &StoreError) -> usize {
     1
 }
 
-/// Run `work` on the root on the blocking pool: every call it makes is a
-/// filesystem syscall.
 async fn on_root<T: Send + 'static>(
     root: &Arc<ResultsRoot>,
     work: impl FnOnce(&ResultsRoot) -> io::Result<T> + Send + 'static,
@@ -478,8 +380,6 @@ fn join_failure(error: tokio::task::JoinError) -> io::Error {
     io::Error::other(JoinFailure(join_failure_text("results root work", error)))
 }
 
-/// The closed cause of an [`on_root`] error: `unknown` for a task that
-/// failed to join, which is no filesystem fault, else the I/O kind.
 fn cause_of(error: &io::Error) -> CauseKind {
     if error
         .get_ref()
@@ -491,8 +391,6 @@ fn cause_of(error: &io::Error) -> CauseKind {
     }
 }
 
-/// Unlink every file in `ids`, stopping at the first failure. Returns how
-/// many were there.
 async fn unlink_all(root: &Arc<ResultsRoot>, ids: Vec<String>) -> io::Result<usize> {
     on_root(root, move |root| {
         let mut removed = 0;
@@ -506,8 +404,6 @@ async fn unlink_all(root: &Arc<ResultsRoot>, ids: Vec<String>) -> io::Result<usi
     .await
 }
 
-/// Unlink every file in `ids`, logging and counting each failure. Returns
-/// how many were unlinked and how many failed.
 async fn unlink_counting(root: &Arc<ResultsRoot>, ids: Vec<String>) -> (usize, usize) {
     let unlinked = on_root(root, move |root| {
         let mut outcome = (0, 0);
@@ -527,7 +423,6 @@ async fn unlink_counting(root: &Arc<ResultsRoot>, ids: Vec<String>) -> (usize, u
         Ok(outcome)
     })
     .await;
-    // The work returns no error of its own, so only the join can fail here.
     unlinked.unwrap_or_else(|e| {
         (
             0,
@@ -536,9 +431,6 @@ async fn unlink_counting(root: &Arc<ResultsRoot>, ids: Vec<String>) -> (usize, u
     })
 }
 
-/// Unlink every file in `ids` last written at or before `cutoff`, logging
-/// and counting each failure. Returns how many were unlinked and how many
-/// failed.
 async fn remove_orphans(
     root: &Arc<ResultsRoot>,
     ids: Vec<String>,
@@ -577,7 +469,6 @@ async fn remove_orphans(
         Ok(outcome)
     })
     .await;
-    // The work returns no error of its own, so only the join can fail here.
     removed.unwrap_or_else(|e| {
         (
             0,
@@ -595,8 +486,6 @@ mod tests {
     use super::*;
     use crate::results::logged::{assert_class_only, logged, sentinel};
 
-    /// A failed store step of the sweep is logged by the error's closed
-    /// class only, and counted.
     #[test]
     fn a_store_step_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
@@ -610,9 +499,6 @@ mod tests {
         assert_eq!(counted, 1);
     }
 
-    /// A listing task that panics is not an I/O fault: its warning names
-    /// no I/O kind (#413 review), while a real filesystem error keeps its
-    /// own.
     #[tokio::test]
     async fn a_root_task_that_fails_to_join_has_no_io_cause() {
         let joined = tokio::task::spawn_blocking(|| panic!("listing task panicked"))

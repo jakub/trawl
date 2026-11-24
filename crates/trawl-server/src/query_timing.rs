@@ -5,24 +5,6 @@
 //! One query's timing account and the two events that report it
 //! (ADR-0046).
 //!
-//! A [`QueryTiming`] is created once a DSL request is valid, before its
-//! `dsl_check`, and every layer that works on the query books its phases
-//! on the account's [`PhaseClock`]. Exactly one side writes the final
-//! `query_timing` event: [`QueryTiming::emit_complete`] and
-//! [`QueryTiming::emit_partial`] share one latch, and a handler's
-//! [`TimingGuard`] writes `outcome=abandoned` if the request is dropped
-//! before anybody else wrote it. When work outlives its request,
-//! [`emit_reclaimed`] carries the worker's final totals on
-//! `query_permit_reclaimed`.
-//!
-//! Both events are root events (`parent: None`) with explicit fields,
-//! so nothing is inherited from the `http_request` span, which carries
-//! the raw path and user agent (ADR-0040). They carry numbers, closed
-//! enums and ids: no user, role, DSL, SQL, literal, path or error text.
-//! A phase value is an `Option<u64>` recorded through tracing's own
-//! `Option` value, so an absent phase is an absent field and a present
-//! one is an integer.
-//!
 //! Lock order: the account's lock and the clock's are leaves. Never take
 //! either while holding the pool registry lock; read what the registry
 //! says, release it, then write the account.
@@ -62,7 +44,6 @@ impl Correlation {
     }
 }
 
-/// An export's body format.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
     Csv,
@@ -71,7 +52,6 @@ pub enum ExportFormat {
 }
 
 impl ExportFormat {
-    /// The closed value the `format` field carries.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -82,7 +62,6 @@ impl ExportFormat {
     }
 }
 
-/// What kind of DSL work the account times.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimingKind {
     /// `POST /api/v1/query`.
@@ -109,7 +88,6 @@ pub enum TimingKind {
 }
 
 impl TimingKind {
-    /// The closed value the `kind` field carries.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -124,7 +102,6 @@ impl TimingKind {
         }
     }
 
-    /// The `format` field: present for exports only.
     #[must_use]
     pub const fn format(self) -> Option<&'static str> {
         match self {
@@ -154,14 +131,9 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The outcome of a failed execution: the one mapping from an error
-    /// to an outcome. The pool's executor refusals are not derived here;
-    /// the pool names them with [`Outcome::CapacityRefused`] where it
-    /// refuses, rather than reading one back out of a 503's message. A
-    /// preparation refusal is typed, so every door that books it reads
-    /// it here (ADR-0063). So is the not-started refusal a cancel by id
-    /// ends a request with in one of its own waits, where no pool account
-    /// was written (ADR-0024, Amendment 2026-11-09).
+    /// The pool's executor refusals are not derived here; the pool names
+    /// them with [`Outcome::CapacityRefused`] where it refuses, rather than
+    /// reading one back out of a 503's message.
     #[must_use]
     pub fn of_error(error: &ServerError) -> Self {
         match error {
@@ -173,7 +145,6 @@ impl Outcome {
         }
     }
 
-    /// The closed value the `outcome` field carries.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -185,7 +156,6 @@ impl Outcome {
         }
     }
 
-    /// The `error_class` field: present on `error` only.
     #[must_use]
     pub const fn error_class(self) -> Option<&'static str> {
         match self {
@@ -207,7 +177,6 @@ pub enum PhysicalOutcome {
 }
 
 impl PhysicalOutcome {
-    /// How a worker's result ended.
     #[must_use]
     pub fn of_result<T>(result: &Result<T, ServerError>) -> Self {
         match result {
@@ -218,7 +187,6 @@ impl PhysicalOutcome {
         }
     }
 
-    /// The closed value the `physical_outcome` field carries.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -231,12 +199,10 @@ impl PhysicalOutcome {
     }
 }
 
-/// Whole microseconds, floored, saturating.
 fn micros(d: Duration) -> u64 {
     u64::try_from(d.as_micros()).unwrap_or(u64::MAX)
 }
 
-/// The mutable half of an account.
 #[derive(Debug)]
 struct Account {
     kind: TimingKind,
@@ -346,7 +312,6 @@ impl QueryTiming {
         self.account().pool_owns_emit = false;
     }
 
-    /// Whether the final `query_timing` has been written.
     #[must_use]
     pub fn emitted(&self) -> bool {
         self.account().emitted
@@ -360,7 +325,6 @@ impl QueryTiming {
         self.account().written.clone()
     }
 
-    /// Keep what the event just carried, for [`Self::written`].
     fn keep_written(&self, totals: PhaseTotals) {
         self.account().written = Some(totals);
     }
@@ -443,8 +407,6 @@ impl TimingGuard {
         Self(timing)
     }
 
-    /// Open the account of one HTTP request's DSL work, correlated by
-    /// the request's id, with its window starting at `origin`.
     #[must_use]
     pub fn for_request(
         query_id: u64,
@@ -460,8 +422,6 @@ impl TimingGuard {
         ))
     }
 
-    /// Open the account of one scheduled or manual run, correlated by
-    /// the run record's id, with its window starting at `origin`.
     #[must_use]
     pub fn for_run(query_id: u64, run_id: i64, origin: Instant) -> Self {
         Self::new(QueryTiming::new(
@@ -495,7 +455,6 @@ impl Drop for TimingGuard {
     }
 }
 
-/// Everything one `query_timing` event says.
 #[derive(Debug)]
 pub struct TimingRecord<'a> {
     pub query_id: u64,
@@ -535,8 +494,6 @@ impl TimingRecord<'_> {
 /// event has no room left. The drift test holds the count there and the
 /// phase fields equal to [`QueryPhase::ALL`]. Adding a field is a
 /// decision, not an edit.
-/// `query_write_us` is the capture file write, its own phase between
-/// `query_post_us` and `query_render_us` (ADR-0046 amendment).
 pub fn emit_query_timing(record: &TimingRecord<'_>) {
     let totals = record.totals;
     tracing::info!(
@@ -577,7 +534,6 @@ pub fn emit_query_timing(record: &TimingRecord<'_>) {
     );
 }
 
-/// Everything one `query_permit_reclaimed` event says.
 #[derive(Debug)]
 pub struct Reclaim<'a> {
     pub query_id: u64,
@@ -594,9 +550,6 @@ pub struct Reclaim<'a> {
 
 /// Write one `query_permit_reclaimed` event: the retained permit came
 /// back, with the worker's final account when there is one.
-///
-/// Keeps the pool's target, where the retained-permit pair has always
-/// been logged.
 pub fn emit_reclaimed(reclaim: &Reclaim<'_>) {
     let totals = reclaim.totals;
     let phase = |p: QueryPhase| totals.and_then(|t| t.get(p));
@@ -772,10 +725,6 @@ mod tests {
         totals
     }
 
-    /// The drift guard: both events declare exactly one field per
-    /// [`QueryPhase`], and `query_timing` sits at tracing's limit of 32
-    /// declared fields (31 plus the message), so adding a field is a
-    /// decision.
     #[test]
     fn event_fields_track_the_phase_list() {
         let totals = every_phase();
@@ -811,8 +760,6 @@ mod tests {
         assert!(reclaim.declared.len() <= 32, "{:?}", reclaim.declared);
     }
 
-    /// Each phase's value lands in its own field, as an integer, and the
-    /// events are roots under the `trawl_server` targets.
     #[test]
     fn phase_values_reach_their_own_fields_as_integers() {
         let totals = every_phase();
@@ -895,8 +842,6 @@ mod tests {
         );
     }
 
-    /// A partial account names the running phase, books only what
-    /// finished, and still sums exactly to its window.
     #[test]
     fn a_partial_account_reports_the_active_phase() {
         let origin = Instant::now();
@@ -939,18 +884,6 @@ mod tests {
         assert_eq!(pool_wait + active + other, observed);
     }
 
-    /// A phase the worker finishes after the request decided to write its
-    /// partial account, and before the account is written, is booked and
-    /// still inside the observed window: `emit_partial` ends the window at
-    /// the instant `snapshot` reads for itself, so the window reaches past
-    /// every total the copy holds.
-    ///
-    /// This does not reproduce the race of a window cut outside the
-    /// clock's lock, a phase finishing between the cut and the copy: bind
-    /// exits here before the snapshot starts, so a cut taken any time
-    /// after the decision would pass as well. The guard against that race
-    /// is structural. `snapshot` takes no cutoff, so no caller can supply
-    /// one read outside the lock.
     #[test]
     fn a_phase_finished_after_the_decision_is_inside_the_partial_window() {
         use std::sync::Barrier;
@@ -1023,8 +956,6 @@ mod tests {
         assert_eq!(completed + active + other, observed);
     }
 
-    /// A dropped handler guard writes the abandonment, complete, unless
-    /// the pool took over or someone already wrote the account.
     #[test]
     fn a_dropped_guard_writes_abandoned_once() {
         let fresh = || {
@@ -1072,8 +1003,6 @@ mod tests {
         );
     }
 
-    /// A scheduled run carries its run id, a failure its class, and
-    /// neither carries text.
     #[test]
     fn a_failed_run_carries_its_class_not_its_text() {
         let timing = QueryTiming::new(
@@ -1102,8 +1031,6 @@ mod tests {
         );
     }
 
-    /// No preparation slot came free: nothing ran, so the account says the
-    /// request was refused for capacity, whichever door booked it.
     #[test]
     fn a_preparation_refusal_is_a_capacity_refusal() {
         assert_eq!(
@@ -1112,9 +1039,6 @@ mod tests {
         );
     }
 
-    /// A cancel by id that ends a request in one of its own waits answers
-    /// the not-started refusal: nothing ran, so the account books it as a
-    /// capacity refusal, not as an error.
     #[test]
     fn a_not_started_refusal_is_a_capacity_refusal() {
         assert_eq!(
@@ -1165,8 +1089,6 @@ mod tests {
         assert_eq!(PhysicalOutcome::NotStarted.as_str(), "not_started");
     }
 
-    /// A reclaim for work that never started carries its physical
-    /// outcome and no phases.
     #[test]
     fn a_reclaim_without_totals_carries_no_phases() {
         let correlation = Correlation::Request("01HZ".into());
@@ -1195,7 +1117,6 @@ mod tests {
         assert_eq!(event.values.get("duckdb_attempts"), None);
     }
 
-    /// The correlation reads carry the ADR-0046 kind values and no format.
     #[test]
     fn the_correlation_reads_have_their_own_kinds() {
         for (kind, spelled) in [

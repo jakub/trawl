@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! End-to-end HTTPS API tests for trawld.
-//!
-//! Starts a real TLS server on a random port with a self-signed cert,
-//! creates API keys, and verifies the full request lifecycle.
 
 mod common;
 
@@ -57,10 +54,6 @@ async fn query_with_filter() {
     assert_eq!(result.result.row_count(), 2);
 }
 
-/// A `sample` after a search reads the filtered rows in a SELECT of its
-/// own: the query answers 200 rather than a parser error, a sample
-/// larger than its input returns exactly the matching rows, and a stage
-/// after it reads only the sample.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_sample_stage_boundaries() {
     use trawl_api::value::Value;
@@ -160,14 +153,11 @@ async fn query_rejects_bad_dsl() {
     }
 }
 
-// -- query lifecycle telemetry -----------------------------------------------
-
 mod lifecycle_capture {
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
 
-    /// One captured tracing event: level plus stringified fields.
     #[derive(Debug, Clone)]
     pub struct Captured {
         pub level: String,
@@ -224,8 +214,6 @@ mod lifecycle_capture {
     }
 }
 
-/// The one global subscriber of this test binary.
-///
 /// The server logs from its tokio workers and blocking threads, which a
 /// thread-local `set_default` never reaches, so the capture has to be the
 /// global subscriber, and a process has one. Under nextest each test is a
@@ -252,14 +240,12 @@ mod telemetry {
     /// from a stringified number. `level` is the event's level.
     pub type Fields = BTreeMap<String, serde_json::Value>;
 
-    /// Keeps [`TIMING_EVENTS`], recorded by their own value types.
     #[derive(Clone, Default)]
     pub struct TimingCapture {
         events: Arc<Mutex<Vec<Fields>>>,
     }
 
     impl TimingCapture {
-        /// Every kept `event_type` event whose `key` field is `value`.
         pub fn of(&self, event_type: &str, key: &str, value: &serde_json::Value) -> Vec<Fields> {
             self.events
                 .lock()
@@ -273,7 +259,6 @@ mod telemetry {
                 .collect()
         }
 
-        /// Every `query_timing` of one HTTP request.
         pub fn timing_of(&self, request_id: &str) -> Vec<Fields> {
             self.of("query_timing", "request_id", &request_id.into())
         }
@@ -323,10 +308,7 @@ mod telemetry {
     }
 
     pub struct Installed {
-        /// Everything that passes the default filter, from the moment a
-        /// test starts it.
         pub info: Capture,
-        /// Everything `trawl_server` logs at DEBUG, likewise.
         pub debug: Capture,
         pub timing: TimingCapture,
     }
@@ -337,7 +319,6 @@ mod telemetry {
     /// queries, which it cannot tell from its own.
     pub static LIFECYCLE: tokio::sync::RwLock<()> = tokio::sync::RwLock::const_new(());
 
-    /// The timing capture, held apart from the lifecycle test.
     pub async fn timing() -> (
         &'static TimingCapture,
         tokio::sync::RwLockReadGuard<'static, ()>,
@@ -346,7 +327,6 @@ mod telemetry {
         (&installed().timing, turn)
     }
 
-    /// The process's subscriber, installed on first use.
     pub fn installed() -> &'static Installed {
         use tracing_subscriber::prelude::*;
 
@@ -380,19 +360,12 @@ mod telemetry {
     }
 }
 
-/// Default-filter lifecycle events for `/query`, `/export` and `/stream`
-/// share a `query_id` and contain no user-supplied content — not the raw
-/// DSL, and not an error message either (parser/emitter text quotes the
-/// user's own tokens). The details survive only as DEBUG-level
-/// `query_text` / `query_error_text` events `trawl_server=info` never stores.
-///
 /// One test, four sentinels: the capture layers belong to the binary's
 /// one global subscriber ([`telemetry`]), and this is the test that
 /// starts them.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn query_export_and_stream_telemetry_carry_no_user_content() {
-    // Global (not thread-local) — the server runs on other tokio workers.
     let _alone = telemetry::LIFECYCLE.write().await;
     let installed = telemetry::installed();
     let info_capture = &installed.info;
@@ -425,7 +398,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         })
         .expect("query_complete captured at info");
 
-    // Correlatable without query text: same allocated query_id...
     let start_id = start
         .fields
         .get("query_id")
@@ -436,14 +408,12 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         .expect("query_complete has query_id");
     assert_eq!(start_id, complete_id, "lifecycle events share the query_id");
 
-    // ...plus query_len for pathological-request diagnosis.
     assert_eq!(
         start.fields.get("query_len").map(String::as_str),
         Some(dsl.len().to_string().as_str()),
         "query_start carries query_len"
     );
 
-    // The raw text is available, as a separate DEBUG-only event.
     let query_text = debug_capture
         .events()
         .into_iter()
@@ -466,8 +436,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         "query_text is keyed on query_id"
     );
 
-    // -- a failing query --------------------------------------------------
-    //
     // The emitter rejects an unknown function by quoting its name, so an
     // error message in default telemetry republishes whatever was typed.
     let bad_dsl = "* | stats zz_failure_needle()";
@@ -480,7 +448,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         other => panic!("expected 400 for the bad function name, got: {other:?}"),
     }
 
-    // -- an export ---------------------------------------------------------
     let raw = common::harness_client_builder().build().unwrap();
     let export_dsl = "service=nginx zz_export_needle";
     let export_resp = raw
@@ -492,7 +459,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         .expect("export request");
     assert!(export_resp.status().is_success(), "{export_resp:?}");
 
-    // -- an SSE stream -----------------------------------------------------
     let stream_dsl = "service=nginx zz_stream_needle";
     let stream_resp = raw
         .get(format!("{}/api/v1/stream", server.url))
@@ -532,7 +498,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         "query_failed carries no error text: {failed:?}"
     );
 
-    // Export and stream speak the same id vocabulary as /query.
     let export_start = find_info("export_start");
     let export_complete = find_info("export_complete");
     assert_eq!(
@@ -556,7 +521,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         "stream_start carries query_len"
     );
 
-    // No user-supplied content anywhere in the default-filter stream.
     for sentinel in [
         "zz_sentinel_needle",
         "zz_failure_needle",
@@ -573,7 +537,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
         }
     }
 
-    // Every one of them is recoverable at DEBUG, keyed on query_id.
     let debug_events = debug_capture.events();
     for (sentinel, event_type) in [
         ("zz_failure_needle", "query_error_text"),
@@ -597,8 +560,6 @@ async fn query_export_and_stream_telemetry_carry_no_user_content() {
     }
 }
 
-// -- query timing (ADR-0046) --------------------------------------------------
-
 mod timing {
     use std::collections::BTreeMap;
 
@@ -606,7 +567,6 @@ mod timing {
 
     use super::telemetry::{Fields, TimingCapture};
 
-    /// A string field's value.
     pub fn text<'a>(event: &'a Fields, name: &str) -> Option<&'a str> {
         event.get(name).map(|v| {
             v.as_str()
@@ -614,8 +574,6 @@ mod timing {
         })
     }
 
-    /// An integer field's value; a field that is present and not
-    /// recorded as an integer fails the test.
     pub fn int(event: &Fields, name: &str) -> Option<u64> {
         event.get(name).map(|v| {
             v.as_u64()
@@ -638,15 +596,12 @@ mod timing {
             .collect()
     }
 
-    /// The one `query_timing` of `request_id`.
     pub fn only(capture: &TimingCapture, request_id: &str) -> Fields {
         let events = capture.timing_of(request_id);
         assert_eq!(events.len(), 1, "one account for {request_id}: {events:?}");
         events.into_iter().next().expect("one")
     }
 
-    /// The account sums exactly to its window: the present phases plus
-    /// the residual are the observed time.
     pub fn assert_sums(event: &Fields) {
         let observed = int(event, "query_observed_us").expect("observed");
         let other = int(event, "query_other_us").expect("other");
@@ -655,7 +610,6 @@ mod timing {
     }
 }
 
-/// POST `dsl` to `/query`: the status, the request's id and the body.
 async fn post_query(
     server: &common::TestServer,
     dsl: &str,
@@ -776,7 +730,6 @@ async fn query_timing_window_matches_execution_record() {
     timing::assert_sums(&event);
 }
 
-/// A `from saved` read looks up its run and takes no publication guard.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_from_saved_skips_publication() {
     use timing::{phases, text};
@@ -813,10 +766,8 @@ async fn query_timing_from_saved_skips_publication() {
     timing::assert_sums(&event);
 }
 
-/// A `from saved` lookup the deadline cuts is a capacity refusal that
-/// books the lookup: the refusal shows where its time went. The lookup
-/// reads postgres, so a lock held on `saved_queries` parks it until the
-/// one-second budget runs out.
+/// The lookup reads postgres, so a lock held on `saved_queries` parks it
+/// until the one-second budget runs out.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_books_an_expired_saved_lookup() {
     use sqlx::{Connection as _, Executor as _};
@@ -856,10 +807,6 @@ async fn query_timing_books_an_expired_saved_lookup() {
     timing::assert_sums(&event);
 }
 
-/// A `from saved` lookup that fails is booked like one that resolved: the
-/// name was read from postgres before it was found missing, so the error
-/// shows where its time went. The account stays a `query` one, never
-/// resolved, and carries the class without the name.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_books_a_failed_saved_lookup() {
     use timing::{flag, int, phases, text};
@@ -895,8 +842,6 @@ async fn query_timing_books_a_failed_saved_lookup() {
     timing::assert_sums(&event);
 }
 
-/// A query refused at its admission check reports that check alone, with
-/// its class and without its text.
 #[tokio::test(flavor = "multi_thread")]
 async fn query_timing_refused_at_dsl_check() {
     use timing::{flag, phases, text};
@@ -1012,8 +957,6 @@ async fn query_timing_export_formats() {
     }
 }
 
-/// Live tail, the health check's engine sample read and field sampling
-/// are not DSL queries, and open no timing account.
 #[tokio::test(flavor = "multi_thread")]
 async fn non_dsl_work_emits_no_query_timing() {
     let (capture, _turn) = telemetry::timing().await;
@@ -1079,8 +1022,6 @@ async fn non_dsl_work_emits_no_query_timing() {
     }
 }
 
-// -- schema endpoint tests ---------------------------------------------------
-
 /// The fixture corpus is dated 2024-01-15 — years outside the default
 /// 90-day retention window — and the boot conformance pass backfills
 /// `field_services` from the partition directories it adopted, so its fields
@@ -1102,7 +1043,6 @@ async fn schema_returns_columns() {
         .unwrap();
     assert!(!schema.columns.is_empty());
 
-    // The fixture corpus carries these columns.
     let names: Vec<&str> = schema.columns.iter().map(|c| c.name.as_str()).collect();
     assert!(names.contains(&"_time"), "missing _time column");
     assert!(names.contains(&"_ingested"), "missing _ingested column");
@@ -1114,9 +1054,6 @@ async fn schema_returns_columns() {
     assert!(names.contains(&"message"), "missing message column");
     assert_eq!(schema.file_count, 2);
 
-    // Columns follow query-result display order: envelope first (in the
-    // declared order), trailing metadata demoted to the very end — never a
-    // raw alphabetical listing with `_ingested` first.
     assert_eq!(names[0], "_time", "envelope leads: {names:?}");
     assert_eq!(
         &names[names.len() - 4..],
@@ -1124,7 +1061,6 @@ async fn schema_returns_columns() {
         "metadata trails: {names:?}"
     );
 
-    // Types are the catalog pins, not a DESCRIBE.
     let severity = schema
         .columns
         .iter()
@@ -1183,8 +1119,6 @@ async fn schema_caching_works() {
     let second = client.schema().await.unwrap();
     assert!(second.cached, "second call should be cached");
 }
-
-// -- queries endpoint tests --------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn queries_own_flag_uses_verified_reader_and_preserves_permission_gate() {
@@ -1260,7 +1194,6 @@ async fn queries_shows_history() {
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
 
-    // Run a query so there's something in history.
     analyst.query_paginated("*", None, None).await.unwrap();
 
     let queries = admin.queries().await.unwrap();
@@ -1278,29 +1211,14 @@ async fn queries_accessible_by_analyst_and_reader() {
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
 
-    // Both analyst and reader can list running queries.
     analyst.queries().await.unwrap();
     reader.queries().await.unwrap();
 }
 
-/// A query whose request timed out keeps its permit until the work
-/// actually stops, and `GET /queries` says so (ADR-0024).
-///
-/// Three readers, one retained entry. An interactive query shows its user
-/// and its DSL to every reader of the route, exactly as the active and
-/// recent lists have always shown the same query. A reader who can watch
-/// it run and read it in history learns nothing from the retained line.
-/// The entry is not also listed as active: one permit, one line. What the
-/// key id still governs is CANCELLATION, asserted below: an unrelated key
-/// sharing the display name is refused.
-///
 /// The retained window is held open, not timed: this server's own pool
 /// parks its worker just past the work-start transition and stays there
 /// until the test lets it go, so every assertion below runs against a
-/// state that cannot move. A wall-clock window (a long worker delay minus
-/// a short request timeout) used to stand in for that, which made the
-/// verdict depend on how busy the runner was and put a correct 503 where
-/// the test demanded a 504.
+/// state that cannot move.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one retained window, asserted from three readers
 async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
@@ -1469,9 +1387,7 @@ async fn retained_work_is_listed_once_and_carries_its_display_metadata() {
 
 /// Resolving `from saved` happens after the tracker has already opened an
 /// entry for the request, so a resolution failure has to finish that entry
-/// like any other failure. When it escaped the handler on its own the id
-/// stayed "active" for the life of the process, and `/queries` reported a
-/// query nobody was running.
+/// like any other failure.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_failed_from_saved_resolution_finishes_its_tracking() {
     const DSL: &str = "| from saved no_such_report | head 1";
@@ -1503,9 +1419,6 @@ async fn a_failed_from_saved_resolution_finishes_its_tracking() {
     assert!(seen.retained.is_empty(), "no permit was ever taken");
 }
 
-/// trawld answers in UTC only: a body from an older client that still
-/// carries a `timezone`, valid or not, is answered, and every timestamp in
-/// the answer is UTC. The field is ignored, never validated.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_stale_timezone_field_is_ignored_and_the_answer_is_utc() {
     const DSL: &str = "service=tz-stale last=1h | table _time";
@@ -1545,7 +1458,6 @@ async fn a_stale_timezone_field_is_ignored_and_the_answer_is_utc() {
     }
 }
 
-/// Poll `cond` until it holds, failing after a generous bound.
 async fn until(what: &str, cond: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while !cond() {
@@ -1643,9 +1555,6 @@ async fn queries_rejects_ingest_role() {
     }
 }
 
-// -- ingest endpoint tests ---------------------------------------------------
-
-/// Build a raw reqwest client that trusts the self-signed harness cert.
 fn raw_client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
@@ -1664,16 +1573,8 @@ async fn ingest_accepts_ndjson() {
     assert_eq!(resp.accepted, 2);
 }
 
-/// The ADR-0013 worked examples, end to end.
-///
-/// A vector-shaped payload (`timestamp` + `level`) lands as the declared
-/// ten-field envelope: `_time` derived and `timestamp` stored verbatim,
-/// `_severity` derived and `level` stored verbatim, `_raw` populated, with
-/// the severity vocabulary riding `_severity`, which nothing can shadow.
-/// The game server's `level:"gold"` keeps its column and gets no
-/// `_severity` at all.
 #[tokio::test(flavor = "multi_thread")]
-#[allow(clippy::too_many_lines)] // the sqlx macro used to hide the body in an inner fn
+#[allow(clippy::too_many_lines)]
 async fn vector_shaped_ingest_is_queryable() {
     let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -1735,8 +1636,6 @@ async fn vector_shaped_ingest_is_queryable() {
         other => panic!("_raw must be a string, got {other:?}"),
     }
 
-    // The game server's row is fully queryable under its own vocabulary
-    // and carries no derived severity at all.
     let gold = query
         .query_paginated("service=vec-svc level=gold last=1h", None, None)
         .await
@@ -1787,8 +1686,6 @@ async fn vector_shaped_ingest_is_queryable() {
         assert_eq!(r.result.row_count(), expected, "{dsl}");
     }
 
-    // An unknown severity value is a 4xx naming the vocabulary, never a
-    // filter that quietly matches nothing.
     let resp = raw_client()
         .post(format!("{}/api/v1/query", server.url))
         .header("authorization", format!("Bearer {}", server.analyst_token))
@@ -1803,9 +1700,6 @@ async fn vector_shaped_ingest_is_queryable() {
         "the error must name the vocabulary: {body}"
     );
 
-    // …and `level` is ordinary sender vocabulary (ADR-0013 §6): grouping
-    // on it and naming it in a `where` IN-list are plain field usage, in
-    // both lanes, batch and live.
     for query_text in [
         "service=vec-svc last=1h | stats count() by level",
         r#"service=vec-svc last=1h | where level in ("error", "fatal")"#,
@@ -1834,21 +1728,10 @@ async fn vector_shaped_ingest_is_queryable() {
     }
 }
 
-/// Provenance is data (ADR-0013 ruling 6), end to end.
-///
-/// `_producer` has to survive the whole journey to be worth anything: the
-/// door stamps it, the WAL and hot buffer carry it, the catalog types it,
-/// and the DSL filters on it. Two of the three doors run against one
-/// server here — the HTTP handler through the real endpoint, and the
-/// syslog door through `SyslogDoor::admit` into the server's own pipeline
-/// (no in-process harness speaks UDP/TCP frames to a live listener, and
-/// the frame parser is not what this test is about). The trawld door's
-/// stamp is covered where its events are built, in `telemetry`'s own
-/// tests.
-///
-/// The forgery half matters as much as the stamp: a sender that puts
-/// `_producer` on the wire must find it under the bare `producer`
-/// remainder, with the real column still naming the door.
+/// Provenance is data (ADR-0013 ruling 6), end to end. The syslog door runs
+/// through `SyslogDoor::admit` into the server's own pipeline: no
+/// in-process harness speaks UDP/TCP frames to a live listener. The trawld
+/// door's stamp is covered in `telemetry`'s own tests.
 #[tokio::test(flavor = "multi_thread")]
 async fn producer_is_stamped_stored_and_queryable_per_door() {
     use std::collections::HashMap;
@@ -1915,7 +1798,6 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
         1
     );
 
-    // The column is queryable, and it partitions the two doors.
     let count = async |dsl: &str| -> i64 {
         let result = query.query_paginated(dsl, None, None).await.unwrap();
         assert_eq!(result.result.row_count(), 1, "{dsl}");
@@ -1927,8 +1809,6 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
     assert_eq!(count("_producer=http last=1h | stats count()").await, 3);
     assert_eq!(count("_producer=syslog last=1h | stats count()").await, 1);
 
-    // The forgery landed bare, the real stamp is untouched, and the wire
-    // spelling stays findable in `_raw`.
     let forged = query
         .query_paginated(
             "service=prov-svc producer=syslog last=1h | table _producer, producer, _raw",
@@ -1958,8 +1838,6 @@ async fn producer_is_stamped_stored_and_queryable_per_door() {
     }
 }
 
-/// An event with an unlisted env is rejected per-event with a typed
-/// message; the sibling with no env lands under `default_env`.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_unlisted_env_rejected_per_event() {
     let server = setup().await;
@@ -1988,8 +1866,6 @@ async fn ingest_unlisted_env_rejected_per_event() {
     );
 }
 
-/// Repairs surface as `trawl_ingest_repairs_total{code, service}` on the
-/// unauthenticated /metrics endpoint.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_repairs_exposed_on_metrics() {
     let server = setup().await;
@@ -2023,10 +1899,6 @@ async fn ingest_repairs_exposed_on_metrics() {
     assert!(line.trim_end().ends_with('1'), "counter at 1: {line}");
 }
 
-/// An unmappable severity source surfaces as
-/// `trawl_severity_unmapped_total{service}` on /metrics — one increment per
-/// event whose source mapped to nothing, and no series at all for a sender
-/// whose source mapped fine (ADR-0013 §2).
 #[tokio::test(flavor = "multi_thread")]
 async fn unmapped_severity_exposed_on_metrics() {
     let server = setup().await;
@@ -2107,7 +1979,6 @@ async fn ingest_partial_success() {
     let server = setup().await;
     let client = raw_client();
 
-    // 3 ndjson events: good, bad json, good
     let body = "{\"service\":\"test-svc\",\"message\":\"one\"}\nnot json\n{\"service\":\"test-svc\",\"message\":\"three\"}";
 
     let resp = client
@@ -2128,7 +1999,6 @@ async fn ingest_partial_success() {
     assert_eq!(body.errors[0].reason, "invalid_json");
 }
 
-/// An ingest request head as `token`, with `framing` as its body header.
 fn ingest_head(server: &common::TestServer, token: &str, framing: &str) -> String {
     let host = server.url.strip_prefix("https://").unwrap();
     format!(
@@ -2147,8 +2017,6 @@ fn unterminated_chunked_ingest(server: &common::TestServer, token: &str, body: &
     request
 }
 
-/// A trawl-granted key without `ingest` is refused on its request head:
-/// trawld answers the 403 without waiting for a body it would discard.
 /// Only the head goes out, announcing 1 MiB, so a server that read the
 /// body first would wait forever and fail the bound here.
 ///
@@ -2173,9 +2041,6 @@ async fn ingest_without_the_grant_is_403_before_the_body_arrives() {
     assert_eq!(body["error"]["message"], "insufficient permissions");
 }
 
-/// The ingest router's body limit answers with the envelope at its shipped
-/// default, whether it learned the size from `Content-Length` or by
-/// reading a chunked body past the limit.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_body_over_max_body_bytes_is_413_with_the_envelope() {
     let server = setup().await;
@@ -2195,8 +2060,6 @@ async fn ingest_body_over_max_body_bytes_is_413_with_the_envelope() {
     common::assert_request_too_large(&resp, message, "chunked");
 }
 
-/// A whole body past a small `[ingest] max_body_bytes`, sent complete in
-/// either framing, gets the envelope naming that setting.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_complete_body_over_the_limit_is_413_with_the_envelope() {
     let server = common::setup_with_body_limits(common::BodyLimits {
@@ -2256,7 +2119,6 @@ async fn ingest_all_rejected_per_event() {
     let server = setup().await;
     let client = raw_client();
 
-    // All 3 events are bad (no service field)
     let body = "{\"message\":\"no svc\"}\n{\"message\":\"also no svc\"}\n{\"message\":\"nope\"}";
 
     let resp = client
@@ -2268,7 +2130,6 @@ async fn ingest_all_rejected_per_event() {
         .await
         .unwrap();
 
-    // Returns 200 even when all events rejected (per-event, not batch-level).
     assert_eq!(resp.status(), 200);
     let body: trawl_api::IngestResponse = resp.json().await.unwrap();
     assert_eq!(body.accepted, 0);
@@ -2288,8 +2149,6 @@ async fn ingest_all_rejected_per_event() {
     );
 }
 
-// -- rate limit tests --------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn rate_limit_returns_429() {
     let server = setup_with_rate_limit(RateLimitConfig {
@@ -2299,11 +2158,9 @@ async fn rate_limit_returns_429() {
     .await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // First 2 should succeed (burst capacity).
     client.query_paginated("*", None, None).await.unwrap();
     client.query_paginated("*", None, None).await.unwrap();
 
-    // 3rd should be rate limited.
     let result = client.query_paginated("*", None, None).await;
     assert!(result.is_err());
     let err = result.unwrap_err();
@@ -2315,11 +2172,6 @@ async fn rate_limit_returns_429() {
     }
 }
 
-/// The interactive ceiling (`default_rpm`) must never apply to `/ingest`, and
-/// the shipper-sized `ingest_rpm` must never apply to the query routes — the
-/// two route classes hold separate bucket maps. Without the split, one number
-/// has to serve both, and sizing it for vector hands every interactive key the
-/// same budget (the loosening this test exists to catch).
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_rpm_is_independent_of_the_interactive_ceiling() {
     let server = setup_with_rate_limit(RateLimitConfig {
@@ -2343,7 +2195,6 @@ async fn ingest_rpm_is_independent_of_the_interactive_ceiling() {
         assert_eq!(resp.status(), 200, "ingest request {i} must not be limited");
     }
 
-    // The query routes still enforce default_rpm = 1: second call is 429.
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     client.query_paginated("*", None, None).await.unwrap();
     let result = client.query_paginated("*", None, None).await;
@@ -2355,10 +2206,6 @@ async fn ingest_rpm_is_independent_of_the_interactive_ceiling() {
     }
 }
 
-/// AC1 (ADR-0006 slice 0): two keys holding the SAME role get independent
-/// buckets — the limiter keys on the keystore id, not on any shared role
-/// bucket. Exhausting key A's quota 429s A while key B still gets 200.
-/// (Role here is test-side policy vocabulary only; the limiter never sees it.)
 #[tokio::test(flavor = "multi_thread")]
 async fn rate_limit_isolates_keys_with_same_role() {
     let server = setup_with_rate_limit(RateLimitConfig {
@@ -2367,7 +2214,6 @@ async fn rate_limit_isolates_keys_with_same_role() {
     })
     .await;
 
-    // Two analyst keys with distinct keystore ids.
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key_a = store
         .create_key(
@@ -2395,7 +2241,6 @@ async fn rate_limit_isolates_keys_with_same_role() {
     let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
     let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
 
-    // Exhaust A's burst, then confirm A is limited.
     a.query_paginated("*", None, None).await.unwrap();
     a.query_paginated("*", None, None).await.unwrap();
     let err = a.query_paginated("*", None, None).await.unwrap_err();
@@ -2406,17 +2251,11 @@ async fn rate_limit_isolates_keys_with_same_role() {
         other => panic!("expected 429 for exhausted key A, got: {other:?}"),
     }
 
-    // B holds the same role but its own bucket — still 200.
     b.query_paginated("*", None, None)
         .await
         .expect("key B must not be limited by key A's exhaustion");
 }
 
-/// The shipper-sized `ingest_rpm` is earned by `Permission::Ingest`, not by
-/// reaching `/api/v1/ingest`. The handler's permission check runs downstream of
-/// the limiter (axum resolves `body: Bytes` first), so an ungated ingest bucket
-/// would widen every reader/analyst key's throughput on the heaviest endpoint
-/// to the shipper ceiling. A reader must stay on `default_rpm`.
 #[tokio::test(flavor = "multi_thread")]
 async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
     let server = setup_with_rate_limit(RateLimitConfig {
@@ -2446,8 +2285,6 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
         "a reader key must ride the interactive bucket on /ingest, not ingest_rpm"
     );
 
-    // The gate is on the permission, not on the route: a real shipper key
-    // still gets its full ingest_rpm burst.
     for i in 0..10 {
         assert_eq!(
             post_ingest(&server.ingest_token).await,
@@ -2456,8 +2293,6 @@ async fn ingest_ceiling_does_not_apply_to_keys_without_ingest_permission() {
         );
     }
 }
-
-// ── endpoint tests (cancellation, validation, pagination, stats, field values) ──
 
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_query_by_admin() {
@@ -2474,9 +2309,6 @@ async fn cancel_query_by_admin() {
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
-    // Cancelling id 1 is a timing guess: the fixture is too small to keep a
-    // query in flight, so this asserts the endpoint answers, not that it
-    // caught anything.
     let _cancel_resp = admin.cancel_query(1).await.unwrap();
 
     let _ = tokio::time::timeout(std::time::Duration::from_secs(2), slow_query).await;
@@ -2497,8 +2329,6 @@ async fn cancel_query_by_analyst_for_nonexistent() {
     let server = setup().await;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Analyst gets "cannot cancel" for non-existent queries — no information
-    // disclosure about whether the query ID exists (only admin sees the difference).
     let result = analyst.cancel_query(9999).await;
     assert!(result.is_err());
 }
@@ -2520,22 +2350,10 @@ async fn cancel_query_rejects_ingest_role() {
 }
 
 /// Non-admin cancellation is authorized by exact keystore id, not display
-/// name. Two `QueryCancel` keys sharing a name ("twin") must stay isolated:
-/// key B cannot cancel key A's in-flight query, while owner A passes the gate
-/// and actually interrupts the query.
-///
-/// A revert to name-matching would let B (same name) through, so this test
-/// guards that regression. It needs a genuinely *active* query — a completed
-/// one has no tracked owner under either scheme, so only a live entry can tell
-/// id-matching from name-matching apart.
-///
-/// The pool's `TEST_QUERY_DELAY_MS` hook (via the crate's `test-support`
-/// feature) holds the query in-flight deterministically — no dataset-size
-/// timing bets against fast CI runners.
+/// name. A completed query has no tracked owner under either scheme, so only
+/// a live entry can tell id-matching from name-matching apart.
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_query_isolated_by_key_id_not_name() {
-    // Permissive rate limits: the observe/cancel polls below run in a tight
-    // window and must not trip the per-minute buckets.
     let permissive = RateLimitConfig {
         default_rpm: 1_000_000,
         ..RateLimitConfig::default()
@@ -2547,7 +2365,6 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     // to this test; reset at the end regardless.
     trawl_server::pool::TEST_QUERY_DELAY_MS.store(3_000, Ordering::Relaxed);
 
-    // Two analyst keys with the same display name but distinct keystore ids.
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let key_a = store
         .create_key(
@@ -2575,14 +2392,11 @@ async fn cancel_query_isolated_by_key_id_not_name() {
     let a = HttpClient::new_insecure(&server.url, key_a.plaintext_token.as_str()).unwrap();
     let b = HttpClient::new_insecure(&server.url, key_b.plaintext_token.as_str()).unwrap();
 
-    // Fire a query as key A in the background; the injected delay keeps it
-    // tracked as active until we are done asserting.
     let slow = {
         let a = a.clone();
         tokio::spawn(async move { a.query_paginated("* | stats count()", None, None).await })
     };
 
-    // Wait until A's query shows up as active, capturing its id.
     let mut target = None;
     for _ in 0..500 {
         if let Ok(resp) = a.queries().await
@@ -2635,7 +2449,6 @@ async fn cancel_query_isolated_by_key_id_not_name() {
 
     trawl_server::pool::TEST_QUERY_DELAY_MS.store(0, Ordering::Relaxed);
 
-    // The interrupted query surfaces an error to its submitter.
     let _ = slow.await;
 }
 
@@ -2657,8 +2470,6 @@ async fn validate_query_valid() {
     assert!(resp.format_error.is_none());
 }
 
-/// A query that parses and runs, but whose formatted text would pass the
-/// query limit, is valid with no text and a typed reason (ADR-0061).
 /// Escaping doubles each tab, so 40 000 of them in a quoted string fit the
 /// limit as written and format to 80 002 bytes in either layout.
 #[tokio::test(flavor = "multi_thread")]
@@ -2720,10 +2531,6 @@ async fn validate_query_unknown_function() {
     assert!(resp.errors.iter().any(|e| e.message.contains("unknown")));
 }
 
-/// Every regex refusal ADR-0063 adds is a parse error, so `/validate`
-/// answers it as invalid with a 200, carrying the parser's own message,
-/// span and hint, rather than as a 400. The fixtures are the ones the
-/// `trawl-core` tests use to prove each refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn validate_reports_regex_refusals_as_invalid() {
     use std::fmt::Write as _;
@@ -2815,10 +2622,6 @@ async fn validate_reports_regex_refusals_as_invalid() {
 /// (ADR-0062), so summing it is one null row. A missing column only
 /// reaches the binder through a resolver defect, planted here by making
 /// the schema probe claim a column no file carries.
-///
-/// Changed on purpose from b02b8acf, where summing a text field whose name
-/// says "column" was the unknown-field 400: the fallback read `DuckDB`'s
-/// text form, whose statement line then said "column".
 #[tokio::test(flavor = "multi_thread")]
 async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
     let dir = tempfile::tempdir().unwrap();
@@ -2875,10 +2678,6 @@ async fn a_binder_failure_on_a_query_only_node_answers_by_its_subtype() {
     }
 }
 
-/// One event whose `message` is not JSON no longer fails a query through
-/// `/api/v1/query`: each json function reads it as null and every row
-/// counts (ADR-0017, amendment of 2026-11-13). Before the document guard
-/// the whole query was an opaque 500.
 #[tokio::test(flavor = "multi_thread")]
 async fn one_document_that_is_not_json_keeps_every_row_through_the_api() {
     let dir = tempfile::tempdir().unwrap();
@@ -2937,7 +2736,6 @@ async fn one_document_that_is_not_json_keeps_every_row_through_the_api() {
             "{call}: {body}"
         );
 
-        // The bad event and a good one, read row by row.
         let (status, body) = query(format!(
             "* | where id == 5 or id == 7 | let k = {call} | sort id | table id, k"
         ))
@@ -2951,12 +2749,6 @@ async fn one_document_that_is_not_json_keeps_every_row_through_the_api() {
     }
 }
 
-/// A JSON path outside the grammar, or one that is not a string literal,
-/// is refused before either lane reads a row (#457, ADR-0017's amendment
-/// of 2026-11-13): `/api/v1/validate` answers `valid: false` and
-/// `/api/v1/query` answers 400, with the shared check's sentence, whether
-/// or not any event matches. Before the check, `$[` was a whole-query
-/// binder 500 and a computed path failed once a valid document arrived.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_refused_json_path_is_refused_by_validate_and_query_with_and_without_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -3213,8 +3005,6 @@ async fn dashboard_stream_rejects_analyst() {
     assert_eq!(body["error"]["message"], "insufficient permissions");
 }
 
-/// Capacity rides the admin-only dashboard (ADR-0042): the GET and the
-/// stream still refuse a non-admin, and an admin's payload carries it.
 #[tokio::test(flavor = "multi_thread")]
 async fn dashboard_capacity_requires_admin() {
     let server = setup().await;
@@ -3278,7 +3068,6 @@ async fn dashboard_capacity_requires_admin() {
         .expect("stats frame missing data line");
     let streamed: serde_json::Value = serde_json::from_str(data).unwrap();
     assert!(streamed["capacity"].is_object(), "{streamed}");
-    // Typed, too: the stream decodes as the wire type with its capacity.
     let _: trawl_api::DashboardSnapshot = serde_json::from_value(streamed).unwrap();
 }
 
@@ -3376,10 +3165,6 @@ async fn whoami_rejects_missing_auth() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn whoami_no_trawl_grant_is_403() {
-    // Policy change with the fleet-auth cutover (ADR-0004): a foreign-app-only
-    // key is rejected by the mandatory trawl policy layer on EVERY
-    // authenticated route — including /whoami, which previously leaked
-    // cross-app assignments to grantless keys.
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.coastwatch_only_token).unwrap();
 
@@ -3426,8 +3211,6 @@ async fn field_values_invalid_field_name() {
     }
 }
 
-// -- request ID tests --------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn response_includes_ulid_request_id() {
     let server = setup().await;
@@ -3450,8 +3233,6 @@ async fn response_includes_ulid_request_id() {
         "request ID should be alphanumeric crockford base32"
     );
 }
-
-// -- reader role restriction tests -------------------------------------------
 
 fn assert_403<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
     let err = result.expect_err("expected 403 but got success");
@@ -3496,7 +3277,6 @@ async fn export_rejects_reader() {
     );
 }
 
-/// Rows in a CSV export: every line but the header.
 fn csv_rows(body: &[u8]) -> usize {
     std::str::from_utf8(body)
         .expect("CSV is UTF-8")
@@ -3505,7 +3285,6 @@ fn csv_rows(body: &[u8]) -> usize {
         .saturating_sub(1)
 }
 
-/// Rows in an NDJSON export: one per non-empty line.
 fn ndjson_rows(body: &[u8]) -> usize {
     std::str::from_utf8(body)
         .expect("NDJSON is UTF-8")
@@ -3514,7 +3293,6 @@ fn ndjson_rows(body: &[u8]) -> usize {
         .count()
 }
 
-/// Rows in a Parquet export, counted by `DuckDB` over the written bytes.
 fn parquet_rows(body: &[u8]) -> usize {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("export.parquet");
@@ -3543,10 +3321,6 @@ fn assert_result_too_large<T: std::fmt::Debug>(
     }
 }
 
-/// Every export format is capped by `max_export_rows`, never by
-/// `max_result_rows`, and a result past its cap is cut at the cap in all
-/// three formats — the way the Parquet export's `LIMIT` cuts it.
-///
 /// The caps are shrunk to five interactive rows and fifty export rows so
 /// that twenty events cross the first and sixty cross the second.
 #[tokio::test(flavor = "multi_thread")]
@@ -3608,7 +3382,6 @@ async fn export_is_capped_by_max_export_rows_not_max_result_rows() {
             20,
             "{format}: whole result"
         );
-        // A requested limit cuts the result, it does not refuse it.
         assert_eq!(export(small, &format, Some(7)).await, 7, "{format}: limit");
         // Past max_export_rows: cut at the cap, however the limit asks.
         assert_eq!(
@@ -3646,16 +3419,12 @@ async fn export_is_capped_by_max_export_rows_not_max_result_rows() {
     }
 }
 
-// -- exports are tracked, counted and recorded like queries -------------------
-
-/// Every export format, in the order the export tests walk them.
 const EXPORT_FORMATS: [trawl_api::ExportFormat; 3] = [
     trawl_api::ExportFormat::Csv,
     trawl_api::ExportFormat::Json,
     trawl_api::ExportFormat::Parquet,
 ];
 
-/// Rows in an export body of `format`.
 fn export_rows(format: &trawl_api::ExportFormat, body: &[u8]) -> usize {
     match format {
         trawl_api::ExportFormat::Csv => csv_rows(body),
@@ -3691,7 +3460,6 @@ impl Drop for QueryDelay {
     }
 }
 
-/// The status and envelope of a request the server refused.
 fn refused_with<T: std::fmt::Debug>(
     result: Result<T, trawl_client::ClientError>,
     what: &str,
@@ -3702,8 +3470,6 @@ fn refused_with<T: std::fmt::Debug>(
     }
 }
 
-/// Poll `client`'s `GET /queries` until an answer satisfies `ready`, and
-/// return that answer.
 async fn queries_until(
     client: &HttpClient,
     what: &str,
@@ -3752,9 +3518,6 @@ fn recent_of(server: &common::TestServer, dsl: &str) -> Vec<trawl_api::Completed
         .collect()
 }
 
-/// The newest outcome for `dsl`, asserting it is the only one recorded
-/// since the tracker held `before` of them, and that its id is no longer
-/// active.
 fn one_more_outcome(
     server: &common::TestServer,
     dsl: &str,
@@ -3781,7 +3544,6 @@ fn one_more_outcome(
     newest
 }
 
-/// How many outcomes `server`'s tracker holds for the query id `id`.
 fn outcomes_of(server: &common::TestServer, id: u64) -> usize {
     server
         .state
@@ -3793,7 +3555,6 @@ fn outcomes_of(server: &common::TestServer, id: u64) -> usize {
         .count()
 }
 
-/// Wait until `server`'s pool holds no permit and retains no work.
 async fn pool_idle(server: &common::TestServer) {
     let pool = &server.state.query.pool;
     until("the pool gave every permit back", || {
@@ -3802,7 +3563,6 @@ async fn pool_idle(server: &common::TestServer) {
     .await;
 }
 
-/// Rows in `server`'s `query_history`, every key's.
 async fn history_rows(server: &common::TestServer) -> i64 {
     use sqlx::Connection as _;
 
@@ -3827,7 +3587,6 @@ struct Outcomes {
 }
 
 impl Outcomes {
-    /// Scraped off `server`'s `/metrics`.
     async fn scrape(server: &common::TestServer) -> Self {
         let body = raw_client()
             .get(format!("{}/metrics", server.url))
@@ -3872,11 +3631,6 @@ impl Outcomes {
     }
 }
 
-/// A running export is listed in `GET /api/v1/queries` like a query: once,
-/// under its submitter's name, with its text, owned by its submitter and by
-/// no one else. It leaves `active` when it answers, and `recent` holds it
-/// once, with the rows its body holds.
-///
 /// This server's pool parks each export's worker at its work start until
 /// both lists are read, so no export can answer first however slow the
 /// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release.
@@ -3979,13 +3733,6 @@ async fn a_running_export_is_listed() {
     }
 }
 
-/// A listed export is cancelled the way a query is (ADR-0024): the key that
-/// submitted it, holding `query_cancel`, and a `server_manage` key can each
-/// cancel one; a key sharing the submitter's display name cannot; and a key
-/// holding only `export` can neither list exports nor cancel one, its own
-/// included. A cancelled export answers an error and closes its tracker
-/// entry once, with the message its caller read.
-///
 /// This server's pool parks each round's workers at their work start until
 /// both cancels land, so neither export can answer first however slow the
 /// runner; `TEST_QUERY_DELAY_MS` then holds each one past the release, as
@@ -4101,8 +3848,6 @@ async fn a_running_export_is_cancellable_by_its_owner() {
     }
 }
 
-/// Two `trawl-analyst` keys named "twin": each may list and cancel its own
-/// work, and their shared display name grants neither the other's.
 async fn twin_keys(server: &common::TestServer) -> (HttpClient, HttpClient) {
     let store = KeyStore::from_pool(server.fleet_pool.clone());
     let twin = async || {
@@ -4125,8 +3870,6 @@ async fn twin_keys(server: &common::TestServer) -> (HttpClient, HttpClient) {
     )
 }
 
-/// Every pool permit, taken before a test sends the request it queues and
-/// held until that request answered: nothing can start while this lives.
 async fn hold_every_permit(server: &common::TestServer) -> trawl_server::pool::PoolExclusive {
     server
         .state
@@ -4137,7 +3880,6 @@ async fn hold_every_permit(server: &common::TestServer) -> trawl_server::pool::P
         .expect("hold every permit of an idle pool")
 }
 
-/// The id `owner`'s `GET /queries` lists `dsl` under, once it is listed.
 async fn listed_id(owner: &HttpClient, dsl: &str) -> u64 {
     queries_until(owner, "the queued request is listed", |seen| {
         seen.active.iter().any(|q| q.snapshot.query == dsl)
@@ -4167,8 +3909,6 @@ fn answered_before_its_deadline(sent: std::time::Instant, what: &str) {
     );
 }
 
-/// What a request a cancel ended while it waited to start answers: the
-/// not-started 503, well before the request's deadline.
 async fn refused_as_not_started<T: std::fmt::Debug>(
     run: tokio::task::JoinHandle<Result<T, trawl_client::ClientError>>,
     sent: std::time::Instant,
@@ -4195,8 +3935,6 @@ async fn refused_as_not_started<T: std::fmt::Debug>(
     );
 }
 
-/// The tracker closed `dsl`'s entry once, with the not-started text, not
-/// timed out and with no rows.
 fn closed_as_not_started(server: &common::TestServer, dsl: &str, before: usize, what: &str) {
     let closed = one_more_outcome(server, dsl, before, what);
     assert_eq!(
@@ -4224,8 +3962,6 @@ async fn reached_the_permit_wait(queued: &trawl_server::pool::seam::Gate, what: 
     .unwrap_or_else(|_| panic!("{what}: never reached the permit wait"));
 }
 
-/// POST `body` to `path` as the analyst, on its own task: the status, the
-/// request's id and the JSON body.
 fn post_as_analyst(
     server: &common::TestServer,
     path: &'static str,
@@ -4247,11 +3983,6 @@ fn post_as_analyst(
     })
 }
 
-/// What a request a cancel ended in the pool's permit wait answers and
-/// accounts: the not-started 503, before its own deadline could fire, and
-/// one `query_timing` that booked the permit wait, refused for capacity
-/// with no work started. A cancel that ended the request's preparation
-/// instead books no permit wait.
 async fn refused_in_the_permit_wait(
     capture: &telemetry::TimingCapture,
     run: tokio::task::JoinHandle<(reqwest::StatusCode, String, serde_json::Value)>,
@@ -4299,13 +4030,6 @@ async fn refused_in_the_permit_wait(
     event
 }
 
-/// A `/query` that waits for a permit is cancelled by its owner's first
-/// `DELETE /queries/{id}` (ADR-0024, Amendment 2026-11-09). The cancel is
-/// sent once the request reached the permit wait, and its account shows
-/// the permit wait is what it ended. It answers the not-started 503 while
-/// every permit is still held, long before its deadline; its tracker entry
-/// closes once with that text and writes no history row; and it never
-/// reaches the worker, so the pool is idle once the permits come back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_query_is_cancellable_by_its_owner() {
     use trawl_server::pool::seam::Seam;
@@ -4367,11 +4091,6 @@ async fn a_queued_query_is_cancellable_by_its_owner() {
     );
 }
 
-/// A Parquet export that waits for a permit is cancelled by its owner the
-/// way a queued query is: the first `DELETE`, sent once the export reached
-/// the permit wait, answers true and ends that wait. The export answers the
-/// not-started 503 while every permit is still held, closes its tracker
-/// entry once with that text and writes no history row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_export_is_cancellable_by_its_owner() {
     use timing::text;
@@ -4425,11 +4144,6 @@ async fn a_queued_export_is_cancellable_by_its_owner() {
     assert_eq!(history_rows(&server).await, history, "no history row");
 }
 
-/// A queued query is not cancellable by a key that shares its owner's
-/// display name: the twin gets the 403 a non-owner gets for running work,
-/// and the query stays queued and listed. The twin's cancel is sent once
-/// the query waits for a permit, so "queued" is where it is. The owner's
-/// cancel after it still answers true and ends the query.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
     use trawl_server::pool::seam::Seam;
@@ -4481,11 +4195,6 @@ async fn a_queued_query_is_not_cancellable_by_a_twin_key() {
     pool_idle(&server).await;
 }
 
-/// A cancel reaches a `from saved` read while its lookup waits on postgres:
-/// a lock held on `saved_queries` parks the lookup, and the owner's cancel
-/// ends the request with the not-started 503 while the lock is still held,
-/// long before its deadline. The account books a capacity refusal over
-/// the admission check and the lookup, and no work started.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancel_reaches_a_saved_lookup() {
     use sqlx::{Connection as _, Executor as _};
@@ -4578,10 +4287,6 @@ async fn a_cancel_reaches_a_saved_lookup() {
     pool_idle(&server).await;
 }
 
-/// A successful export records one recent success and one query history
-/// row for its own key, each with the rows its body holds after every limit
-/// and cap: an export that matched nothing, one cut by its own `limit`, and
-/// one cut by `max_export_rows`.
 #[tokio::test(flavor = "multi_thread")]
 async fn exports_record_counts_in_both_histories() {
     let server = common::setup_with_row_caps(common::RowCaps {
@@ -4656,12 +4361,6 @@ async fn exports_record_counts_in_both_histories() {
     );
 }
 
-/// Every way an export ends without a body closes its tracker entry
-/// exactly once, with the outcome its caller saw, and writes no query
-/// history row: a DSL refusal, an execution failure and a dropped caller on
-/// a server with the default budget, then a timeout and a capacity refusal
-/// on a one-permit server whose budget is one second.
-///
 /// The pool's `Started` seam holds the work that must still be running
 /// when its request ends. Nothing waits out a wall clock except the
 /// one-second budget that the timeout and the capacity refusal are about.
@@ -4674,7 +4373,6 @@ async fn export_outcomes_are_recorded_once() {
     let tracker = &server.state.query.tracker;
     let analyst = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
     for format in EXPORT_FORMATS {
-        // Refused by the DSL check, before any pool work.
         let dsl = "| | | zz_refused_export {{{";
         let before = recent_of(&server, dsl).len();
         let (status, error) = refused_with(
@@ -4701,7 +4399,6 @@ async fn export_outcomes_are_recorded_once() {
         assert!(!closed.timed_out, "{format}");
         assert_eq!(closed.rows, None, "{format}");
 
-        // A caller who walks away while the work runs.
         let dsl = "service=nginx zz_dropped_export";
         let seams = server.state.query.pool.seams();
         let started = seams.hold(Seam::Started);
@@ -4814,13 +4511,6 @@ async fn export_outcomes_are_recorded_once() {
     assert_eq!(history_rows(&tight).await, 0, "no failure writes history");
 }
 
-/// Every export that passes request shaping counts once in `/api/v1/stats`
-/// `total_queries`, and every explicit outcome once in
-/// `trawl_queries_total` under its `status` and once in the
-/// `trawl_query_duration_seconds` observations. A request refused by
-/// shaping counts in neither, and a caller who walks away counts as a
-/// request with no outcome.
-///
 /// The metrics belong to the process, so every assertion is a delta
 /// around one request, never an absolute value.
 #[tokio::test(flavor = "multi_thread")]
@@ -4883,8 +4573,6 @@ async fn exports_are_counted_once() {
         assert_eq!(total_after - total, 1, "{format}: a timeout");
         assert_eq!(outcomes_after.since(outcomes), one(0, 0, 1), "{format}");
 
-        // Refused by request shaping: a format no export has, and a body
-        // with no query.
         let (total, outcomes) = counted(&server, &admin).await;
         let unknown_format = raw_client()
             .post(format!("{}/api/v1/export?format=xlsx", server.url))
@@ -4956,12 +4644,6 @@ async fn exports_are_counted_once() {
     }
 }
 
-/// A history store that fails or stalls costs an export its history row,
-/// never its body. The export answers 200 with every row, its success is
-/// already in recent history while the write waits, and the server logs
-/// `history_error` at WARN with the store's error class alone. A stalled
-/// write is cut at the request's original deadline and not past it.
-///
 /// The stalled exports first spend `HOLD` of their `BUDGET` parked at
 /// their work start, so the write begins with only the rest of the budget
 /// left. Cut at the original deadline, each answers about `BUDGET` in,
@@ -5000,7 +4682,6 @@ async fn export_history_failure_keeps_the_body() {
             .collect::<Vec<_>>()
     };
 
-    // A store whose insert fails at once.
     db.execute("ALTER TABLE query_history RENAME TO query_history_parked")
         .await
         .expect("park query_history");
@@ -5031,7 +4712,6 @@ async fn export_history_failure_keeps_the_body() {
         .await
         .expect("restore query_history");
 
-    // A store whose insert waits on a lock the test holds.
     db.execute("BEGIN; LOCK TABLE query_history IN ACCESS EXCLUSIVE MODE")
         .await
         .expect("lock query_history");
@@ -5124,10 +4804,6 @@ async fn reader_can_query_and_view_history() {
     reader.history(Some(10), None).await.unwrap();
 }
 
-// ---------------------------------------------------------------------------
-// Runs stats endpoint
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn runs_stats_empty() {
     let server = setup().await;
@@ -5149,13 +4825,6 @@ async fn runs_stats_rejects_reader() {
     assert_403(reader.runs_stats().await);
 }
 
-// ---------------------------------------------------------------------------
-// Schedule create/update
-// ---------------------------------------------------------------------------
-
-/// `enabled` has to mean the same thing on both halves of the PUT. The
-/// create path used to hardcode TRUE, so a client that asked for a schedule
-/// it would enable later got one that fired on the next tick instead.
 #[tokio::test(flavor = "multi_thread")]
 async fn put_schedule_honours_enabled_on_create() {
     let server = setup().await;
@@ -5166,7 +4835,6 @@ async fn put_schedule_honours_enabled_on_create() {
         .await
         .unwrap();
 
-    // The saved query has no schedule yet, so this PUT takes the CREATE arm.
     let created = client
         .set_schedule(saved.id, "1h", None, false, None, None)
         .await
@@ -5208,12 +4876,6 @@ async fn put_schedule_honours_enabled_on_create() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// Trigger run endpoint
-// ---------------------------------------------------------------------------
-
-/// A net with no schedule has nothing to record a run under. That is the
-/// request's own fault, so it stays a 400.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_requires_schedule() {
     let server = setup().await;
@@ -5247,7 +4909,6 @@ async fn trigger_run_starts_execution() {
     assert_eq!(summary.status, "running");
     assert_eq!(summary.query, "* | head 3");
 
-    // Wait briefly for execution to complete (test fixtures are tiny).
     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
     let runs = client
@@ -5271,9 +4932,6 @@ async fn trigger_run_rejects_reader() {
     assert_403(reader.trigger_run(1).await);
 }
 
-/// A manual run spends the schedule's lifetime run budget like a scheduled
-/// one, and a spent budget is a conflict with the schedule's state, not a
-/// malformed request: 409.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_rejects_when_max_runs_reached() {
     let server = setup().await;
@@ -5288,7 +4946,6 @@ async fn trigger_run_rejects_when_max_runs_reached() {
         .await
         .unwrap();
 
-    // The one run the cap allows is itself a manual one.
     client.trigger_run(saved.id).await.unwrap();
     wait_for_finished_runs(&server, &client, saved.id, 1).await;
 
@@ -5302,9 +4959,6 @@ async fn trigger_run_rejects_when_max_runs_reached() {
     assert_eq!(runs.runs.len(), 1, "a refused trigger claims nothing");
 }
 
-/// `total_runs` is the schedule's lifetime claim count, so it keeps counting
-/// runs retention deleted, and `exhausted` reads off that same count. The
-/// run statistics and the per-saved runs list still count the runs kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_reports_claimed_runs_and_exhausted() {
     use trawl_server::store::RunStatus;
@@ -5408,8 +5062,6 @@ async fn schedule_reports_claimed_runs_and_exhausted() {
     assert_eq!(kept.runs.len(), 1);
 }
 
-/// `max_runs = 0` is a legal cap that is spent from the start: the schedule
-/// saves, reads exhausted, and neither door claims a run.
 #[tokio::test(flavor = "multi_thread")]
 async fn max_runs_zero_is_exhausted_from_the_start() {
     use trawl_server::store::DueClaim;
@@ -5451,8 +5103,6 @@ async fn max_runs_zero_is_exhausted_from_the_start() {
     assert!(after.exhausted);
 }
 
-/// Assert that a schedule PUT was refused for a `max_runs` above
-/// `i64::MAX`.
 fn assert_max_runs_refused<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) {
     match result {
         Err(trawl_client::ClientError::Server { status, error, .. }) => {
@@ -5467,8 +5117,6 @@ fn assert_max_runs_refused<T: std::fmt::Debug>(result: Result<T, trawl_client::C
     }
 }
 
-/// Claim and finish one run of a schedule through the store, the way the
-/// scheduler spends a run of its budget.
 async fn claim_one_run(
     store: &trawl_server::store::schedule::ScheduleStore,
     schedule_id: i64,
@@ -5490,11 +5138,6 @@ async fn claim_one_run(
         .unwrap();
 }
 
-/// `max_runs` is stored as a signed 64-bit count. Every value up to
-/// `i64::MAX` saves and reads back unchanged, on create and on update. A
-/// larger one is a 400 that names `max_runs` and writes nothing: a refused
-/// create stores no schedule, and a refused update leaves the cap, the
-/// paused state and the spent budget as they were.
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_max_runs_round_trips_or_refuses() {
     use trawl_server::store::schedule::ScheduleStore;
@@ -5595,8 +5238,6 @@ async fn schedule_max_runs_round_trips_or_refuses() {
     }
 }
 
-/// A run in flight refuses another with 409, and says so even when the
-/// cap is also reached: the run in progress is the actionable answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn trigger_run_rejects_when_already_running() {
     use trawl_server::store::schedule::{RunClaim, ScheduleStore};
@@ -5632,15 +5273,9 @@ async fn trigger_run_rejects_when_already_running() {
     assert!(message.contains("already in progress"), "{message}");
 }
 
-/// Poll until `saved_id` has `n` finished runs and `server`'s manual-run
-/// gate has drained, returning the runs newest first.
-///
-/// `trigger_run` returns as soon as the run row exists; the execution is a
-/// spawned task. Polling beats a fixed sleep: a slow machine gets more time,
-/// a fast one does not pay for it. A run row turns terminal before the run
-/// lets go of its manual-run lease (ADR-0018, amended 2026-11-11), so a
-/// test that presses Run now again with the same key needs both, or it
-/// races its own 429.
+/// Waits for the drained gate too: a run row turns terminal before the run
+/// lets go of its manual-run lease (ADR-0018), so a test that presses Run
+/// now again with the same key would race its own 429.
 async fn wait_for_finished_runs(
     server: &common::TestServer,
     client: &HttpClient,
@@ -5667,7 +5302,6 @@ async fn wait_for_finished_runs(
     );
 }
 
-/// The status of a refused client call, or a panic naming what came back.
 fn refused_status<T: std::fmt::Debug>(
     what: &str,
     outcome: Result<T, trawl_client::ClientError>,
@@ -5678,13 +5312,6 @@ fn refused_status<T: std::fmt::Debug>(
     }
 }
 
-/// Running a net now and reading a run's rows need `query` and
-/// `saved_query` (ADR-0018, amended 2026-11-11), judged on real custom
-/// roles. `saved_query` alone still edits nets and lists run metadata.
-/// Each 403 comes before the handler's own work: a key without the grant
-/// is refused on an id that does not exist (no lookup), and on a run whose
-/// stored file is gone, which a key holding both answers 409 (no
-/// result-file read).
 #[tokio::test(flavor = "multi_thread")]
 async fn saved_query_only_cannot_run_or_read_results() {
     let server = setup().await;
@@ -5698,7 +5325,6 @@ async fn saved_query_only_cannot_run_or_read_results() {
 
     let (runner_net, run) = run_and_read(&server, &runner_client).await;
 
-    // `saved_query` alone: nets, schedules and run metadata stay open.
     let editor_net = editor_client
         .create_saved("editor_net", "service=nginx | table service")
         .await
@@ -5757,7 +5383,6 @@ async fn saved_query_only_cannot_run_or_read_results() {
         "saved_query alone reads a missing run's rows"
     );
 
-    // `query` alone gets neither.
     assert_eq!(
         refused_status(
             "query alone",
@@ -5797,8 +5422,6 @@ async fn saved_query_only_cannot_run_or_read_results() {
     downgrade_refuses_before_the_file(&server, &runner_client, runner_net.id, &run).await;
 }
 
-/// A key holding `query` and `saved_query` creates a net, runs it now,
-/// waits for the run to finish and reads its rows: all 200.
 async fn run_and_read(
     server: &common::TestServer,
     client: &HttpClient,
@@ -5827,10 +5450,6 @@ async fn run_and_read(
     (net, run)
 }
 
-/// The runner's role loses `query` between its run and the read: run-now
-/// and the read answer 403, run metadata still lists, and the refusal
-/// comes before the stored file is read. With `query` back, the same read
-/// reaches the deleted file and answers 409.
 async fn downgrade_refuses_before_the_file(
     server: &common::TestServer,
     runner_client: &HttpClient,
@@ -5865,8 +5484,6 @@ async fn downgrade_refuses_before_the_file(
         "a key that lost query runs its net now"
     );
 
-    // With the stored file gone the grant still answers first; restored,
-    // the same read reaches the file and finds it missing.
     let relative = run
         .result_path
         .as_deref()
@@ -5897,20 +5514,11 @@ async fn downgrade_refuses_before_the_file(
     );
 }
 
-/// ADR-0018 ruling 13, end to end: a report run that finds nothing is
-/// recorded with its result, is served by the run endpoint, and is the run
-/// `run=latest` answers from.
-///
-/// The old empty-result path wrote neither a parquet file nor a blob, and
-/// `run=latest` skipped runs with no file, so a report that had just gone
-/// quiet kept answering with the PREVIOUS run's rows. Nothing said the data
-/// was stale. A zero-row run now stores a typed empty parquet file.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     let server = setup().await;
     let client = HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
 
-    // Run one has rows: the fixture corpus carries nginx events.
     let saved = client
         .create_saved("zero_row_report", "service=nginx | table service")
         .await
@@ -5950,8 +5558,6 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         "a zero-row run stores a typed empty parquet file: {newest:?}"
     );
 
-    // The zero-row run is served with its typed columns, not as a null
-    // result.
     let fetched = client
         .get_report_run(saved.id, newest.id)
         .await
@@ -5968,8 +5574,6 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
         "the empty file keeps the typed columns: {fetched:?}"
     );
 
-    // And it is what `run=latest` resolves. Reading the older run would
-    // count its rows here.
     let counted = client
         .query_paginated(
             "| from saved zero_row_report run=latest | stats count()",
@@ -6001,11 +5605,6 @@ async fn from_saved_latest_answers_a_zero_row_run_not_an_older_one() {
     );
 }
 
-/// A `from saved` read asked for its histogram answers `stored_result`
-/// (#197): a stored run's rows are not events, so nothing is counted,
-/// even when the run kept a timestamp `_time`. A `sample` after it does
-/// not change the reason, an aggregation over it carries no histogram,
-/// and a read of a saved query that does not exist keeps its 404.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_histogram_is_stored_result() {
     let server = setup().await;
@@ -6071,7 +5670,6 @@ async fn from_saved_histogram_is_stored_result() {
 /// error. `DuckDB` answers "no files" for a path it cannot resolve, which
 /// reads as an empty result, and the file is not established as gone, so
 /// the answer is neither an empty success nor the 409 for a missing file.
-/// The 500 names no host path.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
@@ -6113,7 +5711,6 @@ async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
         assert!(!read.result.rows.is_empty(), "{dsl}: {:?}", read.result);
     }
 
-    // The run file's directory becomes a link to nothing.
     let parent = stored.parent().expect("the run file has a directory");
     std::fs::rename(parent, parent.with_extension("moved")).unwrap();
     std::os::unix::fs::symlink(parent.with_extension("missing"), parent).unwrap();
@@ -6137,10 +5734,6 @@ async fn a_from_saved_read_below_a_dangling_link_is_an_error() {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Rename net (update with name)
-// ---------------------------------------------------------------------------
 
 #[tokio::test(flavor = "multi_thread")]
 async fn rename_saved_query() {
@@ -6175,8 +5768,6 @@ async fn rename_to_duplicate_fails() {
         .await
         .unwrap();
 
-    // Try to rename `other` to the taken name. A name conflict is a 409
-    // (ADR-0004's StoreError -> HTTP table).
     let err = client
         .update_saved_with_name(other.id, "* | head 2", Some("taken-name"))
         .await
@@ -6189,10 +5780,6 @@ async fn rename_to_duplicate_fails() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// List all runs endpoint
-// ---------------------------------------------------------------------------
-
 #[tokio::test(flavor = "multi_thread")]
 async fn list_all_runs_paginated() {
     let server = setup().await;
@@ -6203,21 +5790,10 @@ async fn list_all_runs_paginated() {
     assert!(resp.runs.is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// repin surface
-// ---------------------------------------------------------------------------
-
-/// `SchemaWrite` gates the trigger: even the admin role (frozen conversion
-/// bundle, no `schema_write`) is refused, while the schema-admin role —
-/// which deliberately lacks `server_manage` — may trigger. The status
-/// surface is `SchemaRead` (read-only surfaces show state without
-/// offering the trigger).
 #[tokio::test(flavor = "multi_thread")]
 async fn repin_permission_matrix() {
     let server = setup().await;
 
-    // Admin: the broadest standing role, server_manage included, and still
-    // no schema_write.
     let admin = HttpClient::new_insecure(&server.url, &server.admin_token).unwrap();
     let err = admin
         .schema_repin(
@@ -6234,7 +5810,6 @@ async fn repin_permission_matrix() {
         trawl_client::ClientError::Server { status, .. } => assert_eq!(status, 403),
         other => panic!("expected 403, got {other:?}"),
     }
-    // No standing role gained the permission silently.
     let resp = admin.whoami().await.unwrap();
     assert!(
         !resp.permissions.contains(&"schema_write".to_owned()),
@@ -6242,8 +5817,6 @@ async fn repin_permission_matrix() {
         resp.permissions
     );
 
-    // Schema-admin: may trigger (an unpinned field is a 400 — authorized,
-    // then refused on the merits, with no side effect).
     let schema_admin = HttpClient::new_insecure(&server.url, &server.schema_admin_token).unwrap();
     let err = schema_admin
         .schema_repin(
@@ -6268,7 +5841,6 @@ async fn repin_permission_matrix() {
     assert!(resp.permissions.contains(&"schema_write".to_owned()));
     assert!(!resp.permissions.contains(&"server_manage".to_owned()));
 
-    // Status: SchemaRead suffices; the reader can see, not trigger.
     let reader = HttpClient::new_insecure(&server.url, &server.reader_token).unwrap();
     let status = reader.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "no repin has run on this server");
@@ -6293,11 +5865,6 @@ async fn repin_permission_matrix() {
     assert!(ingest.schema_repin_status().await.is_err());
 }
 
-/// Cancel is gated like the trigger, not like the status route: a
-/// `SchemaRead` key may watch a repin and may not stop one. With nothing
-/// running, an authorized ask is a 404 carrying the `no_job_running`
-/// verdict rather than an error envelope — the client decodes the status
-/// and the body's own outcome together, so both halves are asserted here.
 #[tokio::test(flavor = "multi_thread")]
 async fn repin_cancel_is_schema_write_gated_and_answers_when_idle() {
     let server = setup().await;
@@ -6325,13 +5892,10 @@ async fn repin_cancel_is_schema_write_gated_and_answers_when_idle() {
         }
         other => panic!("expected no_job_running, got {other:?}"),
     }
-    // Asking changed nothing: no job row was claimed by the refusal.
     let status = schema_admin.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "a cancel claims no job");
 }
 
-/// Contract-typed fields, unknown target types and unpinned fields refuse
-/// with 400 before any job row exists — validation is side-effect-free.
 #[tokio::test(flavor = "multi_thread")]
 async fn repin_validation_refusals_are_side_effect_free() {
     let server = setup().await;
@@ -6365,19 +5929,10 @@ async fn repin_validation_refusals_are_side_effect_free() {
             other => panic!("expected 400 for {field} -> {to}, got {other:?}"),
         }
     }
-    // No job row was ever claimed.
     let status = client.schema_repin_status().await.unwrap();
     assert!(status.job.is_none(), "validation refusals claim no job");
 }
 
-// ---------------------------------------------------------------------------
-// pin gc surface
-// ---------------------------------------------------------------------------
-
-/// `SchemaWrite` gates pin gc exactly as it gates the repin trigger: it
-/// deletes catalog rows, so a reader may not reach it and neither may the
-/// admin role, which never gained the permission. The schema-admin key
-/// runs it and gets a report.
 #[tokio::test(flavor = "multi_thread")]
 async fn gc_pins_permission_matrix() {
     let server = setup().await;
@@ -6408,8 +5963,6 @@ async fn gc_pins_permission_matrix() {
         .expect("schema_write runs a dry gc");
     assert!(report.dry_run);
     assert_eq!(report.deleted, 0, "a dry run deletes nothing: {report:?}");
-    // The window numbers are the server's own: a zero request is accepted
-    // literally and then floored at the packaged retention window.
     assert_eq!(report.requested_older_than_secs, 0);
     assert_eq!(
         report.effective_older_than_secs,
@@ -6417,7 +5970,6 @@ async fn gc_pins_permission_matrix() {
     );
 }
 
-/// Read from an open SSE response until `needle` shows up, or fail loud.
 async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
     let mut bytes: Vec<u8> = Vec::new();
     let read = tokio::time::timeout(Duration::from_secs(15), async {
@@ -6448,8 +6000,6 @@ async fn read_sse_until(resp: &mut reqwest::Response, needle: &str) -> String {
     })
 }
 
-/// Every `data:` payload in the complete frames of an SSE buffer.
-///
 /// The read stops at a frame terminator, but the bytes after it can be
 /// the first half of the next frame, so the buffer is cut at its last
 /// terminator and the remainder is dropped rather than parsed.
@@ -6462,8 +6012,6 @@ fn sse_payloads(buf: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// A read stops at the frame it was waiting for, and the bytes after it
-/// can be the first half of the next one — which is not JSON yet.
 #[test]
 fn sse_payloads_ignores_a_half_arrived_frame() {
     let buf = "event: data\ndata: {\"a\":1}\n\nevent: data\ndata: {\"b\":";
@@ -6473,23 +6021,14 @@ fn sse_payloads_ignores_a_half_arrived_frame() {
 }
 
 /// ADR-0017 §3 through the real SSE loop, on a live server.
-///
-/// The fake-clock cases in `trawl-core`'s `live_sampling` pin the rule;
-/// this pins the wiring, that `stream_query` samples one instant per
-/// event on the pass-through lane and one per emitted snapshot on the
-/// aggregate lane, which no in-process test of the door can observe.
 /// The clock here is the real one, so the assertions are the ones a real
-/// clock can carry: reads that must be EQUAL. Under any per-read or
-/// per-row sampling they would differ by the microseconds it takes to
-/// evaluate the next stage, which is why equality is the discriminating
-/// direction.
+/// clock can carry: reads that must be EQUAL.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_freezes_now_per_event_and_per_snapshot() {
     let server = setup().await;
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
     let raw = raw_client();
 
-    // ── pass-through: one instant per event, across stages ──────────
     let mut stream = raw
         .get(format!("{}/api/v1/stream", server.url))
         .query(&[(
@@ -6525,7 +6064,6 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
     }
     drop(stream);
 
-    // ── aggregate: one instant per emitted snapshot ─────────────────
     let mut stream = raw
         .get(format!("{}/api/v1/stream", server.url))
         .query(&[(
@@ -6575,17 +6113,8 @@ async fn sse_freezes_now_per_event_and_per_snapshot() {
 }
 
 /// A shutdown that fires BEFORE the accept loop polls must still stop it.
-///
 /// The flag has to be state, not an edge. `Notify::notify_waiters()` wakes
-/// whoever is registered at that instant and stores nothing, so a signal
-/// landing before the loop's first `select!` (or while the accept arm's
-/// body runs, between two registrations) was lost and the server kept
-/// accepting after SIGTERM. Under the watch channel the late subscriber
-/// reads the value that is already there.
-///
-/// This test hangs on the old primitive and returns in milliseconds on the
-/// new one; the timeout is generous only so a loaded CI runner cannot turn
-/// a pass into a flake.
+/// whoever is registered at that instant and stores nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn shutdown_set_before_boot_stops_the_accept_loop() {
     let server = setup().await;
@@ -6610,14 +6139,6 @@ async fn shutdown_set_before_boot_stops_the_accept_loop() {
     drop(shutdown_tx);
 }
 
-// ---------------------------------------------------------------------------
-// Report windows on the write surface (ADR-0018 rulings 6, 7, 12)
-// ---------------------------------------------------------------------------
-
-/// The status and message of a refused request, or a panic naming what came
-/// back instead. Both halves matter here: the status is what a client
-/// branches on, the message is the whole point of a refusal that names two
-/// sides.
 fn refusal<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) -> (u16, String) {
     match result.expect_err("expected a refusal") {
         trawl_client::ClientError::Server { status, error, .. } => (status, error.message),
@@ -6625,9 +6146,6 @@ fn refusal<T: std::fmt::Debug>(result: Result<T, trawl_client::ClientError>) -> 
     }
 }
 
-/// Ruling 7: a schedule window and a query that spells its own interval are
-/// two answers to one question, so attaching them is a 400 that names both.
-/// The operator drops one; the server has no basis for choosing which.
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_window_on_a_query_with_a_time_clause_is_refused_naming_both() {
     let server = setup().await;
@@ -6662,8 +6180,6 @@ async fn schedule_window_on_a_query_with_a_time_clause_is_refused_naming_both() 
     }
 }
 
-/// The same rule from the other side: the query text is what moves, and the
-/// standing window is what refuses it. A refused edit stores nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn adding_a_time_clause_to_a_windowed_saved_query_is_refused() {
     let server = setup().await;
@@ -6696,8 +6212,6 @@ async fn adding_a_time_clause_to_a_windowed_saved_query_is_refused() {
     assert_eq!(stored.query, "service=x", "a refused edit stores nothing");
 }
 
-/// Ruling 12: `from saved` reads stored report rows, not ingest events, so
-/// no `_time` window applies to it — in either write direction.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_source_is_refused_a_window() {
     const FROM_SAVED: &str = "| from saved daily_rollup";
@@ -6731,11 +6245,6 @@ async fn from_saved_source_is_refused_a_window() {
     assert!(message.contains("from saved"), "{message}");
 }
 
-// ---------------------------------------------------------------------------
-// Manual runs of windowed schedules (ADR-0018 amended 2026-09-23)
-// ---------------------------------------------------------------------------
-
-/// An RFC 3339 instant off the wire.
 fn instant(text: &str) -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339(text)
         .unwrap_or_else(|e| panic!("{text:?} is not RFC 3339: {e}"))
@@ -6747,7 +6256,6 @@ fn now_micros() -> chrono::DateTime<chrono::Utc> {
     trawl_server::report_window::truncate_to_micros(chrono::Utc::now())
 }
 
-/// The wire spelling of a window bound.
 fn bound(t: chrono::DateTime<chrono::Utc>) -> String {
     trawl_server::report_window::format_window_bound(t)
 }
@@ -6786,8 +6294,6 @@ async fn stored_covered_through(
         .unwrap()
 }
 
-/// Trigger a manual run and return its summary with the instant `t` the
-/// server claimed it at, checked to lie inside the request.
 async fn trigger_at(
     client: &HttpClient,
     saved_id: i64,
@@ -6805,8 +6311,6 @@ async fn trigger_at(
     (summary, t)
 }
 
-/// The listed run a trigger started, once it has finished, checked to be
-/// the row the trigger's summary described.
 async fn finished(
     server: &common::TestServer,
     client: &HttpClient,
@@ -6840,9 +6344,6 @@ async fn finished(
     run
 }
 
-/// A manual `since_last` run is the next window fired early: it starts at
-/// the watermark, ends at `t - lag`, runs the saved text with those bounds
-/// spliced on, and on success moves the watermark to its end.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_of_since_last_schedule_covers_from_watermark() {
     let server = setup().await;
@@ -6884,8 +6385,6 @@ async fn manual_run_of_since_last_schedule_covers_from_watermark() {
     );
 }
 
-/// A fixed span trails `t - lag`, and neither reads nor moves the
-/// watermark, even one a fixed schedule kept from when it tiled.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_of_fixed_schedule_covers_trailing_span() {
     let server = setup().await;
@@ -6921,9 +6420,6 @@ async fn manual_run_of_fixed_schedule_covers_trailing_span() {
     );
 }
 
-/// The catch-up bound applies to a manual run exactly as to a scheduled
-/// one. The fixture's bound is 3 intervals, not the default 24, so a
-/// handler reading the default instead of the configured value fails here.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_clamps_and_flags_truncated() {
     let server = common::setup_with_scheduler(trawl_server::config::SchedulerConfig {
@@ -6962,8 +6458,6 @@ async fn manual_run_clamps_and_flags_truncated() {
     );
 }
 
-/// Ruling 14: a `since_last` schedule with no watermark covers one
-/// interval back from `t - lag`.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_without_predecessor_covers_one_interval() {
     let server = setup().await;
@@ -6992,8 +6486,6 @@ async fn manual_run_without_predecessor_covers_one_interval() {
     assert_eq!(run.status, "success", "{run:?}");
 }
 
-/// A window with nothing new in it is refused as a conflict that says
-/// where coverage stands, and claims nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_with_empty_window_is_409() {
     let server = setup().await;
@@ -7032,10 +6524,6 @@ async fn manual_run_with_empty_window_is_409() {
     );
 }
 
-// -- The fire cursor after a manual run (ADR-0018 amended 2026-09-23) -------
-
-/// Write a schedule's fire cursor directly, to make a tick overdue or
-/// future without waiting for the clock.
 async fn set_next_fire_at(
     server: &common::TestServer,
     schedule_id: i64,
@@ -7050,7 +6538,6 @@ async fn set_next_fire_at(
         .unwrap();
 }
 
-/// A schedule's stored fire cursor.
 async fn stored_next_fire_at(
     server: &common::TestServer,
     schedule_id: i64,
@@ -7063,7 +6550,6 @@ async fn stored_next_fire_at(
         .unwrap()
 }
 
-/// The store the scheduler tick claims through, on the fixture's database.
 async fn tick_store(server: &common::TestServer) -> trawl_server::store::ScheduleStore {
     trawl_server::store::ScheduleStore::new(common::app_pool(&server.app_db_url).await)
 }
@@ -7082,11 +6568,6 @@ async fn tick(
         .unwrap()
 }
 
-/// A successful manual run consumes every fire boundary at or before its
-/// `t`, in every mode, so the overdue tick does not follow it with an older
-/// window. The cursor lands on the cadence's own next boundary, so the
-/// phase never shifts, and the tick claimed there picks up where the manual
-/// run stopped.
 #[tokio::test(flavor = "multi_thread")]
 async fn successful_manual_run_consumes_overdue_tick() {
     use trawl_server::store::DueClaim;
@@ -7148,8 +6629,6 @@ async fn successful_manual_run_consumes_overdue_tick() {
     }
 }
 
-/// A cursor still in the future is left exactly where it is: the manual
-/// run overtook no boundary.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_leaves_future_fire_cursor() {
     use trawl_server::store::DueClaim;
@@ -7187,8 +6666,6 @@ async fn manual_run_leaves_future_fire_cursor() {
     );
 }
 
-/// A manual run that does not succeed changes no cursor, so the overdue
-/// scheduled run still fires and covers the window the manual run did not.
 #[tokio::test(flavor = "multi_thread")]
 async fn failed_manual_run_leaves_overdue_tick_claimable() {
     use trawl_server::store::{DueClaim, ManualRunClaim, RunStatus};
@@ -7253,8 +6730,6 @@ async fn failed_manual_run_leaves_overdue_tick_claimable() {
     }
 }
 
-/// A finish that lands on a run already terminal is not a transition, so
-/// it moves no cursor, even when it says success.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
     use trawl_server::store::{ManualRunClaim, RunStatus};
@@ -7319,7 +6794,6 @@ async fn a_second_finish_of_a_terminal_manual_run_moves_no_cursor() {
     );
 }
 
-/// Block until some backend in this test's database waits on a lock.
 async fn await_lock_waiter(pool: &sqlx::PgPool) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
@@ -7341,7 +6815,6 @@ async fn await_lock_waiter(pool: &sqlx::PgPool) {
     }
 }
 
-/// A run's stored `started_at`.
 async fn stored_started_at(pool: &sqlx::PgPool, run_id: i64) -> chrono::DateTime<chrono::Utc> {
     sqlx::query_scalar("SELECT started_at FROM report_runs WHERE id = $1")
         .bind(run_id)
@@ -7350,13 +6823,6 @@ async fn stored_started_at(pool: &sqlx::PgPool, run_id: i64) -> chrono::DateTime
         .unwrap()
 }
 
-/// Every run's `started_at` comes from ONE clock, the application's,
-/// read after the claim holds its locks. A scheduled claim that stamped
-/// the database's `now()` instead would record its transaction's start,
-/// and against a remote Postgres whose clock is skewed that orders a
-/// manual run against scheduled ones wrongly under `run=latest`, history
-/// and count-based retention.
-///
 /// A single host cannot skew the two clocks, so the test pins the stamp's
 /// domain through the one gap it can open: the claim's transaction begins,
 /// then queues behind a held saved-query lock. `now()` is frozen at the
@@ -7434,7 +6900,6 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
         .await
         .unwrap();
 
-    // The manual run claimed next is the latest by the same clock.
     let before_manual = now_micros();
     let ManualRunClaim::Started(manual) = store
         .claim_manual_run(saved.id, key_id, 24, &RunLease::unattached())
@@ -7471,10 +6936,6 @@ async fn every_claim_stamps_started_at_from_the_app_clock_after_its_locks() {
     );
 }
 
-/// A manual run ignores `enabled`: it runs on a paused schedule and leaves
-/// it paused. The boundaries it overtook stay consumed, so resuming does
-/// not re-run a window the manual run already covered, while the next
-/// boundary fires as planned.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_of_disabled_schedule_runs_and_resume_skips_consumed_boundary() {
     use trawl_server::store::DueClaim;
@@ -7519,8 +6980,6 @@ async fn manual_run_of_disabled_schedule_runs_and_resume_skips_consumed_boundary
     assert_eq!(next.window.map(|w| bound(w.start)), summary.window_end);
 }
 
-/// Query mode keeps today's manual run exactly: the saved DSL verbatim, and
-/// a run row that claims no coverage.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_of_a_query_mode_schedule_still_starts() {
     let server = setup().await;
@@ -7556,9 +7015,6 @@ async fn manual_run_of_a_query_mode_schedule_still_starts() {
     assert_eq!(run.origin.as_deref(), Some("manual"));
 }
 
-/// What a schedule answers about its own window, and what it refuses to be
-/// given. The `lag` pair rides the window: a windowed schedule with no lag
-/// reports the `"0s"` in force, query mode reports nothing at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn schedule_response_carries_window_fields() {
     let server = setup().await;
@@ -7599,8 +7055,6 @@ async fn schedule_response_carries_window_fields() {
         "a fixed window is re-measured from every fire and keeps no watermark"
     );
 
-    // Query mode: the saved DSL owns its own interval, and nothing about a
-    // window is reported.
     let query_mode = client
         .create_saved("resp-query-mode", "service=x last=1h")
         .await
@@ -7621,8 +7075,6 @@ async fn schedule_response_carries_window_fields() {
     assert_eq!(fetched.lag_secs, Some(300));
     assert_eq!(fetched.covered_through, tiling_covered_through);
 
-    // A lag with no window shifts nothing, so it is refused rather than
-    // stored as a number that changes no answer.
     let refused = client
         .create_saved("resp-refusals", "service=x")
         .await
@@ -7648,8 +7100,6 @@ async fn schedule_response_carries_window_fields() {
     }
 }
 
-/// Ruling 11: a run records the window it covered, and a run that had none
-/// omits all four fields rather than claiming a complete window of nothing.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one listing, every run shape it carries
 async fn run_listing_carries_window_and_truncated_flag() {
@@ -7780,11 +7230,6 @@ async fn run_listing_carries_window_and_truncated_flag() {
     assert_eq!(legacy.window_kind, None);
 }
 
-/// The watermark outlives the mode that meant it: ADR-0018 ruling 14 keeps
-/// `covered_through` across an edit so a schedule switched back to tiling
-/// resumes where it stopped. Reporting the stored value regardless would
-/// tell an operator that a fixed-window or query-mode schedule has coverage
-/// up to some instant, which is a claim neither mode makes.
 #[tokio::test(flavor = "multi_thread")]
 async fn covered_through_is_reported_only_while_the_schedule_tiles() {
     let server = setup().await;
@@ -7825,8 +7270,6 @@ async fn covered_through_is_reported_only_while_the_schedule_tiles() {
     assert_eq!(query_mode.window, None);
     assert_eq!(query_mode.covered_through, None);
 
-    // Back to tiling. The store kept the value, so coverage resumes where
-    // it stopped instead of restarting from the new anchor.
     let again = client
         .set_schedule(saved.id, "1h", None, true, Some("since_last"), None)
         .await
@@ -7943,7 +7386,6 @@ async fn list_all_runs_sort_http_contract() {
         default.runs.iter().map(|r| r.run.id).collect::<Vec<_>>(),
         vec![ids[1], ids[2], ids[0]]
     );
-    // Global ordering parameters do not change the per-net endpoint.
     let response = raw
         .get(format!(
             "{}/api/v1/saved/{}/runs?sort=invalid&dir=asc",
@@ -8046,9 +7488,6 @@ async fn list_all_runs_extraction_errors_preserve_json_and_permissions() {
     }
 }
 
-/// A JSON body sent without `Content-Type: application/json` is refused
-/// like any body that does not read: after authority, with the 400
-/// `bad_request` envelope, never the framework's plain-text 415.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_json_body_without_its_content_type_is_a_400_after_authority() {
     let server = setup().await;
@@ -8077,9 +7516,6 @@ async fn a_json_body_without_its_content_type_is_a_400_after_authority() {
     }
 }
 
-/// What a request of one authenticated route may be missing before the
-/// route can read it: the permissions that open it (any one), and requests
-/// whose path, query string or body cannot parse.
 struct ShapeRow {
     route: &'static str,
     method: reqwest::Method,
@@ -8095,18 +7531,13 @@ struct ShapeRow {
     body: Option<(&'static str, &'static str)>,
 }
 
-/// The body limit of the matrix's fixture, both routers.
 const BODY_LIMIT: usize = 1024;
-/// The interactive router's body-limit setting.
 const SERVER_LIMIT: &str = "[server] max_request_body_bytes";
-/// The ingest router's body-limit setting.
 const INGEST_LIMIT: &str = "[ingest] max_body_bytes";
 /// A well-formed bearer token that names no key.
 const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
-/// How long a refusal of a request whose body never ends may take. A
-/// failure bound, never an ordering device: a refusal that needs no byte
-/// of the body is answered at once, and a route that waits on the body
-/// never answers.
+/// A failure bound for a request whose body never ends, never an ordering
+/// device: a route that waits on that body never answers.
 const STALLED_ANSWER_WITHIN: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// `method path` as `token`, its head ending in `framing`, then `body`:
@@ -8144,26 +7575,6 @@ const SHAPE_PERMISSIONS: &[&str] = &[
     "schema_write",
 ];
 
-/// Every authenticated route of `handlers.rs` that reads a path, query
-/// string or body (ADR-0059): a key without the route's permission is
-/// answered 403 whatever it sent, and a key with it is answered the 400
-/// `bad_request` envelope, never axum's plain-text rejection. The routes
-/// that judge their own authority before their shape in the investigation
-/// and result modules have the same check beside their tests; the
-/// attached capture's write authority, judged inside the capture, is a
-/// row here too.
-///
-/// The body limit is judged where the handler reads the body, after
-/// authority: for every authenticated route that reads one, the
-/// investigation, result and ingest routes included, a body past the
-/// limit is 401 with a bad token and 403 without the permission, whether
-/// its length is announced or it is streamed, and only a key with the
-/// permission gets the 413 `request_too_large` envelope naming the
-/// router's setting.
-///
-/// Authority is judged before the body is read at all: a body that never
-/// ends, a chunk begun on a connection the client keeps open, is 401 with
-/// a bad token and 403 without the permission while it is still open.
 #[allow(clippy::too_many_lines)]
 #[tokio::test(flavor = "multi_thread")]
 async fn every_handlers_route_judges_authority_before_request_shape() {
@@ -8549,9 +7960,6 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
         },
     )
     .await;
-    // Per route: a key holding every permission but the route's, and a key
-    // holding only the first of them. Every miss is collected, so a failure
-    // names each route and request that answered wrongly.
     let client = common::harness_client_builder().build().unwrap();
     let mut misses: Vec<String> = Vec::new();
     for (n, row) in rows.iter().enumerate() {
@@ -8606,9 +8014,6 @@ async fn every_handlers_route_judges_authority_before_request_shape() {
                 }
             }
         }
-        // A body past the limit, announced by its length and never sent,
-        // or sent whole in chunks: a bad token is 401, a key without the
-        // permission 403, and only a key with it learns the body's size.
         let Some((path, setting)) = row.body else {
             continue;
         };

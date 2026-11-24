@@ -4,26 +4,6 @@
 
 //! `read`: a page of a captured result, or one cell's text, without
 //! running anything again (ADR-0058, ADR-0057).
-//!
-//! Both actions read trawld's capabilities once, first, for the limits
-//! trawld holds a read to. `action: page` reads `GET /api/v1/results/{id}`
-//! from `offset`, at most `[capture] page_max_rows` rows, of the columns
-//! `columns` names when the call sends it, and every page continuation of
-//! the reply sends the same `columns`; a page of a
-//! `context`, `sightings` or `compare` result prints that read's block,
-//! as the read itself printed it. `action: cell`
-//! reads the result's metadata with a zero-row page, for the column's name
-//! and type, then a byte range of the cell from `byte_offset`, as many
-//! bytes as the response budget holds and `[capture] max_wire_bytes`
-//! allows; the reply says where the rest starts. A result past its
-//! deadline answers trawld's 410 `result_gone`, an unknown id 404: both
-//! are errors naming the code, never an empty page.
-//!
-//! `action: investigation` reads an investigation's entries changed after
-//! `since` and prints them with the renderer `investigation` with
-//! `action: read` uses ([`crate::render::activity`]), proposing `read`
-//! again for the rest. Like that read, it counts what it prints as seen
-//! by this session.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -44,13 +24,9 @@ use crate::reply::InvestigationAction;
 use crate::reply::{CellView, Link, NextAction, ReadAction, ReadReply};
 use crate::session::Seen;
 
-/// The link reason on a page `read` prints: the link belongs to the
-/// search that captured the result.
 pub const READ_LINK: &str = "read does not repeat the search URL; the search that captured this \
 result printed it";
 
-/// Run `read` against `backend`, keeping the session's investigation
-/// bookkeeping in `seen`.
 pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: ReadInput) -> CallToolResult {
     let budget = Budget::new(input.max_bytes);
     let rows = u64::from(input.rows.unwrap_or(DEFAULT_ROWS).clamp(1, MAX_ROWS));
@@ -73,7 +49,6 @@ pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: ReadInput) -> Call
     }
 }
 
-/// `action: investigation`.
 async fn investigation<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -119,10 +94,6 @@ async fn investigation<B: Backend>(
     result
 }
 
-/// `action: page`, reading the call's `rows` rows, or the fewer trawld's
-/// page limit allows, of the columns the call's `columns` names, or of
-/// every column. A `columns` list trawld cannot select by is refused
-/// before any call.
 async fn page<B: Backend>(
     backend: &B,
     result_id: &str,
@@ -160,12 +131,6 @@ async fn page<B: Backend>(
     // budget prints fewer than were read.
     let outcome = render::page_outcome(&view);
     let mut next_actions = continuations(&view);
-    // A correlation result's block, and a sightings read's follow-ups,
-    // travel with every page. A kept result's follow-ups attach to the
-    // investigation it is kept for, as the sightings reply's did, when this
-    // key may write to it; a key that only reads it is proposed the
-    // searches it can run. `whoami` is asked only when a follow-up has a
-    // slot left after the continuations.
     let room = next_actions.len() < render::MAX_NEXT_ACTIONS;
     let attached = match (&page.result.correlation, &page.result.investigation_id) {
         (Some(Correlation::Sightings(_)), Some(id)) if room && may_attach(backend).await => {
@@ -193,10 +158,7 @@ async fn page<B: Backend>(
     render::read(reply, budget, rows)
 }
 
-/// Why `read` refuses `columns`, or `None` when trawld can select by
-/// every name: the list holds 1 to [`PAGE_MAX_COLUMNS`] names, each 1 to
-/// [`MAX_FIELD_NAME_BYTES`] bytes, and none holds a comma, because trawld
-/// splits the list on commas. A name is named by its index, never echoed.
+/// A name is named by its index, never echoed.
 fn refused_columns(columns: &[String]) -> Option<String> {
     if columns.is_empty() {
         return Some(format!(
@@ -235,8 +197,7 @@ fn refused_columns(columns: &[String]) -> Option<String> {
     })
 }
 
-/// `action: cell`. `rows` is the call's `rows` argument, which a cell
-/// range does not use.
+/// `rows` is the call's `rows` argument, which a cell range does not use.
 async fn cell<B: Backend>(
     backend: &B,
     result_id: &str,
@@ -319,10 +280,6 @@ async fn cell<B: Backend>(
     render::read(reply, budget, rows)
 }
 
-/// The bytes a cell read asks trawld for: the budget, held to the
-/// `[capture] max_wire_bytes` trawld's `capabilities` report, because
-/// trawld refuses any longer range. When the capabilities could not be
-/// read, the budget, and trawld's answer stands.
 fn cell_length(budget: Budget, capabilities: Option<&CapabilitiesResponse>) -> u64 {
     let length = budget.bytes() as u64;
     capabilities.map_or(length, |capabilities| {

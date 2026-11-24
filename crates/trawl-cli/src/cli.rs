@@ -37,7 +37,6 @@ pub enum SeverityDialect {
 }
 
 impl SeverityDialect {
-    /// The wire token — the one spelling the server parses.
     #[must_use]
     pub fn token(self) -> &'static str {
         match self {
@@ -47,7 +46,6 @@ impl SeverityDialect {
     }
 }
 
-/// Resolved connection parameters (after config + env + CLI override merge).
 #[derive(Clone)]
 pub struct ConnectionParams {
     pub url: String,
@@ -56,8 +54,6 @@ pub struct ConnectionParams {
 }
 
 impl ConnectionParams {
-    /// Build the `HttpClient` for these params. Every command and the TUI
-    /// connect through here, so the trust rules have one home.
     pub fn client(&self) -> Result<trawl_client::HttpClient, CliError> {
         Ok(trawl_client::HttpClient::with_trust(
             &self.url,
@@ -67,7 +63,6 @@ impl ConnectionParams {
     }
 }
 
-/// Hand-written so the API token never reaches a log line or a panic message.
 impl std::fmt::Debug for ConnectionParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConnectionParams")
@@ -78,26 +73,18 @@ impl std::fmt::Debug for ConnectionParams {
     }
 }
 
-/// The display zone a command that prints instants reads from
-/// `ui.timezone`, parsed once before it sends anything. An invalid value is
-/// a usage error naming it; no path falls back to UTC.
 pub fn display_zone(value: &str) -> Result<DisplayZone, CliError> {
     value
         .parse()
         .map_err(|refusal: trawl_api::zone::ZoneRefusal| CliError::Usage(refusal.to_string()))
 }
 
-/// Export a query's results as Parquet to `output`.
-///
-/// Parquet carries UTC instants and prints none, so this path never reads
-/// the display zone.
 pub async fn run_parquet_query(
     query: &str,
     data: Option<&str>,
     output: Option<&Path>,
     conn: Option<ConnectionParams>,
 ) -> Result<(), CliError> {
-    // Parquet output requires -o flag (binary format can't go to stdout).
     let Some(output_path) = output else {
         return Err(CliError::Usage(
             "parquet output requires -o/--output flag".into(),
@@ -105,14 +92,9 @@ pub async fn run_parquet_query(
     };
     // Callers reach this without `run_query`, so it advises for itself.
     render_query_advice(query, trawl_core::parser::parse(query).ok().as_ref());
-    // Use DuckDB's native COPY TO directly.
     run_parquet_export(query, data, conn.as_ref(), output_path).await
 }
 
-/// Execute a query and print the results, each instant in `zone`.
-///
-/// A Parquet `format` goes to [`run_parquet_query`], which never reads
-/// `zone`.
 pub async fn run_query(
     query: &str,
     data: Option<&str>,
@@ -130,13 +112,8 @@ pub async fn run_query(
         return run_parquet_query(query, data, output, conn).await;
     }
 
-    // One local parse serves the embedded checks below and the advice. It
-    // builds the patterns on both paths, so a text local validation refuses
-    // gets no advice; a failed parse leaves the error to the run.
     let parsed = trawl_core::parser::parse(query).ok();
 
-    // Block `from saved` in embedded mode: resolving a saved query's name
-    // to parquet paths needs the server's saved-query and report-run stores.
     if data.is_some()
         && let Some(ast) = &parsed
         && ast.from_saved_stage().is_some()
@@ -150,9 +127,6 @@ pub async fn run_query(
 
     let (mut result, degraded, severity_columns) = if let Some(data) = data {
         match run_embedded_mode(data, query) {
-            // Embedded mode has no catalog, so no degraded notice to
-            // carry; `sev()` declares its own pin, so its columns still
-            // render as tokens without one.
             Ok(r) => (r, Vec::new(), embedded_severity_columns(parsed.as_ref())),
             Err(CliError::Engine(ref engine_err)) => {
                 render_engine_error(query, engine_err);
@@ -189,12 +163,8 @@ pub async fn run_query(
     )
 }
 
-/// The severity-rendering columns of an embedded query, given its parse.
-///
 /// The same walk the server runs, from a pin-blind root: with no catalog
-/// only a function-declared pin survives it, which is exactly `sev()`. An
-/// unparseable query (`None`) renders nothing special; the engine reports
-/// the parse error.
+/// only a function-declared pin survives it, which is exactly `sev()`.
 fn embedded_severity_columns(parsed: Option<&trawl_core::ast::Query>) -> Vec<String> {
     parsed.map_or_else(Vec::new, |ast| {
         trawl_core::pin_scope::severity_output_columns(
@@ -204,14 +174,6 @@ fn embedded_severity_columns(parsed: Option<&trawl_core::ast::Query>) -> Vec<Str
     })
 }
 
-/// Write the results and their footer to the two streams.
-///
-/// The stream split is the contract: with `-o`, the file is the
-/// deliverable and the footer goes to `err` so it can never
-/// contaminate it; without it, results and footer share `out`.
-///
-/// `destination` is what `out` is. The `-o` file is data even when `out`
-/// is a terminal, so its json and csv carry every value exactly.
 #[allow(clippy::too_many_arguments)]
 fn emit_results(
     result: &mut QueryResult,
@@ -234,7 +196,6 @@ fn emit_results(
             Destination::Data,
             &mut file,
         )?;
-        // The file is the deliverable; the notice belongs on the terminal.
         write_degraded_footer(err, format, degraded)?;
     } else {
         render_results(result, format, zone, severity_columns, destination, out)?;
@@ -244,10 +205,6 @@ fn emit_results(
     Ok(())
 }
 
-/// Render the result rows in the requested format, each instant in `zone`.
-///
-/// The table presents each instant with its own offset; json and csv carry
-/// the wire spelling re-written in `zone`, so `result` leaves converted.
 fn render_results(
     result: &mut QueryResult,
     format: OutputFormat,
@@ -270,15 +227,9 @@ fn render_results(
     }
 }
 
-/// The incomplete-results footer (ADR-0011): one line after the row count
-/// when the query bound a field whose pin is shelving values.
-///
 /// Table output only. json/csv/parquet carry `degraded_fields` on the wire,
-/// which is the notice for a machine, and a prose line inside a machine
-/// format is a parse error waiting to happen. One sentence, no advice beyond
-/// where to look: the case file holds the evidence and the remedy.
-///
-/// A field name is sender text, so each is sanitized whole.
+/// and a prose line inside a machine format is a parse error waiting to
+/// happen.
 fn write_degraded_footer(
     out: &mut impl Write,
     format: OutputFormat,
@@ -297,20 +248,12 @@ fn write_degraded_footer(
     )
 }
 
-/// Validate a DSL query.
-///
-/// If connection params are provided, validates via the server. Otherwise,
-/// validates locally with the same checks: the parse, then
-/// `trawl_core::emitter::validate_pipeline`.
 pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result<(), CliError> {
     if let Some(conn) = conn {
-        // Server-side validation (richer checks).
         let client = conn.client()?;
         let response = client.validate(query).await?;
         if response.valid {
             write_valid(&mut std::io::stdout().lock(), &response)?;
-            // Advice is local and needs no catalog: the server's verdict
-            // stands, and a text the local parser refuses gets none.
             if let Ok(parsed) = trawl_core::parser::parse_unbuilt(query) {
                 let _ = write_advice(
                     &mut io::stderr().lock(),
@@ -323,9 +266,6 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
             return Err(CliError::Usage("query validation failed".into()));
         }
     } else {
-        // Local validation: the parse, then the shared semantic checks
-        // the server's validate and both query lanes run (calls, literal
-        // positions, JSON paths, projections), with no catalog to consult.
         let (errors, advice) = match trawl_core::parser::parse(query) {
             Ok(parsed) => match trawl_core::emitter::validate_pipeline(&parsed.pipeline) {
                 Ok(()) => (Vec::new(), Some(trawl_core::advice::advise(&parsed))),
@@ -348,9 +288,6 @@ pub async fn run_validate(query: &str, conn: Option<ConnectionParams>) -> Result
     Ok(())
 }
 
-/// Print a valid server verdict: `valid`, then why the server returned no
-/// formatted text when it refused to format. A refusal leaves the query
-/// valid, so it is a note, not an error (ADR-0061).
 fn write_valid(
     out: &mut impl std::io::Write,
     response: &trawl_client::ValidationResponse,
@@ -366,7 +303,6 @@ fn write_valid(
     Ok(())
 }
 
-/// Export query results as parquet (embedded or daemon mode).
 async fn run_parquet_export(
     query: &str,
     data: Option<&str>,
@@ -374,10 +310,7 @@ async fn run_parquet_export(
     output_path: &Path,
 ) -> Result<(), CliError> {
     if let Some(data) = data {
-        // Embedded mode: export directly via DuckDB.
         let executor = trawl_engine::executor::Executor::new()?;
-        // Embedded mode is pin-blind by design (no catalog, ADR-0011):
-        // the explicit empty set keeps that decision visible.
         executor.export_parquet(
             query,
             data,
@@ -386,7 +319,6 @@ async fn run_parquet_export(
             usize::MAX,
         )?;
     } else if let Some(conn) = conn {
-        // Daemon mode: fetch parquet bytes via HTTP export endpoint.
         let client = conn.client()?;
         let bytes = client
             .export(query, trawl_client::ExportFormat::Parquet, None)
@@ -400,7 +332,6 @@ async fn run_parquet_export(
     Ok(())
 }
 
-/// Connect to the daemon and execute the query over HTTPS.
 async fn run_daemon_mode(
     conn: &ConnectionParams,
     query: &str,
@@ -410,9 +341,6 @@ async fn run_daemon_mode(
     Ok(daemon_outcome(response))
 }
 
-/// Split a daemon response into what the printer needs: the rows, the
-/// degraded-field note (ADR-0011) and the severity columns. Both advisory
-/// channels are carried, never dropped.
 fn daemon_outcome(
     response: trawl_client::QueryResponse,
 ) -> (QueryResult, Vec<String>, Vec<String>) {
@@ -423,12 +351,8 @@ fn daemon_outcome(
     )
 }
 
-/// Execute the query locally with an embedded `DuckDB` engine.
 fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
     let executor = trawl_engine::executor::Executor::new()?;
-    // CLI has no server-side row limit, hence usize::MAX. Embedded mode is
-    // pin-blind by design (no catalog, ADR-0011): the explicit empty set
-    // keeps that decision visible.
     Ok(executor.run_query(
         query,
         data,
@@ -436,8 +360,6 @@ fn run_embedded_mode(data: &str, query: &str) -> Result<QueryResult, CliError> {
         usize::MAX,
     )?)
 }
-
-// -- output formatters -------------------------------------------------------
 
 fn render_table(
     result: &QueryResult,
@@ -459,11 +381,6 @@ fn render_table(
     let headers: Vec<String> = result.columns.iter().map(|c| table_cell(&c.name)).collect();
     table.set_header(headers);
 
-    // A severity column displays its OTel token (ADR-0013 §6): `17` reads
-    // `error`, the same vocabulary that would filter it. `_severity` by
-    // name, plus whatever the response declared (a `sev()` output). Only
-    // the table renders it; json/csv keep the number for arithmetic
-    // consumers.
     let severity_cells: Vec<bool> = result
         .columns
         .iter()
@@ -475,8 +392,6 @@ fn render_table(
             .iter()
             .enumerate()
             .map(|(i, v)| {
-                // A timestamp shows its wall clock in the display zone with
-                // that instant's own offset, whatever its column is called.
                 let presented = result
                     .columns
                     .get(i)
@@ -499,17 +414,6 @@ fn render_table(
     Ok(())
 }
 
-/// The `OTel` token a `_severity` cell displays, or `None` where the
-/// ladder has no reading for it and the surface renders the value the
-/// way it renders any other.
-///
-/// The one in-crate door onto `trawl_core::severity::token_text` — the
-/// table renderer here and the TUI results grid share the rule but not
-/// their fallback formatting.
-///
-/// An unsigned past `i64::MAX` reads like every other shape the ladder
-/// has no rung for: no token, and the cell shows its digits. Every
-/// dialect's ladder ends well inside `i64`.
 pub(crate) fn severity_token(v: &Value) -> Option<&'static str> {
     match v {
         Value::Integer(n) => trawl_core::severity::token_text(*n),
@@ -517,7 +421,6 @@ pub(crate) fn severity_token(v: &Value) -> Option<&'static str> {
     }
 }
 
-/// A `_severity` cell as the table shows it.
 fn severity_cell_text(v: &Value) -> String {
     severity_token(v).map_or_else(|| v.to_string(), str::to_owned)
 }
@@ -530,8 +433,6 @@ fn render_ndjson(
     for row in &result.rows {
         let mut map = serde_json::Map::new();
         for (col, val) in result.columns.iter().zip(row.iter()) {
-            // An export file, not the wire: integers stay JSON numbers
-            // (ADR-0035, amended 2026-10-22).
             map.insert(col.name.clone(), val.to_plain_json());
         }
         write_json_line(out, &map, destination)?;
@@ -561,8 +462,6 @@ fn render_csv(
     Ok(())
 }
 
-/// Escape a value for CSV output, applying formula injection protection
-/// only to string values (numeric types are inherently safe).
 fn csv_escape_value(val: &Value, destination: Destination) -> String {
     match val {
         Value::Null => String::new(),
@@ -576,11 +475,9 @@ fn csv_escape_value(val: &Value, destination: Destination) -> String {
     }
 }
 
-/// Text as one CSV field for `destination`.
-///
 /// On a terminal each unsafe character, a line break included, becomes
 /// U+FFFD first, so formula protection and quoting see the text the
-/// operator will. Elsewhere the field carries the text exactly.
+/// operator will.
 fn csv_text(text: &str, destination: Destination) -> String {
     match destination {
         Destination::Terminal => csv_escape_string(&sanitize_display_text(text)),
@@ -588,11 +485,7 @@ fn csv_text(text: &str, destination: Destination) -> String {
     }
 }
 
-/// Escape a string for CSV, preventing formula injection and quoting
-/// as needed for commas, quotes, and newlines.
 fn csv_escape_string(s: &str) -> String {
-    // Prevent CSV injection: prefix formula-triggering characters with a
-    // single quote so spreadsheet apps don't interpret cells as formulas.
     let s = if s.starts_with(['=', '+', '-', '@', '\t', '|']) {
         format!("'{s}")
     } else {
@@ -606,9 +499,6 @@ fn csv_escape_string(s: &str) -> String {
     }
 }
 
-// -- error rendering ----------------------------------------------------------
-
-/// Convert a `ParseError` to an `ErrorDetail` for display.
 fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::ErrorDetail {
     trawl_client::ErrorDetail {
         message: e.message.clone(),
@@ -621,30 +511,10 @@ fn parse_error_to_detail(e: &trawl_core::parser::ParseError) -> trawl_client::Er
     }
 }
 
-/// Render structured error details with rustc-style caret underlines to stderr.
-///
-/// For each detail with a span, shows the query text with the error region
-/// underlined:
-/// ```text
-///   _severity=error | staats count() by host
-///                     ~~~~~~
-///   unknown command 'staats'
-///   hint: did you mean 'stats'?
-/// ```
 pub fn render_error_details(query: &str, details: &[trawl_client::ErrorDetail]) {
-    // stderr is the last place to report anything; a failed write has
-    // nowhere to go.
     let _ = write_error_details(&mut io::stderr().lock(), query, details);
 }
 
-/// Write `details` against `query`, the text that was sent.
-///
-/// A span is located with [`locate_span`]. One that cannot index `query`
-/// (reversed, past the end, or inside a character) gets the message and
-/// hint without an excerpt; it is never clamped. A located span shows the
-/// line holding its start, sanitized, and carets under the span's display
-/// cells. A span running onto a later line marks only its start line.
-/// The message and hint are sanitized too: they reach the terminal.
 fn write_error_details(
     out: &mut impl Write,
     query: &str,
@@ -667,8 +537,6 @@ fn write_error_details(
     Ok(())
 }
 
-/// Write the excerpt that heads a located span: a blank line, the span's
-/// start line sanitized, and carets under the span's display cells.
 fn write_caret_excerpt(
     out: &mut impl Write,
     query: &str,
@@ -685,17 +553,11 @@ fn write_caret_excerpt(
     )
 }
 
-/// Print the advice on `parsed`, the parse of `query`, to stderr before
-/// the query runs. A query that did not parse, or that fails the shared
-/// semantic checks, gets none: its errors are the run's to report.
-/// Advice never changes what runs or what is printed on stdout.
 fn render_query_advice(query: &str, parsed: Option<&trawl_core::ast::Query>) {
     let Some(parsed) = parsed else { return };
     if trawl_core::emitter::validate_pipeline(&parsed.pipeline).is_err() {
         return;
     }
-    // stderr is the last place to report anything; a failed write has
-    // nowhere to go.
     let _ = write_advice(
         &mut io::stderr().lock(),
         query,
@@ -703,10 +565,6 @@ fn render_query_advice(query: &str, parsed: Option<&trawl_core::ast::Query>) {
     );
 }
 
-/// Write `report`, advice on `query`, in the error layout: the caret
-/// excerpt, then `advice:` with the message and `hint:` with the hint,
-/// both sanitized. A span that cannot index `query` gets no excerpt. When
-/// the report left findings out, the last line says how many.
 fn write_advice(
     out: &mut impl Write,
     query: &str,
@@ -728,17 +586,10 @@ fn write_advice(
     Ok(())
 }
 
-/// Render a `ClientError` with span details (if available) for CLI output.
 pub fn render_client_error(query: &str, err: &trawl_client::ClientError) {
-    // stderr is the last place to report anything; a failed write has
-    // nowhere to go.
     let _ = write_client_error(&mut io::stderr().lock(), query, err);
 }
 
-/// Write `err` for the query `query`, the text that was sent.
-///
-/// The summary line is sanitized like the details: the server's message
-/// and the error around it reach the terminal.
 fn write_client_error(
     out: &mut impl Write,
     query: &str,
@@ -762,17 +613,10 @@ fn write_client_error(
     }
 }
 
-/// Render an `EngineError` with span details for embedded mode.
 pub fn render_engine_error(query: &str, err: &trawl_engine::error::EngineError) {
-    // stderr is the last place to report anything; a failed write has
-    // nowhere to go.
     let _ = write_engine_error(&mut io::stderr().lock(), query, err);
 }
 
-/// Write `err` for the query `query`, the text that was run.
-///
-/// An error other than a parse error can quote the data the engine read,
-/// so it is sanitized whole, like the details.
 fn write_engine_error(
     out: &mut impl Write,
     query: &str,
@@ -788,11 +632,6 @@ fn write_engine_error(
     }
 }
 
-// -- driver output formatters -------------------------------------------------
-
-/// Render driver result data (columns + JSON rows) in the requested format.
-/// Used by `trawl driver query`, `trawl driver get-results` and the
-/// `trawl schema` tables.
 pub fn render_driver_results(
     columns: &[String],
     rows: &[Vec<serde_json::Value>],
@@ -877,19 +716,16 @@ fn render_driver_csv(
     Ok(())
 }
 
-/// Display a JSON value as a human-readable string (for table cells).
 fn json_display(v: &serde_json::Value) -> String {
     match v {
         serde_json::Value::Null => "null".to_owned(),
         serde_json::Value::Bool(b) => b.to_string(),
         serde_json::Value::Number(n) => n.to_string(),
         serde_json::Value::String(s) => s.clone(),
-        // Arrays/objects: compact JSON representation.
         other => other.to_string(),
     }
 }
 
-/// CSV-escape a JSON value, applying formula injection protection to strings.
 fn csv_escape_json(v: &serde_json::Value, destination: Destination) -> String {
     match v {
         serde_json::Value::Null => String::new(),
@@ -904,7 +740,6 @@ fn csv_escape_json(v: &serde_json::Value, destination: Destination) -> String {
 mod tests {
     use super::*;
 
-    /// A format refusal prints under `valid` and is not an error.
     #[test]
     fn a_valid_query_the_server_would_not_format_says_why() {
         let render = |format_error| {
@@ -930,9 +765,6 @@ mod tests {
         );
     }
 
-    /// The notice is a table-only footer: a machine format carries the
-    /// wire field instead, and a prose line inside ndjson or CSV would
-    /// corrupt it.
     #[test]
     fn the_degraded_footer_is_table_only() {
         let fields = vec!["duration".to_owned(), "status".to_owned()];
@@ -956,10 +788,6 @@ mod tests {
         );
     }
 
-    /// AC 2: integers past 2^53 reach the table with every digit. The
-    /// response is decoded from its wire text, decimal strings under an
-    /// `integer` column, so this is the path a daemon answer takes; a
-    /// reader that went through `f64` would print 9007199254740992.
     #[test]
     fn the_table_prints_big_integers_from_the_wire_exactly() {
         let response: trawl_client::QueryResponse = serde_json::from_str(
@@ -1004,8 +832,6 @@ mod tests {
         assert!(degraded.is_empty());
     }
 
-    /// A mocked daemon response carrying the note channel beside one
-    /// result row.
     fn mocked_response() -> trawl_client::QueryResponse {
         trawl_client::QueryResponse {
             execution: None,
@@ -1028,9 +854,6 @@ mod tests {
         }
     }
 
-    /// The daemon path carries the note channel off the wire and puts it
-    /// on the right stream: with the results when stdout is the
-    /// deliverable, on stderr when a file is.
     #[test]
     fn the_daemon_note_reaches_the_terminal_and_never_the_deliverable() {
         let (result, degraded, severity) = daemon_outcome(mocked_response());
@@ -1059,14 +882,11 @@ mod tests {
         let emit =
             |format, output: Option<&Path>| emit_with(&result, format, output, Destination::Data);
 
-        // Table to stdout: the footer rides the result stream, stderr silent.
         let (out, err) = emit(OutputFormat::Table, None);
         assert!(out.contains("db1"), "{out}");
         assert!(out.contains("note: results may be incomplete"), "{out}");
         assert!(err.is_empty(), "{err}");
 
-        // Table to a file: the file is the deliverable, the footer is
-        // stderr's, and stdout stays silent.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.txt");
         let (out, err) = emit(OutputFormat::Table, Some(&path));
@@ -1076,7 +896,6 @@ mod tests {
         assert!(file.contains("db1"), "{file}");
         assert!(!file.contains("note:"), "{file}");
 
-        // Machine formats stay byte-clean: the wire field is the notice.
         for format in [OutputFormat::Json, OutputFormat::Csv] {
             let (out, err) = emit(format, None);
             assert!(!out.contains("note:"), "{out}");
@@ -1089,9 +908,6 @@ mod tests {
         let (csv, _) = emit(OutputFormat::Csv, None);
         assert_eq!(csv, "host\ndb1\n");
 
-        // The file is data even when stdout is a terminal: with sender text
-        // in a row, the `-o` json and csv hold the bytes a pipe gets. Only
-        // the table, a human format, is sanitized in the file.
         let mut hostile = result.clone();
         hostile
             .rows
@@ -1117,7 +933,6 @@ mod tests {
         assert!(file.contains("x\u{FFFD}[2J\u{FFFD}"), "{file}");
     }
 
-    /// The table renders the token; json and csv keep the number.
     #[test]
     fn the_severity_column_displays_its_token_in_the_table_only() {
         assert_eq!(severity_cell_text(&Value::Integer(17)), "error");
@@ -1147,8 +962,6 @@ mod tests {
         assert!(render(render_csv).contains("17"));
     }
 
-    /// A pivot names its columns from data, so a timestamp column can be
-    /// called `_severity`. Its type decides how it reads, not its name.
     #[test]
     fn a_timestamp_column_named_like_severity_still_shows_in_the_display_zone() {
         use trawl_engine::value::{Column, ColumnType};
@@ -1171,10 +984,6 @@ mod tests {
         assert!(table.contains("2026-10-25 02:30:00 +02:00"), "{table}");
     }
 
-    /// The table shows each instant in the display zone with its own
-    /// offset, so the two 02:30s of a fall-back night differ; json and csv
-    /// carry the wire spelling re-written in the zone. A string column
-    /// holding time-shaped text stays as sent everywhere.
     #[test]
     fn query_output_presents_each_instant_in_the_display_zone() {
         use trawl_engine::value::{Column, ColumnType};
@@ -1239,8 +1048,6 @@ mod tests {
         assert!(row.ends_with(",2026-10-25T00:30:00.000000Z"), "{row}");
     }
 
-    /// The zone a query reads comes from the one trawl-api grammar, and a
-    /// refusal is a usage error naming the value.
     #[test]
     fn an_invalid_display_zone_is_a_usage_error_naming_it() {
         assert_eq!(display_zone(" local ").unwrap(), DisplayZone::Local);
@@ -1249,9 +1056,6 @@ mod tests {
         assert!(err.to_string().contains("\"Mars/Olympus\""), "{err}");
     }
 
-    /// A declared severity column (`sev()`'s output under its own alias)
-    /// renders its token in the table and its number everywhere a machine
-    /// reads (ADR-0013).
     #[test]
     fn a_declared_severity_column_displays_its_token_in_the_table_only() {
         let result = QueryResult {
@@ -1272,7 +1076,6 @@ mod tests {
             "the undeclared column keeps its number: {table}"
         );
 
-        // Undeclared: no list, no tokens.
         let mut buf = Vec::new();
         render_table(&result, DisplayZone::Utc, &[], &mut buf).unwrap();
         let plain = String::from_utf8(buf).unwrap();
@@ -1293,7 +1096,6 @@ mod tests {
         let table = String::from_utf8(buf).unwrap();
         assert!(table.contains("error2"), "mixed-case alias: {table}");
 
-        // Machine formats carry the number in both columns.
         for f in [
             render_ndjson as fn(&QueryResult, Destination, &mut Vec<u8>) -> io::Result<()>,
             render_csv,
@@ -1305,8 +1107,6 @@ mod tests {
         }
     }
 
-    /// The embedded lane names the same columns the server would: the pin
-    /// is the function's, so it survives a catalog-less root.
     #[test]
     fn the_embedded_lane_declares_sev_columns_without_a_catalog() {
         let embedded_severity_columns = |query: &str| {
@@ -1425,10 +1225,6 @@ mod tests {
         );
     }
 
-    /// Embedded parquet export is unbounded when the CLI supplies no row
-    /// limit. Exercises the public CLI lane and reads the artifact back
-    /// through `DuckDB`, since a literal `LIMIT usize::MAX` fails inside
-    /// `DuckDB` before any file is written.
     #[tokio::test]
     async fn embedded_parquet_export_without_limit_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
@@ -1464,7 +1260,6 @@ mod tests {
         assert_eq!(roundtrip, source);
     }
 
-    /// What `write_error_details` prints for one detail with `span`.
     fn render_detail(query: &str, span: Option<(usize, usize)>) -> String {
         let detail = trawl_client::ErrorDetail {
             message: "the message".into(),
@@ -1477,13 +1272,8 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
-    /// The message and hint, alone: what a span that cannot index the
-    /// query gets.
     const NO_EXCERPT: &str = "  the message\n  hint: the hint\n\n";
 
-    /// Every row of the shared span table renders its excerpt line and a
-    /// caret line at the row's display cells, or the message and hint with
-    /// no excerpt when the span cannot index the text.
     #[test]
     fn terminal_caret_layout_conformance() {
         for case in trawl_core::text_layout::SPAN_CASES {
@@ -1512,8 +1302,6 @@ mod tests {
         }
     }
 
-    /// The issue's query: the caret sits under the `(`, the span's first
-    /// display cell, after two double-width characters.
     #[test]
     fn terminal_caret_layout_conformance_issue_query() {
         let query = "service=\"日本\" | where x ~ /(/";
@@ -1529,8 +1317,6 @@ mod tests {
         );
     }
 
-    /// A CRLF query prints no `\r`, and a span running onto later lines
-    /// marks only its start line.
     #[test]
     fn terminal_caret_layout_conformance_crlf() {
         let query = "service=web\r\n| stats count(\r\nby host";
@@ -1543,8 +1329,6 @@ mod tests {
         );
     }
 
-    /// Reversed, past-end and mid-character spans print the message and
-    /// hint with no excerpt, never a clamped caret.
     #[test]
     fn terminal_caret_layout_conformance_unusable_spans() {
         let query = "a=é b";
@@ -1560,8 +1344,6 @@ mod tests {
         assert_eq!(render_detail(query, None), NO_EXCERPT, "no span");
     }
 
-    /// What `write_client_error` prints for a server error whose message
-    /// is `message` and whose one detail has `span`.
     fn render_server_error(message: &str, span: Option<(usize, usize)>) -> String {
         let err = trawl_client::ClientError::Server {
             status: 400,
@@ -1584,8 +1366,6 @@ mod tests {
         String::from_utf8(buf).unwrap()
     }
 
-    /// The summary line, with a span (the envelope's message) or without
-    /// one (the whole error), cannot rewrite the terminal either.
     #[test]
     fn client_error_summary_is_sanitized() {
         let message = "bad\u{1b}[2J\u{202E}x";
@@ -1608,8 +1388,6 @@ mod tests {
         );
     }
 
-    /// A message or hint holding control or bidi characters cannot rewrite
-    /// the terminal line.
     #[test]
     fn terminal_caret_layout_conformance_sanitizes_message_and_hint() {
         let detail = trawl_client::ErrorDetail {
@@ -1626,9 +1404,6 @@ mod tests {
         );
     }
 
-    /// Sender text a table draws, each with what the cell rule makes of it:
-    /// an OSC 52 clipboard write (ESC and BEL), a screen clear, a C1 CSI,
-    /// an RLO, a zero-width space, a soft hyphen, a tab and a lone CR.
     const HOSTILE_CELLS: [(&str, &str); 8] = [
         ("o\u{1b}]52;c;aGk=\u{7}k", "o\u{FFFD}]52;c;aGk=\u{FFFD}k"),
         ("c\u{1b}[2Jl", "c\u{FFFD}[2Jl"),
@@ -1640,16 +1415,12 @@ mod tests {
         ("c\rr", "c\u{FFFD}r"),
     ];
 
-    /// The unsafe characters in `text` that are not a line break.
     fn unsafe_chars(text: &str) -> usize {
         text.chars()
             .filter(|&c| c != '\n' && trawl_core::sanitize::is_unsafe_display_char(c))
             .count()
     }
 
-    /// The text of every cell line a table draws, left to right and top
-    /// to bottom: what sits between its borders (`│` outside, `┆` between
-    /// columns), with the padding spaces (only those) trimmed.
     fn cell_lines(table: &str) -> Vec<&str> {
         table
             .lines()
@@ -1659,10 +1430,6 @@ mod tests {
             .collect()
     }
 
-    /// Both comfy-table renderers draw every header and cell through the
-    /// cell rule, after value presentation: no unsafe character reaches the
-    /// output, each becomes one U+FFFD, and a line break stays a line inside
-    /// its cell.
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -1674,10 +1441,6 @@ mod tests {
         let header = "n\u{1b}[2J\u{202e}\u{9b}";
         let header_shown = "n\u{FFFD}[2J\u{FFFD}\u{FFFD}";
 
-        // `trawl query`: a string column under a hostile name, a list, a
-        // `_severity` column whose text has no token (the fallback), and a
-        // timestamp column whose text does not parse (present_cell's
-        // fallback).
         let result = QueryResult {
             columns: vec![
                 Column::new(header, ColumnType::String),
@@ -1722,10 +1485,8 @@ mod tests {
                 .sum::<usize>();
         assert_eq!(table.matches('\u{FFFD}').count(), sent, "{table}");
 
-        // The driver table (`schema`, `driver query`, `get-results`): a
-        // hostile header, a string, and an object whose keys and values are
-        // hostile. json_display spells the object as compact JSON, which
-        // escapes C0 controls but leaves C1, bidi and format characters raw.
+        // json_display spells the object as compact JSON, which escapes C0
+        // controls but leaves C1, bidi and format characters raw.
         let columns = vec![header.to_owned(), "text".to_owned(), "obj".to_owned()];
         let rows: Vec<Vec<serde_json::Value>> = HOSTILE_CELLS
             .iter()
@@ -1763,7 +1524,6 @@ mod tests {
                 .sum::<usize>();
         assert_eq!(table.matches('\u{FFFD}').count(), sent, "{table}");
 
-        // A line break, LF or CRLF, is a second line inside the same cell.
         let broken = QueryResult {
             columns: vec![Column::new("text", ColumnType::String)],
             rows: vec![
@@ -1794,15 +1554,11 @@ mod tests {
         assert_eq!(cell_lines(&table), ["text", "a", "b", "a", "b"], "{table}");
     }
 
-    /// Every value a prose line interpolates goes through the sanitize
-    /// rule whole: its ESC, RLO and line break each print U+FFFD, and only
-    /// the line's own layout breaks it.
     #[test]
     fn terminal_cli_lines_sanitize_sender_text() {
         let hostile = "v\u{1b}[2J\u{202e}\nx";
         let shown = "v\u{FFFD}[2J\u{FFFD}\u{FFFD}x";
 
-        // The degraded footer names the field twice.
         let mut buf = Vec::new();
         write_degraded_footer(
             &mut buf,
@@ -1818,7 +1574,6 @@ mod tests {
             )
         );
 
-        // The server's reason for not formatting a valid query.
         let response = trawl_client::ValidationResponse {
             valid: true,
             errors: vec![],
@@ -1835,7 +1590,6 @@ mod tests {
             format!("valid\nnot formatted: {shown}\n")
         );
 
-        // An embedded engine error, which can quote the data it read.
         let refused = trawl_engine::error::EngineError::Refused {
             message: hostile.to_owned(),
         };
@@ -1843,7 +1597,6 @@ mod tests {
         write_engine_error(&mut buf, "q", &refused).unwrap();
         assert_eq!(String::from_utf8(buf).unwrap(), format!("trawl: {shown}\n"));
 
-        // A parse error keeps its heading and its caret details.
         let parse = trawl_engine::error::EngineError::Parse(vec![trawl_core::parser::ParseError {
             message: hostile.to_owned(),
             span: 0..1,
@@ -1858,10 +1611,6 @@ mod tests {
         );
     }
 
-    /// One string per group of characters the sanitize rule names, each
-    /// group whole: every C0 control, DEL and every C1 control, the soft
-    /// hyphen, and each explicit range of bidi, zero-width, joiner and
-    /// separator characters. Together they are every unsafe character.
     fn every_unsafe_group() -> Vec<String> {
         use trawl_core::sanitize::is_unsafe_display_char;
         let groups: Vec<String> = [
@@ -1889,10 +1638,6 @@ mod tests {
         groups.iter().map(|group| format!("<{group}>")).collect()
     }
 
-    /// The json under test: every unsafe group, then text that must decode
-    /// unchanged (a quote, a literal backslash, the six characters
-    /// `\u202e`, a backslash right before a real RLO, and a safe character
-    /// outside the BMP), then one short value per escape the test reads.
     fn json_texts() -> Vec<String> {
         let mut texts = every_unsafe_group();
         texts.extend(
@@ -1912,10 +1657,6 @@ mod tests {
         texts
     }
 
-    /// The data bytes are `serde_json::to_writer` of each map plus a
-    /// newline. The terminal text holds no unsafe character but one
-    /// record-ending newline per row, decodes line by line to the same
-    /// maps, and spells each escape the test names.
     fn assert_terminal_json(
         data: &[u8],
         terminal: &[u8],
@@ -1953,9 +1694,6 @@ mod tests {
         }
     }
 
-    /// `json` on a terminal writes every unsafe character, in a key or a
-    /// value at any depth, as a `\uXXXX` escape, so each line decodes to
-    /// exactly what a pipe gets; in a pipe the bytes are `serde_json`'s own.
     #[test]
     #[expect(
         clippy::too_many_lines,
@@ -1974,14 +1712,12 @@ mod tests {
             ("neg", Value::Integer(-1), json!(-1)),
             ("max", Value::UInt(u64::MAX), json!(u64::MAX)),
         ];
-        // Every hostile text is a key too.
         let names: Vec<String> = texts
             .iter()
             .map(|t| format!("k{t}"))
             .chain(scalars.iter().map(|(name, ..)| (*name).to_owned()))
             .collect();
 
-        // `trawl query`: a row of strings, then a row of nested lists.
         let result = QueryResult {
             columns: names
                 .iter()
@@ -2025,8 +1761,6 @@ mod tests {
             &maps,
         );
 
-        // The driver renderer: a row of strings, then a row of objects
-        // whose keys at every depth are hostile too.
         let nested = |t: &str| {
             let mut inner = Map::new();
             inner.insert(format!("d{t}"), json!(t));
@@ -2062,9 +1796,6 @@ mod tests {
             &maps,
         );
 
-        // `driver status`, pretty-printed: the data text is
-        // `to_string_pretty`'s, and the terminal text has its layout, line
-        // for line and indent for indent, with only string content escaped.
         let status = crate::tui::driver::DriverData {
             query: Some(texts.concat()),
             result_columns: Some(names.clone()),
@@ -2093,10 +1824,6 @@ mod tests {
         }
     }
 
-    /// `csv` on a terminal writes U+FFFD for each unsafe character, a line
-    /// break included, before formula protection and quoting, so only the
-    /// record separators break lines. A pipe and an `-o` file keep every
-    /// value byte-exact and formula-protected.
     #[test]
     fn terminal_csv_replaces_unsafe_characters() {
         use serde_json::json;
@@ -2113,8 +1840,6 @@ mod tests {
             (text("a\r\nb"), "\"a\r\nb\"", "a\u{FFFD}\u{FFFD}b"),
             (text("a\rb"), "\"a\rb\"", "a\u{FFFD}b"),
             (text("a\tb"), "a\tb", "a\u{FFFD}b"),
-            // A leading tab is a formula trigger in a file, and U+FFFD,
-            // which is none, on a terminal.
             (text("\tx"), "'\tx", "\u{FFFD}x"),
             (text("=cmd"), "'=cmd", "'=cmd"),
             (text("+1"), "'+1", "'+1"),
@@ -2162,7 +1887,6 @@ mod tests {
         assert_eq!(render(Destination::Data), data);
         assert_eq!(render(Destination::Terminal), terminal);
 
-        // `-o` with a terminal on stdout: the file is data.
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("out.csv");
         let (mut out, mut err) = (Vec::new(), Vec::new());
@@ -2181,7 +1905,6 @@ mod tests {
         assert!(out.is_empty() && err.is_empty(), "{out:?} {err:?}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), data);
 
-        // The driver renderer: the same values as JSON, and an object.
         let mut rows: Vec<Vec<serde_json::Value>> =
             cases.iter().map(|c| vec![c.0.1.clone()]).collect();
         rows.push(vec![json!({ "k\u{202e}": "v" })]);

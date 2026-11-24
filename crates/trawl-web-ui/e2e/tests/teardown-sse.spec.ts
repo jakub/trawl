@@ -6,7 +6,7 @@ import { test, expect, intervalCount, resetScenario, trackIntervals } from '../f
 import { SEL } from '../selectors';
 
 /** crates/trawl-web-ui/src/state/stream_session.rs — the live table's
- * render tick, the timer this spec proves is released on unmount. */
+ * render tick. */
 const RENDER_TICK_MS = 16;
 
 async function pollState(request: import('@playwright/test').APIRequestContext) {
@@ -33,11 +33,9 @@ test('an unmounted live tail closes its EventSource and stops reconnecting', asy
   await page.locator(SEL.realtimeTab).click();
   await page.locator(SEL.liveTailButton).click();
 
-  // Live Tail navigates mode=live; the SSE EventSource should open.
   const opened = await waitFor(async () => (await pollState(request)).sse.open === 1, 5_000);
   expect(opened, 'expected /api/v1/stream to open exactly one EventSource after Live Tail').toBe(true);
 
-  // Navigate away in-SPA (unmounts <Search>, which owns the stream).
   await page.locator(SEL.railHistoryLink).click();
   await expect(page.locator('h1')).toHaveText('Search history');
 

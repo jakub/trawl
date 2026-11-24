@@ -1,6 +1,6 @@
 # Advertised controls are functional or absent: disposition of the web UI placeholders
 
-status: accepted (2026-09-05) — prep ruling record for #100 (item 7)
+status: accepted (2026-09-05) — prep ruling record for #100 (item 7); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The web UI shipped with 13 visible controls that promise a capability and
 deliver a "coming soon" title or toast: five Settings rail items that all
@@ -116,3 +116,10 @@ the Search page. The History page keeps its per-row Save as Net. The
 capture, retarget, close and malformed-link rules above apply unchanged to
 the remaining control. The results toolbar keeps View and Export. No
 shortcut or menu item replaces the removed button.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **For an aggregation result, the View panel's Rows group shows the note "Aggregation results always use the plain table" instead of the Compact and Message first choice.** An aggregation result always renders the plain table, so the choice would change nothing, and a control that changes nothing is the broken promise this ADR bans (`ViewPanel` in `pages/search.rs`).
+- **On a net whose run budget is spent, Run now stays in place, disabled, with `RUN_NOW_SPENT_REASON` as its title and accessible description, wherever Run now is offered, in the nets list and in the net drawer. The list shows `spent N/M` on every spent net, the drawer shows it beside Run now, and the list drops its next-run countdown and its `Pending…` wording.** A spent budget is the net's own state, and the operator can lift it by raising `max_runs` (ADR-0018). The disabled control says why the net stopped and how to run it again, where an absent one would say nothing. A missing grant is different: under ADR-0018, Run now is absent for a key without `query`. The server refuses a manual run of a spent schedule with a 409, and the tick lists no spent schedule, so a countdown or a pending state would promise a run that never comes (`run_now_spent` and `run_budget_label` in `schedule_edit.rs`, `pages/nets.rs`, `components/net_drawer.rs`).

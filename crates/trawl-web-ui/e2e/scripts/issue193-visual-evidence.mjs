@@ -2,8 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Build the SPA first. This runs the exact Health assertions that create the
-// wide/narrow captures, using Playwright's existing owned harness lifecycle.
+// Build the SPA first.
 // E2E_PORT=8193 node crates/trawl-web-ui/e2e/scripts/issue193-visual-evidence.mjs /tmp/issue193-captures
 import { spawnSync, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';

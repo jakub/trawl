@@ -215,7 +215,6 @@ impl Cadence {
         }
     }
 
-    /// Whether the wait listens for pressure wakes at all.
     fn listens(&self) -> bool {
         self.next != Next::Cooldown
     }
@@ -271,7 +270,7 @@ fn deadline_after(now: tokio::time::Instant, interval: Duration) -> tokio::time:
 
 /// The loop's passes, in order, as it planned them, woke for them and
 /// settled them, for unit tests that order their steps by passes instead of
-/// by time (#316). A record is pushed under a short lock that is never held
+/// by time. A record is pushed under a short lock that is never held
 /// across an await; tests read clones from a cursor.
 #[cfg(test)]
 #[derive(Default)]
@@ -285,7 +284,6 @@ impl PassLog {
         self.records.lock().unwrap().push(record);
     }
 
-    /// The records from index `from` on.
     fn since(&self, from: usize) -> Vec<PassRecord> {
         self.records
             .lock()
@@ -295,13 +293,11 @@ impl PassLog {
             .unwrap_or_default()
     }
 
-    /// How many records the log holds.
     pub(crate) fn len(&self) -> usize {
         self.records.lock().unwrap().len()
     }
 }
 
-/// One entry of the [`PassLog`].
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PassRecord {
@@ -517,11 +513,6 @@ pub fn spawn_compaction(
                     let data_loss = outcome.data_loss;
                     if let Some(ref stats) = compaction_stats {
                         stats.total_runs.fetch_add(1, Ordering::Relaxed);
-                        // compact_once returns the combined data-loss
-                        // tally: best-effort daily-rollup failures,
-                        // WAL files quarantined this cycle and
-                        // publication markers left blocking. Surface it
-                        // on the dashboard counter, not just in logs.
                         if data_loss > 0 {
                             stats.total_errors.fetch_add(data_loss, Ordering::Relaxed);
                         }
@@ -615,11 +606,9 @@ async fn hold_boot_pass_for_test(shutdown_rx: &mut watch::Receiver<bool>) -> boo
 /// Returns the number of failures this cycle (0 on a clean run): per-service
 /// daily rollups that failed, WAL files quarantined, env WAL directories
 /// that could not be scanned, and publication markers recovery left
-/// blocking. All of these are best-effort and reported via the count so the
-/// caller can track them without failing the whole cycle.
+/// blocking.
 ///
 /// Public for integration tests only — not part of the external API.
-/// Called internally by [`spawn_compaction`].
 ///
 /// `catalog` carries the field-catalog store + pin cache (ADR-0009).
 /// `None` (tests, embedded-style callers) conforms each batch against
@@ -653,20 +642,8 @@ pub async fn compact_once(
 /// [`compact_once`] with the repin interlocks attached (ADR-0011): each
 /// service batch's pin-snapshot → conform → publish phase runs under the
 /// coordinator's corpus-gate read guard, so no batch can straddle a repin
-/// cutover, and the file-relocating daily rollup is suppressed for as long
-/// as the coordinator holds a rollup pause, so the shadow build's catch-up
-/// diff stays additive. The pause stops a pass that has not begun; the
-/// corpus gate, which every relocating unit takes, stops a pass already in
-/// flight from continuing past the cutover. WAL draining waits for cutover.
-/// It also waits when pending rollup recovery needs to relocate files during
-/// a repin pause, because those hourly inputs must remain unchanged.
-///
-/// Each tick first recovers interrupted compaction publishes from their
-/// publication markers (ADR-0041) under the corpus gate, and skips every
-/// `(env, service)` a marker still claims. Each chunk then publishes under
-/// its own marker: see [`publish_output`]. While hydration's overhang
-/// awaits a proof, the WAL phase ends with a coverage proof
-/// ([`coverage_proof`]), before the rollup.
+/// cutover, and the daily rollup is suppressed while the coordinator holds
+/// a rollup pause.
 ///
 /// `min_age` is the compaction interval: orphaned `.parquet.tmp` files
 /// older than twice it are removed. `wal_min_age` selects the WAL files the
@@ -701,7 +678,6 @@ pub async fn compact_once_coordinated(
     .map(|outcome| outcome.data_loss)
 }
 
-/// What one compaction pass reports.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct PassOutcome {
     /// The failure tally [`compact_once_coordinated`] returns: rollup
@@ -759,18 +735,12 @@ async fn compact_pass(
     retry_removal_syncs(&publication).await?;
     recover_pending_rollups(&publication, repin).await?;
 
-    // Tally of corrupt WAL files quarantined this cycle. Folded into the
-    // return value so it lands on `CompactionStats.total_errors` as a
-    // data-loss signal, mirroring the rollup quarantine count.
     let mut wal_quarantined: u64 = 0;
 
-    // Tally of env WAL directories that could not be scanned this cycle.
     let mut scan_failures: u64 = 0;
 
-    // Chunks that failed or left their publish unfinished this cycle.
     let mut chunk_failures: u64 = 0;
 
-    // WAL files selected this cycle, and those compacted and drained.
     let mut eligible: u64 = 0;
     let mut drained: u64 = 0;
 
@@ -778,16 +748,12 @@ async fn compact_pass(
     // `wal_dir/{env}/` and parquet in `data_dir/{env}/{date}/{HH}/`.
     //
     // The root listing is fallible on purpose: an unreadable WAL root is not
-    // an empty WAL root. Swallowing it would iterate nothing and report a
-    // clean cycle while the WAL never drains and the hot buffer fills until
-    // admission refuses ingest (ADR-0043). A *missing* root is a cold start and yields an
-    // empty list silently. Unlike a single unreadable env (isolated and
-    // counted), a bad root leaves nothing to carry on with.
+    // an empty WAL root. A *missing* root is a cold start and yields an
+    // empty list silently.
     //
     // A root entry that cannot be inspected still lets the listed envs
     // drain, but the pass counts it as a persistent failure: the entry may
-    // be an env whose WAL never drains, and the next pass would skip it the
-    // same way.
+    // be an env whose WAL never drains.
     let mut skipped_scan_error = false;
     let env_wal_dirs = try_list_env_dirs_observed(wal_dir, || skipped_scan_error = true);
     if skipped_scan_error || env_wal_dirs.is_err() {
@@ -831,7 +797,6 @@ async fn compact_pass(
             continue;
         }
         eligible += files.len() as u64;
-        // Group WAL files by service prefix.
         let groups = group_by_service(files);
 
         for (service, wal_files) in &groups {
@@ -851,13 +816,10 @@ async fn compact_pass(
                 "compacting service batch"
             );
 
-            // Process WAL files in chunks to avoid OOM on large backlogs.
-            // Each chunk independently compacts to parquet (merging with
-            // the canonical file if it exists), drains the hot buffer, and
-            // retires its consumed WAL files, all inside one marker-bracketed
-            // publish. If a chunk fails, remaining chunks are skipped and
-            // retried on the next tick: a failed publish may have left its
-            // marker, and the next chunk must not overwrite it.
+            // Process WAL files in chunks to avoid OOM on large backlogs. If a
+            // chunk fails, remaining chunks are skipped and retried on the next
+            // tick: a failed publish may have left its marker, and the next
+            // chunk must not overwrite it.
             let safe_chunk_size = chunk_size.max(1);
             let chunks: Vec<&[PathBuf]> = wal_files.chunks(safe_chunk_size).collect();
             let total_chunks = chunks.len();
@@ -901,10 +863,7 @@ async fn compact_pass(
                 drop(corpus_guard);
 
                 // Folded unconditionally: quarantining renames the corrupt
-                // file to `.corrupt`, so a retry can't re-see (and re-count)
-                // it — dropping the tally on an `Err` result would keep those
-                // data-loss quarantines off the dashboard counter. Mirrors the
-                // rollup's `RollupOutcome` handling.
+                // file to `.corrupt`, so a retry can't re-see (and re-count) it.
                 wal_quarantined += outcome.quarantined;
 
                 match outcome.result {
@@ -946,7 +905,6 @@ async fn compact_pass(
                         // failures returned in this chunk's outcome.
                         CompactionOperation::Chunk.record_failure();
                         chunk_failures += 1;
-                        // Leave remaining WAL files for retry on next tick.
                         // The text mixes DuckDB, store and I/O wording and
                         // keeps no typed source, so it goes to DEBUG only.
                         tracing::debug!(
@@ -988,10 +946,8 @@ async fn compact_pass(
         );
     }
 
-    // After WAL compaction, consolidate older days' hourly files into
-    // per-service daily files. This dramatically reduces file count for
-    // long lookback queries. Rollup is best-effort: a failure for one
-    // day/service is counted and retried next tick, not propagated.
+    // Rollup is best-effort: a failure for one day/service is counted and
+    // retried next tick, not propagated.
     let rollup_suppressed = repin.is_some_and(|c| c.rollup_paused());
     if daily_rollup && rollup_suppressed {
         tracing::info!(
@@ -1162,7 +1118,6 @@ async fn recover_publications(
     })?
 }
 
-/// [`publication_marker::scan_claims`] on a blocking thread.
 async fn scan_claims_blocking(wal_dir: &Path) -> Result<PublicationClaims, String> {
     let wal_dir = wal_dir.to_path_buf();
     tokio::task::spawn_blocking(move || publication_marker::scan_claims(&wal_dir))
@@ -1250,16 +1205,6 @@ fn relocate_pending_rollups(publication: &PublicationGate, io: &RollupIo) -> Res
 /// from a blocking thread, before any reader, producer or compaction pass
 /// exists. No repin job can hold the corpus gate yet, so the publication
 /// write guard alone excludes every other relocator.
-///
-/// Recovery decides from the identities a marker records: it hashes the
-/// files the marker names, then renames, retires or deletes them, but it
-/// parses no Parquet footer and fsyncs no file, only directories. A
-/// failure does not stop the boot: it logs one `rollup_boot_recovery`
-/// ERROR, naming no path, and leaves the marker pending, so reads refuse
-/// `rollup_pending` until a compaction pass recovers it. A marker scan that
-/// failed at boot stays latched until a compaction pass rescans, and is
-/// logged the same way: recovery of the markers the scan did find is no
-/// finished recovery.
 pub(crate) fn recover_rollups_at_boot(publication: &PublicationGate) {
     let markers = publication.pending_rollup_markers();
     let _publication_guard = publication.blocking_write();
@@ -1308,8 +1253,6 @@ async fn rollup_once(
     publication: Option<Arc<PublicationGate>>,
 ) -> Result<u64, String> {
     let mut total: u64 = 0;
-    // Preserve the existing best-effort empty result and warning. Observe
-    // this rollup scan here rather than changing other env-list consumers.
     let mut skipped_scan_error = false;
     let env_dirs = try_list_env_dirs_observed(data_dir, || skipped_scan_error = true);
     if skipped_scan_error || env_dirs.is_err() {
@@ -1417,14 +1360,13 @@ fn rollup_waits(
     false
 }
 
-/// Read an env's entries, observing scan errors while retaining the existing
-/// root-error and per-entry skip behavior.
+/// Read an env's entries, observing scan errors.
 fn read_rollup_env_entries(
     data_dir: &Path,
 ) -> Result<impl Iterator<Item = std::fs::DirEntry>, String> {
     let date_dirs = std::fs::read_dir(data_dir).map_err(|e| {
-        // Retention can remove a directory after this pass discovered it.
-        // Keep the existing Err, but absence is not failed-operation evidence.
+        // Retention can remove a directory after this pass discovered it;
+        // absence is not failed-operation evidence.
         if e.kind() != std::io::ErrorKind::NotFound {
             CompactionOperation::DailyRollupScan.record_failure();
         }
@@ -1446,8 +1388,8 @@ fn read_rollup_env_entries(
 /// Select historical date directories. Today stays hourly for fast writes;
 /// non-date entries such as `wal` do not participate in daily rollup.
 fn historical_rollup_date(path: &Path, today: &str) -> Option<String> {
-    // Follow symlinks and preserve the previous skip policy, but observe
-    // metadata failures that Path::is_dir would otherwise hide.
+    // Follow symlinks, but observe metadata failures that Path::is_dir
+    // would otherwise hide.
     let metadata = match path.metadata() {
         Ok(metadata) => metadata,
         Err(error) => {
@@ -1489,9 +1431,6 @@ async fn rollup_env_once(
             continue;
         };
 
-        // Recover any interrupted rollups from previous runs before
-        // starting new ones. This ensures crash-orphaned hourly files
-        // are cleaned up without re-merging already-consolidated data.
         // Recovery relocates files too (it deletes the hourly sources of a
         // merge that already completed), so it is a gated unit like the
         // merges below.
@@ -1521,10 +1460,8 @@ async fn rollup_env_once(
             crate::error::join_failure_text("rollup recovery", e)
         })?;
         if let Err(e) = recovery {
-            // A wedged recovery is data-loss-adjacent (an interrupted rollup
-            // left orphaned hourlies/tmp that couldn't be cleaned up), so count
-            // it on the error tally like the quarantine path does. Do not
-            // merge surviving inputs again until recovery has retired them.
+            // Do not merge surviving inputs again until recovery has retired
+            // them.
             failures += 1;
             // The text mixes I/O and proof wording and keeps no typed
             // source, so it goes to DEBUG only.
@@ -1542,13 +1479,11 @@ async fn rollup_env_once(
             );
             continue;
         }
-        // Collect hourly subdirs. If none exist, this day is already consolidated.
         let hour_dirs = collect_hour_dirs(&path);
         if hour_dirs.is_empty() {
             continue;
         }
 
-        // Group all parquet files across hour-dirs by service name.
         let service_files = collect_service_files(&hour_dirs);
         if service_files.is_empty() {
             continue;
@@ -1590,10 +1525,8 @@ async fn rollup_env_once(
             .await?;
 
             // Quarantined inputs are data-loss whether or not the merge then
-            // succeeded — fold the count in unconditionally so it lands on the
-            // dashboard counter even when the merge errored and dropped its
-            // valid output (the quarantined files are already renamed aside, so
-            // a retry can't re-count them).
+            // succeeded (the quarantined files are already renamed aside, so a
+            // retry can't re-count them).
             quarantined_total += outcome.quarantined;
             if let Err(e) = outcome.result {
                 CompactionOperation::DailyRollupUnit.record_failure();
@@ -1616,10 +1549,8 @@ async fn rollup_env_once(
             }
         }
 
-        // Remove empty hour-directories after all services are rolled up.
-        // Deliberately ungated: `remove_dir` fails on a non-empty
-        // directory, so this can never take a parquet file — of either
-        // generation — with it.
+        // Removing empty hour directories is deliberately ungated: `remove_dir`
+        // fails on a non-empty directory, so it never takes a parquet file.
         for hour_dir in &hour_dirs {
             if is_dir_empty(hour_dir) {
                 let _ = std::fs::remove_dir(hour_dir);
@@ -1686,7 +1617,6 @@ fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            // Path metadata follows symlinks, matching the previous is_dir.
             let metadata = match p.metadata() {
                 Ok(metadata) => metadata,
                 Err(error) => {
@@ -1707,7 +1637,6 @@ fn collect_hour_dirs(day_dir: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// Collect `{service}.parquet` files across all hour-dirs, grouped by service.
 fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>> {
     let mut groups: HashMap<String, Vec<PathBuf>> = HashMap::new();
 
@@ -1744,7 +1673,6 @@ fn collect_service_files(hour_dirs: &[PathBuf]) -> HashMap<String, Vec<PathBuf>>
     groups
 }
 
-/// Check if a directory is empty.
 fn is_dir_empty(path: &Path) -> bool {
     std::fs::read_dir(path).is_ok_and(|mut entries| entries.next().is_none())
 }
@@ -1884,25 +1812,6 @@ fn sync_removal_day(io: &RollupIo, phase: Phase, day: &Path) -> std::io::Result<
     }
 }
 
-/// Recover from interrupted rollups in a date directory.
-///
-/// Reads each `.rollup-{service}` marker and applies the first case of
-/// ADR-0041 that the identities it records prove, as
-/// [`rollup_marker::classify`] decides from what is at each path now:
-///
-/// - **a.** The canonical file is the replacement, so the rename happened:
-///   fsync the day directory, remove a leftover tmp, then retire the
-///   inputs and remove the marker.
-/// - **b.** The tmp is the replacement and the rename did not happen:
-///   fsync the directory chain, rename, fsync the day directory, then as a.
-/// - **c.** Nothing was retired: delete the tmp and remove the marker. The
-///   next rollup merges again.
-/// - **d.** Nothing is proven: keep every file and the marker, log
-///   `rollup_recovery_unresolved`, and fail the day.
-///
-/// Recovery hashes the files a marker names but parses no Parquet footer,
-/// and fsyncs directories, never a file. Nothing it opens can block: a
-/// marker, tmp or input that is not a regular file reads as unreadable.
 #[cfg(test)]
 fn recover_rollup_markers(day_dir: &Path) -> Result<(), String> {
     recover_rollup_markers_coordinated(day_dir, None, &RollupIo::REAL)
@@ -1930,8 +1839,7 @@ fn recover_rollup_markers_coordinated(
         CompactionOperation::PendingRollupRecovery.record_failure();
         return Err(log_rollup_day_not_canonical(day_dir));
     }
-    // Classify the actual read error before converting it to the existing
-    // string result. A stat-before-read check would race retention again.
+    // A stat-before-read check would race retention.
     let entries = std::fs::read_dir(day_dir).map_err(|e| {
         if e.kind() != std::io::ErrorKind::NotFound {
             CompactionOperation::PendingRollupRecovery.record_failure();
@@ -2133,8 +2041,6 @@ fn logged_rollup_env(day_dir: &Path) -> &str {
         .unwrap_or(LOGGED_INVALID)
 }
 
-/// Parquet magic bytes, written at both the start and end of every valid
-/// parquet file.
 const PARQUET_MAGIC: &[u8; 4] = b"PAR1";
 
 /// Cheap structural validity check for a parquet file.
@@ -2177,21 +2083,16 @@ fn is_valid_parquet_file(mut file: std::fs::File, len: u64) -> bool {
 }
 
 /// Cheap content sniff for a WAL ndjson file, catching the torn-write
-/// corruption signature before it reaches `read_json` — where it otherwise
-/// fails with "Malformed JSON ... unexpected character" and wedges the whole
-/// batch. Like a truncated parquet, no amount of retrying repairs a file of
-/// zeros, so the only escape is to set it aside.
+/// corruption signature before it reaches `read_json`, where it otherwise
+/// wedges the whole batch.
 ///
-/// A WAL file is text: newline-delimited JSON objects. We reject it as
-/// corrupt if it is empty (`read_json(records=true)` errors on empty input),
-/// contains a NUL byte (illegal in JSON text and the dead giveaway of a torn
-/// write whose data blocks never flushed), or is not valid UTF-8. An
-/// unreadable file is likewise rejected — `read_json` can't read it either,
-/// so quarantining beats wedging.
+/// A file is rejected as corrupt if it is empty (`read_json(records=true)`
+/// errors on empty input), contains a NUL byte (the dead giveaway of a torn
+/// write whose data blocks never flushed), is not valid UTF-8, or cannot be
+/// read.
 ///
 /// This deliberately does not fully JSON-parse each line: that would
-/// re-implement `read_json` and reject merely-malformed-but-textual data, a
-/// different (and rarer) class than the crash debris this guards against.
+/// re-implement `read_json`.
 fn is_valid_ndjson(path: &Path) -> bool {
     let Ok(bytes) = std::fs::read(path) else {
         return false;
@@ -2212,23 +2113,8 @@ const MAX_QUARANTINE_ATTEMPTS: u32 = 1000;
 ///
 /// The first candidate is the bare `<path>.corrupt`; subsequent ones append a
 /// counter (`<path>.corrupt.1`, `.corrupt.2`, …). A candidate is claimed by
-/// creating it with `O_EXCL` (`create_new`), so the returned path is an empty
-/// file this caller owns and the subsequent `rename` overwrites nothing that
-/// was already there.
-///
-/// Scope, stated honestly: the reservation makes no-clobber hold between
-/// cooperating in-process quarantiners — every quarantine in trawl funnels
-/// through `quarantine_file`, so that is the whole population. External
-/// mutation of the trawl-owned data root (another process planting or renaming
-/// files under it) is outside the threat model; the workspace forbids `unsafe`,
-/// so the truly atomic `renameat2(RENAME_NOREPLACE)` is not reachable.
-///
-/// A crash between reservation and rename strands a zero-byte reservation
-/// under its `.corrupt`/`.corrupt.<n>` name: inert to every scan glob,
-/// skipped by later quarantines, and distinguishable from a real artifact
-/// only by its size. Accepted — closing it needs
-/// `renameat2(RENAME_NOREPLACE)`, unavailable under the workspace unsafe
-/// forbid.
+/// creating it with `O_EXCL` (`create_new`), so the subsequent `rename`
+/// overwrites nothing that was already there.
 ///
 /// An error keeps the failed reservation's `io::ErrorKind`, so the caller
 /// can log it as a closed cause; every name taken is `AlreadyExists`.
@@ -2273,23 +2159,9 @@ fn quarantine_target(path: &Path) -> std::io::Result<PathBuf> {
 /// which makes it inert: it no longer matches the `*.parquet`/`*.tmp` globs
 /// the rollup scans, nor the `*.ndjson` glob WAL compaction scans.
 ///
-/// The destination is reserved first (`quarantine_target`) rather than renamed
-/// onto blind: `std::fs::rename` silently replaces an existing destination, so
-/// a second corruption of a recurring path (`{env}/{date}/{HH}/{service}` is
-/// stable across ticks) would destroy the first forensic artifact. A taken name
-/// yields `<path>.corrupt.1`, `.corrupt.2`, … — every artifact is kept, and
-/// every one of those names is as inert to the scan globs as the bare form.
-///
-/// `event_type` tags the structured log so operators can distinguish a
-/// rollup quarantine (`rollup_quarantine`) from a WAL-compaction one
-/// (`compaction_quarantine`).
-///
 /// A failed rename is a hard error: the bad file still matches the scan glob
 /// and would re-wedge on every tick forever, so callers must surface (and
-/// count) the failure rather than swallow it. The reservation is removed on
-/// that path so a failure leaves no empty `.corrupt` debris behind.
-///
-/// Returns the path the file now lives at.
+/// count) the failure rather than swallow it.
 fn quarantine_file(
     path: &Path,
     service: &str,
@@ -2369,22 +2241,13 @@ fn quarantine_file(
 
 /// Retire a merge input whose rows now live in a published output: a
 /// merged hourly parquet file after a daily rollup, or a consumed WAL file
-/// after a compaction publish. Deletes it, or makes it inert when it can't
-/// be deleted.
+/// after a compaction publish. Deletes it, or renames it aside with a
+/// `.merged` suffix so it no longer matches a scan glob and can never be
+/// merged again (the merge path has no dedup by design, since two identical
+/// log lines are distinct events).
 ///
-/// Renames it aside with a `.merged` suffix so it no longer matches the
-/// `*.parquet`/`*.tmp` rollup globs or the `*.ndjson` WAL scan, and can
-/// never be merged again (which would duplicate its rows — the merge path
-/// has no dedup by design, since two identical log lines are distinct
-/// events).
-///
-/// A missing source is success: the goal — "this file is no longer present as
-/// a re-mergeable input" — is already satisfied if it's gone. This keeps the
-/// op idempotent so a recovery pass that replays a marker after a partial
-/// retirement loop (some inputs already deleted) doesn't wedge on a phantom.
-/// A failed rename whose source vanished from under us (lost a delete race) is
-/// likewise fine; only a genuine non-`NotFound` rename failure is a hard error,
-/// because then the file still matches its glob and would be merged again.
+/// A missing source is success, so a recovery pass that replays a marker
+/// after a partial retirement loop doesn't wedge on a phantom.
 pub(crate) fn retire_merged_input(path: &Path) -> Result<(), String> {
     match std::fs::remove_file(path) {
         Ok(()) => return Ok(()),
@@ -2420,19 +2283,6 @@ struct RollupOutcome {
     result: Result<(), String>,
 }
 
-/// Blocking: merge hourly parquet files for one service into a daily file.
-///
-/// Opens an in-memory `DuckDB` connection, reads all hourly files via
-/// `read_parquet([list], union_by_name=true)`, sorts by timestamp for
-/// optimal row group statistics, and writes `{service}.parquet.tmp`. It
-/// then publishes the tmp in the durable order of ADR-0041, under a
-/// `.rollup-{service}` [`rollup_marker`] that records the identity of the
-/// replacement, of each hourly input and of the prior daily file, so
-/// recovery can finish or abandon the merge from identities alone.
-///
-/// Thin wrapper over [`rollup_day_inner`] that pairs the accumulated quarantine
-/// count with the merge result, so the count is reported even when the merge
-/// then errors — every `?` bail-out in the inner body would otherwise drop it.
 #[cfg(test)]
 fn rollup_day_blocking(
     day_dir: &Path,
@@ -2501,7 +2351,6 @@ fn rollup_day_inner(
     ))
     .map_err(|e| format!("SET temp_directory failed: {e}"))?;
 
-    // Cap memory and threads — same rationale as compact_service_blocking.
     conn.execute_batch(&format!(
         "SET memory_limit='{}'; SET threads=2",
         memory_limit.replace('\'', "''")
@@ -2551,13 +2400,8 @@ fn rollup_day_inner(
         }
     }
 
-    // No hourly input is left to merge. Every input was corrupt and has
-    // been quarantined, and with no daily file either there is nothing
-    // readable to retry. That is data loss: a whole service/day produced
-    // no daily file. Surface it distinctly at error level (the
-    // partial-corrupt path only logs a cheerful rollup_complete) and report
-    // the quarantine count so it lands on the dashboard counter. A daily
-    // file that remains is left as it is, and no marker lists no input.
+    // No hourly input is left: write no marker and leave any daily file as it
+    // is. Quarantined inputs with no daily file either are data loss.
     if merged_hourly.is_empty() {
         if all_files.is_empty() && *quarantined > 0 {
             tracing::error!(
@@ -2636,12 +2480,6 @@ fn rollup_day_inner(
         // Running out of memory says nothing about the inputs; the failure
         // is already reported as a resource failure.
         if !failure.is_out_of_memory() {
-            // A file that passed `is_valid_parquet`'s magic-byte sniff but
-            // fails `read_parquet` — corrupt middle, or a schema the catalog
-            // invariant says trawl cannot have written. No amount of retrying
-            // repairs either — surface it distinctly at error level so the rare
-            // forever-retry is visible on the dashboard rather than buried in
-            // the count. The driver text goes to DEBUG only.
             tracing::debug!(
                 event_type = "rollup_unreadable",
                 compact_service = %service,
@@ -2735,13 +2573,9 @@ fn rollup_day_inner(
     Ok(())
 }
 
-/// Outcome of one per-service WAL compaction batch.
-///
-/// Mirrors [`RollupOutcome`]: carries `quarantined` alongside `result` so the
-/// data-loss count survives a hard error after files were already set aside.
-/// Quarantining renames the corrupt file to `.corrupt`, so a retry can't
-/// re-see (and re-count) it — if a `result: Err` dropped the tally, those
-/// quarantines would never reach the dashboard counter.
+/// Carries `quarantined` alongside `result`, as [`RollupOutcome`] does, so
+/// the data-loss count survives a hard error after files were already set
+/// aside.
 struct CompactOutcome {
     /// WAL files quarantined this batch (corrupt → `.corrupt`), counted as
     /// data-loss whether or not the rest of the batch then compacted.
@@ -2767,22 +2601,6 @@ struct PublishIncomplete {
 /// Compact a batch of WAL files for a single service into parquet,
 /// enforcing the write-time invariant (ADR-0009): a parquet file is never
 /// written before its columns' pins are durable in postgres.
-///
-/// Four phases:
-/// 1. blocking — read the WAL into `wal_batch`, `DESCRIBE` it, and derive
-///    pin proposals for unpinned columns (candidate ladder over values).
-/// 2. async — `pin_missing` the proposals; the authoritative pins come
-///    back and are folded into the in-process cache (skipped entirely when
-///    the batch proposes nothing — the common case). A store failure is `Err`:
-///    the WAL is retained and retried next tick — never an unconformant
-///    parquet write.
-/// 3. blocking — conform `wal_batch` to the pins (`TRY_CAST` on mismatch,
-///    drop deferred all-null unpinned columns), then merge/sort/COPY, and
-///    publish under a publication marker: rename, drain, retire the consumed
-///    WAL (see [`publish_output`]).
-/// 4. async, best-effort — record `field_conflicts`, touch
-///    `field_services`, bump metrics. A failure here warns and moves on
-///    (the data is already durable and conformant).
 ///
 /// With `catalog: None` (tests, embedded-style callers) the pins are the
 /// envelope seed plus this batch's own proposals — same conform algebra,
@@ -2885,7 +2703,6 @@ async fn compact_service_batch(
         None => local_pins(&prep.proposals),
     };
 
-    // Phase 3: conform + write + publish (blocking).
     let data_dir_owned = data_dir.to_path_buf();
     let wal_dir_owned = wal_dir.to_path_buf();
     let env_owned = env.to_owned();
@@ -2947,13 +2764,9 @@ pub(crate) fn wal_batch_id(env: &str, wal_file: &Path) -> Option<String> {
 /// The hot batches of the WAL files one chunk quarantined in phase 1.
 ///
 /// A quarantined file is renamed to `.corrupt`, out of every later scan, so
-/// no later chunk can name its batch again. A publish drains it with the
-/// rest of the chunk, since the chunk's batch ids name every input; the
-/// all-corrupt branch drains the whole chunk. A chunk that fails (or
-/// panics) after a quarantine drains nothing, so [`Self::run`] drains
-/// these; otherwise
-/// their charge would stay until restart. The quarantined rows never reach
-/// cold storage, which is outside ADR-0041's publication guarantee.
+/// no later chunk can name its batch again. A chunk that fails (or panics)
+/// after a quarantine drains nothing, so [`Self::run`] drains these;
+/// otherwise their charge would stay until restart.
 struct QuarantineDrain<'a> {
     hot_buffer: Option<Arc<HotBuffer>>,
     env: &'a str,
@@ -2991,20 +2804,12 @@ impl QuarantineDrain<'_> {
 /// for this batch's columns, folding the new ones into the in-process cache
 /// on the way.
 ///
-/// `known` is the cache snapshot phase 1 proposed against, and the two
-/// together cover every column of the batch by construction: `propose_pins`
-/// emits a proposal for exactly the columns `known` did not already pin, and
-/// `pin_missing` returns the authoritative pin for each proposal (a racing
-/// batch's pin, not ours, when it got there first). Only a repin cutover
-/// retypes a standing pin, and it holds the corpus gate against this whole
-/// batch, so a `known` entry cannot go stale meanwhile.
+/// Only a repin cutover retypes a standing pin, and it holds the corpus gate
+/// against this whole batch, so a `known` entry cannot go stale meanwhile.
 ///
-/// Deliberately not a `load_pins` + `replace` per batch. A pin row exists
+/// Deliberately not a `load_pins` + `replace` per batch: a pin row exists
 /// for every distinct JSON key ever ingested, so reloading it per chunk per
-/// service per tick is O(catalog) work whose size a noisy or hostile sender
-/// picks — up to [`crate::store::MAX_PINNED_FIELDS`], which is what keeps
-/// that "up to" a number at all. The common case (nothing new to pin) costs
-/// no postgres round trip at all.
+/// service per tick is O(catalog) work whose size a sender picks.
 async fn resolve_pins_durable(
     cat: &CatalogContext,
     mut known: HashMap<String, CanonicalType>,
@@ -3058,15 +2863,6 @@ pub(crate) fn record_conflict_metrics(service: &str, conflicts: &[FieldConflict]
 
 /// Attempts a bookkeeping write gets before it is given up on, and the base
 /// of its exponential backoff.
-///
-/// The parquet is already durable when these run, so a failure cannot fail
-/// the batch — but it can leave a permanent hole: `field_services` is the
-/// authority behind `?service=` and the `last_seen` window, and a lost
-/// observation is re-made only when that service next sends that field,
-/// which for a field it has stopped sending is never. A momentary postgres
-/// blip (failover, restart, a full pool) is therefore worth riding out
-/// in-tick — inside the wall-clock budget below, which is what keeps a
-/// sustained outage from stalling anything.
 const BOOKKEEPING_ATTEMPTS: u32 = 3;
 /// Base delay between bookkeeping attempts; doubles per attempt.
 const BOOKKEEPING_BACKOFF: Duration = Duration::from_millis(100);
@@ -3074,19 +2870,9 @@ const BOOKKEEPING_BACKOFF: Duration = Duration::from_millis(100);
 /// Wall-clock ceiling on one batch's bookkeeping, retries and all.
 ///
 /// The attempt count alone bounds nothing: a postgres outage does not fail
-/// fast, it blocks each write for the pool's whole acquire timeout (10s,
-/// [`crate::store`]), so retries would cost attempts × 10s per batch. And
-/// bookkeeping is awaited inline in phase 4 of a chunk while `compact_once`
-/// walks envs → services → chunks sequentially with no per-tick deadline —
-/// so that cost multiplies by the number of pending batches, against a
-/// 10s compaction interval. A stalled compactor is the one failure this
-/// file will not take: WAL stops draining, the hot buffer fills, and
-/// admission refuses new events (ADR-0043).
-///
-/// So the retry gets a budget instead of a promise. The blips it exists
-/// for (a full pool, a failover mid-query) fail in milliseconds and still
-/// get every attempt; an outage costs one budget per batch no matter what
-/// the pool's acquire timeout is.
+/// fast, it blocks each write for the pool's whole acquire timeout
+/// ([`crate::store`]), and bookkeeping is awaited inline while
+/// `compact_once` walks envs → services → chunks sequentially.
 const BOOKKEEPING_BUDGET: Duration = Duration::from_secs(2);
 
 /// Run one bookkeeping write, retrying a transient failure.
@@ -3198,20 +2984,15 @@ impl InFlight {
 /// Run a batch's bookkeeping writes under [`BOOKKEEPING_BUDGET`], dropping
 /// them when it runs out so compaction can get on with the next chunk.
 ///
-/// Cancelling mid-write is safe for the same reason the retry is: an
-/// abandoned write is at worst a lost ack on an idempotent upsert or an
-/// atomic, per-field-trimmed conflict insert. The conflict insert's
-/// transaction is a [`crate::store::pooled::PooledTransaction`], so one cut
-/// short, even mid-`BEGIN`, closes its connection instead of handing the
-/// pool a session still inside it.
+/// Cancelling mid-write is safe: the upsert is idempotent and the conflict
+/// insert atomic, and its transaction is a
+/// [`crate::store::pooled::PooledTransaction`], so one cut short, even
+/// mid-`BEGIN`, closes its connection instead of handing the pool a session
+/// still inside it.
 ///
-/// The counter fires ONLY here, on the elapsed budget. A write that fails
-/// fast and exhausts its three attempts is a different failure with a
-/// different remedy, and it keeps the `catalog_bookkeeping_error` warning it
-/// has always had. One consequence worth stating: because the two writes
-/// share one budget, a first write that hangs forever means the second never
-/// starts, so a full outage costs one increment on `conflicts` per batch and
-/// none at all on `observations`.
+/// The counter fires only here, on the elapsed budget. A write that fails
+/// fast and exhausts its attempts keeps its `catalog_bookkeeping_error`
+/// warning.
 async fn budgeted_bookkeeping<Fut: std::future::Future<Output = ()>>(
     service: &str,
     in_flight: &InFlight,
@@ -3238,8 +3019,6 @@ async fn budgeted_bookkeeping<Fut: std::future::Future<Output = ()>>(
     }
 }
 
-/// Count rows in a `DuckDB` table. Used to capture row counts before
-/// dropping temporary tables.
 fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
     conn.query_row(
         &format!("SELECT count(*)::BIGINT FROM \"{table}\""),
@@ -3250,32 +3029,19 @@ fn count_rows(conn: &duckdb::Connection, table: &str) -> Result<u64, String> {
     .map_err(|e| statement_failed("count_rows failed", &e))
 }
 
-/// Read WAL ndjson files into a `DuckDB` temp table called `wal_batch`,
-/// returning the number of files that actually contributed rows.
+/// Read WAL ndjson files into a `DuckDB` temp table called `wal_batch`.
 ///
-/// Fast path: one multi-file `read_json` over the whole batch. If that fails
-/// for a non-recoverable reason (a malformed-but-textual file that slipped
-/// past [`is_valid_ndjson`]'s NUL/UTF-8 sniff — e.g. a clean truncation
-/// mid-token), it isolates the offender: probe each file alone, quarantine
-/// the ones that throw, and rebuild from the survivors. This makes a single
-/// poison-pill file unable to wedge the whole batch (the residual the byte
-/// sniff alone could not close). Each file set aside is pushed onto
-/// `quarantined`. A read or probe that runs out of memory isolates nothing:
-/// the batch fails as a resource failure ([`StatementFailure`]) and stays in
-/// the WAL, because a file too large for the limit is not a corrupt one. Returns the files that contributed rows, empty when every
-/// file turned out corrupt (the caller treats that as data-loss, not error).
-///
-/// Complex-typed columns cannot arise here: ingest canonicalization
-/// stringifies top-level object/array values before the WAL is written, and
-/// the conform phase pins every column to a canonical scalar type before
-/// the parquet write (ADR-0009).
+/// If the multi-file `read_json` fails, it isolates the offender: probe each
+/// file alone, quarantine the ones that throw, and rebuild from the
+/// survivors. A read or probe that runs out of memory isolates nothing,
+/// because a file too large for the limit is not a corrupt one. Returns the
+/// files that contributed rows, empty when every file turned out corrupt.
 fn read_wal_to_table(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
     service: &str,
     quarantined: &mut Vec<PathBuf>,
 ) -> Result<Vec<PathBuf>, String> {
-    // Fast path: read the whole batch in one scan. The common case.
     match build_wal_batch(conn, wal_files, service) {
         Ok(()) => return Ok(wal_files.to_vec()),
         // Out of memory is not a malformed file: isolating would probe each
@@ -3283,9 +3049,6 @@ fn read_wal_to_table(
         // memory too would be quarantined whole. The batch stays in the WAL.
         Err(e) if e.is_out_of_memory() => return Err(e.into()),
         Err(e) => {
-            // A non-"Duplicate name" read error means at least one file is
-            // malformed-but-textual. Without isolation that one file fails
-            // the whole batch and wedges the service forever. Isolate it.
             // The driver text can quote the WAL's values, so it goes to
             // DEBUG only.
             tracing::debug!(
@@ -3304,7 +3067,6 @@ fn read_wal_to_table(
         }
     }
 
-    // Clear any partial table left by the failed multi-file attempt.
     let _ = conn.execute_batch("DROP TABLE IF EXISTS wal_batch");
 
     let mut survivors: Vec<PathBuf> = Vec::with_capacity(wal_files.len());
@@ -3386,8 +3148,6 @@ fn timestamp_repair_list(prov_col: &str) -> String {
 /// The hot read casts each envelope TIMESTAMP column with a bare `TRY_CAST`
 /// (`trawl_core`'s hot `REPLACE` list), where the repair falls back to the
 /// file name's instant, then the compaction instant, when that cast fails.
-/// A row is left as it is only if the cast succeeds for every column in
-/// [`trawl_core::schema::TIMESTAMP_COLUMNS`], the list the repair walks.
 /// Rust cannot run `DuckDB`'s cast, so the check is stricter than the cast:
 /// each column must hold a string spelled exactly as ingest spells an
 /// instant, chrono's RFC 3339 UTC at microsecond precision
@@ -3395,10 +3155,6 @@ fn timestamp_repair_list(prov_col: &str) -> String {
 /// check does too: a year after 9999, which chrono writes with a leading
 /// `+`, and a leap second. A year before 1 is written `0000` or with a
 /// leading `-`, and the cast reads it as the same year BC on both sides.
-/// `repair_leaves_unchanged_agrees_with_repair_expr` runs [`repair_expr`]
-/// itself over values on both sides of the check, and ingest's
-/// canonicalizer over each, so the check refuses nothing the canonicalizer
-/// writes and the repair keeps.
 pub(crate) fn repair_leaves_unchanged(row: &serde_json::Map<String, serde_json::Value>) -> bool {
     trawl_core::schema::TIMESTAMP_COLUMNS.iter().all(|column| {
         row.get(*column)
@@ -3445,31 +3201,15 @@ fn is_filename_collision(e: &duckdb::Error) -> bool {
 ///
 /// A lossless ladder — no rung drops a column. The simpler recovery, falling
 /// back to a fixed envelope-column list, is wrong: it loses every custom
-/// column for the whole batch.
-///
-/// 1. Auto-detection (`maximum_depth=2`) with [`WAL_FILE_COL`] as the
-///    provenance column.
-/// 2. On a `filename=` collision ([`is_filename_collision`] — a WAL file
-///    carrying the reserved key itself), the same auto-detect read under
-///    a randomized provenance name. Lossless: every user field survives, and
-///    the row's literal `_trawl_wal_file` value lands in parquet as ordinary
-///    data — it never feeds [`repair_expr`].
-/// 3. On a nested-key collision ([`is_duplicate_name`] — only reachable
-///    from WAL whose nested values ingest never stringified), the same
-///    read at `maximum_depth=1`: every top-level field arrives as an opaque
-///    JSON column and the catalog conform step types it via the lattice. No
-///    column is ever dropped.
-///
-/// Any other read error is returned so the caller can isolate the offending
-/// file, unless it is out of memory ([`StatementFailure::is_out_of_memory`]). A malformed `timestamp` is never fatal here: see
-/// [`repair_expr`].
+/// column for the whole batch. On a `filename=` collision a row's literal
+/// `_trawl_wal_file` value lands in parquet as ordinary data — it never
+/// feeds [`repair_expr`].
 ///
 /// `sample_size=-1` (schema detection over every row, not `DuckDB`'s default
 /// ~20480-row prefix) is what keeps a sparse column alive: `_repairs` rides
 /// only on repaired events, so on a WAL file bigger than the sample it would
 /// fall outside the inferred schema and `union_by_name` would drop it with no
-/// error at all, losing the evidence ADR-0008 promises to preserve. Any
-/// sparse user field is equally exposed.
+/// error at all. Any sparse user field is equally exposed.
 fn build_wal_batch(
     conn: &duckdb::Connection,
     wal_files: &[PathBuf],
@@ -3591,30 +3331,12 @@ pub(crate) fn structured_errors(conn: &duckdb::Connection) -> Result<(), String>
 /// A failed maintenance statement: compaction, rollup, conform or repin
 /// (ADR-0056).
 ///
-/// A maintenance connection reports failures as structured diagnostics
-/// ([`structured_errors`]), and [`Self::duckdb`] classifies one by its
-/// `exception_type`, through the same test the query lanes use
-/// ([`trawl_engine::error::is_out_of_memory`]). The message text is never
-/// searched. `Out of Memory` means the statement did not fit in `[ingest]
-/// compaction_memory_limit`. That is a resource failure, not bad data, so
-/// [`Self::duckdb`] logs it as `maintenance_resource_exhausted` and counts
-/// it on [`crate::metrics::MAINTENANCE_RESOURCE_EXHAUSTED_TOTAL`], once, at
-/// the failed statement. A caller that would otherwise read the failure as
-/// bad input (a corrupt WAL file to quarantine, a nonconformant parquet
-/// file, a file the boot pass skips) asks [`Self::is_out_of_memory`] first
-/// and leaves its inputs alone. What happens next belongs to the operation:
-/// compaction and rollup retry on the compaction task's next pass, boot
-/// conformance leaves the file incomplete until the next boot, and a repin
-/// statement with no fallback ends the job `failed` and abandons its shadow
-/// generation, so an operator submits a new job. Optional sampling falls
-/// back instead (conform's misfit samples, and the repin scan's sampled
-/// count in `repin::rewrite`), and the statement is still counted.
+/// A caller that would read the failure as bad input (a WAL file to
+/// quarantine, a nonconformant parquet, a file the boot pass skips) leaves
+/// its inputs alone when [`Self::is_out_of_memory`] is true.
 ///
-/// The text is `DuckDB`'s own wording behind the caller's context, as the
-/// connection would word it without `errors_as_json`. Every other failure,
-/// from `DuckDB` or not, is carried as text. That text can quote the
-/// generated SQL and the values a statement choked on, so it belongs at
-/// DEBUG only (ADR-0040, amended 2026-11-09): a retained event logs
+/// The text can quote the generated SQL and the values a statement choked
+/// on, so it belongs at DEBUG only (ADR-0040): a retained event logs
 /// [`Self::error_class`] and [`Self::cause_kind`] instead.
 #[derive(Debug)]
 pub(crate) struct StatementFailure {
@@ -3669,7 +3391,6 @@ impl StatementFailure {
         self.cause == CauseKind::DuckdbResourceExhausted
     }
 
-    /// What the failure came from, read off its typed source.
     pub(crate) fn cause_kind(&self) -> CauseKind {
         self.cause
     }
@@ -3725,7 +3446,6 @@ pub(crate) struct ColInfo {
     pub(crate) dtype: String,
 }
 
-/// Run `DESCRIBE <query>` and return the column names and types.
 pub(crate) fn describe_source(
     conn: &duckdb::Connection,
     query: &str,
@@ -3823,11 +3543,9 @@ struct PreparedBatch {
     /// any quarantined as corrupt. The publication marker lists exactly
     /// these, and the publish retires exactly these.
     survivors: Vec<PathBuf>,
-    /// Start instant for the completion log.
     compact_start: std::time::Instant,
 }
 
-/// Outcome of a conformant write, carried to the bookkeeping phase.
 #[derive(Debug)]
 struct WriteReport {
     /// Rows this batch contributed, deliberately not the merged file's
@@ -3882,19 +3600,13 @@ mod phase1_panic {
     }
 }
 
-/// Blocking phase 1: validate + read WAL files into a `wal_batch` table,
-/// `DESCRIBE` it, and derive pin proposals for unpinned columns.
-///
 /// Returns `Ok(None)` when every input was corrupt (data loss surfaced via
 /// the quarantine count — nothing to retry).
 ///
-/// `quarantined` accumulates the corrupt WAL files set aside during this
-/// batch, by their original paths (both the byte sniff and read isolation).
-/// It is threaded by reference so the count, and the drain of those files'
-/// hot batches ([`QuarantineDrain`]), survive an `Err` from any later step —
-/// see [`CompactOutcome`]
-/// (mirrors the rollup [`RollupOutcome`] pattern). Every quarantine is
-/// permanent (`.corrupt` rename), so a retry can't re-count it.
+/// `quarantined` is threaded by reference so the count, and the drain of
+/// those files' hot batches ([`QuarantineDrain`]), survive an `Err` from any
+/// later step. Every quarantine is permanent (`.corrupt` rename), so a retry
+/// can't re-count it.
 fn prepare_service_batch(
     wal_files: &[PathBuf],
     data_dir: &Path,
@@ -4059,28 +3771,12 @@ fn propose_pins(
 /// voting column). Column count is client-chosen — `MAX_PINNED_FIELDS` bounds
 /// the catalog at 10k fields — so none of them may fan out over the full
 /// width.
-///
-/// Both extremes are pathological on a wide batch (measured by execution
-/// against the bundled `DuckDB` 1.5.5, 10k columns × 50 rows): one query per
-/// column is superlinear because every query re-binds the whole table (27s,
-/// and ~n^1.4 in the column count), while a single query over every column
-/// blows aggregate memory (a 40k-column batch OOMs outright) and is roughly
-/// quadratic well before that (the 2-aggregate tally shape: 1k cols 0.68s,
-/// 5k 10.6s, 10k 38.5s). Chunking is flat in both: 10k ladder columns take
-/// ~1.4s and 40k ~7.9s at this width, and the peak is bounded by the chunk,
-/// not the batch. 64…1024 all measure within 25% of each other, so this sits
-/// in the middle.
 pub(crate) const AGG_CHUNK_COLS: usize = 256;
 
 /// How many conflicted columns one batch captures misfit samples for
-/// ([`ConformPlan::capture_samples`]).
-///
-/// One chunk's worth, for the reason above — but the bound bites far
-/// earlier here, because a sampling aggregate is not a counting one:
-/// `list(DISTINCT …)` holds every distinct misfit of every sampled column
-/// in memory before the slice throws all but five away, and the values are
-/// client text. A batch conflicting on more columns than this is a corpus
-/// with a modelling problem the first 256 fields already evidence.
+/// ([`ConformPlan::capture_samples`]): `list(DISTINCT …)` holds every
+/// distinct misfit of every sampled column in memory before the slice throws
+/// all but five away, and the values are client text.
 const MAX_SAMPLED_CONFLICT_COLUMNS: usize = AGG_CHUNK_COLS;
 
 /// How many distinct raw values the capture pulls per column before Rust
@@ -4199,16 +3895,10 @@ pub(crate) fn conform_expr(quoted: &str, dtype: &str, pin: CanonicalType) -> Opt
 
 /// Everything a repin needs to read one column: the target the rewrite
 /// writes with, and the two wire-dialect readings whose disagreement is
-/// ambiguity (ADR-0013).
-///
-/// Built once per job, by the engine, because the engine is the only place
-/// that knows the old pin — and the old pin is what decides whether the
-/// stored column holds wire text at all. A stored `SEVERITY` column holds
-/// canonical `OTel` ladder positions, so its arm is dialect-free in every
-/// variant; a stored VARCHAR holds whatever the sender wrote, so its arm
-/// flips with the assertion exactly as the `_raw` arm does. Deriving that
-/// downstream would mean guessing it from the dialects themselves, which
-/// cannot tell `otel-because-canonical` from `otel-because-asserted`.
+/// ambiguity (ADR-0013). A stored `SEVERITY` column holds canonical `OTel`
+/// ladder positions, so its arm is dialect-free in every variant; a stored
+/// VARCHAR holds whatever the sender wrote, so its arm flips with the
+/// assertion exactly as the `_raw` arm does.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RepinReading {
     /// What the rewrite writes and the plan counts with.
@@ -4219,7 +3909,6 @@ pub(crate) struct RepinReading {
 }
 
 impl RepinReading {
-    /// Build the reading rule from the repin's own facts.
     pub(crate) fn new(from: CanonicalType, to: CanonicalType, dialect: Dialect) -> Self {
         let stored_is_wire = from != CanonicalType::Severity;
         Self {
@@ -4261,9 +3950,7 @@ impl RepinReading {
 /// The repin target column's expression, in the one place both consumers
 /// read it from: [`ConformPlan::build`] under [`ConformPolicy::Repin`]
 /// (the rewrite) and the repin scan's dry-run counting
-/// (`crate::repin::plan`) — the plan predicts with the same SQL the
-/// rewrite writes, by the same doctrine that makes the hot branch and
-/// compaction one builder.
+/// (`crate::repin::plan`).
 pub(crate) fn repin_target_expr(
     quoted: &str,
     has_raw: bool,
@@ -4304,7 +3991,6 @@ pub(crate) struct RepinCountExprs {
     pub(crate) ambiguous: String,
 }
 
-/// Build the counting expressions for one column under `reading`.
 pub(crate) fn repin_count_exprs(
     quoted: &str,
     has_raw: bool,
@@ -4353,11 +4039,6 @@ pub(crate) fn repin_count_exprs(
 /// Wrap a TIMESTAMP-pinned envelope column's conform in a never-NULL last
 /// arm, so conforming a standing file can never manufacture a NULL partition
 /// key (the boot-pass counterpart of [`repair_expr`]'s third arm, ADR-0008).
-///
-/// Only fires for [`ConformPolicy::StandingFile`] on a
-/// [`trawl_core::schema::TIMESTAMP_COLUMNS`] member actually pinned
-/// TIMESTAMP: a `_time` pinned VARCHAR is plain text and needs no partition
-/// guard (and could not take a TIMESTAMP literal anyway).
 fn guard_partition_key(
     policy: &ConformPolicy,
     is_time_col: bool,
@@ -4394,20 +4075,14 @@ pub(crate) enum ConformPolicy {
     /// `_raw`.
     WalBatch,
     /// A standing parquet file (boot conformance pass). Every column is
-    /// conformed, `_time` included — a file whose timestamp column is
-    /// mistyped is exactly what that pass exists to fix — and a column
-    /// with no pin is kept verbatim (pins cover every scanned field, so
-    /// this is unreachable in practice).
+    /// conformed, `_time` included, and a column with no pin is kept
+    /// verbatim.
     ///
     /// `time_fallback` is the last arm of the TIMESTAMP-pinned envelope
-    /// columns' conform, exactly as [`repair_expr`] is for WAL: a value the
-    /// `TRY_CAST` cannot read must not be written as NULL, because a NULL
-    /// partition key sorts first and falls outside every `last=Xh` filter
-    /// — the row would survive the rewrite yet become permanently
-    /// unqueryable by time (ADR-0008). The boot pass has no WAL filename to
-    /// recover an instant from, so the caller supplies the file's own
-    /// partition instant (its `{date}/{HH}` directory), or the conform
-    /// instant when the path carries none.
+    /// columns' conform, exactly as [`repair_expr`] is for WAL (ADR-0008).
+    /// The caller supplies the file's own partition instant (its
+    /// `{date}/{HH}` directory), or the conform instant when the path carries
+    /// none.
     StandingFile {
         time_fallback: chrono::DateTime<chrono::Utc>,
     },
@@ -4441,7 +4116,6 @@ pub(crate) enum ConformPolicy {
     },
 }
 
-/// One column the plan will `TRY_CAST`.
 struct CastEntry {
     /// The folded (catalog-key) name — conflict evidence is attributed to
     /// the field as the catalog knows it, not to the stored spelling.
@@ -4475,7 +4149,6 @@ struct CastEntry {
 /// is renamed to the folded form as part of the conform — a rename with no
 /// cast still counts as a rewrite ([`Self::is_noop`]).
 pub(crate) struct ConformPlan {
-    /// Per-column SELECT expressions, in schema order.
     pub(crate) select_list: Vec<String>,
     /// The retained column names (folded) — the post-conform column set,
     /// so bookkeeping can never claim a service carried a field no parquet
@@ -4489,7 +4162,6 @@ pub(crate) struct ConformPlan {
 }
 
 impl ConformPlan {
-    /// Plan the conform of `schema` against `pins` under `policy`.
     pub(crate) fn build(
         schema: &[ColInfo],
         pins: &HashMap<String, CanonicalType>,
@@ -4581,8 +4253,6 @@ impl ConformPlan {
         plan
     }
 
-    /// Pass one column through — renamed to its folded spelling when the
-    /// stored one differs, untouched otherwise.
     fn keep(&mut self, col: &ColInfo, folded: &str, quoted: String) {
         if folded == col.name {
             self.select_list.push(quoted);
@@ -4594,8 +4264,6 @@ impl ConformPlan {
         self.retained.push(folded.to_owned());
     }
 
-    /// Whether the plan rewrites anything at all (a cast, a deferred-pin
-    /// drop, or a case-fold rename).
     pub(crate) fn is_noop(&self) -> bool {
         self.casts.is_empty() && self.dropped.is_empty() && self.renamed == 0
     }
@@ -4632,17 +4300,8 @@ impl ConformPlan {
     /// one statement is quadratic (38.5s at 10k, vs ~1.4s chunked).
     ///
     /// A conflict is one row per cast column the conform actually nulled.
-    /// A cast that nulls nothing lost no data, whatever the two type names
-    /// say: an all-null pinned column (a batch with no `_repairs`), a JSON
-    /// source that converts fully, and a VARCHAR-pinned field whose batch
-    /// happened to carry only numbers are all honest convergence. Recording
-    /// those would append a row per (field, service) to the append-only
-    /// `field_conflicts` on every compaction tick, forever, for a sender
-    /// that is losing nothing — noise that outgrows the evidence.
-    ///
-    /// Every conflict carries a bounded sample of the values it is about to
-    /// destroy ([`Self::capture_samples`]) — this phase is the only place
-    /// they exist as values rather than as `_raw` text to be re-parsed.
+    /// Recording a cast that nulls nothing would append a row per (field,
+    /// service) to the append-only `field_conflicts` on every compaction tick.
     pub(crate) fn tally_conflicts(
         &self,
         conn: &duckdb::Connection,
@@ -4683,15 +4342,9 @@ impl ConformPlan {
             .filter(|(_, (non_null, ok))| non_null > ok)
             .map(|(i, _)| i)
             .collect();
-        // Best-effort, exactly like the postgres-side evidence writes it
-        // feeds. `list(DISTINCT …)` accumulates every distinct misfit before
-        // the slice caps it and DuckDB does not spill it, so a column with
-        // pathological misfit cardinality can OOM the capture on a batch
-        // whose tally (two scalar aggregates) just succeeded. Propagating
-        // that would fail the whole conform: the WAL is retained, the next
-        // tick retries a larger batch, and ingestion tightens itself to a
-        // stop — while the boot lane would skip the file and withhold the
-        // marker forever. Evidence is worth less than the data it describes.
+        // `list(DISTINCT …)` accumulates every distinct misfit before the
+        // slice caps it and DuckDB does not spill it, so the capture can OOM
+        // on a batch whose tally (two scalar aggregates) just succeeded.
         let mut samples = match self.capture_samples(conn, source, &lossy) {
             Ok(samples) => samples,
             Err(e) => {
@@ -4781,10 +4434,9 @@ impl ConformPlan {
                 }
                 Ok(out)
             })
-            // Best effort, so never a maintenance failure: the caller
-            // records the capture's own failure. An out-of-memory capture is
-            // still logged and counted as a maintenance resource failure
-            // here, like every other maintenance statement.
+            // An out-of-memory capture is still logged and counted as a
+            // maintenance resource failure here, like every other maintenance
+            // statement.
             .map_err(|e| StatementFailure::duckdb("conform sample query failed", &e))?;
 
         let mut out = HashMap::with_capacity(sampled.len());
@@ -4799,11 +4451,6 @@ impl ConformPlan {
     }
 }
 
-/// The misfit-sample capture for one cast column: up to
-/// [`SAMPLE_CANDIDATES`] distinct values the cast nulls, rendered as one
-/// JSON array of strings, from which the caller keeps at most
-/// [`MAX_CONFLICT_SAMPLES`] once they are sanitised.
-///
 /// The predicate is the definition of a shelved value — a stored value the
 /// guarded cast cannot read — written against the same `cast.expr` the
 /// tally counts with, so the samples can only ever be values the conflict
@@ -4814,24 +4461,16 @@ fn sample_expr(cast: &CastEntry) -> String {
     distinct_misfit_samples_sql(&quoted, &text, &cast.expr)
 }
 
-/// The conform's own misfit-sampling aggregate (ADR-0011): up to
-/// [`SAMPLE_CANDIDATES`] DISTINCT values the cast nulls, as one JSON array of
-/// strings, from which [`decode_misfit_samples`] keeps at most
-/// [`MAX_CONFLICT_SAMPLES`].
+/// The conform's own misfit-sampling aggregate (ADR-0011).
 ///
 /// `list(DISTINCT …)` accumulates every distinct misfit before the slice
 /// caps it, which is safe here and only here: the source is one WAL batch,
 /// already bounded by the compactor's own batch limits. The repin scan runs
-/// the same question over a whole corpus, where the distinct count is
-/// unbounded, so it takes [`bounded_misfit_samples_sql`] instead — a
-/// deliberate second spelling, not a drift.
+/// the same question over a whole corpus, so it takes
+/// [`bounded_misfit_samples_sql`] instead.
 ///
-/// `left()` counts characters (probed), so it bounds what `DuckDB`
-/// accumulates and never what the store is promised — the byte cap is
-/// [`sanitize_sample`]'s, in Rust, after the control-character
-/// substitution. `array_slice` takes twice [`MAX_CONFLICT_SAMPLES`]
-/// candidates because sanitising can collapse two distinct raw values into
-/// one sample.
+/// `array_slice` takes twice [`MAX_CONFLICT_SAMPLES`] candidates because
+/// sanitising can collapse two distinct raw values into one sample.
 fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
         "to_json(array_slice(list(DISTINCT left({text}, {MAX_CONFLICT_SAMPLE_BYTES})) \
@@ -4842,28 +4481,19 @@ fn distinct_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> S
 
 /// The repin scan's misfit-sampling aggregate: at most
 /// [`MAX_CONFLICT_SAMPLES`] of the values a column carries whose reading
-/// through `target_expr` is NULL, as one JSON array of strings — bounded by
-/// construction over a corpus of any size.
+/// through `target_expr` is NULL, as one JSON array of strings.
 ///
 /// `approx_top_k` is a fixed-size sketch: its memory is a function of `k`,
-/// never of the distinct cardinality. That is the whole reason it is here
-/// rather than [`distinct_misfit_samples_sql`], whose `list(DISTINCT …)`
-/// holds every distinct misfit before the slice caps it — measured to
-/// exhaust the scan's 2GB memory limit at a few million distinct misfits,
-/// on exactly the corpus a repin exists to repair (a field a sender has
-/// been writing free text into). A report that cannot be produced for the
-/// worst corpus is a report for the cases that did not need it.
-///
-/// What changes with the sketch is which samples: the most frequent
-/// misfits rather than the first distinct ones, approximately ordered. For
-/// an advisory "here is what this pin cannot read" that is at least as
-/// useful, and every value in the list is an exact value the corpus holds
-/// — the approximation is in the ranking, never in the strings.
+/// never of the distinct cardinality. [`distinct_misfit_samples_sql`]'s
+/// `list(DISTINCT …)` was measured to exhaust the scan's 2GB memory limit at
+/// a few million distinct misfits. The sketch keeps the most frequent
+/// misfits, approximately ordered; every value in the list is an exact value
+/// the corpus holds.
 ///
 /// It rides the same statement as the counts (`count_repin_effect`), so
 /// the samples and the numbers describe one read of one file: two
 /// statements could straddle a compaction that replaced the file underneath
-/// them and report evidence from a corpus that never existed.
+/// them.
 pub(crate) fn bounded_misfit_samples_sql(quoted: &str, text: &str, target_expr: &str) -> String {
     format!(
         "to_json(approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), \
@@ -4898,16 +4528,10 @@ pub(crate) fn decode_misfit_samples(rendered: Option<&str>) -> Result<Vec<String
     Ok(kept)
 }
 
-/// One captured misfit made safe to store, return and render: control and
-/// format characters become U+FFFD ([`trawl_core::sanitize`]) and the result
-/// is cut to [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
-///
-/// Sanitising at capture rather than at each read is the point: the value is
-/// whatever bytes a client sent, and it goes on to a postgres row, a JSON
-/// body, an operator's terminal and a browser — one door is auditable, four
-/// are not. Order matters, too: U+FFFD is three bytes where most of what it
-/// replaces is one, so the byte cap is applied after the substitution or it
-/// is not a cap.
+/// Control and format characters become U+FFFD ([`trawl_core::sanitize`]) and
+/// the result is cut to [`MAX_CONFLICT_SAMPLE_BYTES`] on a `char` boundary.
+/// U+FFFD is three bytes where most of what it replaces is one, so the byte
+/// cap is applied after the substitution or it is not a cap.
 pub(crate) fn sanitize_sample(value: &str) -> String {
     let mut cleaned = trawl_core::sanitize::sanitize_display_text(value);
     if cleaned.len() > MAX_CONFLICT_SAMPLE_BYTES {
@@ -4931,15 +4555,12 @@ struct PublishTarget<'a> {
     env: &'a str,
 }
 
-/// A conformed batch written to `{service}.parquet.tmp` and not yet
-/// published.
 struct StagedOutput {
     output_dir: PathBuf,
     tmp_path: PathBuf,
     canonical_path: PathBuf,
     date: chrono::NaiveDate,
     hour: u8,
-    /// Whether the output merged an existing canonical file.
     merged: bool,
     /// Rows in the output file.
     rows: u64,
@@ -4966,11 +4587,6 @@ fn conform_and_write(
     Ok(staged.report)
 }
 
-/// Blocking phase 3: conform `wal_batch` to the authoritative pins, write
-/// the canonical `{service}.parquet` for the current hour (merged with the
-/// existing file when present) to a `.tmp`, and publish it through
-/// [`publish_output`].
-///
 /// `Err` means the output was not published; the WAL stays for the next
 /// tick, and a marker may stay for recovery. `Ok` carries the write report
 /// and, when the output is published but its marker could not be removed,
@@ -4989,8 +4605,6 @@ fn conform_and_publish(
     Ok((staged.report, incomplete))
 }
 
-/// Conform `wal_batch` and COPY it, merged with any existing canonical
-/// file, to `{service}.parquet.tmp` in the current hour's directory.
 fn write_output(
     prep: PreparedBatch,
     pins: &HashMap<String, CanonicalType>,
@@ -5012,12 +4626,8 @@ fn write_output(
         .into_iter()
         .filter(|n| !n.starts_with(WAL_FILE_COL))
         .collect();
-    // Counted before the merge: `merged` holds the whole hour file, and
-    // accumulating that into `field_services.row_count` would re-add every
-    // previously-compacted row on every tick.
     let batch_rows = count_rows(&conn, "wal_batch")?;
 
-    // Determine output directory from current time.
     let now = chrono::Utc::now();
     let date = now.date_naive();
     let hour = u8::try_from(now.hour()).map_err(|e| format!("hour out of range: {e}"))?;
@@ -5026,17 +4636,12 @@ fn write_output(
     std::fs::create_dir_all(&output_dir)
         .map_err(|e| format!("failed to create output dir: {e}"))?;
 
-    // Canonical filename: one parquet file per service per hour-directory.
-    // Merge with existing data if present, then atomic-rename into place.
     let canonical_path = hourly_file(data_dir, date, hour, service);
     let tmp_path = output_dir.join(format!("{service}.parquet.tmp"));
 
     let merged = canonical_path.exists();
 
     let rows: u64 = if merged {
-        // Merge: union existing parquet rows with new WAL batch.
-        // BY NAME handles heterogeneous schemas (different events have
-        // different fields) — missing columns become NULL in parquet.
         // Both sides are catalog-conformant, so a type conflict here means
         // a foreign file and errors loudly (WAL retained, retried).
         merge_with_existing(&conn, &canonical_path, service)?;
@@ -5059,7 +4664,6 @@ fn write_output(
             .map_err(|e| statement_failed("DROP TABLE failed", &e))?;
         count
     } else {
-        // Fresh write: no existing file to merge with.
         conn.execute_batch(&format!(
             "COPY (SELECT * FROM wal_batch ORDER BY \"_time\") TO '{}' \
              (FORMAT PARQUET, COMPRESSION SNAPPY, \
@@ -5092,19 +4696,7 @@ fn write_output(
     })
 }
 
-/// Publish a staged output exactly once (ADR-0041): bracket the rename with
-/// a publication marker that names the output's identity and the consumed
-/// WAL, so a crash or failure at any step leaves a record recovery can
-/// finish or roll back without merging the WAL twice.
-///
-/// 1. fsync the tmp and every directory entry leading to it, then hash it
-///    ([`durable_marker_for`]).
-/// 2. Write the marker durably.
-/// 3. Under the publication write guard: confirm every consumed WAL file is
-///    still there, rename, drain the hot batches, fsync the output
-///    directory.
-/// 4. Retire the consumed WAL files and fsync their directory.
-/// 5. Remove the marker durably.
+/// Publish a staged output exactly once (ADR-0041).
 ///
 /// Runs inside the caller's repin corpus read guard. `Err` means the output
 /// was not published: a failure before the marker leaves only an orphan tmp
@@ -5238,9 +4830,6 @@ fn durable_marker_for(
     // directory's entry in its parent. Syncing only the directories this
     // attempt created would skip one an earlier, failed attempt created, so
     // a retry could retire WAL under an output path that is not durable.
-    // Directory fsyncs cost little next to the COPY and the tmp's own
-    // fsync, and a per-process "already durable" cache would go stale when
-    // retention deletes a date directory and a publish recreates it.
     let entry_dirs = [
         Some(staged.output_dir.as_path()),
         staged.output_dir.parent(),
@@ -5289,10 +4878,6 @@ fn log_compaction_complete(staged: &StagedOutput, service: &str) {
     );
 }
 
-/// Conform `wal_batch` to the pins in place, per [`ConformPolicy::WalBatch`].
-///
-/// Returns the recordable conflicts (see [`ConformPlan::tally_conflicts`])
-/// and the retained column names.
 fn conform_wal_batch(
     conn: &duckdb::Connection,
     schema: &[ColInfo],
@@ -5361,14 +4946,6 @@ fn compact_service_blocking(
     Ok(quarantined.len() as u64)
 }
 
-/// Remove stale `.parquet.tmp` files left by interrupted compaction or
-/// rollup runs.
-///
-/// `data_dir` is one env root (`data/{env}`): checks both `{date}/{HH}/`
-/// (hourly compaction) and `{date}/` (daily rollup) for `.tmp` files older
-/// than `max_age`. These are inert (don't match `*.parquet` globs) but
-/// should be cleaned up to avoid disk waste.
-///
 /// An hourly tmp that a publication marker claims is kept however old it
 /// is: recovery decides "unpublished" from its presence, and without it
 /// the marker would read as a contradiction and block the service.
@@ -5396,7 +4973,6 @@ fn cleanup_stale_tmp_files(
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
-                // Hour subdirectory — check its contents.
                 let hour = path
                     .file_name()
                     .and_then(|name| name.to_str())
@@ -5408,15 +4984,12 @@ fn cleanup_stale_tmp_files(
                 };
                 cleanup_tmp_in_dir(&path, max_age, claimed);
             } else {
-                // Day-level file (from rollup).
                 remove_stale_tmp(&path, max_age);
             }
         }
     }
 }
 
-/// Remove `.tmp` files in a single hour directory that are older than
-/// `max_age`, except those `claimed` names by service.
 fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration, claimed: impl Fn(&str) -> bool) {
     let Ok(files) = std::fs::read_dir(dir) else {
         return;
@@ -5435,7 +5008,6 @@ fn cleanup_tmp_in_dir(dir: &Path, max_age: Duration, claimed: impl Fn(&str) -> b
     }
 }
 
-/// Remove a single `.tmp` file if older than `max_age`.
 fn remove_stale_tmp(path: &Path, max_age: Duration) {
     // Recovery must see the prepared generation before it considers an
     // existing canonical complete. Keep any tmp claimed by a rollup marker.
@@ -5459,15 +5031,8 @@ fn remove_stale_tmp(path: &Path, max_age: Duration) {
     }
 }
 
-/// Scan one env's WAL directory, isolating a read failure to that env.
-///
-/// Returns `None` (after logging) when the directory cannot be read, so the
-/// compaction cycle can skip that env and carry on. Propagating instead
-/// would abort the whole cycle — every other env's WAL drain plus the daily
-/// rollup — for as long as the one bad directory stays unreadable, growing
-/// the WAL without bound and leaving the hot buffer full, so admission
-/// refuses ingest (ADR-0043). A missing directory is not a failure: [`scan_wal_files`] already
-/// reports `NotFound` as an empty scan.
+/// Returns `None` (after logging) on a read failure, so the compaction
+/// cycle skips only this env. A missing directory scans as empty.
 fn scan_env_wal_files(env: &str, env_wal_dir: &Path, min_age: Duration) -> Option<Vec<PathBuf>> {
     match scan_wal_files(env_wal_dir, min_age) {
         Ok(files) => Some(files),
@@ -5527,7 +5092,6 @@ pub(crate) fn scan_wal_files(wal_dir: &Path, min_age: Duration) -> std::io::Resu
     Ok(files)
 }
 
-/// Group WAL file paths by service name (extracted from filename prefix).
 /// Boot hydration groups the same way, so a publication marker blocks the
 /// same files for both.
 pub(crate) fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathBuf>> {
@@ -5539,8 +5103,6 @@ pub(crate) fn group_by_service(files: Vec<PathBuf>) -> HashMap<String, Vec<PathB
             .and_then(|s| s.to_str())
             .unwrap_or("unknown");
 
-        // Filename format: {service}_{unix_millis}_{hex_random}
-        // Find the service by taking everything before the last two `_` segments.
         let service = extract_service_from_filename(filename);
         groups.entry(service).or_default().push(path);
     }
@@ -5583,7 +5145,6 @@ pub(crate) mod oom_support {
         parquet_of(path, BIG_ROWS);
     }
 
-    /// A [`big_parquet`] file with `rows` rows in its one row group.
     pub(crate) fn parquet_of(path: &Path, rows: u64) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         duckdb::Connection::open_in_memory()
@@ -5704,13 +5265,10 @@ mod tests {
         )
     }
 
-    /// [`rollup_once`] with no publication claims and no repin or gate.
     async fn rollup_unclaimed(data: &Path) -> Result<u64, String> {
         rollup_once(data, &PublicationClaims::default(), "2GB", None, None).await
     }
 
-    /// [`rollup_env_once`] for `prod` with no publication claims and no
-    /// repin or gate.
     async fn rollup_env_unclaimed(env_data: &Path) -> Result<u64, String> {
         rollup_env_once(
             "prod",
@@ -5772,8 +5330,6 @@ mod tests {
             1
         );
 
-        // Exercise each existing daily-rollup scan owner with a regular file
-        // in place of its directory, preserving its return/skip behavior.
         assert_eq!(rollup_unclaimed(&wal).await.unwrap(), 0);
         assert_eq!(
             operation_count(&handle, CompactionOperation::DailyRollupScan),
@@ -5868,7 +5424,6 @@ mod tests {
             0
         );
 
-        // A file in place of those directories must still emit real failures.
         std::fs::write(&removed, b"not a directory").unwrap();
         assert!(rollup_env_unclaimed(&removed).await.is_err());
         assert!(collect_hour_dirs(&removed).is_empty());
@@ -6193,9 +5748,6 @@ mod tests {
         assert!(!day.join("svc.parquet").exists());
     }
 
-    /// An abandoned rollup (case c) deletes its tmp and quarantines nothing,
-    /// and is no recovery failure. An unresolved marker (case d) fails
-    /// recovery once and quarantines nothing either.
     #[tokio::test]
     async fn operational_rollup_abort_and_unresolved_recovery_are_separate_facts() {
         let handle = operational_metrics();
@@ -6240,9 +5792,6 @@ mod tests {
         assert!(!state.canonical.exists());
         assert!(!state.marker.exists());
 
-        // A listed input is gone and nothing was published: recovery fails
-        // once, keeps the marker and the other input, and quarantines
-        // nothing.
         let marker = write_marker(
             &state.day,
             "nginx",
@@ -6376,12 +5925,10 @@ mod tests {
         assert!(marker.exists());
     }
 
-    /// A panicked conform-and-publish task fails the batch with fixed text.
     /// The panic payload can quote event values, and this error is logged
     /// as `compaction_error` on a persisted target, so it never carries it.
     #[tokio::test]
     async fn a_compaction_task_panic_never_carries_its_payload() {
-        // The payload of the publication seam's injected panic.
         const PAYLOAD: &str = "injected publication task panic";
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
@@ -6563,8 +6110,6 @@ mod tests {
         }
     }
 
-    // ---- publication markers (ADR-0041, #252) -----------------------------
-
     fn recovery_count(
         handle: &metrics_exporter_prometheus::PrometheusHandle,
         outcome: RecoveryOutcomeKind,
@@ -6613,7 +6158,6 @@ mod tests {
         String::from_utf8_lossy(&logs.lock().unwrap()).into_owned()
     }
 
-    /// One tagged event per message, in a WAL file with a unique name.
     fn tagged_wal(env_wal: &Path, service: &str, tags: &[&str]) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -6633,8 +6177,6 @@ mod tests {
         path
     }
 
-    /// Put a WAL file's events in the hot buffer under its batch id, as
-    /// ingest does after the WAL write.
     fn insert_hot(hot: &HotBuffer, env: &str, wal: &Path, service: &str) {
         let body = std::fs::read_to_string(wal).unwrap();
         let events: Vec<serde_json::Map<String, serde_json::Value>> = body
@@ -6656,7 +6198,6 @@ mod tests {
         }))
     }
 
-    /// Every `message` in every published parquet file, sorted.
     fn published_messages(data: &Path) -> Vec<String> {
         let mut rows: Vec<String> = find_files_by_ext(data, "parquet")
             .iter()
@@ -6769,12 +6310,6 @@ mod tests {
         std::fs::metadata(dir).unwrap().uid() == 0
     }
 
-    /// A consumed WAL file that can be neither deleted nor renamed aside
-    /// after the publish: the failure is counted once as the removal
-    /// operation, the published output and its drained batches stand, and
-    /// the marker keeps the WAL from being merged again. Before ADR-0041
-    /// this failure was a warning after the publish and the next tick merged
-    /// the WAL a second time.
     #[cfg(unix)]
     #[tokio::test]
     async fn operational_consumed_wal_removal_failure_preserves_published_output() {
@@ -6796,7 +6331,6 @@ mod tests {
         let (entered, release) = hot.publication().pause_next_publication_for_test();
         let obstruct_dir = env_wal.clone();
         let obstruction = std::thread::spawn(move || {
-            // The publish arrives at its pause; the bound only names a hang.
             entered.recv_timeout(HANG_GUARD).unwrap();
             // The output is renamed into place and the marker written. Make
             // both the delete and the rename-aside of the input fail.
@@ -6831,10 +6365,6 @@ mod tests {
         assert_eq!(published_messages(&data), ["retained"]);
     }
 
-    /// AC4: a consumed WAL that cannot be deleted never duplicates. Several
-    /// ticks leave exactly one copy of every event, the marker blocks the
-    /// re-merge, and each failure is logged and counted. Once the WAL can be
-    /// retired again, one tick finishes the publish.
     #[cfg(unix)]
     #[tokio::test]
     async fn compaction_undeletable_wal_never_duplicates() {
@@ -6862,7 +6392,6 @@ mod tests {
         let (entered, release) = hot.publication().pause_next_publication_for_test();
         let obstruct_dir = env_wal.clone();
         let obstruction = std::thread::spawn(move || {
-            // The publish arrives at its pause; the bound only names a hang.
             entered.recv_timeout(HANG_GUARD).unwrap();
             let guard = ModeGuard::read_only(&obstruct_dir);
             release.send(()).unwrap();
@@ -6897,8 +6426,6 @@ mod tests {
         let log = logged(&logs);
         assert!(log.contains("finishing the publish failed"), "{log}");
         assert!(log.contains("publication_recovery_failed"), "{log}");
-        // The retire failure's text is DEBUG-only; the ERROR names the cause
-        // (ADR-0040, amended 2026-11-09).
         assert!(log.contains("cause_kind=\"unknown\""), "{log}");
         assert!(!log.contains("failed to retire merged input"), "{log}");
 
@@ -6915,10 +6442,6 @@ mod tests {
         assert_eq!(published_messages(&data), sorted(&tags));
     }
 
-    /// AC5 at tick level: a marker whose canonical output carries another
-    /// identity and whose tmp is gone is a named, counted failure. Nothing
-    /// under the WAL or data root changes, and the service stays blocked on
-    /// every later tick although its WAL is ready to compact.
     #[tokio::test]
     async fn publication_recovery_contradiction_touches_nothing() {
         fn snapshot(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
@@ -6988,10 +6511,6 @@ mod tests {
         assert!(log.contains("reason=\"output_mismatch\""), "{log}");
     }
 
-    /// A crash after the marker and before the rename: the next tick rolls
-    /// the publish back (marker and tmp removed, WAL and hot batches kept)
-    /// and then publishes the batch exactly once, merged with the canonical
-    /// that was already there.
     #[tokio::test]
     async fn publish_interrupted_after_marker_rolls_back_and_publishes_once() {
         let handle = operational_metrics();
@@ -7003,7 +6522,6 @@ mod tests {
         std::fs::create_dir_all(&env_wal).unwrap();
         let hot = hot_buffer();
 
-        // An earlier batch is already published in this hour.
         let earlier = tagged_wal(&env_wal, "svc", &["cam-earlier"]);
         insert_hot(&hot, "prod", &earlier, "svc");
         assert_eq!(tick(&wal, &data, &hot).await.unwrap(), 0);
@@ -7050,9 +6568,6 @@ mod tests {
         assert_eq!(published_messages(&data), expected);
     }
 
-    /// A crash after the rename and before retirement: the output and the
-    /// drain stand, and the next tick retires the WAL instead of merging it
-    /// again.
     #[tokio::test]
     async fn publish_interrupted_after_rename_retires_without_duplicating() {
         let handle = operational_metrics();
@@ -7103,12 +6618,9 @@ mod tests {
         );
     }
 
-    /// AC7: stale-tmp cleanup keeps a tmp that a pending marker claims. A
-    /// publish stops after its marker, and the read-only WAL env directory
+    /// A publish stops after its marker, and the read-only WAL env directory
     /// keeps recovery from removing that marker, so its claim stands while
-    /// the tmp ages past the cleanup threshold. Deleting the tmp there would
-    /// leave a marker with neither output, a contradiction that blocks the
-    /// service for good. Once recovery can run, the batch publishes once.
+    /// the tmp ages past the cleanup threshold.
     #[cfg(unix)]
     #[tokio::test]
     async fn stale_tmp_cleanup_keeps_a_tmp_a_marker_claims() {
@@ -7164,13 +6676,9 @@ mod tests {
         assert_eq!(published_messages(&data), sorted(&tags));
     }
 
-    /// AC7: the daily rollup leaves alone every hourly file of a
-    /// `(date, service)` a pending marker claims. A published marker whose
-    /// WAL cannot be retired stays after recovery, and rolling its hourly
-    /// file into the daily one would delete the canonical output whose
-    /// identity recovery checks. Another service on the same day rolls up
-    /// as usual. Once retirement works, recovery finishes and the next
-    /// rollup takes the file.
+    /// A published marker whose WAL cannot be retired stays after recovery,
+    /// and rolling its hourly file into the daily one would delete the
+    /// canonical output whose identity recovery checks.
     #[cfg(unix)]
     #[tokio::test]
     async fn rollup_leaves_a_claimed_hourly_file_alone() {
@@ -7258,12 +6766,6 @@ mod tests {
         );
     }
 
-    /// Every publish syncs the whole output directory chain before its
-    /// marker, not only the directories that attempt created. The first
-    /// attempt creates `data/prod/{date}/{HH}` and fails on the sync of
-    /// `data/prod`. A retry finds every directory in place, but it must
-    /// still sync `data/prod`, so while that sync fails it may neither
-    /// publish nor retire the WAL.
     #[test]
     fn a_retried_publish_syncs_directories_an_earlier_attempt_created() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7325,10 +6827,6 @@ mod tests {
         assert!(!marker_file(&wal, "prod", "svc").exists());
     }
 
-    /// A consumed WAL file withdrawn after compaction read it (its writer's
-    /// directory fsync failed and it rejected the write) must not publish:
-    /// the sender retries that batch. The publish rolls back, keeps the
-    /// other inputs, and the next tick publishes them exactly once.
     #[tokio::test]
     async fn a_withdrawn_wal_file_rolls_the_publish_back() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7347,7 +6845,6 @@ mod tests {
             &[kept.clone(), withdrawn.clone()],
             Some(&hot),
             None,
-            // The writer withdraws its file after compaction read it.
             move || std::fs::remove_file(withdraw).unwrap(),
         )
         .await
@@ -7365,9 +6862,6 @@ mod tests {
         assert_eq!(hot.event_count(), 0);
     }
 
-    /// The marker lists only the inputs that contributed rows. A corrupt
-    /// input is quarantined and never named, and a chunk whose every input
-    /// is corrupt writes no marker at all.
     #[tokio::test]
     async fn the_marker_names_only_surviving_inputs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7407,8 +6901,6 @@ mod tests {
         assert_eq!(published_messages(&data), ["surv-good"]);
     }
 
-    /// How [`quarantined_batches_drain_whether_or_not_their_chunk_publishes`]
-    /// ends its first compaction pass.
     #[derive(Debug, Clone, Copy)]
     pub(super) enum ChunkEnd {
         Publishes,
@@ -7422,12 +6914,6 @@ mod tests {
         PrepPanics,
     }
 
-    /// A quarantined WAL file is renamed out of every later scan, so only
-    /// the chunk that quarantined it can drain its hot batch. A publish
-    /// drains it with the chunk; a chunk that fails after the quarantine
-    /// must drain it too, or its charge stays until restart. That includes a
-    /// chunk whose preparation panics after the quarantine. The chunk's
-    /// other batches stay resident until a retry publishes them.
     #[tokio::test]
     async fn quarantined_batches_drain_whether_or_not_their_chunk_publishes() {
         for end in [
@@ -7439,7 +6925,6 @@ mod tests {
         }
     }
 
-    /// One pass of [`quarantined_batches_drain_whether_or_not_their_chunk_publishes`].
     /// `catalog` is the dead catalog for [`ChunkEnd::CatalogUnreachable`],
     /// and `None` for every other end.
     #[allow(clippy::too_many_lines)] // one fixture, every way the chunk can end
@@ -7530,8 +7015,6 @@ mod tests {
         assert_eq!(hot.batch_count(), 2, "{end:?}: the failed chunk stays");
         assert!(published_messages(&data).is_empty(), "{end:?}");
 
-        // Clear the fault: the retry publishes the rest, and nothing
-        // stays behind to age.
         if matches!(end, ChunkEnd::WriteFails) {
             std::fs::remove_file(&env_data).unwrap();
         }
@@ -7671,7 +7154,6 @@ mod tests {
         let complete = std::fs::read(&marker).unwrap();
         let stage = day.join(format!("..rollup-nginx.next.{}", std::process::id()));
         std::fs::create_dir(&stage).unwrap();
-        // A publish whose staged name is taken fails before its rename.
         let partial = RollupMarker::new(
             "nginx",
             identity(&daily),
@@ -7704,9 +7186,6 @@ mod tests {
         );
     }
 
-    /// An abandoned rollup (case c) whose tmp removal fails keeps its
-    /// marker, and the retry abandons it again: the prior daily file and
-    /// the unpublished hourly are both kept.
     #[tokio::test]
     async fn failed_rollup_abort_cannot_retire_unpublished_rows_on_retry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -7866,8 +7345,6 @@ mod tests {
             )
             .unwrap();
         });
-        // The writer arrives at its publication pause; the bound only
-        // names a hang.
         entered.recv_timeout(HANG_GUARD).unwrap();
         assert_eq!(hot.event_count(), 1);
         assert_eq!(find_files_by_ext(&data, "parquet").len(), 1);
@@ -7920,8 +7397,6 @@ mod tests {
             .result
             .unwrap();
         });
-        // The writer arrives at its publication pause; the bound only
-        // names a hang.
         entered.recv_timeout(HANG_GUARD).unwrap();
         assert!(hourly.exists());
         assert_eq!(read_strings(&daily, "msg"), vec!["old", "new"]);
@@ -7985,9 +7460,6 @@ mod tests {
         assert!(!staged.exists());
     }
 
-    /// A rollup that stopped before its rename, whose tmp is not its
-    /// output, is abandoned (case c): the old daily file and the hourly
-    /// inputs are kept, and the tmp is deleted.
     #[test]
     fn corrupt_tmp_preserves_old_daily_and_hourlies() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8003,9 +7475,6 @@ mod tests {
         assert!(!state.marker.exists());
     }
 
-    /// A marker recovery cannot resolve keeps readers closed and stays:
-    /// here the daily file is neither the prior the marker records nor its
-    /// replacement.
     #[tokio::test]
     async fn failed_rollup_recovery_keeps_readers_closed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8021,9 +7490,6 @@ mod tests {
         assert!(state.marker.exists());
     }
 
-    /// Rollup recovery admits compaction on rollup state alone: the restart
-    /// backlog is what compaction drains, so it must not stop the pass
-    /// (ADR-0041 slice 2). A failed marker scan still does.
     #[tokio::test]
     async fn rollup_boot_recovery_does_not_wait_for_the_restart_backlog() {
         let dir = tempfile::tempdir().unwrap();
@@ -8050,8 +7516,6 @@ mod tests {
         );
     }
 
-    /// Each compaction pass retries a failed marker scan, and a complete
-    /// one lets the pass drain WAL again (ADR-0041 slice 2).
     #[tokio::test]
     async fn rollup_boot_recovery_rescan_runs_on_each_compaction_pass() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8099,9 +7563,6 @@ mod tests {
         assert!(gate.read().await.is_ok());
     }
 
-    /// Boot recovers every rollup marker the gate's scan registered, on a
-    /// gate born starting, and leaves the restart state to hydration
-    /// (ADR-0041 slice 2).
     #[test]
     fn rollup_boot_recovery_recovers_the_scanned_markers() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8139,9 +7600,6 @@ mod tests {
         );
     }
 
-    /// A boot whose rollup marker scan failed logs that at ERROR, naming no
-    /// path, and never as a finished recovery: reads refuse
-    /// `rollup_pending` until a compaction pass completes a rescan.
     #[test]
     fn rollup_boot_recovery_logs_a_failed_marker_scan_at_error() {
         let logs = captured_logs();
@@ -8172,9 +7630,6 @@ mod tests {
         );
     }
 
-    /// A boot recovery that fails does not stop the boot: it logs one
-    /// ERROR naming no path and leaves the marker pending, so reads refuse
-    /// `rollup_pending` until a compaction pass recovers it.
     #[test]
     fn rollup_boot_recovery_failure_leaves_the_marker_pending() {
         #[derive(Clone, Default)]
@@ -8191,8 +7646,6 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
-        // The daily file is neither the prior the marker records nor its
-        // replacement, so recovery cannot prove what the rollup did.
         let state = interrupted_rollup(&data, true, Phase::Rename);
         replace_with_other_parquet(tmp.path(), &state.canonical);
         let marker = state.marker.clone();
@@ -8230,14 +7683,6 @@ mod tests {
         );
     }
 
-    /// A rollup marker under an env child that is not a canonical date is
-    /// not in the layout, so recovery refuses its day before listing it:
-    /// no file is observed, moved or removed, the marker stays registered,
-    /// and reads refuse `rollup_pending` (ADR-0041, amendment of
-    /// 2026-11-08). Each refusal is a counted recovery failure, logged with
-    /// the proof `day_not_canonical` and no path, and boot reports no
-    /// finished recovery. Under a canonical date, the marker's identities
-    /// would promote the tmp and retire the input.
     #[test]
     fn rollup_recovery_refuses_a_noncanonical_day() {
         let handle = operational_metrics();
@@ -8303,10 +7748,6 @@ mod tests {
         assert!(!log.contains(&*tmp.path().to_string_lossy()), "{log}");
     }
 
-    /// A marker listing an input under hour `24` or `99` fails validation
-    /// (case d, `marker_malformed`): boot recovery keeps it and every file,
-    /// and reads refuse `rollup_pending`. Were those hours valid, its
-    /// identities would promote the tmp and retire the input.
     #[test]
     fn rollup_recovery_keeps_a_marker_listing_an_hour_past_23() {
         let logs = captured_logs();
@@ -8363,10 +7804,6 @@ mod tests {
         gate
     }
 
-    /// Boot awaits rollup recovery before the listener binds, so a FIFO at
-    /// a rollup marker path must not block it waiting for a FIFO writer.
-    /// The boot goes on; the marker stays pending, and reads refuse
-    /// `rollup_pending`.
     #[cfg(target_os = "linux")]
     #[test]
     fn rollup_boot_recovery_leaves_a_fifo_marker_pending_without_blocking() {
@@ -8395,12 +7832,6 @@ mod tests {
         );
     }
 
-    /// A FIFO at the staged rollup output does not block boot recovery
-    /// either, and is never taken for the merge's output: it is no regular
-    /// file, so recovery leaves it in place. With every input present and
-    /// nothing published, recovery abandons the rollup and keeps the hourly
-    /// inputs (case c). With the output already renamed into place, it
-    /// finishes the rollup (case a).
     #[cfg(target_os = "linux")]
     #[test]
     fn rollup_boot_recovery_steps_past_a_fifo_staged_output_without_blocking() {
@@ -8448,9 +7879,6 @@ mod tests {
         }
     }
 
-    /// A rollup marker over [`rollup_marker::MAX_ROLLUP_MARKER_BYTES`] is
-    /// not read, so no file it names is retired, and it stays pending. One
-    /// at the bound is read and recovered.
     #[cfg(unix)]
     #[test]
     fn rollup_boot_recovery_reads_no_marker_over_the_bound() {
@@ -8481,15 +7909,6 @@ mod tests {
         }
     }
 
-    /// The pass-through shortcut is a claim about the conform, not about
-    /// the physical type: it holds only where a column already of that
-    /// type needs nothing done to it.
-    ///
-    /// SEVERITY is the exception, and it must be: its domain is the 1-24
-    /// ladder, so a BIGINT column carrying `99` still has to be nulled —
-    /// otherwise the corpus holds a value whose canonical token text is
-    /// NULL, and `_severity=warn*` and the results table disagree about
-    /// what is in the column (ADR-0013).
     #[test]
     fn the_conform_pass_through_excludes_the_severity_range_guard() {
         for pin in [
@@ -8508,7 +7927,6 @@ mod tests {
         let sql = conform_expr("\"c\"", "BIGINT", CanonicalType::Severity)
             .expect("SEVERITY still guards the ladder range");
         assert!(sql.contains("BETWEEN 1 AND 24"), "{sql}");
-        // …and a non-matching physical type conforms as any other pin does.
         assert!(conform_expr("\"c\"", "VARCHAR", CanonicalType::Severity).is_some());
     }
 
@@ -8541,7 +7959,6 @@ mod tests {
         assert_eq!(groups["postgres"].len(), 1);
     }
 
-    /// Helper: write an ndjson WAL file with the given records.
     fn write_wal_file(dir: &Path, service: &str, records: &[&str]) -> PathBuf {
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -8552,7 +7969,6 @@ mod tests {
         path
     }
 
-    /// Recursively find files matching an extension under a directory.
     fn find_files_by_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
         let mut result = Vec::new();
         if let Ok(entries) = std::fs::read_dir(dir) {
@@ -8580,7 +7996,6 @@ mod tests {
 
         compact_service_blocking(&wal_files, &data_dir, "nginx", "2GB").unwrap();
 
-        // Should create {date}/{hour}/nginx.parquet (canonical name).
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
         assert_eq!(
@@ -8589,16 +8004,10 @@ mod tests {
             "expected canonical filename"
         );
 
-        // No .tmp files left behind.
         let tmp_files = find_files_by_ext(&data_dir, "tmp");
         assert!(tmp_files.is_empty(), "stale .tmp files found");
     }
 
-    /// A WAL batch too large for the compaction memory limit is a resource
-    /// failure, not a corrupt file (ADR-0056). The single-file probe that
-    /// isolates corrupt WAL runs out of memory on the same file, so reading
-    /// that as corruption would quarantine sound data. The WAL is kept as
-    /// it was, nothing is quarantined and no parquet is written.
     #[test]
     fn maintenance_out_of_memory_is_a_resource_failure_in_compaction() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8623,8 +8032,6 @@ mod tests {
         );
         assert_eq!(exhausted, 1, "{logs}");
         assert!(logs.contains("maintenance_resource_exhausted"), "{logs}");
-        // The event carries the class and the cause; `DuckDB`'s text stays
-        // at DEBUG, below what this capture keeps.
         assert!(
             logs.contains("error_class=\"service_unavailable\""),
             "{logs}"
@@ -8642,9 +8049,6 @@ mod tests {
         assert!(find_files_by_ext(&data_dir, "parquet").is_empty());
     }
 
-    /// A merge with the hour's existing file that runs out of memory is a
-    /// resource failure, not a catalog invariant violation (ADR-0056): the
-    /// existing file is trawl's own and conformant. Both inputs are kept.
     #[test]
     fn maintenance_out_of_memory_is_a_resource_failure_in_compaction_merge() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8696,9 +8100,6 @@ mod tests {
         );
     }
 
-    /// A rollup that runs out of memory is a resource failure, not
-    /// unreadable input (ADR-0056). Every hourly input is kept for the next
-    /// pass and no daily file is published.
     #[test]
     fn maintenance_out_of_memory_is_a_resource_failure_in_rollup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8736,21 +8137,17 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // First compaction: write initial data.
         let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"first"}"#;
         let files1 = vec![write_wal_file(&wal_dir, "nginx", &[r1])];
         compact_service_blocking(&files1, &data_dir, "nginx", "2GB").unwrap();
 
-        // Second compaction: merge new data into existing file.
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","message":"second"}"#;
         let files2 = vec![write_wal_file(&wal_dir, "nginx", &[r2])];
         compact_service_blocking(&files2, &data_dir, "nginx", "2GB").unwrap();
 
-        // Still only one parquet file.
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
 
-        // Verify merged file contains both rows.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -8765,11 +8162,6 @@ mod tests {
         assert_eq!(count, 2, "merged file should contain 2 rows");
     }
 
-    /// `field_services.row_count` is accumulated by `touch_services`, so
-    /// the report must carry this batch's rows — the merged file's total
-    /// would re-add every earlier batch on every tick. And the observed
-    /// fields must be the post-conform set: a deferred-pin column is
-    /// dropped from the parquet, so claiming it as observed is a lie.
     #[test]
     fn write_report_counts_only_this_batch_and_written_fields() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8838,8 +8230,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Ingest out-of-order timestamps in both the fresh-write and
-        // merge paths to verify both sort.
         let late = r#"{"_time":"2026-01-01T00:00:10Z","_ingested":"2026-01-01T00:00:10Z","service":"nginx","msg":"late"}"#;
         let early = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"nginx","msg":"early"}"#;
         compact_service_blocking(
@@ -8850,8 +8240,6 @@ mod tests {
         )
         .unwrap();
 
-        // Second batch merges into the existing file; include a timestamp
-        // that should sort between the two above.
         let middle = r#"{"_time":"2026-01-01T00:00:05Z","_ingested":"2026-01-01T00:00:05Z","service":"nginx","msg":"middle"}"#;
         compact_service_blocking(
             &[write_wal_file(&wal_dir, "nginx", &[middle])],
@@ -8892,8 +8280,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Two records with different key sets — simulates the real scenario
-        // where services emit log lines with varying JSON shapes.
         let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"base record"}"#;
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"extra","extra_field":"surprise","error":"oh no"}"#;
 
@@ -8905,7 +8291,6 @@ mod tests {
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet_files.len(), 1);
 
-        // Verify both rows are present in the output.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -8930,10 +8315,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Simulates the real data shape: outer envelope + nested json object
-        // with varying subkeys. The `json` object has different keys across
-        // records, and `k8s_namespace` at the top level coexists with
-        // `namespace` inside the nested object.
         let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"startup","k8s_namespace":"default","json":{"level":"info","msg":"starting","namespace":"kube-system","build":{"version":"1.0","commit":"abc123"}}}"#;
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"runtime","k8s_namespace":"default","json":{"level":"warn","msg":"something happened"}}"#;
 
@@ -9007,9 +8388,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Create 3 WAL files. Compact them in two calls to simulate chunking:
-        // first call processes 2 files, second call processes 1 file and
-        // merges with the existing parquet from the first call.
         let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"test","message":"one"}"#;
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"test","message":"two"}"#;
         let r3 = r#"{"_time":"2026-01-01T00:00:02Z","_ingested":"2026-01-01T00:00:02Z","service":"test","message":"three"}"#;
@@ -9018,10 +8396,8 @@ mod tests {
         let f2 = write_wal_file(&wal_dir, "test", &[r2]);
         let f3 = write_wal_file(&wal_dir, "test", &[r3]);
 
-        // Chunk 1: first two files.
         compact_service_blocking(&[f1, f2], &data_dir, "test", "2GB").unwrap();
 
-        // Chunk 2: third file merges into existing parquet.
         compact_service_blocking(&[f3], &data_dir, "test", "2GB").unwrap();
 
         let parquet_files = find_files_by_ext(&data_dir, "parquet");
@@ -9046,21 +8422,15 @@ mod tests {
 
     #[test]
     fn compact_merges_despite_type_conflict() {
-        // The k8s containerID scenario: first batch carries `container_id`
-        // as a JSON object, second as a plain string. The conform pipeline
-        // pins the column VARCHAR at the first write, so the second batch
-        // merges with no conflict at all — no cast fallback involved.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // First batch: container_id is a JSON object.
         let r1 = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"kubelet","message":"start","container_id":{"id":"abc123","runtime":"containerd"}}"#;
         let f1 = write_wal_file(&wal_dir, "kubelet", &[r1]);
         compact_service_blocking(&[f1], &data_dir, "kubelet", "2GB").unwrap();
 
-        // Second batch: container_id is a plain string.
         let r2 = r#"{"_time":"2026-01-01T00:00:01Z","_ingested":"2026-01-01T00:00:01Z","service":"kubelet","message":"running","container_id":"def456"}"#;
         let f2 = write_wal_file(&wal_dir, "kubelet", &[r2]);
 
@@ -9085,7 +8455,6 @@ mod tests {
             "both rows should be present despite type conflict on container_id"
         );
 
-        // Verify the conflicting column was cast to VARCHAR.
         let col_type: String = conn
             .query_row(
                 &format!(
@@ -9104,9 +8473,6 @@ mod tests {
 
     #[test]
     fn compaction_coerces_complex_fields_to_varchar() {
-        // An object-valued field must be written as VARCHAR so hourly files
-        // never disagree on its physical type. Scalars keep their inferred
-        // types.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -9120,7 +8486,6 @@ mod tests {
         assert_eq!(parquet.len(), 1);
         let conn = duckdb::Connection::open_in_memory().unwrap();
 
-        // The object field is coerced to VARCHAR, preserving the JSON text.
         let (ty, val): (String, String) = conn
             .query_row(
                 &format!(
@@ -9135,7 +8500,6 @@ mod tests {
         assert_eq!(ty, "VARCHAR", "object field must be coerced to VARCHAR");
         assert!(val.contains("abc"), "JSON text should be preserved: {val}");
 
-        // A scalar field keeps its inferred numeric type.
         let count_ty: String = conn
             .query_row(
                 &format!(
@@ -9236,7 +8600,6 @@ mod tests {
         (dtype, nn, total)
     }
 
-    /// One canonical envelope record with a custom field value spliced in.
     fn record_with(field: &str, value: &str, i: usize) -> String {
         format!(
             "{{\"_time\":\"2026-01-01T00:00:{:02}Z\",\"_ingested\":\"2026-01-01T00:00:{:02}Z\",\
@@ -9246,11 +8609,6 @@ mod tests {
         )
     }
 
-    /// The SEVERITY ladder guard must not turn every already-conformed file
-    /// into a rewrite: `_severity` is in every parquet trawl writes, so a
-    /// plan whose only cast is that guard is the identity unless the source
-    /// actually holds an out-of-ladder number — and the tally is what proves
-    /// it, per file, before the in-place rewrite is paid for.
     #[test]
     fn a_guard_only_plan_over_an_in_range_source_nulls_nothing() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9277,8 +8635,6 @@ mod tests {
             "1-24 values are already conformant: nothing to rewrite"
         );
 
-        // …and an out-of-ladder value is still caught, so the skip is
-        // decided by the data rather than by the pin.
         conn.execute_batch("INSERT INTO wal_batch VALUES (99, 'm')")
             .unwrap();
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
@@ -9286,8 +8642,6 @@ mod tests {
         assert_eq!(conflicts[0].rows_nulled, 1);
     }
 
-    /// A plan that also renames or drops is never guard-only, whatever its
-    /// casts are: those changes are invisible to the tally.
     #[test]
     fn a_rename_alongside_the_guard_is_not_guard_only() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9308,11 +8662,6 @@ mod tests {
         assert!(!plan.is_guard_only(), "the case-fold rename is real work");
     }
 
-    /// Only a cast that nulled something is conflict evidence.
-    /// `field_conflicts` is append-only and compaction ticks every few
-    /// seconds, so recording a lossless conform (here: a VARCHAR-pinned
-    /// field whose batch happened to carry only numbers) would append a row
-    /// per (field, service) forever for a sender losing nothing.
     #[test]
     fn lossless_conform_is_not_recorded_as_a_conflict() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9342,10 +8691,9 @@ mod tests {
         assert_eq!(conflicts[0].rows_nulled, 1, "'x' is the only nulled value");
     }
 
-    /// A plan wider than one aggregate chunk must blame the column the rows
-    /// were actually nulled in: the tally runs in batched passes, so a
-    /// slot-mapping slip would hand a lossless column its neighbour's
-    /// evidence. Alternating lossy/lossless across the boundary catches that.
+    /// The tally runs in batched passes, so a slot-mapping slip would hand a
+    /// lossless column its neighbour's evidence. Alternating lossy/lossless
+    /// across the boundary catches that.
     #[test]
     fn tally_conflicts_spans_chunk_boundary_without_crossing_columns() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9384,9 +8732,6 @@ mod tests {
         );
     }
 
-    /// The evidence a conflict row carries beyond its counts: which values
-    /// the pin is actually costing. Distinct, capped, and only ever values
-    /// the cast nulled — a lossless column's convergence is not evidence.
     #[test]
     fn conflict_samples_are_the_distinct_nulled_values_capped_at_five() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9425,11 +8770,6 @@ mod tests {
         );
     }
 
-    /// A misfit value is client text of client-chosen length and content, so
-    /// the sample is cut to a byte budget and stripped of control characters
-    /// at capture — before it reaches postgres, a response body or a
-    /// terminal. The substitution runs first (U+FFFD is three bytes where the
-    /// character it replaces is one), and the cut lands on a `char` boundary.
     #[test]
     fn conflict_samples_are_control_sanitised_then_byte_capped() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9480,11 +8820,6 @@ mod tests {
         assert_eq!(lengths, vec![5, 15, 255, 256]);
     }
 
-    /// `DISTINCT` runs in `DuckDB` over the raw values, but what is stored
-    /// is the sanitised, byte-capped form — and two raw misfits can collapse
-    /// into one of those. The stored set is deduplicated after both
-    /// transforms, so "at most five DISTINCT samples" describes the samples
-    /// rather than the values they came from.
     #[test]
     fn conflict_samples_are_distinct_after_sanitisation() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9518,14 +8853,10 @@ mod tests {
         );
     }
 
-    /// A capture that fails must cost the samples, never the batch.
-    ///
     /// The failure is real, not mocked: `list(DISTINCT …)` accumulates every
     /// distinct misfit and `DuckDB` does not spill it, so a memory limit the
     /// two scalar tally aggregates fit inside comfortably is one the capture
-    /// exhausts. Propagating it would fail the conform, retain the WAL, and
-    /// have the next tick retry a bigger batch — an ingestion stall that
-    /// tightens itself with every retry.
+    /// exhausts.
     #[test]
     fn a_failed_sample_capture_still_records_the_conflict() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9570,12 +8901,6 @@ mod tests {
         );
     }
 
-    /// A sample capture that runs out of memory is still a maintenance
-    /// resource failure (ADR-0056), even though sampling is best-effort: the
-    /// conflict counts survive, `catalog_sample_capture_failed` is counted,
-    /// and the same `maintenance_resource_exhausted` event and counter the
-    /// other maintenance statements raise fire once, so an operator sizing
-    /// `ingest.compaction_memory_limit` sees the pressure.
     #[test]
     fn an_out_of_memory_sample_capture_is_counted_as_a_resource_failure() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -9613,17 +8938,11 @@ mod tests {
         assert!(logs.contains("catalog_sample_capture_failed"), "{logs}");
     }
 
-    /// A batch that conflicts on nothing runs no sample query at all — the
-    /// capture is a second aggregate pass over client-width data, and a
-    /// healthy install must not pay it every tick.
-    ///
     /// Observed rather than assumed, through the one signal a swallowed
     /// capture leaves: both fixtures are wide enough that a capture over
     /// them exhausts the connection's memory limit, so a capture that ran
     /// would bump the failure counter. The conflicting fixture proves the
     /// probe has teeth; the clean one proves the capture never ran.
-    /// (Widening the sampled set from "the columns that conflicted" to
-    /// "every cast column" fails the second assertion.)
     #[test]
     fn a_batch_with_no_conflicts_runs_no_sample_query() {
         // Distinct 200-byte values: enough that `list(DISTINCT …)` cannot
@@ -9682,11 +9001,6 @@ mod tests {
         assert!(!ran, "a clean batch must not run the capture at all");
     }
 
-    /// At the sampled-column cap the evidence degrades, never the tally: a
-    /// batch conflicting on more columns than one capture pass may cover
-    /// still records every conflict, and only the columns past the cap lose
-    /// their samples. Which columns those are is decided by name, so a wide
-    /// batch samples the same fields whatever order it describes in.
     #[test]
     fn the_sampled_column_cap_drops_samples_not_conflicts() {
         let cols = MAX_SAMPLED_CONFLICT_COLUMNS + 1;
@@ -9721,8 +9035,6 @@ mod tests {
             "the last column BY NAME is the one that loses its samples"
         );
     }
-
-    // --- the pin ladder is deterministic over mixed batches (ADR-0009) ---
 
     #[test]
     fn pin_ladder_one_outlier_among_integers_pins_bigint() {
@@ -9764,8 +9076,6 @@ mod tests {
         assert_eq!(dtype, "VARCHAR", "a 50/50 batch honestly pins VARCHAR");
         assert_eq!((nn, total), (20, 20), "nothing nulls on a VARCHAR pin");
 
-        // The JSON-typed source column must land UNQUOTED: '5' and 'n/a',
-        // never '"n/a"'.
         let values = read_strings(&parquet[0], "DISTINCT duration");
         assert!(
             values.contains(&"n/a".to_owned()),
@@ -9868,18 +9178,6 @@ mod tests {
     /// batch pins BIGINT and stores that integer — and a >2^53 INTEGER
     /// batch still pins BIGINT bit-exactly (JSON keeps integer tokens
     /// integral, so nothing rounds it at all).
-    ///
-    /// Text-first scoring (ADR-0011) takes both sides of the guard from one
-    /// text, which is what makes this deterministic. Comparing the DOUBLE
-    /// column's own BIGINT cast (`…768`, the double's exact value) against
-    /// the column's 17-significant-digit rendering (`…800`) would refuse the
-    /// pin over the gap between two spellings of one double, and answer
-    /// differently for any `read_json` class that renders that double
-    /// differently. Below 2^53 nothing moves: a real fraction survives
-    /// into the text and is still refused
-    /// ([`Self::pin_ladder_fractional_majority_pins_double_not_bigint`]),
-    /// as is a fractional value that arrives as TEXT at any magnitude
-    /// ([`Self::conform_to_bigint_pin_nulls_beyond_2_pow_53_fractionals`]).
     #[test]
     fn pin_ladder_beyond_2_pow_53_integral_doubles_pin_bigint() {
         let tmp = tempfile::tempdir().unwrap();
@@ -9935,9 +9233,6 @@ mod tests {
         );
     }
 
-    /// Conform-time twin of the boundary case: against an existing BIGINT
-    /// pin, a >2^53 fractional value must NULL and tally — never write the
-    /// rounded `...711`.
     #[test]
     fn conform_to_bigint_pin_nulls_beyond_2_pow_53_fractionals() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -10005,11 +9300,6 @@ mod tests {
         assert_eq!(nn, 19, "only the string nulls");
     }
 
-    /// The catalog holds ASCII-folded names only, so the conform plan must
-    /// fold a mixed-case column onto its pin — a type-matching column still
-    /// gets a rename (a rewrite, not a no-op), and a cast column lands under
-    /// the folded alias with its conflict evidence attributed to the catalog
-    /// key.
     #[test]
     fn conform_plan_folds_mixed_case_columns_onto_their_pins() {
         let schema = vec![
@@ -10046,17 +9336,11 @@ mod tests {
             plan.select_list[1]
         );
 
-        // WalBatch: an unpinned mixed-case column is judged by its folded
-        // name — pinned under `dur`, so it is conformed, not dropped.
         let wal_plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert!(wal_plan.dropped.is_empty(), "{:?}", wal_plan.dropped);
         assert_eq!(wal_plan.retained, vec!["dur", "note"]);
     }
 
-    /// The repin policy (ADR-0011): the target column routes through the
-    /// resurrection expression — stored guarded reading first, then the
-    /// `_raw` re-extraction — while every already-conformant column passes
-    /// through untouched.
     #[test]
     fn repin_policy_routes_the_target_through_resurrection() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -10070,7 +9354,6 @@ mod tests {
         )
         .unwrap();
         let schema = describe_source(&conn, "f").unwrap();
-        // The one-entry-flipped pin map: status now VARCHAR.
         let pins: HashMap<String, CanonicalType> = [
             ("status".to_owned(), CanonicalType::Varchar),
             ("service".to_owned(), CanonicalType::Varchar),
@@ -10121,10 +9404,6 @@ mod tests {
         );
     }
 
-    /// The forced resurrection-only pass (`to == current` + force): the
-    /// column's physical type already IS the pin, which the ordinary
-    /// conform would treat as a noop — the repin target must still be
-    /// rewritten so shelved values come back.
     #[test]
     fn repin_policy_fires_even_when_the_dtype_already_matches_the_pin() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -10164,10 +9443,6 @@ mod tests {
         assert_eq!(got, Some(7), "the shelved value comes back");
     }
 
-    /// Defensive: an affected file that (against the envelope invariant)
-    /// carries no `_raw` column falls back to the plain guarded conform —
-    /// a resurrection arm referencing a missing column would fail the
-    /// whole rewrite.
     #[test]
     fn repin_policy_without_raw_column_falls_back_to_plain_conform() {
         let schema = vec![ColInfo {
@@ -10194,14 +9469,6 @@ mod tests {
         );
     }
 
-    /// Two sampling aggregates, one promise. The conform's own evidence
-    /// accumulates every distinct misfit and slices — safe over a bounded
-    /// WAL batch — while the repin scan reads a whole corpus and takes a
-    /// fixed-size sketch instead, because the distinct count there is a
-    /// sender's free text and nothing bounds it. What they share is
-    /// what a sample is: the same subject (a value the column carries whose
-    /// reading is NULL), the same character cap, and the same
-    /// sanitise-then-cap-then-dedup decode.
     #[test]
     fn both_sampling_aggregates_share_the_subject_and_the_decode() {
         let quoted = quote_ident("dur");
@@ -10209,7 +9476,6 @@ mod tests {
         let unbounded = distinct_misfit_samples_sql(&quoted, &text, "TARGET");
         let bounded = bounded_misfit_samples_sql(&quoted, &text, "TARGET");
 
-        // The conform's shape is unchanged (its input is a bounded batch).
         assert_eq!(
             unbounded,
             "to_json(array_slice(list(DISTINCT \
@@ -10225,7 +9491,6 @@ mod tests {
         };
         assert_eq!(sample_expr(&cast), unbounded);
 
-        // One subject, one cap, in both.
         for sql in [&unbounded, &bounded] {
             assert!(
                 sql.contains("FILTER (WHERE \"dur\" IS NOT NULL AND (TARGET) IS NULL)"),
@@ -10234,8 +9499,6 @@ mod tests {
             assert!(sql.contains(&format!("left({text}, {MAX_CONFLICT_SAMPLE_BYTES})")));
             assert!(sql.starts_with("to_json(") && sql.ends_with(")::VARCHAR"));
         }
-        // The repin's memory is a function of k, never of the corpus: the
-        // sketch is the whole point, and `list(DISTINCT …)` must not appear.
         assert!(
             bounded.contains(&format!(
                 "approx_top_k(left({text}, {MAX_CONFLICT_SAMPLE_BYTES}), {MAX_CONFLICT_SAMPLES})"
@@ -10245,16 +9508,11 @@ mod tests {
         assert!(!bounded.contains("list(DISTINCT"), "{bounded}");
     }
 
-    /// The bounded aggregate, executed against the shape that exhausts the
-    /// unbounded one: a column whose every value is a distinct misfit. The
-    /// scan must survive and return at most five samples, all of them real
-    /// values from the corpus.
     #[test]
     fn the_bounded_sampler_survives_a_high_cardinality_misfit_column() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
             .unwrap();
-        // 200k DISTINCT unreadable values — every row its own misfit.
         conn.execute_batch(
             "CREATE TABLE f AS SELECT ('gold-' || i::VARCHAR) AS level FROM range(200000) t(i)",
         )
@@ -10274,7 +9532,6 @@ mod tests {
             assert!(sample.starts_with("gold-"), "{sample} is not a real value");
         }
 
-        // And a column with nothing to sample answers nothing, not an error.
         conn.execute_batch("CREATE TABLE clean AS SELECT 'error' AS level")
             .unwrap();
         let sql = format!(
@@ -10289,11 +9546,6 @@ mod tests {
         );
     }
 
-    /// Decoding caps, sanitises and de-duplicates in that order: `left()`
-    /// bounds what `DuckDB` accumulates in characters, the byte cap and the
-    /// control-character substitution happen in Rust, and DISTINCT is
-    /// re-applied after both because sanitising can collapse two raw values
-    /// into one sample.
     #[test]
     fn decoding_samples_caps_sanitises_then_dedups() {
         assert_eq!(decode_misfit_samples(None).unwrap(), Vec::<String>::new());
@@ -10310,11 +9562,6 @@ mod tests {
         assert!(decode_misfit_samples(Some("not json")).is_err());
     }
 
-    /// The counting expressions over a SEVERITY target, executed: a sender's
-    /// `level` column repinned onto the ladder. Tokens map dialect-free,
-    /// `gold` maps nowhere, and the numeral `3` maps under both dialects to
-    /// different rungs — which is the whole ambiguity notion, counted
-    /// whatever the job asserted.
     #[test]
     fn repin_counts_over_a_severity_target_separate_loss_from_ambiguity() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -10354,8 +9601,6 @@ mod tests {
         // does not depend on the assertion; only the gate does.
         assert_eq!(count(Dialect::Syslog), (5, 4, 1));
 
-        // The values themselves, to prove the dialect actually changes what
-        // the rewrite would write.
         let read = |dialect| {
             let reading =
                 RepinReading::new(CanonicalType::Varchar, CanonicalType::Severity, dialect);
@@ -10381,11 +9626,6 @@ mod tests {
         assert_eq!(exprs.ambiguous, "0");
     }
 
-    /// A repin whose SOURCE is already `SEVERITY` reads its stored column
-    /// dialect-free: the values are canonical ladder positions, and
-    /// re-reading a stored `3` as syslog would silently corrupt it to 17.
-    /// Only the `_raw` arm — the sender's own wire text — takes the
-    /// assertion (ADR-0013).
     #[test]
     fn a_severity_source_keeps_its_stored_arm_dialect_free() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -10416,8 +9656,6 @@ mod tests {
              `3` reads as syslog err"
         );
 
-        // And the ambiguity variants keep that arm fixed too, so a stored
-        // canonical value is not reported as ambiguous.
         let exprs = repin_count_exprs("\"sev\"", true, "sev", reading);
         let ambiguous: i64 = conn
             .query_row(
@@ -10432,15 +9670,9 @@ mod tests {
         );
     }
 
-    /// Conform-time lossless guarantee: a batch disagreeing with an
-    /// existing typed pin must null (and tally) every value the cast would
-    /// alter — never write a silently rounded one. Numeric-space tolerance
-    /// keeps genuinely lossless drift (`4.0 → 4`).
     #[test]
     fn conform_to_bigint_pin_nulls_rounded_values_and_records_them() {
         let conn = duckdb::Connection::open_in_memory().unwrap();
-        // A DOUBLE column (a sender flip-flopping JSON number encodings)
-        // and a VARCHAR column, both against a BIGINT pin.
         conn.execute_batch(
             "CREATE TABLE wal_batch AS \
              SELECT * FROM (VALUES (1.5::DOUBLE, '1.5'), (4.0::DOUBLE, '42')) t(frac, txt)",
@@ -10457,7 +9689,6 @@ mod tests {
         let plan = ConformPlan::build(&schema, &pins, &ConformPolicy::WalBatch);
         assert_eq!(plan.cast_count(), 2);
 
-        // The tally counts the rounded values as NULLED — they are losses.
         let conflicts = plan.tally_conflicts(&conn, "wal_batch", "svc").unwrap();
         let nulled: HashMap<&str, u64> = conflicts
             .iter()
@@ -10469,8 +9700,6 @@ mod tests {
             "each column's fractional value is evidence: {conflicts:?}"
         );
 
-        // And the written values match: NULL where rounding would have
-        // altered, the exact integer where the round trip holds.
         let select = plan.select_list.join(", ");
         let rows: Vec<(Option<i64>, Option<i64>)> = {
             let mut stmt = conn
@@ -10488,10 +9717,9 @@ mod tests {
         );
     }
 
-    /// A batch wider than one ladder chunk must pin every column to the type
-    /// its own values support: the ladder runs in batched aggregate passes,
-    /// so a slot-mapping slip would silently hand a column its neighbour's
-    /// verdict. Alternating verdicts across the chunk boundary catch that.
+    /// The ladder runs in batched aggregate passes, so a slot-mapping slip
+    /// would silently hand a column its neighbour's verdict. Alternating
+    /// verdicts across the chunk boundary catch that.
     #[test]
     fn pin_ladder_spans_chunk_boundary_without_crossing_verdicts() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10527,8 +9755,6 @@ mod tests {
         compact_service_blocking(&[f], &data_dir, "svc", "2GB").unwrap();
         let parquet = find_files_by_ext(&data_dir, "parquet");
 
-        // Probe both sides of the boundary, including the columns straddling
-        // it, plus the very first and last column of the batch.
         let probes = [0, 1, 2, 254, 255, 256, 257, 258, cols - 2, cols - 1];
         for i in probes {
             let (dtype, _, total) = column_stats(&parquet[0], &format!("f{i}"));
@@ -10569,8 +9795,6 @@ mod tests {
             "an all-null unpinned column defers (absent from the file): {cols:?}"
         );
 
-        // Batch 2: real values arrive → the field pins and both batches
-        // read cleanly through one union.
         let r2 = record_with("maybe", "7", 1);
         let f2 = write_wal_file(&wal_dir, "svc", &[r2.as_str()]);
         compact_service_blocking(&[f2], &data_dir, "svc", "2GB").unwrap();
@@ -10585,10 +9809,6 @@ mod tests {
         );
     }
 
-    /// What a hot snapshot's null-only key turns into when compaction
-    /// drains it (ADR-0062): unpinned, the column is not stored, so the
-    /// hot projection's `EXCLUDE` matches what the parquet will carry;
-    /// pinned, it is stored with the pin's type and reads NULL.
     #[test]
     fn compaction_stores_a_null_only_key() {
         let records = [record_with("k", "null", 0), record_with("k", "null", 1)];
@@ -10663,7 +9883,6 @@ mod tests {
         assert_eq!(status_ty, "BIGINT", "batch-mate custom column survives");
         assert_eq!((status_nn, total), (1, 2));
 
-        // The nested value stays reachable as JSON text.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let pod: String = conn
             .query_row(
@@ -10723,7 +9942,6 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(50));
 
-        // Create a fresh .tmp file that must not be removed.
         let fresh = hour_dir.join("postgres.parquet.tmp");
         std::fs::write(&fresh, b"fresh").unwrap();
 
@@ -10746,7 +9964,6 @@ mod tests {
         let day_dir = data_dir.join("2026-01-01");
         std::fs::create_dir_all(&day_dir).unwrap();
 
-        // Day-level stale .tmp from interrupted rollup.
         let stale = day_dir.join("nginx.parquet.tmp");
         std::fs::write(&stale, b"stale").unwrap();
 
@@ -10761,9 +9978,6 @@ mod tests {
         assert!(!stale.exists(), "day-level stale .tmp should be removed");
     }
 
-    /// An hour directory the writer never produces, `24/` or `99/`, is not
-    /// an hour: daily rollup leaves its file on disk and out of the merge,
-    /// and canonical attribution does not count it either.
     #[tokio::test]
     async fn rollup_skips_noncanonical_hour_dir() {
         let tmp = tempfile::tempdir().unwrap();
@@ -10798,7 +10012,6 @@ mod tests {
         }
     }
 
-    /// Helper: create a parquet file with the given rows in a specific hour-dir.
     fn write_hourly_parquet(
         data_dir: &Path,
         date: &str,
@@ -10812,7 +10025,6 @@ mod tests {
         // happens within the same timestamp used by write_wal_file.
         let wal_files = [write_wal_file(&wal_dir, service, records)];
 
-        // Use DuckDB directly to write parquet (simpler than going through compact).
         let hour_dir = data_dir.join(date).join(hour);
         std::fs::create_dir_all(&hour_dir).unwrap();
         let out = hour_dir.join(format!("{service}.parquet"));
@@ -10832,19 +10044,13 @@ mod tests {
         ))
         .unwrap();
 
-        // Clean up temp wal files.
         let _ = std::fs::remove_dir_all(&wal_dir);
 
         out
     }
 
-    // ---- rollup publish and recovery fixtures (ADR-0041, #357) ----------
-
-    /// The historical day the rollup fixtures roll up.
     const ROLLUP_DAY: &str = "2026-01-15";
 
-    /// One `nginx` event at `hour`:00 of [`ROLLUP_DAY`], whose `msg` is
-    /// `msg`.
     fn nginx_row(hour: &str, msg: &str) -> String {
         format!(
             r#"{{"_time":"{ROLLUP_DAY}T{hour}:00:00Z","_ingested":"{ROLLUP_DAY}T{hour}:00:00Z","service":"nginx","msg":"{msg}"}}"#
@@ -10863,7 +10069,6 @@ mod tests {
         }
     }
 
-    /// The `HH/{service}.parquet` name of the hourly file `path`.
     fn input_name(path: &Path) -> String {
         let hour = path
             .parent()
@@ -10934,7 +10139,6 @@ mod tests {
         out
     }
 
-    /// Copy the directories and regular files under `from` to `to`.
     fn copy_tree(from: &Path, to: &Path) {
         std::fs::create_dir_all(to).unwrap();
         for entry in std::fs::read_dir(from).unwrap() {
@@ -10948,7 +10152,6 @@ mod tests {
         }
     }
 
-    /// Whether `gate` admits a corpus read now.
     fn reads_answer(gate: &PublicationGate) -> bool {
         tokio::runtime::Builder::new_current_thread()
             .build()
@@ -10957,7 +10160,6 @@ mod tests {
             .is_ok()
     }
 
-    /// The paths of one service-day an interrupted rollup left.
     struct Interrupted {
         day: PathBuf,
         hourlies: Vec<PathBuf>,
@@ -11003,8 +10205,6 @@ mod tests {
         }
     }
 
-    /// Put a real Parquet file at `path` that no rollup fixture merged,
-    /// staged under `root/other`.
     fn replace_with_other_parquet(root: &Path, path: &Path) {
         let staging = root.join("other");
         let other = write_hourly_parquet(
@@ -11018,8 +10218,6 @@ mod tests {
         std::fs::remove_dir_all(staging).unwrap();
     }
 
-    /// The rollup's durable order (ADR-0041): every call it makes, in the
-    /// order it made them, each with the result the real call returned.
     /// Its inputs sit in three hour directories beside a prior daily file,
     /// and the second retirement finds a directory where its input was, so
     /// it renames the input aside as `.merged`. That hour directory is
@@ -11123,14 +10321,6 @@ mod tests {
         assert_eq!(read_strings(&canonical, "msg"), ["prior", "01", "02", "03"]);
     }
 
-    /// Each sync and marker operation of the rollup fails in turn, chosen
-    /// by phase and occurrence (ADR-0041). No failure retires an input
-    /// before the rename's day fsync succeeds, and none completes the
-    /// rollup. Before the marker exists, reads answer and every input is as
-    /// it was. While the marker is on disk, reads refuse. After the
-    /// unlink's fsync fails, reads answer and the removal-sync obligation
-    /// holds. A tmp whose footer does not parse fails the rollup before any
-    /// marker exists, with every input unchanged.
     #[test]
     #[allow(clippy::too_many_lines)] // one table of faults, one set of checks
     fn rollup_sync_failure_matrix() {
@@ -11263,7 +10453,6 @@ mod tests {
         }
     }
 
-    /// What recovery must do with one state of [`rollup_recovery_matrix`].
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Recovers {
         /// Case a: the daily file is the output; the inputs are retired.
@@ -11276,18 +10465,6 @@ mod tests {
         Unresolved(rollup_marker::Proof),
     }
 
-    /// Rollup recovery over real Parquet files, from each state a crash or
-    /// a later change can leave (ADR-0041). Each state is the files a
-    /// rollup leaves when one of its calls fails, then changed as named.
-    /// Recovery takes a with the tmp absent, matching and not matching,
-    /// records no rename in a, takes b, and takes c with no prior and with
-    /// a matching prior. It fails closed (d) on a prior mismatch, a missing
-    /// input, an input set aside as `.merged`, an old-format marker and a
-    /// present input that changed under a: every file stays byte-identical,
-    /// and `rollup_recovery_unresolved` names the service and day and no
-    /// path. It never parses a footer or fsyncs a file, and observes the
-    /// canonical first. Running it twice gives the files running it once
-    /// does, as does a run that fails midway followed by one that does not.
     #[test]
     #[allow(clippy::too_many_lines)] // one table of states, one set of checks
     fn rollup_recovery_matrix() {
@@ -11488,8 +10665,6 @@ mod tests {
                             "{name}: the day is synced before the first retirement"
                         );
                     }
-                    // Retirement is durable before the marker goes, and the
-                    // marker's unlink is synced after it.
                     let at = |phase: Phase| entries.iter().rposition(|e| e.phase == phase);
                     let unlink = at(Phase::MarkerUnlink).expect(name);
                     assert!(
@@ -11554,7 +10729,6 @@ mod tests {
                 }
             }
 
-            // Twice is once.
             let again = recover_rollup_markers_coordinated(&day_in(&once), None, &RollupIo::REAL);
             assert_eq!(
                 again.is_ok(),
@@ -11567,8 +10741,6 @@ mod tests {
                 "{name}: a second run changes nothing"
             );
 
-            // A run that fails midway, then one that does not, ends where
-            // one run does.
             if let Some((phase, occurrence)) = fault {
                 let interrupted = tmp.path().join("interrupted");
                 copy_tree(&original, &interrupted);
@@ -11590,11 +10762,6 @@ mod tests {
         }
     }
 
-    /// A rollup whose unlink fsync fails leaves its service-day owed while
-    /// the marker path is gone (ADR-0041). While it is owed, reads answer
-    /// and no rollup of that service-day runs. The next compaction pass
-    /// retries the fsync for real, which ends the obligation, and the
-    /// rollup runs again.
     #[tokio::test]
     async fn rollup_unlink_sync_retry() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11635,7 +10802,6 @@ mod tests {
         assert!(gate.read().await.is_ok(), "reads answer");
         let published = std::fs::read(&daily).unwrap();
 
-        // While it is owed, the rollup skips the service-day.
         let late =
             write_hourly_parquet(&env, ROLLUP_DAY, "05", "nginx", &[&nginx_row("05", "late")]);
         rollup_env_once(
@@ -11654,7 +10820,6 @@ mod tests {
         assert!(gate.removal_sync_owed(&marker));
         assert!(gate.read().await.is_ok());
 
-        // The next pass's real fsync ends it, and that pass rolls up again.
         let errors = compact_once(
             &tmp.path().join("no-wal"),
             &data,
@@ -11673,9 +10838,6 @@ mod tests {
         assert!(gate.read().await.is_ok());
     }
 
-    /// Retention deleting the day of an owed removal does not keep the
-    /// obligation forever: the retry fsyncs the env directory instead, which
-    /// makes the day's removal durable, marker entry and all (ADR-0041).
     #[tokio::test]
     async fn rollup_unlink_sync_retry_ends_when_retention_deletes_the_day() {
         let tmp = tempfile::tempdir().unwrap();
@@ -11709,7 +10871,6 @@ mod tests {
         assert!(outcome.result.is_err());
         assert!(gate.removal_sync_owed(&marker));
 
-        // Retention deletes the whole day directory.
         std::fs::remove_dir_all(&day).unwrap();
 
         let errors = compact_once(
@@ -11730,9 +10891,6 @@ mod tests {
         );
     }
 
-    /// After a restart, rollup recovery runs before a compaction pass
-    /// compacts new WAL, and reads refuse `rollup_pending` while a marker
-    /// is unresolved (ADR-0041).
     #[tokio::test]
     async fn rollup_restart_visibility() {
         fn pass_buffer() -> Arc<HotBuffer> {
@@ -11810,9 +10968,6 @@ mod tests {
         assert_eq!(rows, ["fresh", "old"], "no row lost or doubled");
         assert!(gate.read().await.is_ok());
 
-        // A marker recovery cannot resolve: the daily file is neither the
-        // prior nor the replacement it records. No pass compacts WAL, and
-        // reads keep refusing.
         let tmp = tempfile::tempdir().unwrap();
         let data = tmp.path().join("data");
         let wal = tmp.path().join("wal");
@@ -11863,15 +11018,12 @@ mod tests {
             .result
             .unwrap();
 
-        // Day-level file should exist.
         let daily = day_dir.join("nginx.parquet");
         assert!(daily.exists(), "daily parquet should exist");
 
-        // Hourly files should be deleted.
         assert!(!f1.exists(), "hourly file 1 should be deleted");
         assert!(!f2.exists(), "hourly file 2 should be deleted");
 
-        // Verify row count.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -11892,7 +11044,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        // First rollup: create initial daily file.
         let r1 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"a"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
@@ -11900,11 +11051,9 @@ mod tests {
             .result
             .unwrap();
 
-        // Late-arriving data creates a new hourly file.
         let r2 = r#"{"_time":"2026-01-15T03:00:00Z","_ingested":"2026-01-15T03:00:00Z","service":"nginx","msg":"late"}"#;
         let f2 = write_hourly_parquet(&data_dir, date, "03", "nginx", &[r2]);
 
-        // Second rollup: should merge existing daily + new hourly.
         rollup_day_blocking(&day_dir, "nginx", &[f2], "2GB")
             .result
             .unwrap();
@@ -11930,7 +11079,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        // Write records in reverse order across hours.
         let r1 = r#"{"_time":"2026-01-15T23:00:00Z","_ingested":"2026-01-15T23:00:00Z","service":"nginx","msg":"late"}"#;
         let r2 = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"nginx","msg":"early"}"#;
         let f1 = write_hourly_parquet(&data_dir, date, "23", "nginx", &[r1]);
@@ -11941,7 +11089,6 @@ mod tests {
             .result
             .unwrap();
 
-        // Verify rows are sorted by timestamp (ascending).
         let daily = day_dir.join("nginx.parquet");
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let first_msg: String = conn
@@ -11961,10 +11108,7 @@ mod tests {
     fn rollup_of_nonconformant_hourlies_errors_loudly_and_retains_inputs() {
         // Hour 01 carries `offset` as a STRUCT, hour 02 as a plain string —
         // a mix write-time conformance cannot produce, so it can only mean
-        // foreign parquet dropped into the tree (ADR-0009). The rollup must
-        // fail loudly and retain the hourly inputs for the operator (retried
-        // next tick), never half-produce a daily file and never rewrite both
-        // sides with a silent VARCHAR cast.
+        // foreign parquet dropped into the tree (ADR-0009).
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -11994,10 +11138,7 @@ mod tests {
     fn merge_into_foreign_nonconformant_parquet_errors_and_retains_wal() {
         // The canonical hourly file already holds `container_id` as a STRUCT
         // (foreign parquet — the conform pipeline always writes VARCHAR for
-        // it). Merging a conformant WAL batch into it hits a union type
-        // conflict, and there is no cast-and-retry: the batch errors (logged
-        // as catalog_invariant_violation), the WAL file survives for the next
-        // tick, and the existing file is untouched.
+        // it).
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -12042,7 +11183,6 @@ mod tests {
         std::fs::create_dir_all(day.join("00")).unwrap();
         std::fs::create_dir_all(day.join("14")).unwrap();
         std::fs::create_dir_all(day.join("23")).unwrap();
-        // Not an hour directory.
         std::fs::write(day.join("nginx.parquet"), b"data").unwrap();
 
         let dirs = collect_hour_dirs(&day);
@@ -12081,8 +11221,6 @@ mod tests {
             0
         );
 
-        // Each independently failed metadata lookup is observed, unlike the
-        // once-per-root aggregation used by the outer environment listing.
         for hour in ["04", "05"] {
             symlink(hour, day.join(hour)).unwrap();
             assert_ne!(
@@ -12128,7 +11266,6 @@ mod tests {
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Create hourly parquet files for a historical date (not today).
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
@@ -12137,7 +11274,6 @@ mod tests {
         );
         write_hourly_parquet(&data_dir.join("prod"), &yesterday, "01", "nginx", &[&r1]);
 
-        // WAL dir is empty — compact_once should still run rollup.
         compact_once(
             &wal_dir,
             &data_dir,
@@ -12151,7 +11287,6 @@ mod tests {
         .await
         .unwrap();
 
-        // Day-level file should exist from rollup (under the env root).
         let daily = data_dir.join("prod").join(&yesterday).join("nginx.parquet");
         assert!(
             daily.exists(),
@@ -12159,11 +11294,6 @@ mod tests {
         );
     }
 
-    /// The repin job's rollup interlock (ADR-0011): while the coordinator
-    /// holds a rollup pause, a compaction tick drains WAL but never
-    /// relocates hourly files into dailies — the shadow build's catch-up
-    /// diff must stay additive. Dropping the pause resumes consolidation on
-    /// the next tick.
     #[tokio::test]
     async fn rollup_is_suppressed_while_a_repin_pause_is_held() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12223,12 +11353,6 @@ mod tests {
         );
     }
 
-    /// The other half of that interlock (ADR-0011): a rollup pass that was
-    /// already running when the job started. The pause flag alone only stops
-    /// a pass that has not begun — a pass in flight would keep relocating
-    /// files straight through `swap_envs` and republish pre-repin types into
-    /// the new generation. So every relocating unit takes the corpus gate:
-    /// the cutover waits it out, and the rest of the pass stands down.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_running_rollup_pass_is_gated_by_the_cutover_and_stands_down() {
         let tmp = tempfile::tempdir().unwrap();
@@ -12248,7 +11372,6 @@ mod tests {
 
         let coordinator = Arc::new(RepinCoordinator::new());
 
-        // The cutover holds the corpus gate — as it does across the swap.
         let cutover = coordinator.cutover_guard().await;
 
         let c = Arc::clone(&coordinator);
@@ -12275,8 +11398,6 @@ mod tests {
             "a relocating rollup unit may not run under the cutover's guard"
         );
 
-        // The job claims the rollup while that pass sits on the gate, then
-        // the cutover completes.
         let pause = coordinator.pause_rollup();
         drop(cutover);
         tick.await.unwrap().unwrap();
@@ -12323,17 +11444,12 @@ mod tests {
             .result
             .unwrap();
 
-        // Marker should be cleaned up after successful rollup.
         assert!(!marker.exists(), "marker should be removed after rollup");
-        // Canonical file should exist.
         assert!(day_dir.join("nginx.parquet").exists());
     }
 
     #[test]
     fn rollup_recovery_after_rename_crash() {
-        // A crash after the rename and before any retirement: the daily
-        // file is the merge's output, so recovery retires the hourly files
-        // the marker lists (case a).
         let tmp = tempfile::tempdir().unwrap();
         let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
         assert!(state.marker.exists());
@@ -12349,8 +11465,6 @@ mod tests {
             "marker should be removed after recovery"
         );
 
-        // The same crash, then a daily file the merge never wrote in its
-        // place: recovery retires nothing and keeps the marker (case d).
         let tmp = tempfile::tempdir().unwrap();
         let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
         replace_with_other_parquet(tmp.path(), &state.canonical);
@@ -12368,8 +11482,6 @@ mod tests {
 
     #[test]
     fn rollup_recovery_after_tmp_crash() {
-        // Simulate crash after .tmp write but before rename:
-        // .tmp exists, marker exists, no canonical yet.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -12382,10 +11494,6 @@ mod tests {
         let tmp_file = day_dir.join("nginx.parquet.tmp");
         let marker = day_dir.join(".rollup-nginx");
 
-        // Simulate: the merge's output was written as the tmp, the marker
-        // records its identity, no canonical yet. Recovery promotes only a
-        // tmp with that identity (see `recovery_discards_truncated_tmp` for
-        // one without it).
         std::fs::copy(&f1, &tmp_file).unwrap();
         write_marker(
             &day_dir,
@@ -12397,7 +11505,6 @@ mod tests {
         assert!(!canonical.exists());
         assert!(tmp_file.exists());
 
-        // Recovery should rename .tmp to canonical, delete hourlies and marker.
         recover_rollup_markers(&day_dir).unwrap();
 
         assert!(canonical.exists(), "canonical should exist after recovery");
@@ -12408,9 +11515,6 @@ mod tests {
 
     #[test]
     fn rollup_recovery_stale_marker() {
-        // A marker whose daily file, tmp and listed hourly are all gone
-        // proves nothing: recovery keeps it, and the day fails with text
-        // that names no path.
         let tmp = tempfile::tempdir().unwrap();
         let day_dir = tmp.path().join("data/prod/2026-01-15");
         std::fs::create_dir_all(&day_dir).unwrap();
@@ -12438,7 +11542,6 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
 
-        // A real parquet file is valid.
         let data_dir = dir.join("data");
         let r = r#"{"_time":"2026-01-15T01:00:00Z","_ingested":"2026-01-15T01:00:00Z","service":"x","m":"y"}"#;
         let good = write_hourly_parquet(&data_dir, "2026-01-15", "01", "x", &[r]);
@@ -12477,7 +11580,6 @@ mod tests {
         std::fs::write(&nul, [0u8; 662]).unwrap();
         assert!(!is_valid_ndjson(&nul), "all-NUL file is corrupt");
 
-        // A valid record followed by an embedded NUL (partial torn write).
         let partial = dir.join("partial.ndjson");
         std::fs::write(&partial, b"{\"a\":1}\n\x00\x00\x00").unwrap();
         assert!(!is_valid_ndjson(&partial), "embedded NUL is corrupt");
@@ -12488,7 +11590,6 @@ mod tests {
         std::fs::write(&empty, b"").unwrap();
         assert!(!is_valid_ndjson(&empty), "zero-byte file is invalid");
 
-        // Non-UTF-8 garbage (no NUL byte) exercises the UTF-8 branch.
         let binary = dir.join("binary.ndjson");
         std::fs::write(&binary, [0xff, 0xfe, 0xfd, 0x01]).unwrap();
         assert!(!is_valid_ndjson(&binary), "non-UTF-8 is invalid");
@@ -12509,10 +11610,6 @@ mod tests {
         let good = r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","service":"nginx","message":"hello"}"#;
         let good_file = write_wal_file(&wal_dir, "nginx", &[good]);
 
-        // A pure-NUL WAL file (the torn-write crash signature: unflushed
-        // blocks read back as 0x00). write_wal_file only writes text, so write
-        // it directly; keep the `nginx_` prefix so it groups with the good
-        // file's service. 662 bytes mirrors the live homelab debris.
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::SystemTime::UNIX_EPOCH)
             .unwrap()
@@ -12525,11 +11622,9 @@ mod tests {
                 .unwrap();
         assert_eq!(quarantined, 1, "the NUL file should be quarantined");
 
-        // Good data still compacts to exactly one parquet.
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1, "good WAL must still produce a parquet");
 
-        // Corrupt file renamed aside; bytes preserved for forensics.
         assert!(!bad_file.exists(), "corrupt WAL renamed away");
         let mut corrupt = bad_file.into_os_string();
         corrupt.push(".corrupt");
@@ -12538,7 +11633,6 @@ mod tests {
             "corrupt WAL quarantined to .corrupt"
         );
 
-        // Only the good row landed.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -12569,8 +11663,6 @@ mod tests {
         std::fs::write(&a, [0u8; 128]).unwrap();
         std::fs::write(&b, [0u8; 128]).unwrap();
 
-        // All inputs corrupt: no parquet, no error (nothing readable to retry),
-        // but both are counted as quarantined data-loss.
         let quarantined =
             compact_service_blocking(&[a.clone(), b.clone()], &data_dir, "svc", "2GB").unwrap();
         assert_eq!(quarantined, 2, "both corrupt inputs counted");
@@ -12584,10 +11676,6 @@ mod tests {
 
     #[test]
     fn compact_isolates_malformed_textual_ndjson_keeps_good() {
-        // A malformed-but-textual WAL file (valid UTF-8, no NUL, but truncated
-        // mid-JSON) slips past the byte sniff and fails read_json. Per-file
-        // read isolation must quarantine it (alongside a NUL file) while still
-        // compacting the good data — one poison file must not wedge the batch.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
@@ -12624,7 +11712,6 @@ mod tests {
         .unwrap();
         assert_eq!(quarantined, 2, "malformed + NUL files both quarantined");
 
-        // Good data still compacts to exactly one parquet, one row.
         let parquet = find_files_by_ext(&data_dir, "parquet");
         assert_eq!(parquet.len(), 1, "good WAL still produces a parquet");
 
@@ -12654,11 +11741,8 @@ mod tests {
     #[test]
     fn compact_keeps_quarantine_count_when_a_later_step_fails() {
         // A NUL file is quarantined (count=1) and then a step after the
-        // quarantine errors (output dir can't be created because data_dir is a
-        // regular file). The count must survive the Err — a naive `?` would
-        // drop it, and since the file is already renamed `.corrupt` a retry
-        // can't re-count it. Mirrors the rollup
-        // `rollup_keeps_quarantine_count_when_merge_errors` guarantee.
+        // quarantine errors. The count must survive the Err: since the file is
+        // already renamed `.corrupt` a retry can't re-count it.
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         std::fs::create_dir_all(&wal_dir).unwrap();
@@ -12725,7 +11809,6 @@ mod tests {
         );
         assert_eq!(outcome.quarantined, 1, "one corrupt input quarantined");
 
-        // Good data rolled up; corrupt file quarantined, not read.
         let daily = day_dir.join("nginx.parquet");
         assert!(daily.exists(), "daily file built from the valid hourly");
         assert!(!good.exists(), "consumed valid hourly should be deleted");
@@ -12761,11 +11844,9 @@ mod tests {
         let bad_dir = data_dir.join(date).join("00");
         std::fs::create_dir_all(&bad_dir).unwrap();
         let bad = bad_dir.join("svc.parquet");
-        std::fs::write(&bad, b"").unwrap(); // zero-byte
+        std::fs::write(&bad, b"").unwrap();
 
         let day_dir = data_dir.join(date);
-        // No error (nothing recoverable to retry), no daily file produced,
-        // but the quarantine count surfaces the data-loss.
         let outcome = rollup_day_blocking(&day_dir, "svc", std::slice::from_ref(&bad), "2GB");
         assert!(
             outcome.result.is_ok(),
@@ -12782,17 +11863,13 @@ mod tests {
 
     #[test]
     fn rollup_keeps_quarantine_count_when_merge_errors() {
-        // One input is corrupt (quarantined, count=1); a second input passes the
-        // magic-byte sniff but is unreadable by read_parquet (valid PAR1
-        // bookends, bogus footer length), so the merge COPY hard-errors. The
-        // quarantine count must still ride out on the outcome: a naive
-        // `return Err` would drop it, and since the quarantined file is already
+        // The quarantine count must still ride out on the outcome when the
+        // merge COPY hard-errors: since the quarantined file is already
         // renamed `.corrupt`, a retry tick could never re-count it.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
 
-        // Corrupt (zero-byte) input → quarantined.
         let corrupt_dir = data_dir.join(date).join("00");
         std::fs::create_dir_all(&corrupt_dir).unwrap();
         let corrupt = corrupt_dir.join("nginx.parquet");
@@ -12825,10 +11902,6 @@ mod tests {
 
     #[test]
     fn recovery_discards_truncated_tmp() {
-        // A tmp that is not the merge's output must not be promoted to
-        // canonical. Nothing was published and every input is present, so
-        // recovery abandons the rollup: the tmp is deleted and the hourly
-        // files are retained for a fresh rollup.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -12869,21 +11942,17 @@ mod tests {
 
     #[test]
     fn compact_once_counts_quarantine_as_error() {
-        // Counter wiring: an all-corrupt service/day must surface its
-        // quarantine count through rollup_once → compact_once's returned u64
-        // (which spawn_compaction folds into stats.total_errors).
         let tmp = tempfile::tempdir().unwrap();
         let wal_dir = tmp.path().join("wal");
         let data_dir = tmp.path().join("data");
         std::fs::create_dir_all(&wal_dir).unwrap();
 
-        // Historical (non-today) day with one all-corrupt service.
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1))
             .format("%Y-%m-%d")
             .to_string();
         let bad_dir = data_dir.join("prod").join(&yesterday).join("00");
         std::fs::create_dir_all(&bad_dir).unwrap();
-        std::fs::write(bad_dir.join("svc.parquet"), b"").unwrap(); // zero-byte
+        std::fs::write(bad_dir.join("svc.parquet"), b"").unwrap();
 
         let rt = tokio::runtime::Runtime::new().unwrap();
         let errors = rt
@@ -12903,7 +11972,6 @@ mod tests {
             errors > 0,
             "quarantine data-loss should flow out as a rollup failure/data-loss tally, got {errors}"
         );
-        // No daily file from the all-corrupt input.
         assert!(
             !data_dir
                 .join("prod")
@@ -12974,10 +12042,6 @@ mod tests {
 
     #[test]
     fn rollup_does_not_duplicate_rows_when_hourly_survives() {
-        // Simulate a delete that fails on the first rollup (the hourly is
-        // retired aside as `.merged`), then run a second rollup over the same
-        // day. The retired `.merged` file must not be re-merged, so the daily
-        // row count stays put rather than doubling.
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let date = "2026-01-15";
@@ -12986,7 +12050,6 @@ mod tests {
         let f1 = write_hourly_parquet(&data_dir, date, "01", "nginx", &[r1]);
         let day_dir = data_dir.join(date);
 
-        // First rollup builds the daily file and retires the hourly.
         rollup_day_blocking(&day_dir, "nginx", std::slice::from_ref(&f1), "2GB")
             .result
             .unwrap();
@@ -12994,25 +12057,18 @@ mod tests {
         let daily = day_dir.join("nginx.parquet");
         assert!(daily.exists());
 
-        // Simulate a "delete failed → retired aside" hourly that survived as
-        // `.merged` (what retire_merged_input leaves behind on a bad delete).
-        // It must not be re-collected nor re-merged.
         let stranded = day_dir.join("01").join("nginx.parquet.merged");
         std::fs::create_dir_all(stranded.parent().unwrap()).unwrap();
         std::fs::copy(&daily, &stranded).unwrap();
 
-        // Re-discover service files for the day exactly as rollup_once does.
         let hour_dirs = collect_hour_dirs(&day_dir);
         let service_files = collect_service_files(&hour_dirs);
 
-        // The stranded `.merged` file must not appear as an input.
         assert!(
             service_files.get("nginx").is_none_or(Vec::is_empty),
             "retired .merged hourly must not be re-collected for rollup"
         );
 
-        // Second rollup over the canonical only (no live hourlies) — must not
-        // double the count even though `.merged` bytes sit alongside.
         rollup_day_blocking(&day_dir, "nginx", &[], "2GB")
             .result
             .unwrap();
@@ -13033,10 +12089,6 @@ mod tests {
 
     #[test]
     fn recovery_keeps_marker_when_hourly_retire_fails() {
-        // The daily file is the merge's output, and the retirement of a
-        // listed hourly fails. Recovery must return Err and leave the
-        // marker in place so the next pass retries, and that retry
-        // finishes the rollup.
         let tmp = tempfile::tempdir().unwrap();
         let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
         let recorder = Recorder::new();
@@ -13060,9 +12112,6 @@ mod tests {
 
     #[test]
     fn retire_merged_input_is_idempotent_on_missing_file() {
-        // Retiring an already-gone hourly is a no-op success. The goal
-        // ("this file is no longer a re-mergeable hourly") is already met, so a
-        // missing source must not propagate as Err (which would wedge recovery).
         let tmp = tempfile::tempdir().unwrap();
         let gone = tmp.path().join("never-existed.parquet");
         assert!(!gone.exists());
@@ -13079,41 +12128,28 @@ mod tests {
 
     #[test]
     fn recovery_completes_after_partial_hourly_cleanup() {
-        // A crash mid-cleanup-loop deletes some hourlies but leaves the
-        // marker, which lists all of them. The next recovery pass replays the
-        // marker verbatim, so retiring an already-gone hourly must be a no-op
-        // success: an Err on the first phantom short-circuits before the
-        // marker delete and wedges recovery permanently. The daily file is
-        // the merge's output, so an absent input was retired (case a).
         let tmp = tempfile::tempdir().unwrap();
         let state = interrupted_rollup(tmp.path(), false, Phase::Retire);
         let (already_deleted, still_present) = (&state.hourlies[0], &state.hourlies[1]);
 
-        // Simulate the partial cleanup: the first hourly was deleted before the
-        // crash, the second was not.
         std::fs::remove_file(already_deleted).unwrap();
         assert!(still_present.exists());
 
         recover_rollup_markers(&state.day)
             .expect("recovery must tolerate a phantom-missing hourly");
 
-        // The surviving hourly is retired (deleted, or renamed aside as .merged).
         let mut aside = still_present.clone().into_os_string();
         aside.push(".merged");
         assert!(
             !still_present.exists() || PathBuf::from(aside).exists(),
             "the present hourly must be retired (gone or .merged)"
         );
-        // The marker must be removed so later compaction ticks don't replay it.
         assert!(
             !state.marker.exists(),
             "marker must be removed after recovery completes"
         );
     }
 
-    // --- malformed-timestamp repair tests (ADR-0008) -----------------------
-
-    /// Read a single-column query over a parquet file into strings.
     fn read_strings(parquet: &Path, select: &str) -> Vec<String> {
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let mut stmt = conn
@@ -13130,9 +12166,6 @@ mod tests {
         rows
     }
 
-    /// A hand-written WAL file with a malformed timestamp compacts, and the
-    /// row's timestamp comes from the filename's unix-millis segment rather
-    /// than wedging the batch.
     #[test]
     fn compact_repairs_malformed_timestamp_from_filename() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13163,9 +12196,6 @@ mod tests {
         );
     }
 
-    /// Each row's filename fallback comes from its own WAL file, never a
-    /// batch-level value: one batch spanning two files with different
-    /// unix-millis values recovers two different instants.
     #[test]
     fn compact_filename_fallback_is_per_file() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13201,8 +12231,6 @@ mod tests {
         );
     }
 
-    /// All four malformed-`_time` shapes compact without error and land with
-    /// a non-NULL timestamp.
     #[test]
     fn compact_repairs_all_trigger_variants() {
         let variants = [
@@ -13411,15 +12439,9 @@ mod tests {
     }
 
     /// [`repair_leaves_unchanged`] is the Rust reading of [`repair_expr`]
-    /// that boot hydration trusts. Run the repair itself, through
-    /// [`build_wal_batch`], over rows whose instants fall on both sides of
-    /// the check, and read the same rows as the hot side does: the hot
-    /// reader and a bare `TRY_CAST` per envelope TIMESTAMP column. Every
-    /// row the check accepts must leave the repair with the instants the
-    /// hot read gives it, and every row the repair changes must be refused.
-    /// A row the canonicalizer writes as it is, and that the repair leaves
-    /// as the hot read gives it, must be accepted: refusing it would leave
-    /// real writer output for compaction, as overhang.
+    /// that boot hydration trusts. A row the canonicalizer writes as it is,
+    /// and that the repair leaves as the hot read gives it, must be accepted:
+    /// refusing it would leave real writer output for compaction, as overhang.
     #[test]
     fn repair_leaves_unchanged_agrees_with_repair_expr() {
         let rows = repair_probe_rows();
@@ -13475,9 +12497,6 @@ mod tests {
         }
     }
 
-    /// A repaired event past `DuckDB`'s default JSON sample window still
-    /// reaches parquet with its `_repairs` intact.
-    ///
     /// `_repairs` is sparse by construction — only repaired events carry it
     /// — so auto-detection over a bounded sample would miss it on any WAL
     /// file bigger than the sample and drop the column with no error at all,
@@ -13521,10 +12540,6 @@ mod tests {
         );
     }
 
-    /// The two path dimensions (ADR-0009): compaction writes
-    /// `data/{env}/{date}/{HH}/{service}.parquet`, never merges across
-    /// envs, and carries service names verbatim so `api.v2` and `api_v2`
-    /// land in distinct files.
     #[tokio::test]
     async fn compact_once_partitions_by_env_and_verbatim_service() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13548,7 +12563,6 @@ mod tests {
             row("lab", "lab-row"),
         )
         .unwrap();
-        // Dotted vs underscored service in the same env: distinct files.
         std::fs::write(
             wal_dir.join("prod").join("api.v2_1730000000000_cccc.ndjson"),
             r#"{"_time":"2026-01-01T00:00:00Z","_ingested":"2026-01-01T00:00:00Z","env":"prod","service":"api.v2","message":"dotted"}"#,
@@ -13612,10 +12626,8 @@ mod tests {
         );
     }
 
-    /// One unreadable env WAL directory is isolated to its own env: it is
-    /// counted and skipped, never propagated. Envs are walked in sorted
-    /// order, so `broken` is scanned before `prod` — a propagated error
-    /// would stall `prod`'s WAL drain (and the rollup) indefinitely.
+    /// Envs are walked in sorted order, so `broken` is scanned before `prod`
+    /// — a propagated error would stall `prod`'s WAL drain.
     #[cfg(unix)]
     #[tokio::test]
     async fn compact_once_isolates_unreadable_env_wal_dir() {
@@ -13675,11 +12687,6 @@ mod tests {
         assert!(!prod_wal.exists(), "a later env's WAL must still drain");
     }
 
-    /// An unreadable WAL *root* is not an empty WAL root: it must surface as
-    /// an error, never as a clean cycle. Swallowing it iterates no envs, so
-    /// the WAL never drains, the hot buffer fills until admission refuses
-    /// new events, and the error counter stays at zero: a stall no counter
-    /// explains (ADR-0008).
     #[cfg(unix)]
     #[tokio::test]
     async fn compact_once_errors_on_unreadable_wal_root() {
@@ -13720,8 +12727,6 @@ mod tests {
         );
     }
 
-    /// The other half of the pair: a WAL root that does not exist yet is a
-    /// legitimate cold start, and must stay a silent, clean, zero-error run.
     #[tokio::test]
     async fn compact_once_is_clean_when_wal_root_is_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13744,9 +12749,6 @@ mod tests {
         assert_eq!(errors, 0, "a cold start reports no errors");
     }
 
-    /// One bad event does not affect its batch-mates: 1 bad + 2 good in one
-    /// WAL file all land, the WAL directory drains, and `compact_once`
-    /// reports zero errors — no poison pill.
     #[tokio::test]
     async fn compact_once_drains_bad_timestamp_without_errors() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13797,9 +12799,6 @@ mod tests {
         assert_eq!(count, 3, "all three events (incl. the repaired one) land");
     }
 
-    /// A user event legitimately carrying a field named `filename` keeps all
-    /// its columns — the synthetic WAL-provenance column uses a reserved
-    /// name precisely so it cannot collide.
     #[test]
     fn compact_keeps_user_field_named_filename() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13826,14 +12825,9 @@ mod tests {
         );
     }
 
-    /// A WAL file carrying the reserved provenance key still drains, and
-    /// drains losslessly: a row literally carrying `_trawl_wal_file` collides
-    /// with the synthetic provenance column, which must route to the renamed
-    /// provenance retry rather than failing the read forever (the isolation
-    /// path cannot save it — `probe_ndjson` omits `filename=`, so the file
-    /// parses cleanly and is kept as a survivor). Its innocent batch-mate
-    /// must land too, and every user field outside the vector envelope must
-    /// survive the rename.
+    /// A row literally carrying `_trawl_wal_file` collides with the synthetic
+    /// provenance column, which must route to the renamed provenance retry
+    /// rather than failing the read forever.
     #[tokio::test]
     async fn compact_once_drains_wal_carrying_reserved_provenance_key() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13880,7 +12874,6 @@ mod tests {
             "both events land, including the batch-mate"
         );
 
-        // Non-envelope user fields survive on both rows.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let (request_id, wal_file_val, trace_id): (String, String, String) = conn
             .query_row(
@@ -13900,8 +12893,6 @@ mod tests {
             "the client's literal column is preserved as ordinary data"
         );
 
-        // The malformed timestamp was repaired from the file's own name, not
-        // from the client-controlled `_trawl_wal_file` value.
         let repaired: i64 = conn
             .query_row(
                 &format!(
@@ -13920,8 +12911,6 @@ mod tests {
         );
     }
 
-    /// The synthetic `_trawl_wal_file` provenance column never reaches the
-    /// parquet schema.
     #[test]
     fn compact_excludes_wal_provenance_column() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13958,8 +12947,6 @@ mod tests {
         );
     }
 
-    /// A WAL filename that does not conform to `{service}_{millis}_{hex4}`
-    /// degrades to the compaction-instant arm — never a NULL timestamp.
     #[test]
     fn compact_nonconforming_filename_falls_back_to_now() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13991,10 +12978,8 @@ mod tests {
         );
     }
 
-    /// A recurring path (`{env}/{date}/{HH}/{service}.parquet` is stable
-    /// across ticks) corrupting twice must leave two artifacts: `rename`
-    /// clobbers an existing destination, so a blind second quarantine would
-    /// destroy the first one's bytes.
+    /// `rename` clobbers an existing destination, so a blind second
+    /// quarantine would destroy the first one's bytes.
     #[test]
     fn repeated_quarantine_keeps_every_artifact() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14004,7 +12989,6 @@ mod tests {
         let first = quarantine_file(&bad, "svc", "rollup_quarantine", QuarantineKind::Parquet)
             .expect("first quarantine must succeed");
 
-        // Same path corrupts again on a later tick.
         std::fs::write(&bad, b"second corruption").unwrap();
         let second = quarantine_file(&bad, "svc", "rollup_quarantine", QuarantineKind::Parquet)
             .expect("second quarantine must succeed");
@@ -14017,7 +13001,6 @@ mod tests {
         assert_eq!(std::fs::read(&second).unwrap(), b"second corruption");
         assert!(!bad.exists(), "both originals were renamed away");
 
-        // Both names stay inert to the scan globs.
         for p in [&first, &second] {
             let ext = p
                 .extension()
@@ -14031,8 +13014,6 @@ mod tests {
         }
     }
 
-    /// A failed reservation is a hard error, not a swallowed log — the
-    /// bad file still matches the scan glob and would re-wedge every tick.
     #[test]
     #[cfg(unix)]
     fn quarantine_file_signals_reservation_failure() {
@@ -14067,9 +13048,6 @@ mod tests {
         assert!(bad.exists(), "original stays put when quarantine fails");
     }
 
-    /// A failed rename is a hard error too, and it cleans up the reservation,
-    /// so a retry re-uses the bare `.corrupt` name instead of stepping over
-    /// zero-byte debris.
     #[test]
     fn quarantine_file_signals_rename_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14101,10 +13079,6 @@ mod tests {
         );
     }
 
-    /// A postgres outage does not fail fast — each write blocks on the pool's
-    /// acquire timeout — so the retry must be bounded by wall clock, not by
-    /// attempt count, or one batch's bookkeeping outlasts the compaction
-    /// interval and the WAL stops draining.
     #[tokio::test(start_paused = true)]
     async fn bookkeeping_budget_bounds_a_hung_write() {
         let start = tokio::time::Instant::now();
@@ -14116,8 +13090,6 @@ mod tests {
         );
     }
 
-    /// The blips the retry exists for fail in milliseconds, so the budget
-    /// must not cost them their attempts.
     #[tokio::test(start_paused = true)]
     async fn budget_leaves_room_for_every_fast_failing_attempt() {
         let calls = std::cell::Cell::new(0_u32);
@@ -14154,8 +13126,6 @@ mod tests {
             .expect("current-thread runtime")
     }
 
-    /// Run `body` against a LOCAL prometheus recorder and return the scrape.
-    ///
     /// `metrics::with_local_recorder` installs on the current thread only,
     /// which is why the runtime above is current-thread: increments made
     /// inside `block_on` land in this recorder rather than the process-wide
@@ -14175,9 +13145,6 @@ mod tests {
         )
     }
 
-    /// The budget covers both writes, so the counter is only useful if it
-    /// says which one was in flight. A hung conflicts write is the first
-    /// half.
     #[test]
     fn a_hung_conflicts_write_counts_against_conflicts() {
         let rendered = under_local_recorder(|| {
@@ -14200,8 +13167,6 @@ mod tests {
         );
     }
 
-    /// And the second half: conflicts finishes, observations hangs, and the
-    /// cursor has moved.
     #[test]
     fn a_hung_observations_write_counts_against_observations() {
         let rendered = under_local_recorder(|| {
@@ -14229,10 +13194,6 @@ mod tests {
         );
     }
 
-    /// Retry exhaustion is not a timeout. Both writes fail fast, spend
-    /// every attempt, and finish well inside the budget: that failure has
-    /// its own log line and must leave this counter alone, or an alert on
-    /// it fires for a failure whose remedy is different.
     #[test]
     fn fast_retry_exhaustion_counts_no_timeout() {
         let rendered = under_local_recorder(|| {
@@ -14258,8 +13219,6 @@ mod tests {
         );
     }
 
-    // -- hot-buffer pressure (ADR-0043) ---------------------------------------
-
     use crate::hot_buffer::{Charge, HotBufferConfig};
     use crate::ingest::pipeline::{AdmittedGroup, PipelineWriter, ServiceBatch};
     use crate::ingest::producer::ProducerKind;
@@ -14274,7 +13233,6 @@ mod tests {
         }))
     }
 
-    /// Reserve and build one `(prod, service)` group of `count` events.
     fn admitted_group(
         pipeline: &PipelineWriter,
         producer: ProducerKind,
@@ -14284,7 +13242,6 @@ mod tests {
         admitted_env_group(pipeline, producer, "prod", service, count)
     }
 
-    /// Reserve and build one `(env, service)` group of `count` events.
     fn admitted_env_group(
         pipeline: &PipelineWriter,
         producer: ProducerKind,
@@ -14318,7 +13275,6 @@ mod tests {
         }
     }
 
-    /// Write admitted groups through the real WAL + hot-buffer path.
     async fn write_groups(pipeline: &Arc<PipelineWriter>, groups: Vec<AdmittedGroup>) -> usize {
         let pipeline = Arc::clone(pipeline);
         tokio::task::spawn_blocking(move || pipeline.write(groups))
@@ -14356,8 +13312,8 @@ mod tests {
             }
         }
 
-        /// Shut the loop down and join it. The join waits by yielding, so a
-        /// paused test's clock stays where the test left it.
+        /// The join waits by yielding, so a paused test's clock stays where
+        /// the test left it.
         async fn stop(self) {
             self.shutdown.send(true).unwrap();
             until("compaction stops on shutdown", || self.handle.is_finished()).await;
@@ -14375,8 +13331,6 @@ mod tests {
         write.await.unwrap()
     }
 
-    /// Reads a loop's [`PassLog`] in order from a cursor, so a test sees
-    /// every pass once and never takes an old record for the next one.
     struct Passes {
         stats: Arc<CompactionStats>,
         seen: usize,
@@ -14390,12 +13344,10 @@ mod tests {
             }
         }
 
-        /// The next record, a wake included.
         async fn next(&mut self, what: &str) -> PassRecord {
             self.next_where(what, |_| true).await
         }
 
-        /// The next planned or settled record, passing over wakes.
         async fn next_pass(&mut self, what: &str) -> PassRecord {
             self.next_where(what, |record| !matches!(record, PassRecord::Woke { .. }))
                 .await
@@ -14435,12 +13387,10 @@ mod tests {
             }
         }
 
-        /// Every record the loop has written so far, whatever the cursor.
         fn all(&self) -> Vec<PassRecord> {
             self.stats.passes.since(0)
         }
 
-        /// How many passes the loop has planned so far.
         fn planned_count(&self) -> usize {
             self.all()
                 .iter()
@@ -14449,7 +13399,6 @@ mod tests {
         }
     }
 
-    /// Poll `done` every 20 ms until it holds or `limit` passes.
     async fn eventually(limit: Duration, mut done: impl FnMut() -> bool) -> bool {
         let deadline = Instant::now() + limit;
         while Instant::now() < deadline {
@@ -14461,9 +13410,6 @@ mod tests {
         done()
     }
 
-    /// The pass log holds each pass as planned, then settled, in order:
-    /// the boot pass on an empty WAL, with the pressure generation it
-    /// consumed and the cadence state it left.
     #[tokio::test(start_paused = true)]
     async fn the_pass_log_records_a_pass_as_planned_then_settled() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14501,10 +13447,6 @@ mod tests {
         );
     }
 
-    /// With a one-hour interval, the normal pass never fires during
-    /// the test, and the WAL files are seconds old. Only a pressure pass
-    /// (zero WAL age) can publish them and drain the buffer.
-    ///
     /// The loop must be waiting, its boot pass done, before the reservation
     /// enters pressure. Otherwise the boot pass could run before the WAL
     /// file exists and find nothing, or drain it itself, and the test would
@@ -14586,10 +13528,6 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// Every pass fails to publish (the env data path is a file), so
-    /// none drains anything, while `Full` refusals advance the pressure
-    /// generation every few milliseconds. The cooldown keeps the loop to
-    /// about one pass per interval instead of one per refusal.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn stalled_pressure_passes_stay_bounded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14601,8 +13539,6 @@ mod tests {
             Some(Arc::clone(&hot)),
             None,
         ));
-        // Self-telemetry may fill the whole cap; external producers now
-        // have no free space at all.
         let group = admitted_group(&pipeline, ProducerKind::Trawld, "svc", 100);
         assert_eq!(write_groups(&pipeline, vec![group]).await, 100);
 
@@ -14651,9 +13587,8 @@ mod tests {
         );
     }
 
-    /// A hot buffer under pressure whose env `prod` can never publish: its
-    /// data path is a file. `prod` holds 90 of 100 events, written as
-    /// self-telemetry so a later self-telemetry batch still fits.
+    /// `prod` holds 90 of 100 events, written as self-telemetry so a later
+    /// self-telemetry batch still fits.
     async fn stalled_prod(tmp: &Path) -> (Arc<HotBuffer>, Arc<WalWriter>, Arc<PipelineWriter>) {
         std::fs::create_dir_all(tmp.join("data")).unwrap();
         std::fs::write(tmp.join("data").join("prod"), b"not a directory").unwrap();
@@ -14670,12 +13605,9 @@ mod tests {
         (hot, wal, pipeline)
     }
 
-    /// A partial stall that feeds itself. Env `prod` never publishes, and
-    /// env `dev` is healthy. A self-telemetry batch lands in `dev` about
-    /// 100 ms after every pass, the way a failing pass's own error lines
-    /// reach the next self-telemetry flush. With a one-hour interval, the
-    /// first pass fails `prod` and cools down; the inserts it provoked must
-    /// not start another.
+    /// A self-telemetry batch lands in `dev` about 100 ms after every pass,
+    /// the way a failing pass's own error lines reach the next
+    /// self-telemetry flush.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn partial_stall_self_feedback_stays_bounded() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14721,13 +13653,6 @@ mod tests {
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
     }
 
-    /// The same feedback through the real producer. The loop's own
-    /// `compaction chunk failed` line reaches a `WalLayer` wired as
-    /// trawld's `main` wires it, and the flush task writes it into the
-    /// healthy default env `dev` under the self-telemetry reserve, once per
-    /// production flush interval. None of those inserts may start a pass
-    /// while the cooldown runs.
-    ///
     /// The compaction task logs from its own worker threads, so the layer
     /// sits in the global subscriber; nextest runs each test in its own
     /// process.
@@ -14786,10 +13711,6 @@ mod tests {
         );
     }
 
-    /// One pass drains env `dev` and fails env `prod`. The drain is not
-    /// clean progress: a rerun would fail `prod` again, and its error lines
-    /// would give the rerun after it something to drain. The loop cools
-    /// down after that first pass instead of rerunning.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_pass_that_drains_but_fails_a_chunk_cools_down() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14815,12 +13736,8 @@ mod tests {
         );
     }
 
-    /// One pass drains env `dev`, but one entry of the WAL root cannot be
-    /// inspected: a symlink loop, which fails with `ELOOP` for any user.
-    /// That entry may be an env whose WAL never drains, so the pass cools
-    /// down as a failed chunk does, after it has drained the healthy env.
-    /// A later insert that puts the buffer under pressure must then wait
-    /// for the normal pass, an hour out.
+    /// One entry of the WAL root cannot be inspected: a symlink loop, which
+    /// fails with `ELOOP` for any user.
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_incomplete_wal_root_scan_drains_and_cools_down() {
@@ -14842,7 +13759,6 @@ mod tests {
             "the loop must be a skipped scan error, not a vanished entry"
         );
 
-        // The loop starts under pressure, so its first pass runs at once.
         let compaction = Loop::spawn(tmp.path(), Duration::from_secs(3600), false, &hot);
         let stats = Arc::clone(&compaction.stats);
         let waiting = eventually(Duration::from_secs(30), || {
@@ -14870,22 +13786,12 @@ mod tests {
         assert_eq!(hot.event_count(), 60, "the second batch waits");
     }
 
-    /// A stuck env below a quarter of the cap never holds the buffer under
-    /// pressure on its own. A large but legal request cannot fit beside it,
-    /// so each retry is a `Full` refusal that latches `Refusing` and wakes
-    /// the loop, while a healthy trickle gives every pass something to
-    /// drain. The pass fails `prod`, drains the trickle and ends `Open`. The
-    /// failure alone must start the cooldown: with a one-hour interval, the
-    /// retries get one pass, not one each.
-    ///
     /// The stuck env is written after the boot pass, which would otherwise
     /// fail `prod` itself and cool down before any retry. The cadence clock
     /// is paused, so the only pass the cooldown can end in is the one the
     /// test starts by advancing to the normal deadline.
     #[tokio::test(start_paused = true)]
     async fn a_failing_pass_that_ends_open_still_cools_down() {
-        /// Write one trickle event and retry the large request once.
-        /// Returns whether the request was refused.
         async fn trickle_and_retry(pipeline: &Arc<PipelineWriter>) -> bool {
             let trickle = admitted_env_group(pipeline, ProducerKind::Http, "dev", "small", 1);
             assert_eq!(write_paused(pipeline, vec![trickle]).await, 1);
@@ -14917,8 +13823,6 @@ mod tests {
         assert_eq!(write_paused(&pipeline, vec![stuck]).await, 10);
         assert_eq!(hot.admission_state(), AdmissionState::Open);
 
-        // The first refusal wakes the loop, and the inserts since the empty
-        // boot pass let that wake start a pass.
         assert!(
             trickle_and_retry(&pipeline).await,
             "the large request is refused"
@@ -14950,9 +13854,6 @@ mod tests {
             passes.all()
         );
 
-        // The pass after the cooldown is the normal one, at its deadline:
-        // no refusal started a pass in between, and the scheduled retry
-        // still runs.
         tokio::time::advance(failed.next_normal - tokio::time::Instant::now()).await;
         let normal = passes.planned("the normal pass at the deadline").await;
         assert_eq!(normal.kind, PassKind::Normal, "{normal:?}");
@@ -14961,13 +13862,8 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// A burst on an empty buffer, after a boot pass that found no WAL at
-    /// all: two groups reserve, and a third does not fit, so its refusal
-    /// wakes the loop before either group's WAL exists. With no insert since
-    /// the empty pass, that wake starts no pass. The in-flight groups then
-    /// land, and their inserts must start the pass that drains them. The
-    /// cadence clock stays paused through the drain, so the normal deadline
-    /// cannot rescue a lost insert wake.
+    /// The cadence clock stays paused through the drain, so the normal
+    /// deadline cannot rescue a lost insert wake.
     #[tokio::test(start_paused = true)]
     async fn a_refusal_before_the_wal_exists_does_not_strand_the_burst() {
         let tmp = tempfile::tempdir().unwrap();
@@ -14995,8 +13891,6 @@ mod tests {
         assert!(matches!(refused, Err(crate::hot_buffer::Refusal::Full)));
         assert_eq!(hot.admission_state(), AdmissionState::Refusing);
 
-        // The loop takes the refusal's wake before either group has written
-        // its WAL, and the wake starts no pass.
         let woke = passes.next("the refusal's wake").await;
         assert!(
             matches!(woke, PassRecord::Woke { started: false, .. }),
@@ -15005,8 +13899,6 @@ mod tests {
         assert_eq!(hot.drained_batches(), 0, "only the empty boot pass ran");
 
         assert_eq!(write_paused(&pipeline, vec![a, b]).await, 90);
-        // Only the inserts' pressure wakes can start the passes that drain
-        // the burst: the normal deadline is an hour out on a paused clock.
         until("the burst drains", || hot.event_count() == 0).await;
         compaction.stop().await;
 
@@ -15014,13 +13906,8 @@ mod tests {
         assert_eq!(hot.admission_state(), AdmissionState::Open);
     }
 
-    /// 30 events are resident and 30 more are reserved. The first pass
-    /// drains the resident batch cleanly, but the reservation keeps the
-    /// buffer under pressure, so the loop reruns at once and finds no WAL:
-    /// the reserved group has not written it yet. When that group lands,
-    /// its insert must start the pass that drains it. The cadence clock
-    /// stays paused through the drain, so the normal deadline cannot rescue
-    /// a lost insert wake.
+    /// The cadence clock stays paused through the drain, so the normal
+    /// deadline cannot rescue a lost insert wake.
     #[tokio::test(start_paused = true)]
     async fn a_clean_rerun_that_races_in_flight_charge_drains_it_after() {
         let tmp = tempfile::tempdir().unwrap();
@@ -15055,8 +13942,6 @@ mod tests {
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
 
         assert_eq!(write_paused(&pipeline, vec![in_flight]).await, 30);
-        // Only the insert's pressure wake can start the pass that drains
-        // it: the normal deadline is an hour out on a paused clock.
         until("the in-flight group drains", || hot.event_count() == 0).await;
         compaction.stop().await;
 
@@ -15064,12 +13949,8 @@ mod tests {
         assert_eq!(hot.admission_state(), AdmissionState::Open);
     }
 
-    /// A normal pass is planned while the buffer is `Open`, so it takes only
-    /// WAL older than the interval, and a repin cutover holds it. A burst
-    /// meanwhile puts the buffer under pressure. Once the cutover ends, the
-    /// held pass finds no WAL it may take and drains nothing. The burst's
-    /// pressure wake must still start a pass at once, not at the next
-    /// normal deadline: the test moves the paused cadence clock only to
+    /// The burst's pressure wake must still start a pass at once, not at the
+    /// next normal deadline: the test moves the paused cadence clock only to
     /// reach the held pass's deadline.
     #[tokio::test(start_paused = true)]
     async fn a_normal_pass_held_across_a_burst_keeps_its_pressure_wake() {
@@ -15145,8 +14026,6 @@ mod tests {
         assert_eq!(hot.admission_state(), AdmissionState::Pressure);
         drop(cutover);
 
-        // No further advance: the next deadline is an hour out, so only the
-        // burst's pressure wake can start the pass that drains it.
         let normal = passes.settled("the held normal pass settles").await;
         assert_eq!(
             (normal.kind, normal.outcome.drained),
@@ -15165,14 +14044,8 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// A reservation holds 90 of 100 events and has not written its WAL, so
-    /// a pass can find nothing to drain. `Full` refusals wake the loop;
-    /// after the boot pass found nothing, they must not start a pass each.
-    /// The reservation's insert does start one, and it drains the batch.
-    ///
-    /// The refusals are counted, and the check that none started a pass
-    /// follows the loop's wake for the last of them. This test keeps the
-    /// real clock: the normal deadline is an hour out, past the hang guard.
+    /// This test keeps the real clock: the normal deadline is an hour out,
+    /// past the hang guard.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn refusals_against_in_flight_charge_wait_for_an_insert() {
         const REFUSALS: u64 = 500;
@@ -15276,9 +14149,6 @@ mod tests {
         );
     }
 
-    /// Historical hourly files for one service, a hot buffer that a
-    /// reservation above one half holds under pressure, and the daily file
-    /// a rollup would write.
     struct HeldPressure {
         tmp: tempfile::TempDir,
         day: PathBuf,
@@ -15327,11 +14197,8 @@ mod tests {
         }
     }
 
-    /// A pressure pass skips the daily rollup. A held reservation keeps the
-    /// buffer under pressure and the cadence clock is paused, so no normal
-    /// pass can run. After an empty boot pass, an insert starts a pressure
-    /// pass that drains it, and the historical hourly files stay as they
-    /// were: no daily file, and no rollup marker.
+    /// A held reservation keeps the buffer under pressure and the cadence
+    /// clock is paused, so no normal pass can run.
     #[tokio::test(start_paused = true)]
     async fn a_pressure_pass_skips_the_daily_rollup() {
         let held = held_pressure();
@@ -15363,12 +14230,6 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// The normal deadline still rolls up while pressure holds, and a
-    /// pressure pass between does not move it. With the cadence clock
-    /// paused, the test advances to half the interval, where an insert's
-    /// pressure pass drains, and then to the original deadline, where the
-    /// normal pass rolls the historical hourly files into the daily file and
-    /// retires every one of them.
     #[tokio::test(start_paused = true)]
     async fn the_normal_deadline_rolls_up_under_held_pressure() {
         let held = held_pressure();
@@ -15427,8 +14288,6 @@ mod tests {
         compaction.stop().await;
     }
 
-    /// A [`PassOutcome`] with the three counts the cadence reads, plus a
-    /// data-loss tally it must ignore, and no overhang.
     fn outcome(
         eligible: u64,
         drained: u64,
@@ -15444,21 +14303,14 @@ mod tests {
         }
     }
 
-    /// Whether a pass is urgent under `admission` with no overhang.
     fn pressed(admission: AdmissionState) -> bool {
         urgent(admission, false)
     }
 
-    /// The plan a pass of `kind` gets under `admission`, with no overhang.
     fn plan_for(kind: PassKind, admission: AdmissionState, interval: Duration) -> PassPlan {
         PassPlan::new(kind, pressed(admission), interval, true)
     }
 
-    /// The cadence alone, on a synthetic clock, with a pressure wake at
-    /// every 100 ms step: a stalled drain, and refusals against charge that
-    /// is only in flight, each run about one pass per interval, and the
-    /// normal deadline moves only with normal passes. Inserts, not wakes,
-    /// bound the passes that find nothing.
     #[test]
     fn cadence_bounds_stalled_pressure_and_keeps_the_normal_deadline() {
         let interval = Duration::from_secs(10);
@@ -15509,8 +14361,6 @@ mod tests {
             "an insert at every step starts a pass at every step"
         );
 
-        // A clean drain under pressure reruns at once, without moving the
-        // deadline.
         let mut cadence = Cadence::new(t0, interval);
         let now = t0 + Duration::from_secs(1);
         let plan = plan_for(PassKind::Pressure, AdmissionState::Pressure, interval);
@@ -15529,9 +14379,6 @@ mod tests {
         assert_eq!(cadence.next_normal, t0 + interval);
     }
 
-    /// An interval past what `Instant` can hold saturates the normal
-    /// deadline instead of panicking, so the compaction task survives it,
-    /// and the deadline still lies in the future.
     #[test]
     fn cadence_saturates_the_normal_deadline_on_a_huge_interval() {
         let interval = Duration::from_secs(u64::MAX);
@@ -15553,9 +14400,6 @@ mod tests {
         assert_eq!(cadence.due(now, false), None);
     }
 
-    /// A cooldown is the one state whose wait does not listen for pressure
-    /// wakes, so no refusal or insert can start a pass during it. Every
-    /// other state listens.
     #[test]
     fn cadence_cooldown_does_not_listen() {
         let interval = Duration::from_secs(3600);
@@ -15596,9 +14440,6 @@ mod tests {
         assert_eq!(data_loss, 0);
     }
 
-    /// Every branch of [`Cadence::finished`], and what each one lets start
-    /// the next pass: at once, on a wake, only on a wake after an insert,
-    /// or only at the normal deadline.
     #[test]
     #[allow(clippy::too_many_lines)] // one flat table, one row per branch
     fn cadence_follows_failures_eligible_and_drained_batches() {
@@ -15802,9 +14643,6 @@ mod tests {
         }
     }
 
-    // -- restart overhang (ADR-0041 slice 2) ----------------------------------
-
-    /// A hot buffer whose gate hydration left in overhang.
     fn overhang_buffer() -> (Arc<HotBuffer>, Arc<PublicationGate>) {
         let gate = Arc::new(PublicationGate::starting());
         gate.finish_hydration(true).unwrap();
@@ -15816,7 +14654,6 @@ mod tests {
         (Arc::new(hot), gate)
     }
 
-    /// `outcome`, with overhang still held when the pass ended.
     fn unproven(eligible: u64, drained: u64, persistent_failures: u64) -> PassOutcome {
         PassOutcome {
             overhang: true,
@@ -15824,10 +14661,6 @@ mod tests {
         }
     }
 
-    /// The first pass is due at once, before the normal deadline and
-    /// whatever the admission state. It takes WAL of every age and starts
-    /// no daily rollup, and the rollup keeps its deadline, one interval
-    /// after the start.
     #[test]
     fn cadence_first_pass_is_due_at_boot_and_starts_no_daily_rollup() {
         let interval = Duration::from_secs(3600);
@@ -15864,9 +14697,6 @@ mod tests {
         assert!(PassPlan::new(PassKind::Normal, false, interval, true).daily_rollup);
     }
 
-    /// Overhang makes a pass urgent with admission `Open`: a normal pass
-    /// takes WAL of every age, and a pass that drained reruns at once and
-    /// takes every age too. Once a proof settles, `Open` is not urgent.
     #[test]
     fn cadence_overhang_with_open_admission_takes_any_age_and_reruns_after_a_drain() {
         let interval = Duration::from_secs(3600);
@@ -15901,7 +14731,6 @@ mod tests {
         let rerun = PassPlan::new(PassKind::Pressure, urgent(open, true), interval, true);
         assert_eq!(rerun.wal_min_age, Duration::ZERO);
 
-        // The rerun drains more and still cannot prove coverage: again.
         cadence.finished(
             PassKind::Pressure,
             rerun,
@@ -15912,7 +14741,6 @@ mod tests {
         );
         assert_eq!(cadence.next, Next::Rerun);
 
-        // Its proof settles: `Open` alone waits for the normal deadline.
         cadence.finished(
             PassKind::Pressure,
             rerun,
@@ -15926,9 +14754,6 @@ mod tests {
         assert_eq!(cadence.next_normal, t0 + interval);
     }
 
-    /// While overhang holds, a persistent failure cools down however much
-    /// the pass drained, and so does a failed proof with nothing drained:
-    /// neither loops at once, and wakes after inserts start nothing.
     #[test]
     fn cadence_overhang_persistent_failure_cools_down() {
         let interval = Duration::from_secs(10);
@@ -15950,9 +14775,6 @@ mod tests {
                 assert!(!cadence.listens(), "{name}, {kind:?}");
             }
 
-            // A standing fault with an insert and a wake at every 100 ms
-            // step, as its own log lines would give: about one pass per
-            // interval.
             let mut cadence = Cadence::new(t0, interval);
             let (mut passes, mut inserted) = (0_u32, 0_u64);
             for ms in (0..100_000).step_by(100) {
@@ -15972,9 +14794,6 @@ mod tests {
         }
     }
 
-    /// A pass that takes WAL of every age and finds none waits for an
-    /// insert, unless overhang holds. Then its proof failed with nothing
-    /// drained, and the loop cools down instead of waiting on inserts.
     #[test]
     fn cadence_no_insert_wait_while_overhang() {
         let interval = Duration::from_secs(3600);
@@ -16000,7 +14819,6 @@ mod tests {
                 );
                 assert_eq!(cadence.next, Next::Cooldown, "{admission:?}, {kind:?}");
 
-                // The same pass once the overhang is proven covered.
                 let mut cadence = Cadence::new(t0, interval);
                 cadence.finished(
                     kind,
@@ -16019,10 +14837,6 @@ mod tests {
         }
     }
 
-    /// A publish that finished before a crash: the canonical output carries
-    /// the marker's identity and the WAL it consumed is still in place. The
-    /// pass's recovery retires that WAL, the pass's only progress. It counts
-    /// as drained, so an urgent pass reruns instead of cooling down.
     #[tokio::test]
     async fn cadence_marker_recovery_retirement_counts_as_drained() {
         let tmp = tempfile::tempdir().unwrap();
@@ -16088,10 +14902,6 @@ mod tests {
         assert_eq!(cadence.next, Next::Rerun, "not stuck while overhang holds");
     }
 
-    /// A full pass while hydration's overhang holds and no rollup marker is
-    /// pending: rollup recovery admits the WAL phase, the pass drains the
-    /// WAL that never became resident with the resident batch, and its
-    /// coverage proof settles the gate before the pass returns.
     #[tokio::test]
     async fn rollup_boot_recovery_overhang_pass_drains_the_wal_and_settles() {
         let logs = captured_logs();
@@ -16151,11 +14961,6 @@ mod tests {
         assert_eq!(log.matches("corpus_settled").count(), 1, "{log}");
     }
 
-    /// The loop's first pass runs at once on an `Open` buffer and drains
-    /// the overhang: WAL seconds old that never became resident, an hour
-    /// before the normal deadline, and it leaves the historical hourly
-    /// files for the rollup's own deadline. Its proof settles the gate, so
-    /// the loop then waits.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn cadence_boot_pass_drains_overhang_at_once_and_starts_no_rollup() {
         let tmp = tempfile::tempdir().unwrap();
@@ -16203,8 +15008,6 @@ mod pg_tests {
     use super::CatalogContext;
     use super::tests::{ChunkEnd, quarantined_chunk_ends};
 
-    /// [`ChunkEnd::CatalogUnreachable`]: phase 2 cannot make the pins
-    /// durable, and the quarantined batch still drains.
     #[tokio::test]
     async fn quarantined_batches_drain_when_the_catalog_is_unreachable() {
         // Deliberately unreachable: this pool simulates a dead catalog

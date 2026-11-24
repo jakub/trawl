@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
 
-# A new push to a pull request cancels its older run. Each push to main gets
+# Each push to main gets
 # its own group, so no main run is ever cancelled: a merge landing shortly
 # after another would otherwise leave the first merge with no verdict, and
 # rust-cache saves only from a finished main run. A shared group would not
@@ -23,19 +23,12 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
-# Every job runs on a GitHub-hosted runner, and they share the repository's
-# 10 GB Actions cache. Each rust-cache step below saves only on main: pull
-# requests restore main's entries and never evict them with per-PR copies.
-# Jobs that compile the same thing share a key.
-#
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
+# Jobs share the repository's 10 GB Actions cache. Each rust-cache step below
+# saves only on main: pull requests restore main's entries and never evict them
+# with per-PR copies.
 
 jobs:
   changes:
-    # Decides which path-gated jobs this run needs; see ci/changed-scopes.py.
-    # A push to main runs every job, so main stays fully verified and keeps
-    # the caches that pull requests restore warm.
     name: changed scopes
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -63,12 +56,6 @@ jobs:
           fi
 
   repo-checks:
-    # Eight checks that each do under a minute of work, run as steps of one
-    # job. As separate jobs, each paid for its own runner, checkout and tool
-    # setup, and took one of the account's 40 concurrent job slots; a pull
-    # request that touches crates starts about 30 jobs at once. Every check
-    # step runs even when an earlier one fails (`!cancelled()`), and each has
-    # its own timeout, so one hung check cannot hide the others' results.
     name: repository checks
     runs-on: ubuntu-24.04
     timeout-minutes: 20
@@ -82,9 +69,8 @@ jobs:
       # source tests' Debian package checks.
       - name: Install Debian test tooling
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends openssl dpkg-dev
-      # The release source tests compile the actual Cargo helper, then exercise
-      # its target and integrity boundaries with cached fixtures and no
-      # downloader on PATH. cargo-deny shells out to `cargo metadata`.
+      # The release source tests compile the actual Cargo helper.
+      # cargo-deny shells out to `cargo metadata`.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
@@ -127,7 +113,6 @@ jobs:
         if: ${{ !cancelled() }}
         timeout-minutes: 5
         run: python3 -m unittest discover -s scripts/release -p 'test_*.py' -v
-      # render.sh finishes in about a minute.
       - name: helm template
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -149,8 +134,6 @@ jobs:
           tar -xzf "$fixture_dir/vector.tar.gz" -C "$fixture_dir"
           VECTOR_BIN="$fixture_dir/vector-x86_64-unknown-linux-gnu/bin/vector" \
             python3 scripts/test-vector-collector.py
-      # Committed Claude Code transcripts hold only sanitize.py's allowlist,
-      # and no evidence stream carries session metadata.
       - name: evidence transcripts
         if: ${{ !cancelled() }}
         timeout-minutes: 5
@@ -186,18 +169,6 @@ jobs:
       - run: cargo clippy --workspace --all-targets --no-default-features
 
   test-build:
-    # The workspace tests run in three stages so that neither compiling nor
-    # testing waits for the other's leftovers:
-    #   test-build   compiles every test binary once and archives them;
-    #   test (N/3)   three jobs, each extracting that archive beside a fresh
-    #                checkout and running one slice of the tests against its
-    #                own postgres;
-    #   test-guards  runs, beside the other two, the checks that need a cargo
-    #                build but no test results: fleet-admin migrate, the
-    #                postgres admission guard and the DuckDB launcher smoke.
-    # One job used to do all of it: 3m29s of warm compile, then 5m29s of
-    # tests on four threads, then 49s of guard, on the critical path.
-    #
     # Every compile-time path the tests bake in with env!() (CARGO_MANIFEST_DIR,
     # CARGO_BIN_EXE_*, CARGO) points into /home/runner/work/trawl/trawl, the
     # same checkout path on every hosted runner. The test jobs extract the
@@ -214,9 +185,7 @@ jobs:
       # its stack frames are unchanged. Keep it full: trawl-core's 2 MiB
       # parser stack test is calibrated against the unoptimized,
       # full-debuginfo build (crates/trawl-core/src/parser/mod.rs), and CI
-      # is the only place that build runs. The archive carries the binaries
-      # but not the .dwo files, so a backtrace in a test job names functions
-      # without file and line.
+      # is the only place that build runs.
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -231,9 +200,7 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       # nextest is pinned by VERSION, not just by the action sha: the action
       # manifest at this sha ships 0.9.132, whose filterset grammar predates
-      # the `group()` predicate pg-admission-guard queries with -- the guard
-      # step failed on every run while local 0.9.143 parsed it fine. Pin the
-      # version the local gates validate.
+      # the `group()` predicate pg-admission-guard queries with.
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
           tool: nextest@0.9.143
@@ -241,8 +208,7 @@ jobs:
       # `keystore` feature when it is built as a selected workspace package,
       # silently compiling out its pg test files. The explicit fleet-auth/*
       # features below re-enable them deterministically. Do NOT drop them.
-      # test-guards builds with the same selection. The archive records it,
-      # so the test jobs cannot run a different one.
+      # test-guards builds with the same selection.
       - name: Build and archive the test binaries
         run: >-
           cargo nextest archive --workspace --no-default-features
@@ -284,7 +250,6 @@ jobs:
     permissions:
       contents: read
     strategy:
-      # Every slice reports, so one failure does not hide another.
       fail-fast: false
       matrix:
         partition: [1, 2, 3]
@@ -353,22 +318,11 @@ jobs:
           # treats FLEET_DATABASE_URL as its highest-precedence keystore
           # override (ADR-0004 slice 3), so setting it process-wide would
           # silently repoint every fixture's per-test keystore DSN at the
-          # shared service container. The #[sqlx::test] harness hardwires
-          # DATABASE_URL. There is no skip mode: #[sqlx::test] panics loudly
-          # when DATABASE_URL is unset or unreachable, so "pg tests silently
-          # skipped" cannot produce a misleading green (the
-          # FLEET_TESTS_REQUIRED backstop died with the PgFixture in ADR-0004
-          # slice 3 / issue #12).
+          # shared service container.
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          # A doctor test that needs a user namespace fails here instead of
-          # printing SKIPPED, so a skip is never counted as a pass.
           TRAWL_TEST_REQUIRE_USERNS: "1"
 
   test-guards:
-    # Checks that need the workspace test build but no test results, run
-    # beside test-build and the test slices instead of after them. This job
-    # compiles the same test binaries again from the same cache, which costs
-    # runner time but no wall time.
     name: test guards
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -380,7 +334,6 @@ jobs:
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     services:
       postgres:
-        # Same digest as the test job's service.
         image: postgres:18@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
         env:
           POSTGRES_PASSWORD: postgres
@@ -400,7 +353,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
-      # test-build owns the cache and saves it; this job only reads it.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
@@ -409,20 +361,12 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079
         with:
           tool: nextest@0.9.143
-      # Explicit migration step: run the operational `fleet-admin migrate`
-      # command against the service container. Spells out AC10's migration
-      # step and exercises the exact deploy-time command the helm init
-      # container runs (AC11) against a live postgres. The trawl app-state
-      # database needs no CI migrate step: trawld auto-migrates it at boot
-      # (sole writer).
       - name: Apply fleet-auth schema migrations
         run: cargo run -p fleet-admin -- migrate
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-      # Membership in the `postgres` group is hand-written in
-      # .config/nextest.toml; this recomputes it from the sources and fails
-      # if a pg-touching test runs outside the group. Same feature selection
-      # as test-build, because a feature can compile a pg test file out.
+      # Same feature selection as test-build, because a feature can compile a pg
+      # test file out.
       - name: Guard the postgres admission group
         if: ${{ !cancelled() }}
         run: >-
@@ -437,16 +381,9 @@ jobs:
         run: bin/trawld-dev --version
 
   server-mutations:
-    # Each crates/trawl-server/mutations/*.patch removes one guard. The
-    # script runs every patch's tests on the pristine tree first (the
-    # control), then applies each patch, requires nextest exit 100 (a
-    # kill), and reverts it. A build failure or a filter that matches no
-    # test fails the job; it never counts as a kill. The nets patch boots
-    # real servers, hence the same postgres service and DATABASE_URL as
-    # the test job. The workflow-level RUSTFLAGS makes every mutant compile
-    # under -D warnings.
-    # It skips when the pull request cannot change what trawl-server
-    # compiles or how nextest runs it (ci/changed-scopes.py).
+    # The nets patch boots real servers, hence the same postgres service and
+    # DATABASE_URL as the test job. The workflow-level RUSTFLAGS makes every
+    # mutant compile under -D warnings.
     name: Server guard mutations
     runs-on: ubuntu-24.04
     needs: changes
@@ -455,20 +392,15 @@ jobs:
     permissions:
       contents: read
     env:
-      # Each mutant relinks the trawl-server test binaries; see `test`.
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     services:
       postgres:
-        # Same digest as the test job's service.
         image: postgres:18@sha256:3a4264520e121176619f54ff867d12774bc81e95e7b84db58d63bccdb6144b81
         env:
           POSTGRES_PASSWORD: postgres
           POSTGRES_DB: postgres
         ports:
           - 5432:5432
-        # tmpfs data directory, as in docker-compose.dev.yml. The health
-        # check asks over TCP: the image's init-time server listens only on
-        # the unix socket and is stopped before the real one starts.
         options: >-
           --tmpfs /var/lib/postgresql
           --health-cmd="pg_isready -h 127.0.0.1 -U postgres"
@@ -530,12 +462,7 @@ jobs:
           shared-key: wasm-check
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo clippy -p trawl-web-ui --target wasm32-unknown-unknown
-      # The search URL codec is a pure library the SPA re-exports, so it is
-      # checked for wasm32 on its own as well as through trawl-web-ui.
       - run: cargo clippy -p trawl-search-url --target wasm32-unknown-unknown
-      # Both sides of the default-off `atmosphere` feature: the bare run is
-      # the shape non-mounting consumers compile (and the one that must NOT
-      # link the vendored snippet), the second covers the backdrop itself.
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown
       - run: cargo clippy -p fleet-ui --target wasm32-unknown-unknown --features atmosphere
 
@@ -556,19 +483,9 @@ jobs:
       - uses: taiki-e/install-action@ad7375e0bba1919d6e57488597dede2841199079 # trunk
         with:
           tool: trunk
-      # The SPA mounts Atmosphere on /login (dep-level `atmosphere` feature,
-      # ADR-0012), so exactly one emitted shader snippet must ship — zero
-      # means the feature fell off (the mount would be a compile error, but
-      # the emission path is wasm-bindgen's, so pin it), more than one means
-      # stale staging leaked into dist.
       - name: Build SPA
         working-directory: crates/trawl-web-ui
         run: |
-          # wasm-bindgen appends to its output dir and never prunes it, and
-          # rust-cache restores that dir — so an orphaned snippet from an
-          # earlier build would be copied into dist and miscount below.
-          # Purge the staging snippets so the assertion sees only what THIS
-          # build emitted.
           rm -rf ../../target/wasm-bindgen/release/snippets
           trunk build --release
           count=$(ls dist/snippets/fleet-ui-*/vendor/paper-shaders.js 2>/dev/null | wc -l)
@@ -576,12 +493,6 @@ jobs:
             echo "::error::expected exactly one fleet-ui shader snippet in trawl-web-ui dist, found $count (ADR-0012)"
             exit 1
           fi
-      # The workbench is the only wasm-target build of the Atmosphere
-      # backdrop (it opts in via `data-cargo-features` in index.html).
-      # wasm-bindgen inlines `module = "/vendor/paper-shaders.js"` as a
-      # compile-time snippet, so a missing bundle already fails the build;
-      # the assertion pins the emission path the generated shim imports
-      # (ADR-0012).
       - name: Build fleet-ui workbench
         working-directory: crates/fleet-ui
         run: |
@@ -605,7 +516,6 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      # See `test`.
       CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -646,14 +556,6 @@ jobs:
       - run: cargo build --release -p trawl-web
 
   web-ui-mutations:
-    # Each patch in crates/trawl-web-ui/e2e/mutations plants one regression.
-    # mutation-check.sh builds each mutant SPA, requires its target spec to
-    # fail and its routing control to pass, then reverts. A kill only counts
-    # next to a green baseline on the same commit, and the workflow gives
-    # that by requiring web-ui-e2e too. The legs, at most six patches each,
-    # run in parallel. Each leg builds its own debug (wasm-dev) SPAs, so none
-    # waits on trunk-build. The legs skip when the pull request cannot
-    # change what the SPA compiles (ci/changed-scopes.py).
     name: web UI mutations (${{ matrix.set }})
     runs-on: ubuntu-24.04
     needs: changes
@@ -686,7 +588,6 @@ jobs:
               36-send-window-merged-text.patch
               37-board-read-while-hidden.patch
               38-board-read-inside-pause.patch
-    # At most six apply/build/run cycles after browser and package setup.
     timeout-minutes: 45
     permissions:
       contents: read
@@ -742,13 +643,10 @@ jobs:
     needs: trunk-build
     # CI runs one worker per job (see playwright.config.ts), so the suite
     # is split across jobs instead, each with its own stub server.
-    # fullyParallel lets the split fall between tests of one file. fail-fast is off so one red shard still lets
-    # the others report their results.
     strategy:
       fail-fast: false
       matrix:
         shard: [1, 2, 3, 4]
-    # Include package installation, both bounded browser suites and evidence upload.
     timeout-minutes: 40
     # This job executes third-party code (npm packages, a CDN-fetched
     # browser): read-only token, and no credentials persisted into
@@ -772,20 +670,14 @@ jobs:
         run: test -f crates/trawl-web-ui/dist/index.html
       - run: npm ci --no-audit --no-fund
         working-directory: crates/trawl-web-ui/e2e
-      # The browser binary cache is keyed on the lockfile: bumping
-      # @playwright/test invalidates it, so the installed Chromium always
-      # matches the pinned package version.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
       - run: npx playwright install --with-deps chromium
         working-directory: crates/trawl-web-ui/e2e
-      # retries=0 lives in playwright.config.ts (flake policy: fix or
-      # quarantine loudly, never retry past it).
-      # A shard runs about a quarter of the suite. The aggregate bound keeps
-      # the full-suite headroom, so an unbalanced shard on a busy shared
-      # runner is not cut off. Per-test timeouts stay unchanged.
+      # The aggregate bound keeps the full-suite headroom, so an unbalanced
+      # shard on a busy shared runner is not cut off.
       - run: npm run test -- --shard=${{ matrix.shard }}/4 --global-timeout=1500000
         working-directory: crates/trawl-web-ui/e2e
         env:
@@ -936,17 +828,12 @@ jobs:
         run: test -f crates/trawl-web-ui/dist/index.html
       - run: npm ci --no-audit --no-fund
         working-directory: crates/trawl-web-ui/e2e
-      # The browser binary cache is keyed on the lockfile: bumping
-      # @playwright/test invalidates it, so the installed Chromium always
-      # matches the pinned package version.
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: ~/.cache/ms-playwright
           key: playwright-${{ runner.os }}-${{ hashFiles('crates/trawl-web-ui/e2e/package-lock.json') }}
       - run: npx playwright install --with-deps chromium
         working-directory: crates/trawl-web-ui/e2e
-      # retries=0 lives in playwright.config.ts (flake policy: fix or
-      # quarantine loudly, never retry past it).
       - run: bash scripts/atmosphere-mutation-check.sh
         working-directory: crates/trawl-web-ui/e2e
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
@@ -958,58 +845,25 @@ jobs:
 
   fuzz-smoke:
     name: pin-aware fuzz smoke (parse_emit)
-    # A bounded gating run of the pin-aware parse/emit fuzz target: parse
-    # arbitrary DSL, invent a catalog pin for every name
-    # `field_refs::referenced_fields` reports out of the parsed query, emit
-    # SQL under those pins, and assert the differential oracle in the
-    # target. (Not every field the query binds: bare-word search terms and
-    # time bounds are excluded there, and those envelope fields have fixed
-    # production types, so there is no pin to vary.)
-    # A second bounded run fuzzes format_roundtrip: every input that parses
-    # must format faithfully or be refused as too long (ADR-0061).
-    # It links no DuckDB and needs no postgres, so ten minutes is generous
-    # (each target measured at ~25s of build plus ~15s of fuzzing).
-    #
     # The build target is pinned explicitly below, and that flag is
     # load-bearing. `cargo fuzz` does NOT default `--target` to the host
-    # triple: it defaults to the triple cargo-fuzz ITSELF was compiled for,
-    # baked in at its own build time via
-    # `current_platform::CURRENT_PLATFORM`. The only Linux artifact the
-    # cargo-fuzz 0.13.2 release publishes is
-    # `cargo-fuzz-0.13.2-x86_64-unknown-linux-musl.tar.gz`, so
-    # install-action hands every Linux runner, glibc or not, a musl-static
-    # binary that then builds the fuzz target for musl. That fails twice
-    # over: AddressSanitizer cannot instrument a statically linked libc
-    # ("sanitizer is incompatible with statically linked libc"), and no
-    # musl std is installed to link against anyway. A dev machine whose
-    # cargo-fuzz came from `cargo install` is built against glibc and
-    # defaults to gnu, which is why this only ever showed up in CI.
-    # `--target x86_64-unknown-linux-gnu` makes the build independent of
-    # how the tool was packaged.
-    #
-    # The explicit `--target` removes the dependency on how cargo-fuzz was
-    # PACKAGED, not the dependency on the image shipping a glibc toolchain:
-    # the ASan runtime ships inside the pinned nightly and install-action
-    # pins cargo-fuzz, but the image's own glibc, C toolchain and linker
-    # come from the runner image this workflow pins.
+    # triple: it defaults to the triple cargo-fuzz ITSELF was compiled for.
+    # install-action hands every Linux runner a musl-static binary, which
+    # without the flag builds the fuzz target for musl, and AddressSanitizer
+    # cannot instrument a statically linked libc.
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # This job executes code the PR controls: a fuzz target running mutated
-    # input through PR-authored code, and every build script in the
-    # dependency tree, which runs at build time. Read-only token, and no
-    # credentials persisted into .git/config for that code to read.
+    # This job runs code the PR controls (the fuzz target and every build
+    # script), so: read-only token, and no credentials persisted into
+    # .git/config for that code to read.
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
-      # Pinned by DATE. cargo-fuzz needs a nightly compiler (-Zsanitizer),
-      # and a floating `nightly` is the one input that can redden a merge
-      # gate with no code change in the PR: a compiler published overnight
-      # can add a lint, change a codegen flag or break libfuzzer-sys, and
-      # the failure lands on whoever opens a PR that morning. Bump this
-      # line deliberately, on its own, so the bump is what gets reviewed.
+      # Pinned by DATE: a floating `nightly` can redden a merge gate with no
+      # code change in the PR. Bump this line deliberately, on its own.
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: nightly-2026-08-24
@@ -1026,13 +880,8 @@ jobs:
         with:
           tool: cargo-fuzz@0.13.2
       # The fuzz package carries its OWN Cargo.lock (it is workspace-
-      # `exclude`d), and that lockfile had gone stale: it still pinned
-      # chumsky 0.12 while the workspace moved to 0.13, so nobody had built
-      # these targets since the bump. Assert it resolves unchanged before
-      # fuzzing, or a fresh runner silently fuzzes a different dependency
-      # tree than the one committed. `cargo fuzz run` has no `--locked`
-      # passthrough (verified against 0.13.2 `--help`), so the check is a
-      # preflight rather than a flag.
+      # `exclude`d). `cargo fuzz run` has no `--locked` passthrough, so the
+      # check is a preflight rather than a flag.
       - name: Assert the fuzz lockfile is current
         working-directory: crates/trawl-core
         env:
@@ -1044,19 +893,11 @@ jobs:
       - name: Fuzz parse_emit
         working-directory: crates/trawl-core
         env:
-          # RUSTFLAGS is overridden, and this is not cosmetic. The
-          # workflow-level `RUSTFLAGS: -D warnings` is inherited by every
-          # job, cargo-fuzz APPENDS its sanitizer flags to whatever it
-          # inherits, and nightly 1.100 deprecates
-          # `AtomicU64::fetch_update` (renamed `try_update`), which
-          # crates/trawl-core/src/stream.rs uses. So the inherited flag
-          # turns that warning into an error and the fuzz build dies before
-          # a single input runs. Renaming the method is NOT the fix:
-          # `try_update` does not exist on stable 1.98, so adopting it would
-          # break every other job in this file. The deprecation is
-          # unresolvable until the MSRV moves, and until then this job
-          # compiles trawl-core without `-D warnings`. The stable clippy job
-          # is what actually gates warnings.
+          # Cleared: cargo-fuzz APPENDS its sanitizer flags to the workflow's
+          # `-D warnings`, which turns nightly 1.100's deprecation of
+          # `AtomicU64::fetch_update` (crates/trawl-core/src/stream.rs) into an
+          # error. `try_update` does not exist on stable 1.98. The stable clippy
+          # job is what actually gates warnings.
           RUSTFLAGS: ""
         run: |
           # A writable scratch corpus FIRST, the committed inputs after:
@@ -1066,27 +907,17 @@ jobs:
           mkdir -p "$RUNNER_TEMP/corpus"
           # -runs counts corpus REPLAY first: libFuzzer loads every
           # committed input under the paths below before it mutates
-          # anything, and prints the total as `#N INITED`. That N is the
-          # floor, and the job log is where to read it — a count written
-          # down here rots the next time someone commits a seed. Any -runs
-          # under it is a load test wearing a fuzzing costume: the job
-          # exits 0 having explored nothing new. When this was last
-          # measured the line read `#3849 INITED` and 25000 left ~21k
-          # mutation runs (628 new coverage units, ~3100 exec/s, ~8s).
-          # Raise -runs freely; never lower it below the `#N INITED` the
-          # log reports, or the job stops fuzzing without ever going red.
+          # anything, and prints the total as `#N INITED`. Raise -runs freely;
+          # never lower it below the `#N INITED` the log reports, or the job
+          # stops fuzzing without ever going red.
           #
-          # -seed=114 is deliberate. libFuzzer's mutation sequence is a pure
-          # function of (seed, binary, corpus), so a gating job stays
-          # reproducible: a new crash means THIS PR made a previously
-          # explored path panic, rather than the job being a lottery that
-          # reddens an unrelated PR and goes green on re-run.
+          # -seed=114 keeps a gating job reproducible: libFuzzer's mutation
+          # sequence is a pure function of (seed, binary, corpus).
           #
           # The input paths are relative to THIS step's working directory,
           # crates/trawl-core: cargo-fuzz does not chdir into fuzz/ before
           # exec'ing the target, so `seeds/parse_emit` would resolve to
-          # nothing and libFuzzer exits 1 with "No such file or directory"
-          # (verified, not assumed).
+          # nothing and libFuzzer exits 1 with "No such file or directory".
           cargo +nightly-2026-08-24 fuzz run parse_emit \
             --target x86_64-unknown-linux-gnu \
             "$RUNNER_TEMP/corpus" fuzz/seeds/parse_emit fuzz/corpus/parse \
@@ -1098,21 +929,11 @@ jobs:
           # Overridden for the reason the parse_emit step gives.
           RUSTFLAGS: ""
         run: |
-          # The same shape as the parse_emit step: a writable scratch corpus
-          # first, the committed seeds (one per ADR-0061 regression input)
-          # and the parse corpus after, a fixed seed, and -runs above the
-          # `#N INITED` floor the log reports. Measured locally at `#3869 INITED`,
-          # 25000 left ~21k mutation runs (655 new units, ~1700 exec/s,
-          # ~15s).
           mkdir -p "$RUNNER_TEMP/format-corpus"
           cargo +nightly-2026-08-24 fuzz run format_roundtrip \
             --target x86_64-unknown-linux-gnu \
             "$RUNNER_TEMP/format-corpus" fuzz/seeds/format_roundtrip fuzz/corpus/parse \
             -- -runs=25000 -seed=114 -max_len=65536 -timeout=5 -rss_limit_mb=2048 -print_final_stats=1
-      # A crash must arrive with the input that reproduces it, because the
-      # bytes are the whole bug report. `if: failure()` only, so this never
-      # affects job status; the job fails on the fuzzer's nonzero exit and
-      # on nothing else.
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: failure()
         with:

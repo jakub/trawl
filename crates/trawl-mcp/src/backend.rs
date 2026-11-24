@@ -3,11 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The typed backend the tools call (ADR-0058).
-//!
-//! [`Backend`] has one method per trawl-client call a tool uses, with the
-//! same arguments and return types, so a tool can only ask trawld what the
-//! HTTP API answers. Its one implementation is [`HttpClient`]; tests
-//! substitute a recording backend. Each method returns a `Send` future,
+//! Each method returns a `Send` future,
 //! because rmcp runs every request on a spawned task.
 
 use std::future::Future;
@@ -23,42 +19,26 @@ use trawl_client::{
     RetentionExtension, SchemaResponse, SightingsRequest, ValidationResponse, WhoAmIResponse,
 };
 
-/// The trawld calls the MCP tools make, typed as trawl-client types them.
-///
-/// Every error is a [`ClientError`]: a refusal from trawld keeps its code,
-/// message, request id and `Retry-After` wait for the tool to render.
 pub trait Backend: Send + Sync {
-    /// The key's identity and effective permissions (`GET /api/v1/whoami`).
     fn whoami(&self) -> impl Future<Output = Result<WhoAmIResponse, ClientError>> + Send;
 
-    /// Daemon health with the HTTP status it came with, always 200 or 503
-    /// (`GET /api/v1/health`).
+    /// Daemon health with the HTTP status it came with, always 200 or 503.
     fn health_with_status(
         &self,
     ) -> impl Future<Output = Result<(u16, HealthResponse), ClientError>> + Send;
 
-    /// The server version, DSL features, bounds, quotas, admission numbers,
-    /// link origin and health, for any trawl grant
-    /// (`GET /api/v1/capabilities`).
     fn capabilities(
         &self,
     ) -> impl Future<Output = Result<CapabilitiesResponse, ClientError>> + Send;
 
-    /// The live monitor's snapshot, retention reach included; needs
-    /// `server_manage` (`GET /api/v1/dashboard`).
     fn dashboard(&self) -> impl Future<Output = Result<DashboardSnapshot, ClientError>> + Send;
 
-    /// The rich per-service schema from the daemon's refresh cache
-    /// (`GET /api/v1/schema/services`).
     fn schema_services(
         &self,
     ) -> impl Future<Output = Result<ServiceSchemaResponse, ClientError>> + Send;
 
-    /// The installation's column schema (`GET /api/v1/schema`).
     fn schema(&self) -> impl Future<Output = Result<SchemaResponse, ClientError>> + Send;
 
-    /// Pinned fields with aggregates, optionally for one service
-    /// (`GET /api/v1/schema/fields`).
     fn catalog_fields(
         &self,
         service: Option<&str>,
@@ -66,8 +46,6 @@ pub trait Backend: Send + Sync {
         limit: Option<usize>,
     ) -> impl Future<Output = Result<CatalogFieldsResponse, ClientError>> + Send;
 
-    /// One field's pin, a page of its observations and its conflict
-    /// evidence (`GET /api/v1/schema/field`).
     fn catalog_field(
         &self,
         name: &str,
@@ -75,8 +53,6 @@ pub trait Backend: Send + Sync {
         after: Option<&str>,
     ) -> impl Future<Output = Result<CatalogFieldResponse, ClientError>> + Send;
 
-    /// Distinct values of a field, optionally scoped to one service
-    /// (`GET /api/v1/schema/values/{field}`).
     fn field_values(
         &self,
         field: &str,
@@ -84,7 +60,6 @@ pub trait Backend: Send + Sync {
         service: Option<&str>,
     ) -> impl Future<Output = Result<FieldValuesResponse, ClientError>> + Send;
 
-    /// Execute a DSL query with pagination (`POST /api/v1/query`).
     fn query_paginated(
         &self,
         dsl: &str,
@@ -92,45 +67,33 @@ pub trait Backend: Send + Sync {
         offset: Option<usize>,
     ) -> impl Future<Output = Result<QueryResponse, ClientError>> + Send;
 
-    /// Validate a DSL query without executing it (`POST /api/v1/validate`).
     fn validate(
         &self,
         dsl: &str,
     ) -> impl Future<Output = Result<ValidationResponse, ClientError>> + Send;
 
-    /// Capture a search as an immutable, expiring result
-    /// (`POST /api/v1/results`, ADR-0057).
     fn capture(
         &self,
         request: &CaptureRequest,
     ) -> impl Future<Output = Result<CaptureResponse, ClientError>> + Send;
 
-    /// Capture the rows around a captured focus row
-    /// (`POST /api/v1/results/context`, ADR-0058).
     fn context(
         &self,
         request: &ContextRequest,
     ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
 
-    /// Capture where one literal occurs, with exact per-service counts
-    /// (`POST /api/v1/results/sightings`, ADR-0058).
     fn sightings(
         &self,
         request: &SightingsRequest,
     ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
 
-    /// Capture one filter's counts in a foreground and a baseline window
-    /// from one statement (`POST /api/v1/results/compare`, ADR-0058).
     fn compare(
         &self,
         request: &CompareRequest,
     ) -> impl Future<Output = Result<CorrelationResponse, ClientError>> + Send;
 
-    /// The key's own unexpired captures, newest first
-    /// (`GET /api/v1/results`).
     fn list_results(&self) -> impl Future<Output = Result<ResultList, ClientError>> + Send;
 
-    /// One page of a captured result (`GET /api/v1/results/{id}`).
     fn result_page(
         &self,
         id: &str,
@@ -139,8 +102,7 @@ pub trait Backend: Send + Sync {
         columns: Option<&[&str]>,
     ) -> impl Future<Output = Result<ResultPage, ClientError>> + Send;
 
-    /// A byte range of one captured cell's wire JSON text
-    /// (`GET /api/v1/results/{id}/cells/{row}/{column}`).
+    /// A byte range of one captured cell's wire JSON text.
     fn result_cell(
         &self,
         id: &str,
@@ -150,22 +112,18 @@ pub trait Backend: Send + Sync {
         length: Option<u64>,
     ) -> impl Future<Output = Result<ResultCell, ClientError>> + Send;
 
-    /// Every investigation, open ones first
-    /// (`GET /api/v1/investigations`, ADR-0059).
     fn list_investigations(
         &self,
     ) -> impl Future<Output = Result<InvestigationList, ClientError>> + Send;
 
-    /// Create an investigation if absent; `true` when this call created it
-    /// (`PUT /api/v1/investigations/{id}`).
+    /// Create an investigation if absent; `true` when this call created it.
     fn create_investigation(
         &self,
         id: &str,
         request: &CreateInvestigation,
     ) -> impl Future<Output = Result<(bool, Investigation), ClientError>> + Send;
 
-    /// An investigation and its entries changed after `since`
-    /// (`GET /api/v1/investigations/{id}?since=&limit=`).
+    /// An investigation and its entries changed after `since`.
     fn read_investigation(
         &self,
         id: &str,
@@ -173,24 +131,18 @@ pub trait Backend: Send + Sync {
         limit: Option<u64>,
     ) -> impl Future<Output = Result<InvestigationRead, ClientError>> + Send;
 
-    /// Append a keep, a finding or a note
-    /// (`POST /api/v1/investigations/{id}/entries`).
     fn append_entry(
         &self,
         id: &str,
         entry: &AppendEntry,
     ) -> impl Future<Output = Result<AppendResponse, ClientError>> + Send;
 
-    /// Overwrite one of title, question or status
-    /// (`PATCH /api/v1/investigations/{id}`).
     fn patch_investigation(
         &self,
         id: &str,
         request: &PatchInvestigation,
     ) -> impl Future<Output = Result<PatchResponse, ClientError>> + Send;
 
-    /// Overwrite a finding's status
-    /// (`PUT /api/v1/investigations/{id}/findings/{seq}/status`).
     fn set_finding_status(
         &self,
         id: &str,
@@ -198,16 +150,12 @@ pub trait Backend: Send + Sync {
         request: &FindingStatusUpdate,
     ) -> impl Future<Output = Result<AppendResponse, ClientError>> + Send;
 
-    /// Keep an investigation's evidence longer, `server_manage` only
-    /// (`PUT /api/v1/investigations/{id}/retention`). No tool calls it.
     fn extend_retention(
         &self,
         id: &str,
         request: &RetentionExtension,
     ) -> impl Future<Output = Result<Investigation, ClientError>> + Send;
 
-    /// Delete an investigation, `server_manage` only
-    /// (`DELETE /api/v1/investigations/{id}`). No tool calls it.
     fn delete_investigation(
         &self,
         id: &str,

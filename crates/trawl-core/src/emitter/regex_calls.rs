@@ -5,94 +5,6 @@
 //! How many RE2 programs the regex calls in one statement can make
 //! `DuckDB` build, by kind (ADR-0063).
 //!
-//! A query's own regexes bind as parameters. The emitter also writes
-//! regex calls whose patterns are SQL literals: `sev()`'s severity
-//! reading and the hot branch's conform of a `SEVERITY` pin
-//! (`crate::conform::FIXED_REGEXES`). Each call compiles an RE2 program
-//! at bind and again on every thread that runs it, so the batch lane's
-//! RE2 allowance counts every call of either.
-//!
-//! A call's kind is the allowance it takes ([`RegexSites`]): a call of
-//! one of conform's regexes through its own function is `fixed`, any
-//! other `regexp_extract` call is `extract`, and every other call is
-//! `matching`. The emit-time counter still counts the parameters for
-//! the pattern cap ([`super::MAX_REGEX_PARAMS`]); the allowance takes
-//! the larger of its count and this one, kind by kind.
-//!
-//! # Why the finished SQL, and why a weight instead of a tally
-//!
-//! The SQL text holds each such call once per place the emitter wrote
-//! it, but `DuckDB` makes more of them than the text shows:
-//!
-//! - its parser rewrites a simple `CASE subject WHEN …` into one
-//!   comparison per arm, each with its own copy of the subject, so the
-//!   reading's ASCII gate is 38 calls, not one;
-//! - its binder copies a same-`SELECT` alias's expression into every
-//!   place a later item names it, copies a built-in macro's argument
-//!   into every place the macro's body names it (`nullif` writes its
-//!   first argument twice), writes a `BETWEEN`'s operand into both of
-//!   its comparisons, and copies a `PIVOT`'s aggregate once per pivot
-//!   value, up to [`crate::complexity::PIVOT_FILTER_THRESHOLD`];
-//! - its optimizer substitutes a projection's expression into a filter
-//!   that names the column (filter pushdown), pushes a filter into both
-//!   branches of a `UNION`, and can rewrite a window into a join of its
-//!   input with an aggregate of that input, so the input's plan runs
-//!   twice and a filter above reaches both sides. So `severity matches
-//!   "x"` over the hot union names a 199-call conform 24 times through
-//!   the token-text `CASE` and builds about 4800 programs, and a filter
-//!   on a `let` of `matches` runs the one `matches` twice.
-//!
-//! A projection that names a column reads it: no pass copies a
-//! projection's expression into a later projection.
-//!
-//! A tally at the call sites would have to repeat every one of those
-//! rules for every rendering that might carry a call. Weighing the
-//! finished statement sees every call in one place, whichever rendering
-//! wrote it, so it is immune to how the text came to repeat it. Each
-//! rule above becomes a multiplier on the text, and every multiplier is
-//! the most `DuckDB` makes:
-//!
-//! - every call weighs 1 of its kind, a parameter's call included;
-//! - a simple `CASE` weighs its subject once per `WHEN` arm;
-//! - a call of a macro weighs each argument as many times as the
-//!   macro's body names it ([`macro_copies`]);
-//! - a `BETWEEN` weighs its operand twice;
-//! - a `PIVOT`'s `USING` list weighs
-//!   [`crate::complexity::PIVOT_FILTER_THRESHOLD`] times;
-//! - a common table expression weighs once per place the statement
-//!   names it;
-//! - every column a relation carries has a weight, the calls one copy of
-//!   its expression brings when the optimizer substitutes it into a
-//!   filter, and every name a filter or a join condition reads weighs
-//!   its column's weight;
-//! - an item, a grouping or an ordering pays only its own calls, and a
-//!   later item naming an earlier alias pays the alias's copy, as the
-//!   binder makes it;
-//! - a `UNION` weighs its heaviest branch, kind by kind, and each column
-//!   it carries weighs the heaviest branch's expression for it, because
-//!   a thread holds one branch's programs at a time (see below);
-//! - a filter's own calls weigh once per scan path beneath it, because
-//!   pushdown copies a filter into both sides of a join; a `UNION` has
-//!   the paths of its branch with the most;
-//! - a `SELECT` with a window weighs its input's plan once more, and a
-//!   filter above it weighs every column it names twice.
-//!
-//! Every weight saturates, and an expression `COLUMNS(…)` expands
-//! around a weighed part reads as saturated, because the expansion's
-//! width is the input's. A saturated count is an allowance no
-//! reservation holds, so the query is refused instead of under-counted.
-//!
-//! The weight over-counts wherever `DuckDB` makes fewer copies than the
-//! rule allows, or holds fewer at once: its common-subexpression pass
-//! folds identical copies in a projection, a window's second input
-//! computes only the columns its aggregate reads, a join builds one side
-//! before it probes with the other, and a common table expression named
-//! in two branches of a `UNION` weighs twice. An over-count costs
-//! allowance; an under-count would leave RE2 memory outside the
-//! reservation. `trawl-engine/tests/fixed_regex_sites.rs` holds the
-//! weight against the calls in `DuckDB`'s bound and optimized plans that
-//! one thread can hold at once.
-//!
 //! # Why a `UNION` weighs its heaviest branch
 //!
 //! A call's RE2 program lives in the expression state of the pipeline
@@ -114,11 +26,7 @@
 //!   task until it finishes (`executor.cpp:578-600`).
 //!
 //! So one thread never holds two branches' programs at once, and the
-//! most it holds is its heaviest branch's. The `UNION_BRANCHES` part of
-//! `docs/evidence/issue-335/re2-memory.txt` measures it: a union of two
-//! branches over the same rows as one scan, the filter pushed into both,
-//! took 1.07 to 1.16 times the scan's RE2 memory at 4 and 16 sites on 1
-//! and 4 threads, where both branches at once would take about twice.
+//! most it holds is its heaviest branch's.
 //!
 //! The rule needs a branch's task to run to the end on its thread. A
 //! task that blocks keeps its state while its thread takes another, and
@@ -139,10 +47,6 @@ use std::ops::Range;
 use crate::complexity::PIVOT_FILTER_THRESHOLD;
 use crate::pattern::memory::RegexSites;
 
-/// The RE2 programs the regex calls in `sql` can make `DuckDB` build,
-/// every copy its parser, binder and optimizer can make included, by the
-/// kind of allowance each takes ([`RegexSites`]).
-///
 /// `sql` is one statement the emitter wrote. Each kind saturates at
 /// `u64::MAX`.
 #[must_use]
@@ -201,10 +105,6 @@ pub fn macro_copies(name: &str, position: usize) -> u64 {
     copies.get(position).copied().unwrap_or(1)
 }
 
-// ---------------------------------------------------------------------------
-// Tokens
-// ---------------------------------------------------------------------------
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Tok {
     /// A bare word, keyword or identifier, folded to lower case.
@@ -215,7 +115,6 @@ enum Tok {
     /// which is how the emitter writes a pattern; `None` for an `E'…'` or
     /// a dollar-quoted one.
     Str(Option<String>),
-    /// A parameter placeholder.
     Param,
     Open(char),
     Close,
@@ -249,7 +148,6 @@ fn tokenize(sql: &str) -> Vec<Tok> {
             i += 1;
             continue;
         }
-        // Comments.
         if ch == '-' && chars.get(i + 1) == Some(&'-') {
             while i < len && chars[i] != '\n' {
                 i += 1;
@@ -390,7 +288,6 @@ fn tokenize(sql: &str) -> Vec<Tok> {
     tokens
 }
 
-/// The index just past the `E'…'` literal whose body starts at `i`.
 fn skip_string(chars: &[char], mut i: usize) -> usize {
     while i < chars.len() {
         match chars[i] {
@@ -403,8 +300,6 @@ fn skip_string(chars: &[char], mut i: usize) -> usize {
     i
 }
 
-/// The index just past the ordinary `'…'` literal whose body starts at
-/// `i`, and the body with each doubled quote read as one.
 fn string_body(chars: &[char], mut i: usize) -> (usize, String) {
     let mut body = String::new();
     while i < chars.len() {
@@ -423,8 +318,6 @@ fn string_body(chars: &[char], mut i: usize) -> (usize, String) {
     (i, body)
 }
 
-/// Where each bracket and each `CASE` closes, so a walk skips a nested
-/// group in one step.
 struct Pairs {
     close: HashMap<usize, usize>,
     end: HashMap<usize, usize>,
@@ -457,11 +350,6 @@ impl Pairs {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Weights
-// ---------------------------------------------------------------------------
-
-/// Regex calls, counted by the kind of allowance each takes.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Kinds {
     extract: u64,
@@ -507,7 +395,6 @@ impl Kinds {
         }
     }
 
-    /// The heavier of two weights, kind by kind.
     fn max(self, other: Self) -> Self {
         Self {
             extract: self.extract.max(other.extract),
@@ -516,7 +403,6 @@ impl Kinds {
         }
     }
 
-    /// Every call, whatever its kind.
     fn sum(self) -> u64 {
         self.extract
             .saturating_add(self.matching)
@@ -596,7 +482,6 @@ impl Rel {
         Self::made(Kinds::default())
     }
 
-    /// A relation with no columns of weight, whose plan weighs `calls`.
     fn made(calls: Kinds) -> Self {
         Self {
             columns: HashMap::new(),
@@ -654,8 +539,6 @@ impl<'a> Env<'a> {
         }
     }
 
-    /// This scope inside a `SELECT` list whose earlier items define
-    /// `aliases`.
     fn aliasing(&self, aliases: &'a HashMap<String, Weight>) -> Self {
         Self {
             maps: self.maps.clone(),
@@ -698,7 +581,6 @@ impl<'a> Env<'a> {
     }
 }
 
-/// The common table expressions in scope, by name.
 #[derive(Default, Clone)]
 struct Scope {
     ctes: HashMap<String, Rel>,
@@ -709,7 +591,6 @@ struct Weigher<'t> {
     pairs: &'t Pairs,
 }
 
-/// The clause keywords that end a `SELECT` list or another clause.
 const CLAUSES: &[&str] = &[
     "from", "where", "group", "having", "qualify", "window", "order", "limit", "offset",
 ];
@@ -728,7 +609,6 @@ impl Weigher<'_> {
         self.word(i) == Some(word)
     }
 
-    /// The name token `i` spells, bare or quoted.
     fn name(&self, i: usize) -> Option<&str> {
         match self.tokens.get(i) {
             Some(Tok::Word(w) | Tok::Name(w)) => Some(w.as_str()),
@@ -736,7 +616,6 @@ impl Weigher<'_> {
         }
     }
 
-    /// The index after the group or `CASE` starting at `i`, or `i + 1`.
     fn skip(&self, i: usize) -> usize {
         match self.tokens.get(i) {
             Some(Tok::Open(_)) => self.pairs.close.get(&i).map_or(i + 1, |c| c + 1),
@@ -745,7 +624,6 @@ impl Weigher<'_> {
         }
     }
 
-    /// The positions in `range` outside every nested group and `CASE`.
     fn top_level(&self, range: Range<usize>) -> Vec<usize> {
         let mut out = Vec::new();
         let mut i = range.start;
@@ -756,7 +634,6 @@ impl Weigher<'_> {
         out
     }
 
-    /// `range` split at its top-level commas.
     fn split_commas(&self, range: Range<usize>) -> Vec<Range<usize>> {
         let mut parts = Vec::new();
         let mut start = range.start;
@@ -772,7 +649,6 @@ impl Weigher<'_> {
         parts
     }
 
-    /// `range` without the brackets around all of it.
     fn unwrap(&self, mut range: Range<usize>) -> Range<usize> {
         while range.len() >= 2
             && matches!(self.tokens[range.start], Tok::Open('('))
@@ -788,11 +664,6 @@ impl Weigher<'_> {
         self.word(start).is_some_and(|w| QUERY_STARTS.contains(&w)) && !range.is_empty()
     }
 
-    // -----------------------------------------------------------------------
-    // Expressions
-    // -----------------------------------------------------------------------
-
-    /// What `range`, an expression, weighs where `env` names its columns.
     fn expr(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
         if range.is_empty() {
             return Weight::default();
@@ -919,7 +790,6 @@ impl Weigher<'_> {
             .plus(self.expr(first..body.end, env, scope))
     }
 
-    /// A call of `name` with its arguments in `args`.
     fn call(&self, name: &str, args: Range<usize>, env: &Env<'_>, scope: &Scope) -> Weight {
         let parts = self.split_commas(args.clone());
         if is_re2_function(name) {
@@ -992,10 +862,6 @@ impl Weigher<'_> {
         });
         self.expr(range, env, scope).total().sum() > inside
     }
-
-    // -----------------------------------------------------------------------
-    // Queries
-    // -----------------------------------------------------------------------
 
     /// What the query in `range` weighs, and the relation it makes.
     fn query(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
@@ -1107,7 +973,6 @@ impl Weigher<'_> {
         u64::try_from(n).unwrap_or(u64::MAX)
     }
 
-    /// One `SELECT`, `PIVOT` or other query core.
     fn core(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
         let range = self.unwrap(range);
         match self.word(range.start) {
@@ -1121,7 +986,6 @@ impl Weigher<'_> {
         }
     }
 
-    /// The first top-level position of each clause keyword in `range`.
     fn clauses(&self, range: Range<usize>) -> Vec<(usize, &'static str)> {
         let mut found: Vec<(usize, &'static str)> = Vec::new();
         for i in self.top_level(range) {
@@ -1169,7 +1033,6 @@ impl Weigher<'_> {
         // expressions substituted in.
         let mut own = Kinds::default();
 
-        // The SELECT list: DISTINCT [ON (…)] first, then the items.
         let mut list = range.start + 1..list_end;
         let mut modifiers = Weight::default();
         if matches!(self.word(list.start), Some("all")) {
@@ -1341,7 +1204,6 @@ impl Weigher<'_> {
         )
     }
 
-    /// A FROM clause: its items side by side, and their join conditions.
     fn from(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
         let mut items = Vec::new();
         let mut conditions = Vec::new();
@@ -1392,7 +1254,6 @@ impl Weigher<'_> {
 
     /// One relation a FROM clause reads, any alias after it ignored.
     fn source_item(&self, range: Range<usize>, env: &Env<'_>, scope: &Scope) -> (Kinds, Rel) {
-        // Join qualifiers before the relation.
         let mut start = range.start;
         while matches!(
             self.word(start),
@@ -1491,8 +1352,6 @@ mod tests {
     use super::*;
     use crate::severity::Dialect;
 
-    /// Every call `sql` weighs, whatever its kind: the copy rules are
-    /// the same for each.
     fn calls(sql: &str) -> u64 {
         let sites = regex_calls(sql);
         sites
@@ -1509,8 +1368,6 @@ mod tests {
         }
     }
 
-    /// A query core that is no `SELECT`, `PIVOT` or `WITH` weighs each of
-    /// its calls, and reading it never recurses into itself.
     #[test]
     fn a_query_core_no_rule_reads_weighs_its_calls() {
         assert_eq!(
@@ -1527,10 +1384,6 @@ mod tests {
         );
     }
 
-    /// Each call weighs one of its kind: `fixed` for one of conform's
-    /// regexes through its own function, `extract` for any other
-    /// `regexp_extract`, `matching` for every other call, a parameter's
-    /// included.
     #[test]
     fn each_call_weighs_one_of_its_kind() {
         assert_eq!(
@@ -1579,9 +1432,6 @@ mod tests {
         assert_eq!(calls("SELECT * FROM t WHERE \"a\" != 'b'"), 0);
     }
 
-    /// A parameter's call is copied by the same rules as any other: into
-    /// a filter that reads its column, and into both branches of a
-    /// union, where a thread holds one branch's copy at a time.
     #[test]
     fn a_parameter_call_weighs_every_copy_of_it() {
         assert_eq!(
@@ -1606,9 +1456,6 @@ mod tests {
         );
     }
 
-    /// The optimizer may rewrite a window into a join of its input with
-    /// an aggregate of it: the input's plan runs on both sides, and a
-    /// filter above reaches both, so its copy of a column weighs twice.
     #[test]
     fn a_filter_above_a_window_weighs_both_of_its_inputs() {
         let sql = "WITH s AS (SELECT regexp_matches(m, ?) AS \"a\" FROM t), \
@@ -1627,7 +1474,6 @@ mod tests {
         );
     }
 
-    /// Text that only spells a call is no call.
     #[test]
     fn strings_names_and_comments_are_no_calls() {
         assert_eq!(calls("SELECT 'regexp_replace(a, ''b'', '''')' FROM t"), 0);
@@ -1643,8 +1489,6 @@ mod tests {
         );
     }
 
-    /// The parser writes a simple CASE's subject into every arm; a
-    /// searched CASE has no subject.
     #[test]
     fn a_simple_case_weighs_its_subject_once_an_arm() {
         assert_eq!(
@@ -1669,7 +1513,6 @@ mod tests {
         );
     }
 
-    /// A macro copies its argument once per place its body names it.
     #[test]
     fn a_macro_weighs_each_argument_as_often_as_its_body_names_it() {
         assert_eq!(
@@ -1688,8 +1531,6 @@ mod tests {
         assert_eq!(macro_copies("lower", 0), 1);
     }
 
-    /// A later item naming an earlier alias pays the alias's copy; an
-    /// item that only passes an input column on pays nothing.
     #[test]
     fn a_lateral_alias_is_copied_into_every_item_naming_it() {
         assert_eq!(
@@ -1701,9 +1542,6 @@ mod tests {
         );
     }
 
-    /// A projection's expression is substituted into every filter that
-    /// names its column, through every layer; a projection naming the
-    /// column reads it.
     #[test]
     fn a_named_column_weighs_its_expression_where_it_can_be_substituted() {
         let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"b\" FROM t)";
@@ -1737,9 +1575,6 @@ mod tests {
         );
     }
 
-    /// A filter over a UNION is pushed into each branch, and a thread
-    /// runs one branch at a time: its own calls weigh once, and each
-    /// column it names weighs the heaviest branch's expression for it.
     #[test]
     fn a_filter_over_a_union_weighs_its_heaviest_branch() {
         let sql = "WITH s AS (SELECT * FROM (SELECT * FROM read_parquet('p') UNION ALL BY NAME \
@@ -1750,9 +1585,6 @@ mod tests {
         assert_eq!(calls(sql), 1 + 1 + 1);
     }
 
-    /// A UNION's branches run one at a time on a thread, so the union
-    /// weighs its heaviest branch, kind by kind. Every other set
-    /// operation is a join, which weighs both sides.
     #[test]
     fn a_union_weighs_its_heaviest_branch_kind_by_kind() {
         assert_eq!(
@@ -1787,7 +1619,6 @@ mod tests {
         );
     }
 
-    /// A PIVOT binds its aggregates once per value, up to the threshold.
     #[test]
     fn a_pivot_weighs_its_aggregates_at_the_threshold() {
         assert_eq!(
@@ -1798,7 +1629,6 @@ mod tests {
         );
     }
 
-    /// A common table expression binds once per place it is named.
     #[test]
     fn a_common_table_expression_weighs_once_a_reference() {
         let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"b\" FROM t)";
@@ -1811,7 +1641,6 @@ mod tests {
         );
     }
 
-    /// A lambda's parameter is no column, so it borrows no weight.
     #[test]
     fn a_lambda_parameter_is_no_column() {
         let cte = "WITH s AS (SELECT regexp_replace(a, 'x', '') AS \"c\" FROM t)";
@@ -1829,8 +1658,6 @@ mod tests {
         );
     }
 
-    /// A COLUMNS expansion around a weighed part has the input's width,
-    /// which the text cannot know: the count saturates.
     #[test]
     fn a_columns_expansion_around_a_call_saturates() {
         assert_eq!(
@@ -1859,9 +1686,6 @@ mod tests {
         }
     }
 
-    /// The binder writes a BETWEEN's operand into both of its bounds'
-    /// comparisons, NOT BETWEEN's too; the bounds and the conjunction
-    /// after it bind once.
     #[test]
     fn a_between_weighs_its_operand_twice() {
         let x = "regexp_replace(m, 'a', '')";

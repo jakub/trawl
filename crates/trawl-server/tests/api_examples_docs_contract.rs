@@ -2,60 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The API reference's response examples are wire values. Each JSON
-//! example under the sections below must decode as the `trawl_api` type
-//! the route answers with and encode back to the same JSON, so a renamed,
-//! misspelled, or invented field fails here.
-//!
-//! Ingest: every `reason` an example under "Ingest events" and "Preview
-//! ingest" shows must be a `RejectReason` wire code, and every repair a
-//! `RepairCode`, imported rather than copied. The preview example was
-//! captured from a real trawld; only `arrival` and `_ingested` vary
-//! between runs, and both are free-form strings to the wire type.
-//!
-//! Results: the examples under "Result columns", "Run a query", "Report
-//! run" and "Stream live events" decode through the typed result codec
-//! (ADR-0035, amended 2026-10-22), so an untyped column, a JSON-number
-//! integer or a cell that disagrees with its column's type fails here.
-//! The histogram example under "Run a query" holds the invariants
-//! `EventHistogram::consistent_with` checks, and its reason table names
-//! every `HistogramReason` (#197).
-//!
-//! Captured results: the request and response examples under "Capture a
-//! result", "List captured results", "Read a page of a captured result"
-//! and "Read one cell of a captured result" decode as the `trawl_api::results`
-//! types the routes answer with (ADR-0057), and agree with themselves: a
-//! page's positions name its columns, and a cell's ranges join into a cell
-//! that lands under its type.
-//!
-//! Correlation reads: the request and response examples under "Read the
-//! rows around a captured row", "Find where a literal appears" and
-//! "Compare two windows" decode as `ContextRequest`, `SightingsRequest`,
-//! `CompareRequest` and `CorrelationResponse` (ADR-0058), and agree with
-//! themselves: the facts name the request's inputs and the result's
-//! counts, and each `query` is the text trawl-core composes from the
-//! request.
-//!
-//! Capabilities: the example under "Server capabilities" decodes as
-//! `CapabilitiesResponse` (ADR-0058), and its DSL lists are names the
-//! grammar knows.
-//!
-//! Investigations: the `sequence_conflict` envelope in the chapter's
-//! introduction decodes as `ErrorResponse` with its `conflict` member and
-//! the server's own message, and every request and response example under
-//! the investigation routes, "Attach a capture to an investigation"
-//! included, decodes as the `trawl_api::investigations` or
-//! `trawl_api::results` type the route takes or answers with (ADR-0059).
-//! The examples agree with each other: a response echoes its request, an
-//! overwrite answers the sequence after the one it expected and carries
-//! activity exactly when its request sent `seen_seq`, and a read reaches
-//! the investigation's own `seq`. The limits and the fixed texts
-//! the pages quote are the server's constants and messages.
-//!
-//! Manual runs: the examples under "Run a saved query now" are the
-//! `manual_run_busy` refusal, whose message is the server's own, and a
-//! run summary (ADR-0018, amended 2026-11-11).
-
 use std::collections::BTreeMap;
 
 use serde::Serialize;
@@ -88,8 +34,6 @@ use trawl_server::results::service::GoneReason;
 
 const API: &str = include_str!("../../../docs/src/content/docs/reference/api.md");
 
-/// The text under the `### {heading}` section, up to the next heading of
-/// level 2 or 3.
 fn section(heading: &str) -> &'static str {
     let marker = format!("\n### {heading}\n");
     let start = API
@@ -105,8 +49,6 @@ fn section(heading: &str) -> &'static str {
     &rest[..end]
 }
 
-/// The text under the `## {heading}` chapter, up to its first `###`
-/// section or the next chapter.
 fn chapter_intro(heading: &str) -> &'static str {
     let marker = format!("\n## {heading}\n");
     let start = API
@@ -122,7 +64,6 @@ fn chapter_intro(heading: &str) -> &'static str {
     &rest[..end]
 }
 
-/// Every fenced `json` block in `text`, in document order.
 fn json_blocks(text: &str) -> Vec<&str> {
     let mut blocks = Vec::new();
     let mut rest = text;
@@ -135,7 +76,6 @@ fn json_blocks(text: &str) -> Vec<&str> {
     blocks
 }
 
-/// Decode `example` as `T` and check it encodes back to the same JSON.
 /// Serde ignores unknown fields when decoding, so the round trip is what
 /// catches a field the wire type does not have.
 fn decode_exactly<T: DeserializeOwned + Serialize>(heading: &str, example: &str) -> T {
@@ -271,11 +211,6 @@ fn the_query_response_example_carries_typed_big_integers() {
     assert_eq!(response.pagination.returned, response.result.rows.len());
 }
 
-/// The second example under "Run a query" is a raw-event page that asked
-/// for its histogram (#197). It decodes exactly as `QueryResponse`, its
-/// histogram is consistent with the page's `total`, and it counts errors
-/// the page does not hold. The reason table names every reason the wire
-/// has, in the order the server decides them.
 #[test]
 fn the_query_histogram_example_is_the_wire_type() {
     let heading = "Run a query";
@@ -407,7 +342,6 @@ fn the_stream_examples_are_typed_result_frames() {
         "{heading:?} snapshot example shows capped"
     );
 
-    // The SSE transcript's frames are wire values too.
     let mut frames = 0;
     let mut event = "";
     for line in text.lines() {
@@ -547,10 +481,6 @@ fn the_capabilities_example_is_the_wire_type_with_known_dsl_names() {
     );
 }
 
-/// What every correlation response example shares: its kind, one fact per
-/// column, `truncated` read from its counts, a result id, an executed text
-/// that is the query under its window, and listed column values that count
-/// every kept row.
 fn assert_correlated(heading: &str, result: &CapturedResult, kind: CaptureKind, rows: u64) {
     assert_eq!(result.kind, kind, "{heading:?} kind");
     assert_eq!(
@@ -736,7 +666,6 @@ fn the_busiest_service_sums_its_groups_across_envs() {
     // A tie goes to the first name in order, whatever the group order.
     let tied = [group("prod", Some("web"), 4), group("prod", Some("api"), 4)];
     assert_eq!(busiest_service(&tied), Some("api"));
-    // Events without a service name no service.
     let unnamed = [group("prod", None, 10), group("prod", Some("auth"), 2)];
     assert_eq!(busiest_service(&unnamed), Some("auth"));
     assert_eq!(busiest_service(&[group("prod", None, 10)]), None);
@@ -793,8 +722,6 @@ fn the_compare_examples_rank_one_statement_over_both_windows() {
     assert_eq!(result.query, composed.text(), "{heading:?} query");
 }
 
-/// The schedule example is the wire type, and its run budget agrees with
-/// itself: `exhausted` is `max_runs` set and `total_runs` at or over it.
 #[test]
 fn the_set_a_schedule_example_is_the_wire_type_with_its_run_budget() {
     let heading = "Set a schedule";
@@ -808,8 +735,6 @@ fn the_set_a_schedule_example_is_the_wire_type_with_its_run_budget() {
     );
 }
 
-/// Run now refuses before the claim with the fixed `manual_run_busy`
-/// envelope, or answers a running manual run's summary.
 #[test]
 fn the_run_now_examples_are_a_summary_and_the_busy_refusal() {
     let heading = "Run a saved query now";
@@ -829,7 +754,6 @@ fn the_run_now_examples_are_a_summary_and_the_busy_refusal() {
     );
 }
 
-/// The saved list embeds the schedule shape, so it carries `exhausted` too.
 #[test]
 fn the_saved_query_list_example_is_the_wire_type() {
     let heading = "Saved query list";
@@ -840,8 +764,6 @@ fn the_saved_query_list_example_is_the_wire_type() {
     );
 }
 
-/// The run statistics count kept runs: the statuses sum to no more than
-/// the total.
 #[test]
 fn the_run_statistics_example_is_the_wire_type() {
     let heading = "Run statistics";
@@ -852,7 +774,6 @@ fn the_run_statistics_example_is_the_wire_type() {
     );
 }
 
-/// The JSON examples under `heading`, which must number `count`.
 fn examples(heading: &str, count: usize) -> Vec<&'static str> {
     let examples = json_blocks(section(heading));
     assert_eq!(
@@ -995,9 +916,6 @@ fn the_append_examples_are_three_entries_and_the_finding_answered() {
     assert!(section(heading).contains(&format!("at most {ACTIVITY_LIMIT}")));
 }
 
-/// An overwrite's `activity` against its request's `seen_seq`: present
-/// exactly when the request sent one, and then other keys' entries
-/// changed after it, through at least the entry written.
 fn assert_overwrite_activity(
     heading: &str,
     seen_seq: Option<u64>,
@@ -1089,9 +1007,6 @@ fn the_overwrite_examples_answer_the_sequence_after_the_expected_one() {
     assert_eq!(extended.retain_until, extended.retain_ceiling);
 }
 
-/// What every attached read's answer says, whichever route ran it: the
-/// result is kept from birth for the request's investigation, names the
-/// step it appended, and carries the activity the request asked for.
 fn assert_kept_from_birth(
     attach: &Attach,
     result: &CapturedResult,

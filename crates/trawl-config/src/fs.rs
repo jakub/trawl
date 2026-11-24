@@ -3,13 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Filesystem helpers shared by trawl's owner-only diagnostic files.
-//!
-//! Lives here rather than in each consumer because getting an
-//! owner-only file right takes two steps that are easy to half-do:
-//! `OpenOptions::mode` applies only when the file is *created*, so a
-//! pre-existing looser file must additionally be `chmod`ed after the
-//! open. Every trawl file that carries query text (the query debug log,
-//! the TUI trace log) goes through this one helper.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -17,25 +10,11 @@ use std::path::Path;
 
 /// Open `path` with the flags applied by `configure`, owner-restricted
 /// to `mode` on Unix — set at creation, then re-applied so a
-/// pre-existing looser file is tightened too. `mode` is ignored on
-/// non-Unix platforms.
-///
-/// On Unix the open also carries `O_NOFOLLOW`, so a symlink at the
-/// final path component is refused (`ELOOP`) rather than followed.
-/// These paths are operator-configured, appended to, and `chmod`ed:
-/// following a link planted by a local user — in a shared-writable
-/// directory, or in the window a rollover's rename leaves open — would
-/// append trawl's most sensitive output into a file of their choosing
-/// and re-mode that file to `mode`. A log path that is *deliberately*
-/// a symlink must be given as the link target instead.
+/// pre-existing looser file is tightened too.
 ///
 /// The post-open `chmod` failure is *returned, not raised*: POSIX
 /// `chmod` requires the caller to own the file, so a file owned by
-/// another uid can open fine and still refuse to be re-moded. Whether
-/// that is fatal is the caller's policy decision (`trawl-server`'s
-/// query log tolerates it when the existing mode is already tight;
-/// the TUI log does not), so the file and the error come back together
-/// and nothing here decides for them.
+/// another uid can open fine and still refuse to be re-moded.
 pub fn open_with_mode(
     path: &Path,
     mode: u32,
@@ -68,9 +47,6 @@ pub fn open_with_mode(
     Ok((file, chmod_error))
 }
 
-/// Turn the `O_NOFOLLOW` refusal into a message an operator can act on —
-/// a bare `ELOOP` on a path they configured reads like a filesystem bug.
-/// Every other error is passed through untouched.
 fn describe_open_error(path: &Path, err: io::Error) -> io::Error {
     #[cfg(unix)]
     if err.raw_os_error() == Some(libc::ELOOP) {
@@ -131,10 +107,6 @@ mod tests {
         );
     }
 
-    /// A symlink at the log path is a local user's way of redirecting
-    /// trawl's most sensitive output into a file they control — and, via
-    /// the tighten step, of getting an arbitrary file `chmod`ed. The open
-    /// must fail without touching the target at all.
     #[test]
     fn refuses_to_follow_a_symlink_at_the_path() {
         use std::os::unix::fs::PermissionsExt as _;

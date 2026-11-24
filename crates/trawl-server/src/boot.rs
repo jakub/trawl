@@ -7,8 +7,7 @@
 //!
 //! They run after publication recovery and state construction, and before
 //! self-telemetry, compaction, the other workers, the scheduler and the
-//! listener start. `main` and the integration-test fixture both call
-//! [`prepare_corpus`], so the tests boot the sequence trawld runs.
+//! listener start.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -21,40 +20,8 @@ use crate::state::AppState;
 
 /// Prepare the corpus and the captured results for serving.
 ///
-/// Every node first reconciles the results root with the captured-result
-/// rows ([`crate::results::sweep::reconcile_at_boot`]): staged files and
-/// files no capture names go, rows whose files are gone are marked, and
-/// captures over a lowered quota and evidence past its retention are
-/// pruned. Then every investigation step a process that ended left without
-/// an outcome reads `interrupted`
-/// ([`crate::store::InvestigationStore::interrupt_running_steps`]), before
-/// any capture can append another. Then every report run such a process
-/// left `running` reads `error`, `interrupted by server restart`
-/// ([`crate::store::ScheduleStore::cleanup_stale_runs`], ADR-0018 as
-/// amended 2026-11-06), so no stale row refuses a claim once the listener
-/// serves, whatever `[scheduler] enabled` says. Both node types hold a
-/// results root, investigations and report runs, so these run before
-/// either door below.
-///
-/// An ingest node then runs these steps in order:
-///
-/// 1. Recover the rollup markers the gate's boot scan registered. A failure
-///    does not stop the boot: reads stay refused as `rollup_pending` until
-///    a compaction pass recovers the marker.
-/// 2. Run the ADR-0009 boot conformance pass. It leaves alone every file
-///    that a pending publication marker claims or that sits in a day
-///    directory holding a rollup marker.
-/// 3. Hydrate the surviving WAL into the hot buffer.
-/// 4. Finish hydration on the publication gate: settled when every file
-///    became resident, overhang otherwise, until a compaction pass proves
-///    coverage.
-///
 /// Self-telemetry must not be active yet. A WAL file it wrote before step 3
 /// would be inserted once and hydrated a second time.
-///
-/// A query-only node reads parquet only. It checks that the archive belongs
-/// to the connected catalog, hydrates nothing, and logs one warning when it
-/// finds WAL files, because it never reads them.
 ///
 /// # Errors
 ///
@@ -87,15 +54,9 @@ pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), Str
         .map_err(|e| join_failure_text("boot rollup recovery", e))?;
     }
 
-    // Fatal on failure, like the epoch gate: a data root not proven
-    // conformant must not serve queries. A per-path failure is not that: an
-    // unreadable or foreign parquet file, or a subdirectory the walk cannot
-    // enumerate, is skipped and counted inside the pass, so one bad path
-    // cannot keep the daemon down. So is every file a publication marker
-    // still claims after boot recovery, and every file in a day an
-    // unresolved rollup marker holds or whose marker unlink boot recovery
-    // could not make durable: the pass leaves it untouched and withholds
-    // completion, so the next boot conforms it once the marker resolves.
+    // Fatal on failure, like the epoch gate. A bad or claimed path is not a
+    // failure: the pass skips and counts it, so one bad file cannot keep the
+    // daemon down.
     let summary = conform::ensure_conformance(
         &state.storage.catalog,
         &state.query.field_catalog,
@@ -128,8 +89,7 @@ pub async fn prepare_corpus(state: &AppState, config: &Config) -> Result<(), Str
 
 /// Record `interrupted` on every step a process that ended left running,
 /// at the results clock's now: the process that ran its work is gone
-/// (ADR-0059). The evidence clock does not move. One `investigations_boot`
-/// event logs the count.
+/// (ADR-0059). The evidence clock does not move.
 async fn interrupt_running_steps(state: &AppState) -> Result<(), String> {
     let interrupted = state
         .storage
@@ -147,10 +107,7 @@ async fn interrupt_running_steps(state: &AppState) -> Result<(), String> {
 
 /// Mark `error` every report run a process that ended left `running`. The
 /// advisory lock is held, so no live sibling owns one, and the listener has
-/// not served, so no claim this process admitted can be among them. The
-/// watermark and the fire cursor stay where they are, as for any failed run
-/// (ADR-0018 ruling 9). The store logs `stale_runs_cleaned` with the count
-/// when it marks any.
+/// not served, so no claim this process admitted can be among them.
 async fn mark_stale_report_runs(state: &AppState) -> Result<(), String> {
     state
         .storage
@@ -161,16 +118,10 @@ async fn mark_stale_report_runs(state: &AppState) -> Result<(), String> {
         .map_err(|e| format!("boot stale report-run recovery failed: {e}"))
 }
 
-/// The query-only half of [`prepare_corpus`].
 async fn prepare_query_only(state: &AppState, config: &Config) -> Result<(), String> {
     // A query-only node skips the conformance pass, but `/api/v1/schema`
     // still answers from this catalog's pins, which describe the archive
-    // only if this catalog wrote it. Check the same dual-sided marker as a
-    // gate, and refuse the boot rather than advertise a schema about
-    // someone else's data. Only a marker naming another catalog does that:
-    // an archive with no marker (what an incomplete conformance pass
-    // leaves) warns and serves, exactly as the ingest node does for the
-    // same corpus.
+    // only if this catalog wrote it.
     let identity =
         conform::verify_archive_identity(&state.storage.catalog, &config.data.base_dir()).await?;
     match identity {
@@ -188,8 +139,6 @@ async fn prepare_query_only(state: &AppState, config: &Config) -> Result<(), Str
         ),
     }
 
-    // The restart guarantee covers ingest nodes only (ADR-0041): this node
-    // never reads the WAL, so rows still there are missing from its answers.
     let wal_dir = config.wal_dir();
     let files = tokio::task::spawn_blocking(move || count_wal_files(&wal_dir))
         .await
@@ -205,9 +154,6 @@ async fn prepare_query_only(state: &AppState, config: &Config) -> Result<(), Str
     Ok(())
 }
 
-/// Count the `*.ndjson` entries in the WAL's env directories, the layout
-/// the writer produces and compaction takes. Bounded to that one level;
-/// anything that cannot be listed counts nothing.
 fn count_wal_files(wal_dir: &Path) -> u64 {
     let envs = crate::env_dirs::try_list_env_dirs(wal_dir).unwrap_or_default();
     envs.iter()

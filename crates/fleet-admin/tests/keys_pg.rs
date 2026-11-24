@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration coverage for `fleet-admin keys` against a real Postgres.
-//!
-//! Calls fleet-auth's `KeyStore` directly (the same API surface the CLI
-//! drives) rather than spawning the `fleet-admin` binary per test. Faster,
-//! and the binary's command functions are thin enough that they don't
-//! contribute additional behaviour worth re-validating from a subprocess.
-
 mod common;
 
 use std::time::Duration;
@@ -28,7 +21,6 @@ fn names(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// Seed the roles the key tests hand out.
 async fn seed_roles(store: &KeyStore) {
     store
         .create_role(
@@ -172,7 +164,6 @@ async fn assign_role_adds_and_rejects_duplicate(pool: sqlx::PgPool) {
         .await
         .expect("first assignment");
 
-    // Same role again → RoleAlreadyAssigned, NOT silent no-op.
     let err = keys::assign_role(&store, &prefix, &role)
         .await
         .expect_err("duplicate assignment must error");
@@ -573,8 +564,6 @@ async fn retype_unknown_prefix_returns_key_not_found(pool: sqlx::PgPool) {
 async fn create_duplicate_name_is_allowed(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
 
-    // Pin the schema contract — name is NOT unique, two keys can share
-    // a label (operators distinguish them by prefix).
     store
         .create_key("dup", PrincipalKind::Service, &[], None)
         .await

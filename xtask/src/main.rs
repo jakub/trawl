@@ -2,26 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Workspace task runner:
-//! - `build-web` — the SPA-into-binary build in the right order:
-//!   1. `trunk build [--release]` inside `crates/trawl-web-ui/`
-//!   2. release builds precompress + enforce the wire-size budget
-//!   3. `cargo build [--release] -p trawl-web`
-//! - `compress-web` — precompress an existing release SPA and enforce
-//!   the gzip/Brotli wire-size budgets (used by cross-build CI).
-//! - `design-cards` — emit static fleet-ui preview cards for
-//!   claude.ai/design (see `design_cards` module).
-//! - `ingest-fuzz` — emit deterministic, Vector-compatible NDJSON corpora
-//!   for the ingest canonicalizer and field-catalog pin/conform boundary,
-//!   per producer profile (`--profile http|syslog|trawld`).
-//! - `pg-admission-guard` — prove every pg-touching test runs inside the
-//!   `postgres` nextest group, so the workspace cannot outgrow postgres'
-//!   `max_connections` (ADR-0021 ruling 4, see `pg_admission`).
-//! - `e2e` — the real-browser Playwright suite (issue #118,
-//!   `crates/trawl-web-ui/e2e/`): trunk-build the SPA, `npm ci` the
-//!   suite's own devDependency, install the chromium browser, then run
-//!   the suite against the zero-npm-dep stub server in `e2e/harness/`.
-//!
 //! Aliased as `cargo xtask` via `.cargo/config.toml`.
 
 mod design_cards;
@@ -190,16 +170,11 @@ fn main() -> ExitCode {
     }
 }
 
-/// Is `tool` on `PATH`? Used to fail loudly and by name rather than let
-/// `Command::spawn` bubble up a bare "No such file or directory".
 fn tool_on_path(tool: &str) -> bool {
     std::env::var_os("PATH")
         .is_some_and(|paths| std::env::split_paths(&paths).any(|dir| dir.join(tool).is_file()))
 }
 
-/// `cargo xtask e2e` — build the SPA, install the suite's own npm
-/// dependency + browser, then run Playwright against the zero-npm-dep
-/// stub server in `e2e/harness/server.mjs`.
 fn run_e2e(skip_build: bool, release: bool, headed: bool, grep: Option<&str>) -> ExitCode {
     let root = workspace_root();
     let web_ui = root.join("crates").join("trawl-web-ui");
@@ -478,12 +453,9 @@ fn human_bytes(bytes: u64) -> String {
 }
 
 /// A nested `cargo` command without the package variables `cargo xtask`
-/// exported to this process. `cargo xtask` is `cargo run`, which sets
-/// xtask's `CARGO_MANIFEST_DIR`, `CARGO_PKG_*` and friends for the binary. A
-/// nested cargo hands them on to build scripts, and ring's build script
-/// watches several of them, so the nested build recompiled ring and every
-/// crate above it, and left those units fingerprinted for the next plain
-/// cargo command to rebuild again.
+/// exported to this process. A nested cargo hands them on to build scripts, and
+/// ring's build script watches several of them, so the nested build recompiled
+/// ring and every crate above it.
 fn cargo() -> Command {
     let mut cmd = Command::new(env!("CARGO"));
     for (name, _) in std::env::vars_os() {
@@ -518,7 +490,6 @@ fn run(mut cmd: Command) -> bool {
     }
 }
 
-/// The workspace root — parent of `xtask/`.
 fn workspace_root() -> PathBuf {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
     manifest

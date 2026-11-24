@@ -2,12 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The labelled sidebar and the command bar that replaced the icon rail
-// and the topbar mode tabs (ADR-0032). The overlay's geometry at narrow
-// widths is responsive-layout's; what is here is the state the sidebar
-// owns: the persisted collapse, the current-page marking, the crumb the
-// command bar derives from it, and what the overlay does to ⌘K.
-
 import { test, expect, resetScenario } from '../fixtures';
 import { SEL } from '../selectors';
 
@@ -20,15 +14,12 @@ test('collapse is a preference that survives a reload', async ({ page }) => {
 
   await collapse.click();
   await expect(rail).toHaveClass(/collapsed/);
-  // Collapsed is icon-only, so the label the control offers flips too.
   await expect(page.locator(SEL.sidebarCollapse)).toHaveAccessibleName('Expand sidebar');
-  // The state is written where the theme lives, not kept in memory.
   expect(await page.evaluate(() => JSON.parse(localStorage.getItem('trawl.ui')!).sidebar))
     .toBe('collapsed');
 
   await page.reload();
   await expect(page.locator('nav.rail')).toHaveClass(/collapsed/);
-  // A collapsed link is still a named destination, not a bare glyph.
   const search = page.locator('nav.rail .grp > a[title="Search"]');
   await expect(search).toHaveAccessibleName('Search');
 
@@ -53,8 +44,6 @@ for (const [route, label] of [
     await expect(current).toHaveCount(1);
     await expect(current).toHaveAttribute('title', label);
     await expect(current).toHaveClass(/active/);
-    // The command bar no longer carries mode tabs: the crumb is the
-    // active item's label, derived from the same groups.
     await expect(page.locator(SEL.topbarCrumb)).toHaveText(label);
   });
 }
@@ -68,8 +57,6 @@ test('the narrow overlay owns the layer, so the palette chord stays inert until 
   await expect(toggle).toHaveAttribute('aria-expanded', 'true');
   await expect(page.locator('nav.rail.overlay')).toBeVisible();
 
-  // The overlay is the topmost layer, so the palette refuses the chord
-  // rather than stacking a second dialog over the navigation.
   await page.keyboard.press('Control+k');
   await expect(page.locator(SEL.paletteDialog)).toHaveCount(0);
 
@@ -78,7 +65,6 @@ test('the narrow overlay owns the layer, so the palette chord stays inert until 
   await expect(toggle).toBeFocused();
   await expect(toggle).toHaveAttribute('aria-expanded', 'false');
 
-  // And it works again once the overlay is gone.
   await page.keyboard.press('Control+k');
   await expect(page.locator(SEL.paletteDialog)).toBeVisible();
 });

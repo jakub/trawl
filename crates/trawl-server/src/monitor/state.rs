@@ -4,9 +4,7 @@
 
 //! Snapshot collection for the monitor dashboard.
 //!
-//! On each tick, reads atomics, semaphore permits, and tracker snapshots
-//! to build a [`MonitorSnapshot`] for rendering. All reads are cheap and
-//! non-blocking — no subscriptions or channels needed.
+//! All reads are cheap and non-blocking — no subscriptions or channels needed.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
@@ -15,42 +13,35 @@ use trawl_api::{ActiveQuerySnapshot, CompletedQuerySnapshot, DashboardSnapshot};
 
 use crate::state::AppState;
 
-/// Complete state snapshot consumed by the UI renderer on each tick.
 #[derive(Debug)]
 pub struct MonitorSnapshot {
-    // -- header --
     pub hostname: String,
     pub listen_addr: String,
     pub uptime: Duration,
     pub version: &'static str,
     pub healthy: bool,
 
-    // -- executor pool --
     pub pool_capacity: usize,
     pub pool_active: usize,
     /// The subset of `pool_active` held by work whose request already
     /// answered (ADR-0024).
     pub pool_retained: usize,
 
-    // -- hot buffer --
     pub hot_buffer_events: usize,
     pub hot_buffer_max_events: usize,
     pub hot_buffer_bytes: usize,
     pub hot_buffer_max_bytes: usize,
     pub hot_buffer_batches: usize,
 
-    // -- query throughput --
     pub total_queries: u64,
     pub query_rate: f64,
     pub query_errors: u64,
     pub query_timeouts: u64,
 
-    // -- ingest (HTTP) --
     pub ingest_events: u64,
     pub ingest_rate: f64,
     pub ingest_rejected: u64,
 
-    // -- syslog --
     pub syslog_enabled: bool,
     pub syslog_events_udp: u64,
     pub syslog_events_tcp: u64,
@@ -59,39 +50,31 @@ pub struct MonitorSnapshot {
     pub syslog_dropped: u64,
     pub syslog_tcp_connections: u64,
 
-    // -- WAL --
     pub wal_files: u64,
     pub wal_bytes: u64,
     pub wal_measurement: trawl_api::StorageMeasurement,
 
-    // -- compaction --
     pub last_compaction_secs: Option<u64>,
     pub compaction_runs: u64,
     pub compaction_errors: u64,
 
-    // -- storage --
     pub parquet_files: u64,
     pub parquet_bytes: u64,
     pub parquet_measurement: trawl_api::StorageMeasurement,
 
-    // -- capacity (ADR-0042) --
     pub capacity: trawl_api::Capacity,
 
-    // -- SSE --
     pub sse_active: usize,
     pub sse_max: usize,
 
-    // -- scheduler --
     pub scheduler_enabled: bool,
     pub scheduler_schedules: usize,
 
-    // -- queries --
     pub recent_queries: Vec<CompletedQuerySnapshot>,
     pub active_queries: Vec<ActiveQuerySnapshot>,
 }
 
 impl MonitorSnapshot {
-    /// Convert to the shared wire type for API responses and shared rendering.
     pub fn to_dashboard_snapshot(&self) -> DashboardSnapshot {
         DashboardSnapshot {
             hostname: self.hostname.clone(),
@@ -141,8 +124,6 @@ impl MonitorSnapshot {
     }
 }
 
-/// Tracks counter deltas between ticks to compute rates (events/sec, queries/sec).
-///
 /// Uses an exponential moving average (EMA) to smooth out bursty ingest
 /// patterns. With a smoothing factor of 0.3, it takes ~5 ticks for a
 /// step change to reach ~83% of the new value — enough to eliminate the
@@ -158,7 +139,6 @@ pub struct RateTracker {
     pub syslog_rate: f64,
 }
 
-/// EMA smoothing factor (0..1). Lower = smoother but slower to respond.
 const RATE_SMOOTHING: f64 = 0.3;
 
 impl Default for RateTracker {
@@ -176,7 +156,6 @@ impl Default for RateTracker {
 }
 
 impl RateTracker {
-    /// Update rates from current counter values. Call once per tick.
     #[allow(clippy::cast_precision_loss)] // dashboard display — u64→f64 precision loss is fine
     pub fn update(&mut self, total_queries: u64, total_ingest: u64, total_syslog: u64) {
         let elapsed = self.last_tick.elapsed().as_secs_f64();
@@ -198,7 +177,6 @@ impl RateTracker {
     }
 }
 
-/// The `AppState` handle plus the values the dashboard carries between ticks.
 #[derive(Debug)]
 pub struct MonitorState {
     state: AppState,
@@ -208,11 +186,8 @@ pub struct MonitorState {
     scheduler_enabled: bool,
     syslog_enabled: bool,
     pub rate_tracker: RateTracker,
-    /// Health check runs on a slower cadence (every N ticks).
     health_counter: u32,
     last_healthy: bool,
-    /// Enabled-schedule count, pushed by the async snapshot collector loop
-    /// (the store is async; `snapshot()` stays sync and just reads this).
     cached_schedule_count: usize,
 }
 
@@ -241,19 +216,14 @@ impl MonitorState {
         }
     }
 
-    /// Update the enabled-schedule count shown on the dashboard. Called by
-    /// the async snapshot collector, which owns the (async) store access.
     pub fn set_schedule_count(&mut self, count: usize) {
         self.cached_schedule_count = count;
     }
 
-    /// Whether the scheduler is enabled (the collector only polls the
-    /// schedule count when it is).
     pub fn scheduler_enabled(&self) -> bool {
         self.scheduler_enabled
     }
 
-    /// Collect a snapshot of all dashboard fields. Cheap reads only.
     #[allow(clippy::too_many_lines)]
     pub fn snapshot(&mut self) -> MonitorSnapshot {
         let pool = &self.state.query.pool;
@@ -263,7 +233,6 @@ impl MonitorState {
         let pool_active = pool_capacity - pool.available_permits();
         let pool_retained = pool.retained();
 
-        // Hot buffer stats (zeros when ingest is disabled).
         let (hb_events, hb_max_events, hb_bytes, hb_max_bytes, hb_batches) =
             if let Some(ref buf) = self.state.query.hot_buffer {
                 let cfg = buf.config();
@@ -282,7 +251,6 @@ impl MonitorState {
         let ingest_events = self.state.ingest.total_events.load(Ordering::Relaxed);
         let ingest_rejected = self.state.ingest.total_rejected.load(Ordering::Relaxed);
 
-        // Syslog stats (zeros when syslog is disabled).
         let (syslog_udp, syslog_tcp, syslog_parse, syslog_drop, syslog_conns) =
             if let Some(ref stats) = self.state.ingest.syslog_stats {
                 (
@@ -300,30 +268,23 @@ impl MonitorState {
         self.rate_tracker
             .update(total_queries, ingest_events, syslog_total);
 
-        // Count errors and timeouts from recent history.
         let recent = tracker.recent();
         let query_errors = recent.iter().filter(|q| q.error.is_some()).count() as u64;
         let query_timeouts = recent.iter().filter(|q| q.timed_out).count() as u64;
 
         let active_queries = tracker.active();
 
-        // SSE connections: total permits minus available.
         let sse_available = self.state.query.sse_semaphore.available_permits();
         let sse_active = self.sse_max.saturating_sub(sse_available);
 
-        // Scheduler: the enabled-schedule count is pushed by the async
-        // snapshot collector via `set_schedule_count` (the pg store is
-        // async and this method must stay sync/cheap).
         let scheduler_schedules = self.cached_schedule_count;
 
-        // Health check on slower cadence (every 30 ticks).
         self.health_counter += 1;
         if self.health_counter >= 30 {
             self.health_counter = 0;
             self.last_healthy = pool.available_permits() > 0;
         }
 
-        // Compaction stats (None/zeros when ingest is disabled).
         let (last_compaction_secs, compaction_runs, compaction_errors) =
             if let Some(ref stats) = self.state.ingest.compaction_stats {
                 let epoch_secs = stats.last_run_epoch_secs.load(Ordering::Relaxed);
@@ -344,15 +305,9 @@ impl MonitorState {
                 (None, 0, 0)
             };
 
-        // These short cache reads assemble each count/bytes/status/age tuple.
-        // WAL configuredness comes from the same writer used by collection,
-        // including before the first stats-emitter tick or scrape.
         let wal = crate::metrics::cached_wal_stats(self.state.ingest.wal_writer.is_some());
         let (parquet, parquet_scan) = crate::metrics::cached_parquet_scan();
 
-        // Capacity reads the same Parquet sample as the totals above, the
-        // headroom cache, and retention's evidence. Today's UTC date is read
-        // once, so every environment is projected against the same day.
         let (headroom, headroom_sample) = crate::metrics::cached_headroom();
         let retention = &self.state.retention;
         let capacity = crate::capacity::assemble(
@@ -418,8 +373,6 @@ impl MonitorState {
     }
 }
 
-/// Convenience wrapper over [`MonitorState::new`] that takes `listen_addr`
-/// by reference.
 pub fn from_app_state(
     state: AppState,
     listen_addr: &str,

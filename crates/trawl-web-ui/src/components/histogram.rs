@@ -5,47 +5,6 @@
 //! `<Histogram/>` — 80px strip rendering a stacked ok/err bar chart of
 //! every event in the result, above the snapshot table of a raw-event
 //! query.
-//!
-//! The strip's input is the count trawld answers in the same response as
-//! the page (`QueryResponse::histogram`): 48 half-open UTC bins from the
-//! first usable `_time` of the whole result to past its last, with each
-//! bin's errors (`_severity` at 17 or above, ADR-0013 §9). The browser
-//! never buckets rows. Each page shows its own execution's count, so a
-//! page turn redraws the strip from the response that answered it.
-//!
-//! What it shows, in order:
-//!
-//! 1. While the page's request is pending (the page's whole `loading`
-//!    test, not only the transport flag), the shared loading hint, with no
-//!    bars and no caption. A retained earlier response is never drawn.
-//! 2. A failed request: the quiet `—`. The results table reports it.
-//! 3. A result with no rows collapses the strip; the table says so.
-//! 4. Otherwise `crate::histogram::strip` decides: no histogram is the
-//!    `—`, an unavailable one says why, a ready one that breaks an
-//!    invariant is the `—`, and anything else draws.
-//!
-//! A drawn chart carries a one-line key above the bars: what they count
-//! (every event in the result, and those without a usable time), how long
-//! one bucket is, that the bins are UTC, and what the colours mean. A
-//! result without `_severity` gets one swatch. When the query kept only
-//! some events (`head`, `tail`, `dedup`), a second line says so, and the
-//! strip grows by that line. `crate::histogram` builds every string.
-//!
-//! The x axis reads the bins' integer bounds: round UTC clock times
-//! inside the series, each placed at its own position
-//! (`crate::histogram::clock_ticks`). The tick step depends on how wide
-//! the axis is, so the axis width is measured after the bars render and
-//! whenever the strip resizes, and only the axis re-renders when it
-//! changes.
-//!
-//! A bar's tooltip is centred on it, then measured against the strip and
-//! shifted sideways (`--tip-shift`) so an edge bar's tip never runs past
-//! the strip, where `.search-col` clips it. The shift is
-//! `crate::histogram::tip_shift`. A bar's tip is placed when the bar is
-//! hovered or focused, and every tip is placed again after the bars
-//! render and whenever the strip resizes. A tip already on screen then
-//! follows a window resize or a live refresh without the pointer or the
-//! focus having to move.
 
 use fleet_ui::{LoadState, Loaded};
 use leptos::prelude::*;
@@ -69,13 +28,9 @@ const TIP_EDGE: i32 = 3;
 #[component]
 pub fn Histogram(
     rows: LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
-    /// The page's `loading` test: true until the response on screen
-    /// answers the request the page shows.
-    #[prop(into)]
-    pending: Signal<bool>,
+    #[prop(into)] pending: Signal<bool>,
 ) -> impl IntoView {
     let strip = NodeRef::<leptos::html::Div>::new();
-    // The x axis's measured width in pixels; `None` until it is laid out.
     let axis_width = RwSignal::new(None::<f64>);
     // Every bar moves when the strip changes width, including the one
     // whose tip is on screen. The observer disconnects with the
@@ -131,7 +86,6 @@ pub fn Histogram(
     }
 }
 
-/// The key, the scale, the bars and the axis of a drawn strip.
 fn bars(
     drawn: Drawn,
     strip: NodeRef<leptos::html::Div>,
@@ -218,10 +172,6 @@ fn bars(
     }
 }
 
-/// Measure the entered or focused bar's tip against the strip and set the
-/// tip's `--tip-shift`, which the stylesheet adds to its centring
-/// transform.
-///
 /// Measured at the moment it is shown rather than once at render: the
 /// strip's width follows the viewport and the tip's width its label.
 fn place_tip(ev: &web_sys::Event) {
@@ -254,8 +204,6 @@ fn place_all_tips(strip: &web_sys::Element) {
     }
 }
 
-/// The x axis's tick labels for an axis `width` pixels wide, each at its
-/// tick's position.
 fn axis_ticks(series: &Series, width: f64) -> impl IntoView + use<> {
     clock_ticks(series, width)
         .into_iter()
@@ -271,9 +219,6 @@ fn axis_ticks(series: &Series, width: f64) -> impl IntoView + use<> {
         .collect_view()
 }
 
-/// Read the x axis's width into `axis_width`, when it is laid out and
-/// differs from the last reading. A disposed strip has no signal left to
-/// set, and the write is skipped.
 fn measure_axis(strip: &web_sys::Element, axis_width: RwSignal<Option<f64>>) {
     let Some(axis) = strip.query_selector(".xax").ok().flatten() else {
         return;
@@ -284,7 +229,6 @@ fn measure_axis(strip: &web_sys::Element, axis_width: RwSignal<Option<f64>>) {
     }
 }
 
-/// Measure one bar's tip against the strip and set its `--tip-shift`.
 fn place_bar_tip(bar: &HtmlElement, strip: &web_sys::Element) {
     let Some(tip) = bar
         .query_selector(".tip")

@@ -2,19 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration tests around the expired-session cookie clearing path.
-//!
-//! The `Session` extractor distinguishes three auth failure modes:
-//!
-//! 1. **missing cookie** → 401, no cookie cleared (nothing to clear)
-//! 2. **tampered cookie** → 401, no cookie cleared (don't confirm
-//!    decryption failure to an attacker)
-//! 3. **valid decrypt but expired** → 401 + Set-Cookie: Max-Age=0
-//!    so the browser stops sending a token it can never redeem
-//!
-//! These tests drive all three end-to-end, hand-crafting the expired and
-//! tampered cookies and observing the response.
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
@@ -28,7 +15,6 @@ use zeroize::Zeroizing;
 fn test_state(allow_insecure_cookies: bool) -> AppState {
     let web = WebConfig {
         allow_insecure_cookies,
-        // Required since ADR-0016: resolution refuses an empty allowlist.
         public_origins: vec!["https://trawl.example.com".to_owned()],
         ..WebConfig::default()
     };
@@ -48,7 +34,7 @@ fn expired_cookie(state: &AppState) -> String {
 
 #[tokio::test]
 async fn expired_session_returns_401_with_clear_cookie() {
-    let state = test_state(true); // dev mode, no Secure
+    let state = test_state(true);
     let app = routes::build(state.clone());
     let cookie = expired_cookie(&state);
 
@@ -73,13 +59,12 @@ async fn expired_session_returns_401_with_clear_cookie() {
     assert!(set_cookie.contains("Max-Age=0"));
     assert!(set_cookie.contains("HttpOnly"));
     assert!(set_cookie.contains("SameSite=Lax"));
-    // dev: allow_insecure_cookies=true → no Secure
     assert!(!set_cookie.contains("Secure"));
 }
 
 #[tokio::test]
 async fn expired_cookie_in_prod_mode_includes_secure() {
-    let state = test_state(false); // prod mode
+    let state = test_state(false);
     let app = routes::build(state.clone());
     let cookie = expired_cookie(&state);
 
@@ -103,9 +88,6 @@ async fn expired_cookie_in_prod_mode_includes_secure() {
 
 #[tokio::test]
 async fn missing_cookie_does_not_send_set_cookie() {
-    // Protect against Set-Cookie-on-every-401 behavior. Missing cookie
-    // → no cookie to clear. Otherwise a probe-style attacker could
-    // trivially fingerprint the proxy.
     let app = routes::build(test_state(true));
 
     let req = Request::builder()
@@ -124,23 +106,15 @@ async fn missing_cookie_does_not_send_set_cookie() {
 
 #[tokio::test]
 async fn tampered_cookie_does_not_send_set_cookie() {
-    // Similar rationale: we don't want to distinguish "your cookie
-    // was tampered" from "you never had a cookie". AEAD failure and
-    // missing cookie both surface as Unauthorized with no clear
-    // directive.
     let state = test_state(true);
     let app = routes::build(state.clone());
 
-    // Build a valid cookie, then bit-flip it.
     let payload = SessionPayload {
         token: Zeroizing::new("flt_x".into()),
         name: "x".into(),
         exp: SessionExpiry::from_unix_seconds(chrono::Utc::now().timestamp() + 3600),
     };
     let mut value = encrypt(state.cookie_key(), &payload).unwrap();
-    // Flip a byte near the middle — lands inside ciphertext → AEAD reject.
-    // Pick a replacement that is *guaranteed different* from the original;
-    // naively replacing with 'A' is a ~1/64 no-op when the byte already is 'A'.
     let mid = value.len() / 2;
     let orig = value.as_bytes()[mid];
     let replacement = if orig == b'A' { 'B' } else { 'A' };

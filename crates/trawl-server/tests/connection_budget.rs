@@ -3,22 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The postgres admission budget, checked at compile-and-run time.
-//!
-//! `.config/nextest.toml` bounds every pg-touching binary with one group
-//! width. That width, the per-shape connection ceilings in `common`, and
-//! the CI server's `max_connections` are numbers that must keep agreeing;
-//! nothing else notices when one of them moves. This test is the
-//! arithmetic written down once.
-//!
-//! It multiplies the WIDEST shape, not an average and not the full-server
-//! one: the group admits whatever mix of shapes nextest happens to
-//! schedule, so the only safe assumption is that every slot holds the
-//! widest.
-//!
-//! No tokio, no postgres, no fixture server: it reads a handful of consts
-//! and a TOML line. It lives in the `postgres` nextest group anyway,
-//! because it shares the fixture module and the admission guard derives
-//! membership from that.
 
 mod common;
 
@@ -27,10 +11,6 @@ mod common;
 /// loudly instead of the test passing over an empty string.
 const NEXTEST_CONFIG: &str = include_str!("../../../.config/nextest.toml");
 
-/// Connections the run needs that no single test shape holds.
-///
-/// Three named parts, none of them slack for its own sake:
-///
 /// * `SUPERUSER_RESERVED` is postgres' own `superuser_reserved_connections`,
 ///   which is subtracted from `max_connections` for ordinary roles. CI
 ///   connects as the superuser and would not pay it; a developer running
@@ -44,15 +24,12 @@ const NEXTEST_CONFIG: &str = include_str!("../../../.config/nextest.toml");
 ///   release and only runs during setup and teardown, when the test's own
 ///   shape is not yet at its peak.
 fn headroom(max_threads: u32) -> u32 {
-    /// `superuser_reserved_connections`, the postgres default.
     const SUPERUSER_RESERVED: u32 = 3;
-    /// Concurrent setup/teardown windows in sqlx's master pool.
     const SQLX_MASTER_CHURN: u32 = 4;
 
     SUPERUSER_RESERVED + common::ADMIN_TRANSIENT * max_threads + SQLX_MASTER_CHURN
 }
 
-/// `max-threads` of the `[test-groups.postgres]` table.
 fn postgres_group_max_threads() -> u32 {
     let mut in_group = false;
     for line in NEXTEST_CONFIG.lines() {
@@ -97,9 +74,6 @@ fn postgres_group_width_fits_the_connection_budget() {
 
 #[test]
 fn the_worst_shape_is_the_widest_shape() {
-    // `WORST_TEST_CONNECTION_CEILING` is a const `max` over the shapes; a
-    // new shape added to `common` without being folded into it would leave
-    // the budget quietly under-counting.
     for (name, ceiling) in [
         ("full server", common::FULL_SERVER_CONNECTION_CEILING),
         ("direct store", common::DIRECT_STORE_CONNECTION_CEILING),
@@ -118,8 +92,6 @@ fn the_worst_shape_is_the_widest_shape() {
 
 #[test]
 fn the_group_is_wide_enough_to_be_worth_having() {
-    // A width of 1 would serialize the whole pg suite; that is a config
-    // typo, not a budget. Catches a fat-fingered `max-threads = 1`.
     assert!(
         postgres_group_max_threads() >= 4,
         "postgres group is too narrow"

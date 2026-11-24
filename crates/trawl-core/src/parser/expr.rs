@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Layer 4: expression parser with operator precedence.
-//!
-//! Recursive descent with `foldl`/`foldr` for 7 precedence levels.
-//! Used in `where` clauses, aggregation arguments, and `in` lists.
 
 use chumsky::prelude::*;
 
@@ -20,32 +17,9 @@ use crate::parser::primitives::{
 };
 use crate::pattern::{PatternKind, literal_operand};
 
-/// How deeply one expression may nest before the grammar refuses it.
-///
 /// Every nesting level (a parenthesised sub-expression, a function
-/// call's arguments, an `in (…)` list) is one more recursive descent
-/// through the whole precedence chain, and each descent costs stack. The
-/// input cap (`MAX_QUERY_LEN`) alone does not bound that: `a(a(a(…` fits
-/// twenty thousand levels into 64 KiB of text, which is enough to walk a
-/// thread off the end of its stack. trawld parses each query it admits
-/// in a `spawn_blocking` preparation job, whose thread has a tokio
-/// worker's 2 MiB stack, so an unbounded grammar is a remote crash a
-/// single query can spell.
-///
-/// What a level costs is a property of the build, not of the DSL: a
-/// release build spends tens of bytes per level, an unoptimized build
-/// with full debuginfo tens of kilobytes (LLVM cannot merge the stack
-/// slots of chumsky's enormous combinator types once every one of them
-/// is a named debugger variable). Three orders of magnitude of spread is
-/// why one measurement cannot argue an unbounded grammar safe, so the
-/// bound is measured against the hungriest build: unoptimized with full
-/// debuginfo, where a 2 MiB stack carries nesting into the forties and
-/// dies in the sixties.
-///
-/// Sixteen is a quarter of what that build survives, a rounding error in
-/// a release one, and still far past any query a person writes:
-/// `((a + b) * (c - d))` is two, and the deepest expression in this
-/// repository's tests, docs and UI-composed queries is three.
+/// call's arguments, an `in (…)` list) costs stack, and the input cap
+/// (`MAX_QUERY_LEN`) alone does not bound that.
 pub(crate) const MAX_EXPR_DEPTH: usize = 16;
 
 thread_local! {
@@ -68,11 +42,6 @@ impl Drop for DepthGuard {
     }
 }
 
-/// Run `inner` one nesting level deeper, refusing past [`MAX_EXPR_DEPTH`].
-///
-/// The refusal is a parse error carrying the limit, not a silent
-/// truncation and not a crash: an over-nested query is answered, in the
-/// same shape as every other thing the grammar declines.
 fn nested<'src, T: 'src>(
     inner: impl Parser<'src, ParserInput<'src>, T, ParserExtra<'src>> + Clone + 'src,
 ) -> impl Parser<'src, ParserInput<'src>, T, ParserExtra<'src>> + Clone {
@@ -91,25 +60,10 @@ fn nested<'src, T: 'src>(
     })
 }
 
-/// Parse an expression with full operator precedence.
-///
-/// Precedence (low to high):
-/// 1. `or`
-/// 2. `and`
-/// 3. `not` (unary)
-/// 4. `==` `!=` `>` `>=` `<` `<=` `in` `matches` (comparison)
-/// 5. `+` `-` (additive)
-/// 6. `*` `/` `%` (multiplicative)
-/// 7. `-` (unary negation)
 #[allow(clippy::too_many_lines)]
 pub(crate) fn expr<'src>()
 -> impl Parser<'src, ParserInput<'src>, Spanned<Expr>, ParserExtra<'src>> + Clone {
     recursive(|expr| {
-        // --- atoms ---
-
-        // function_call: ident "(" args ")", tried before bare field_ref.
-        // The head is the unquoted production, because a function is not a
-        // field: `lower`(x) is a field reference, never a call (ADR-0013 §7).
         let func_call = spanned(
             plain_name()
                 .then_ignore(just('(').spaced())
@@ -145,7 +99,6 @@ pub(crate) fn expr<'src>()
         .labelled("expression")
         .boxed();
 
-        // --- precedence 7: unary negation `-` ---
         let unary_neg = just('-').repeated().foldr(atom, |_op, operand| {
             let span = operand.span.clone();
             Spanned::new(
@@ -157,7 +110,6 @@ pub(crate) fn expr<'src>()
             )
         });
 
-        // --- precedence 6: multiplicative `*` `/` `%` ---
         let mul_op = choice((
             just('*').to(BinaryOp::Mul),
             just('/').to(BinaryOp::Div),
@@ -180,7 +132,6 @@ pub(crate) fn expr<'src>()
                     )
                 });
 
-        // --- precedence 5: additive `+` `-` ---
         let add_op = choice((just('+').to(BinaryOp::Add), just('-').to(BinaryOp::Sub))).spaced();
 
         let additive = multiplicative.clone().foldl(
@@ -198,7 +149,6 @@ pub(crate) fn expr<'src>()
             },
         );
 
-        // --- precedence 4: comparison ---
         let cmp_op = choice((
             just("==").to(BinaryOp::Eq),
             just("!=").to(BinaryOp::Ne),
@@ -279,7 +229,6 @@ pub(crate) fn expr<'src>()
             })
             .boxed();
 
-        // --- precedence 3: unary `not` ---
         let not_expr = keyword("not").or(keyword("NOT")).spaced().repeated().foldr(
             comparison,
             |_kw, operand| {
@@ -294,7 +243,6 @@ pub(crate) fn expr<'src>()
             },
         );
 
-        // --- precedence 2: `and` ---
         let and_expr = not_expr.clone().foldl(
             keyword("and")
                 .or(keyword("AND"))
@@ -314,7 +262,6 @@ pub(crate) fn expr<'src>()
             },
         );
 
-        // --- precedence 1: `or` ---
         and_expr.clone().foldl(
             keyword("or")
                 .or(keyword("OR"))
@@ -338,11 +285,7 @@ pub(crate) fn expr<'src>()
 }
 
 /// The right side of `matches`, `like` or `ilike` spelled as an
-/// expression. It must be literal text ([`literal_operand`], ADR-0063): a
-/// pattern is priced and built once before anything runs, so it cannot be
-/// a value computed per event. Its text then gets the checks every pattern
-/// gets ([`check_pattern`]): a quoted `matches` body is checked as a
-/// `/body/` one is.
+/// expression. It must be literal text ([`literal_operand`], ADR-0063).
 ///
 /// A refusal is emitted over the operand's span, not returned: the
 /// comparison still parses, so no other reading of the same text can win
@@ -377,9 +320,6 @@ mod tests {
         expr().parse(input).into_result().unwrap()
     }
 
-    /// A backticked name is always a field reference (ADR-0013 ruling 7):
-    /// function names are not fields, so the call head takes the
-    /// unquoted production and `` `lower`(x) `` does not parse as a call.
     #[test]
     fn backticked_name_is_never_a_function_call() {
         let parsed = expr().parse("`lower`(x)").into_result();
@@ -391,11 +331,9 @@ mod tests {
                 "a backticked head must lex as a field, never a call"
             ),
         }
-        // …and the whole-query door refuses it outright.
         assert!(crate::parser::parse("| let y = `lower`(x)").is_err());
     }
 
-    /// A backticked field reference reaches expressions verbatim.
     #[test]
     fn backticked_field_reference_keeps_its_name() {
         assert_eq!(
@@ -484,7 +422,6 @@ mod tests {
     #[test]
     fn test_arithmetic() {
         let result = parse_expr("a + b * c");
-        // should parse as a + (b * c) due to precedence
         match &result.node {
             Expr::Binary { lhs, op, rhs } => {
                 assert_eq!(*op, BinaryOp::Add);
@@ -501,7 +438,6 @@ mod tests {
     #[test]
     fn test_logical_and_or() {
         let result = parse_expr("a > 1 and b < 2 or c == 3");
-        // should parse as (a > 1 and b < 2) or (c == 3)
         match &result.node {
             Expr::Binary { op, .. } => assert_eq!(*op, BinaryOp::Or),
             other => panic!("expected Binary Or, got {other:?}"),
@@ -551,14 +487,12 @@ mod tests {
 
     #[test]
     fn test_keyword_not_in_ident() {
-        // "android" should parse as field_ref, not "and" + "roid"
         let result = parse_expr("android");
         assert_eq!(result.node, Expr::FieldRef("android".to_string()));
     }
 
     #[test]
     fn test_double_minus() {
-        // `a - -b` should parse as Sub(a, Neg(b))
         let result = parse_expr("a - -b");
         match &result.node {
             Expr::Binary { lhs, op, rhs } => {
@@ -647,9 +581,6 @@ mod tests {
         }
     }
 
-    /// `matches /re/` reads its body under the same rule as a search value
-    /// (ADR-0061 ruling 1): alternation without whitespace before the `|`
-    /// is a regex, and a cut body is an error over the whole `/…/`.
     #[test]
     fn matches_regex_obeys_the_same_body_rule() {
         let result = parse_expr("host matches /err|warn/");
@@ -683,7 +614,6 @@ mod tests {
 
     #[test]
     fn test_division_still_works() {
-        // `/` as division must not be confused with regex delimiters
         let result = parse_expr("x / 2 > 0");
         match &result.node {
             Expr::Binary { lhs, op, .. } => {
@@ -720,7 +650,6 @@ mod tests {
         }
     }
 
-    /// The one expression a single-stage `where` or `let` query carries.
     fn stage_expr(query: &str) -> Expr {
         let parsed = crate::parser::parse(query).unwrap_or_else(|e| panic!("{query}: {e:?}"));
         match &parsed.pipeline[0].node {
@@ -730,8 +659,6 @@ mod tests {
         }
     }
 
-    /// The three places an expression is read: a `where` condition, a
-    /// `let` value and a `case()` argument.
     fn expression_contexts(expr: &str) -> [String; 3] {
         [
             format!("| where {expr}"),
@@ -740,9 +667,6 @@ mod tests {
         ]
     }
 
-    /// `and`, `or` and `not` are read in all lowercase or all capitals,
-    /// with one meaning; a mixed spelling keeps its old reading, and a
-    /// word that only starts with a keyword stays a field.
     #[test]
     fn expression_boolean_case_matrix() {
         let spellings = [
@@ -774,7 +698,6 @@ mod tests {
             }
         }
 
-        // `not` binds tighter than `and`, and `and` tighter than `or`.
         let root = stage_expr("| where NOT a == 1 OR b == 2 AND c == 3");
         let Expr::Binary {
             lhs,
@@ -831,10 +754,6 @@ mod tests {
         assert_eq!(rhs.node, Expr::FieldRef("NOT".to_string()));
     }
 
-    /// `NOT` at the start of an expression operand is the operator, so
-    /// text that read a bare field named `NOT` there now reads otherwise
-    /// (ADR-0061, amendment of 2026-11-09). A backticked name, or `NOT`
-    /// past an operand start, is still the field.
     #[test]
     fn a_bare_not_field_is_read_as_the_operator() {
         for query in ["| where NOT == 1", "| where NOT.x == 1"] {

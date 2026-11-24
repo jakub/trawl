@@ -4,45 +4,9 @@
 
 //! Semaphore-bounded executor pool for concurrent query execution.
 //!
-//! Pre-creates a pool of [`Executor`] instances sharing the same underlying
-//! `DuckDB` database via [`Executor::try_clone`]. Long-lived connections
-//! benefit from `DuckDB`'s internal metadata caching (parquet file stats,
-//! column statistics, prepared statement cache).
-//!
 //! The semaphore limits concurrency, and each permit corresponds to exactly
-//! one pooled executor. Timed-out queries are interrupted via `DuckDB`'s
-//! interrupt handle; the executor is reclaimed once the interrupted work
-//! actually stops, which is not when the request answered.
-//!
-//! # The request and the work it started are two lifetimes (ADR-0024)
-//!
-//! A request that times out, or whose caller walks away, stops waiting —
-//! it does not stop the `DuckDB` bind or scan its permit is paying for.
-//! Every resource that work holds (the permit, the publication guard, the
-//! executor, the interrupt registration and any charge its caller attached
-//! with [`WorkContext::holding`]) therefore belongs to [`WorkSlot`], which
-//! the request future hands to the blocking task and never owns again.
-//! Timeout, caller drop, a refusal before startup, a panic and ordinary
-//! completion all converge on that one `Drop`.
-//!
-//! Between the request's outcome and that cleanup the work is *retained*:
-//! it still occupies a permit that `pool_active` counts, and
-//! [`retained`](ExecutorPool::retained) is the subset an operator can see.
-//! One [`Registry`] mutex covers the pending entries, the interrupt slots,
-//! the retained entries and the idle executors together, because the
-//! invariants that matter are cross-map ones: an interrupt may only fire
-//! while the executor it was taken from is still out on the query it
-//! belongs to, and a cancel latched while work waited to start is the one
-//! its worker reads.
-//!
-//! # A cancel reaches work that waits to start (ADR-0024, Amendment 2026-11-09)
-//!
-//! A tracked request takes a [`Pending`] guard before its tracker entry
-//! opens. Until its work takes a slot, a cancel by id latches the entry's
-//! flag and wakes every wait the request is in; each wait answers the
-//! capacity refusal and drops what it holds. Promotion into a slot moves
-//! the flag, so a cancel that landed after the last wait is refused by the
-//! worker at its work-start transition.
+//! one pooled executor. The request and the work it started are two
+//! lifetimes (ADR-0024).
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -71,51 +35,24 @@ use crate::hot_buffer::{HotBuffer, HotSnapshot};
 use crate::query_timing::{Outcome, PhysicalOutcome, QueryTiming, Reclaim, emit_reclaimed};
 use crate::source::{compute_source, select, selection_bytes};
 
-/// Test-only delay injected into the blocking query and Parquet export
-/// tasks so timeout and cancellation tests can reliably win the
-/// `select!`/cancel race. Zero means
-/// no delay. Compiled for unit tests and, via the `test-support` feature,
-/// for this crate's own integration tests — no production consumer enables
-/// that feature, so release builds never carry it.
 #[cfg(any(test, feature = "test-support"))]
 pub static TEST_QUERY_DELAY_MS: AtomicU64 = AtomicU64::new(0);
 
-/// Hands each [`ExecutorPool`] its `instance` id.
 static NEXT_POOL_INSTANCE: AtomicU64 = AtomicU64::new(0);
 
-/// The longest an autocomplete sample waits to GET a permit and the
-/// publication guard, together (ADR-0024).
-///
-/// Its own overall deadline still caps the whole call: this is the
-/// smaller of the two, so a slow acquisition fails the sample instead of
-/// eating a query-length budget before it reads anything.
 const SAMPLE_ACQUIRE_BUDGET: Duration = Duration::from_secs(1);
 
-/// Which door a unit of pool work came through.
-///
-/// Presentation and authorization metadata only: every kind takes the same
-/// permit, the same executor and the same cleanup. `Sample` is the helper
-/// lane — it holds capacity like any query, so it is in the registry and in
-/// the retained count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkKind {
-    /// `POST /api/v1/query`.
     Query,
-    /// A `| from saved` query, reading a recorded run's parquet.
     FromSaved,
-    /// `POST /api/v1/export`, any format.
     Export,
-    /// A scheduled report run.
     Scheduled,
-    /// Autocomplete's distinct-value sample.
     Sample,
-    /// `POST /api/v1/results`: a query whose result is written once as a
-    /// capture (ADR-0057).
     Capture,
 }
 
 impl WorkKind {
-    /// The stable wire/log spelling.
     #[must_use]
     pub fn as_str(self) -> &'static str {
         match self {
@@ -129,49 +66,23 @@ impl WorkKind {
     }
 }
 
-/// Whose authority a unit of work runs under.
-///
-/// The fleet keystore id, never a name: names are mutable and non-unique,
-/// and this is the anchor non-admin cancellation is authorized against.
-/// It stays inside the server — no route puts an owner id on the wire.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkOwner {
-    /// The key that submitted the request.
     Key(i64),
-    /// The server itself: scheduled runs. No human owner,
-    /// admin-cancellable.
     System,
 }
 
-/// The lifecycle identity of one unit of pool work.
-///
-/// Clone rather than Copy: it carries the submitter's display name, which
-/// the retained listing shows a reader entitled to see it. A lane that
-/// needs the kind past the point it hands this over keeps a copy of
-/// [`WorkKind`], which is Copy.
 #[derive(Debug, Clone)]
 pub struct WorkContext {
     pub kind: WorkKind,
     pub owner: WorkOwner,
-    /// The submitting key's display name. Display metadata only — never
-    /// the anchor for an authorization decision, which is
-    /// [`WorkOwner::Key`]'s id, because names are mutable and non-unique.
     user: Option<Arc<str>>,
-    /// The query's timing account (ADR-0046), for the DSL lanes whose
-    /// caller keeps one. The pool books its waits, the startup and the
-    /// worker's phases on its clock, and settles who writes the account
-    /// when the request stops waiting before the work stops running.
     timing: Option<QueryTiming>,
-    /// What the caller charged for this work and must stay charged until
-    /// the work stops ([`Self::holding`]). Opaque to the pool, which only
-    /// drops it.
     holds: Option<Arc<dyn Any + Send + Sync>>,
-    /// Count the final result into a histogram ([`Self::with_histogram`]).
     histogram: Option<HistogramAsk>,
 }
 
 impl WorkContext {
-    /// Work submitted by an authenticated key, which retains that key's id.
     #[must_use]
     pub fn key(kind: WorkKind, key_id: i64) -> Self {
         Self {
@@ -184,7 +95,6 @@ impl WorkContext {
         }
     }
 
-    /// Work the server started for itself.
     #[must_use]
     pub fn system(kind: WorkKind) -> Self {
         Self {
@@ -197,25 +107,20 @@ impl WorkContext {
         }
     }
 
-    /// Record the submitter's display name for the retained listing.
     #[must_use]
     pub fn with_user(mut self, name: &str) -> Self {
         self.user = Some(Arc::from(name));
         self
     }
 
-    /// Time this work on `timing`'s account (ADR-0046).
     #[must_use]
     pub fn with_timing(mut self, timing: QueryTiming) -> Self {
         self.timing = Some(timing);
         self
     }
 
-    /// Count the final result by `_time` ([`crate::histogram::count`]) in
-    /// the worker, under the post phase and the work's cancel latch, and
-    /// answer it on [`ExecuteOutcome::histogram`]. Only
-    /// [`ExecutorPool::execute`] and [`ExecutorPool::execute_capped`] read
-    /// it.
+    /// Only [`ExecutorPool::execute`] and [`ExecutorPool::execute_capped`] read
+    /// the ask.
     #[must_use]
     pub fn with_histogram(mut self, ask: HistogramAsk) -> Self {
         self.histogram = Some(ask);
@@ -223,16 +128,8 @@ impl WorkContext {
     }
 
     /// Keep `holds` until this work stops, not until its request does.
-    ///
-    /// The slot that takes the permit takes `holds` with it and drops it
-    /// after the permit, however the work ends (ADR-0024): a capture's
-    /// admission slot and quota reservation stay charged for exactly as
-    /// long as its executor permit (ADR-0057). Work refused before it took
-    /// a permit drops `holds` with this context.
-    ///
-    /// One value per unit of work: a second call replaces, and so drops,
-    /// the first. A clone of this context shares the value, so a caller
-    /// that keeps a clone keeps the charge.
+    /// A clone of this context shares the value, so a caller that keeps a clone
+    /// keeps the charge.
     #[must_use]
     pub fn holding(mut self, holds: Arc<dyn Any + Send + Sync>) -> Self {
         self.holds = Some(holds);
@@ -240,37 +137,19 @@ impl WorkContext {
     }
 }
 
-/// How many scheduled runs may be in flight on a pool of `permits`
-/// executor permits: half of them, at least 1 (ADR-0018, amended
-/// 2026-11-09). On a pool of 4, two scheduled runs leave two permits to
-/// interactive work.
 pub(crate) fn scheduled_cap(permits: usize) -> usize {
     (permits / 2).max(1)
 }
 
-/// How many manual runs may be in flight on a pool of `permits` executor
-/// permits: a quarter of them, at least 1 (ADR-0018, amended
-/// 2026-11-11). Separate from [`scheduled_cap`], so a busy scheduler never
-/// refuses Run now and Run now never defers a schedule.
 pub(crate) fn manual_cap(permits: usize) -> usize {
     (permits / 4).max(1)
 }
 
-/// A manual run refused by its gate ([`ExecutorPool::try_lease_manual`]):
-/// the caller's key already holds a manual run, or the installation-wide
-/// cap is full. Nothing was taken.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ManualBusy {
-    /// Advisory whole seconds until the refusing holder's estimated end,
-    /// at least 1.
     pub retry_after_secs: u64,
 }
 
-/// The gate on manual runs in flight: one per key, [`manual_cap`] in all.
-///
-/// The map is the whole state. It holds one entry per active manual
-/// lease, keyed by the caller's key id, with that run's estimated end, and
-/// metadata only: never a reference back to a lease.
 #[derive(Debug)]
 struct ManualGate {
     limit: usize,
@@ -278,11 +157,6 @@ struct ManualGate {
 }
 
 impl ManualGate {
-    /// Take a place for `key_id`, estimated to end `estimate` after `now`,
-    /// or refuse, deciding under one short lock with no await: a key that
-    /// already holds a place is refused with its own estimate, a full gate
-    /// with its earliest holder's. Both limits are taken together or not
-    /// at all.
     fn try_take(
         self: &Arc<Self>,
         key_id: i64,
@@ -304,7 +178,6 @@ impl ManualGate {
                 ),
             });
         }
-        // An absurd estimate saturates instead of overflowing the clock.
         let end = now
             .checked_add(estimate)
             .unwrap_or_else(|| now + Duration::from_secs(u64::from(u32::MAX)));
@@ -316,9 +189,6 @@ impl ManualGate {
     }
 }
 
-/// One manual run's place in [`ManualGate`], shared by every clone of its
-/// [`RunLease`]. Its drop, when the last clone goes, removes the key's
-/// entry, so the gate holds only active leases.
 struct ManualSlot {
     gate: Arc<ManualGate>,
     key_id: i64,
@@ -330,21 +200,9 @@ impl Drop for ManualSlot {
     }
 }
 
-/// One run's place in a cap on runs in flight: a scheduled run's
-/// ([`ExecutorPool::try_lease_scheduled`]) or a manual run's
-/// ([`ExecutorPool::try_lease_manual`]).
-///
-/// Clones share one charge, which returns its place when the last clone
-/// drops. A run's place lasts until its physical work ends, not until its
-/// request does: the run, its preparation job and its executor work each
-/// keep a clone, so a run that timed out keeps its place while its work
-/// still runs.
 #[derive(Clone)]
 pub struct RunLease {
-    /// The place itself, returned when the last clone of it drops.
     charge: Arc<dyn Any + Send + Sync>,
-    /// The seams of the pool that granted this lease, for work that has no
-    /// slot to carry them (see [`seam`]).
     #[cfg(any(test, feature = "test-support"))]
     seams: Arc<seam::Table>,
 }
@@ -356,17 +214,11 @@ impl std::fmt::Debug for RunLease {
 }
 
 impl RunLease {
-    /// This lease as a charge that work keeps until it stops
-    /// ([`WorkContext::holding`]): the same shared place, never a second
-    /// one.
     #[must_use]
     pub fn into_hold(self) -> Arc<dyn Any + Send + Sync> {
         self.charge
     }
 
-    /// A lease that holds no place in any cap, with seams of its own, for
-    /// store-level tests that claim a run with no pool. Never a stand-in
-    /// for a real lease in production code.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn unattached() -> Self {
@@ -376,51 +228,27 @@ impl RunLease {
         }
     }
 
-    /// The worker's side of the granting pool's seams, for run work that
-    /// has no slot to carry them: a claim's window resolution
-    /// ([`seam::Seam::Resolving`]).
     #[cfg(any(test, feature = "test-support"))]
     pub fn reach(&self, seam: seam::Seam) {
         self.seams.reach(seam);
     }
 }
 
-/// One registered query's cancellation state.
-///
-/// The slot exists from registration — before the blocking task runs, let
-/// alone binds — so a cancellation arriving before the handle does is
-/// latched rather than lost, and the worker refuses to start on it. A
-/// tracked request's slot takes the flag of its [`PendingEntry`], so a
-/// cancellation that arrived while the work waited is latched here too.
 struct InterruptSlot {
-    /// `DuckDB`'s interrupt handle, once the worker published it.
     handle: Option<Arc<duckdb::InterruptHandle>>,
-    /// Cancellation was requested. Never cleared: a repeat cancellation is
-    /// accepted while the work exists, and an acknowledgement means
-    /// requested, not stopped.
-    ///
-    /// Once the slot exists, written only inside the registry lock, so the
-    /// decisions that read it here — publish the handle, start the work —
-    /// stay serialized against invocation. It is an atomic because the
-    /// executor reads the same flag from its blocking thread at the
-    /// bind-to-execute boundary ([`WorkSlot::cancel_latch`]), where taking
-    /// the registry lock would put a `DuckDB` bind inside it.
+    /// Once the slot exists, written only inside the registry lock. It is an
+    /// atomic because the executor reads the same flag from its blocking thread
+    /// at the bind-to-execute boundary ([`WorkSlot::cancel_latch`]), where
+    /// taking the registry lock would put a `DuckDB` bind inside it.
     cancelled: Arc<AtomicBool>,
 }
 
-/// The accounting half of a registered unit of work.
 struct RetainedEntry {
     id: u64,
     kind: WorkKind,
     owner: WorkOwner,
-    /// The submitting key's display name, for the retained listing.
     user: Option<Arc<str>>,
-    /// The DSL, for the operator-facing retained listing. Filtered by
-    /// owner and permission at the route, never by presence here; helper
-    /// lanes carry no DSL at all.
     display: Option<String>,
-    /// The worker passed its work-start transition. A held permit alone
-    /// does not prove this.
     started_work: bool,
     registered_at: Instant,
     /// When the request recorded its outcome and left the work running.
@@ -428,40 +256,14 @@ struct RetainedEntry {
     retained_since: Option<Instant>,
 }
 
-/// A tracked request's cancellation state while its work waits to start
-/// (ADR-0024, Amendment 2026-11-09).
-///
-/// It lives from [`ExecutorPool::pend`] until [`ExecutorPool::begin_slot`]
-/// promotes it into an [`InterruptSlot`], or until the request's
-/// [`Pending`] guard drops. It never holds an interrupt handle: nothing
-/// has an executor yet.
 struct PendingEntry {
-    /// The cancel flag. Promotion moves this same `Arc` into the
-    /// [`InterruptSlot`], so a cancel latched while the work waited is the
-    /// one the worker reads at its work-start transition.
     cancelled: Arc<AtomicBool>,
-    /// Wakes every wait the request is in. A `watch` rather than a
-    /// `Notify`: its value is state, so a wait that starts after the cancel
-    /// still sees it, and every waiter reads it.
     wake: tokio::sync::watch::Sender<bool>,
 }
 
-/// Everything the pool must decide atomically about work in flight.
-///
-/// One mutex, not four: the proof that a stale interrupt cannot hit a
-/// reused connection is that invocation and deregistration-plus-re-idle
-/// are the same critical section, and the proof that a cancel latched on
-/// waiting work reaches its worker is that promotion from `pending` to
-/// `interrupts` is one too. Split the maps and either ordering becomes a
-/// hope. Critical sections here are map operations only — no awaits, no
+/// Critical sections here are map operations only — no awaits, no
 /// query execution.
-///
-/// An id is in at most one of `pending` and `interrupts`. A tracked id
-/// stays in one of them from [`ExecutorPool::pend`] until its work's slot
-/// is released, or until its guard drops when the work never got a slot.
 struct Registry {
-    /// Tracked requests whose work waits to start: for a preparation slot,
-    /// a permit or the publication guard.
     pending: HashMap<u64, PendingEntry>,
     interrupts: HashMap<u64, InterruptSlot>,
     retained: HashMap<u64, RetainedEntry>,
@@ -469,20 +271,6 @@ struct Registry {
 }
 
 impl Registry {
-    /// Latch cancellation for one unit of work and interrupt it if it has
-    /// published a handle. For a tracked request whose work still waits to
-    /// start, latch its flag and wake every wait it is in.
-    ///
-    /// The slot is deliberately kept: cancellation is a request, not a
-    /// stop, so a repeat cancellation must keep succeeding while the work
-    /// exists, and the worker still has to read the latch at its
-    /// work-start transition. Only [`WorkSlot::drop`] removes a slot, in
-    /// this same critical section — which is why an interrupt can never
-    /// reach the next query to take that executor.
-    ///
-    /// A pending entry is kept for the same reasons, and the flag it
-    /// latches is the one promotion hands the worker. It has no handle, so
-    /// nothing is interrupted.
     fn request_cancel(&mut self, id: u64) -> bool {
         if let Some(slot) = self.interrupts.get_mut(&id) {
             slot.cancelled.store(true, Ordering::SeqCst);
@@ -508,13 +296,9 @@ impl Registry {
     }
 }
 
-/// Why work was refused before it started: by a wait that gave up, or by
-/// the worker at its work-start transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StartRefusal {
-    /// The budget was gone before any work began.
     Expired,
-    /// Cancellation was latched before any work began.
     Cancelled,
 }
 
@@ -527,19 +311,13 @@ impl StartRefusal {
     }
 }
 
-/// What wakes a tracked request's waits when a cancel by id reaches it.
-///
-/// A `watch` receiver reads the current value before it waits, so a cancel
-/// sent before a wait starts ends that wait at once. A channel closed while
-/// its value is still false is not a cancel: promotion or the request's
-/// guard closed it, and the wait goes on under its deadline. The default is
-/// an untracked request's wake, which never fires.
+/// A channel closed while its value is still false is not a cancel:
+/// promotion or the request's guard closed it, and the wait goes on under
+/// its deadline.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Wake(Option<tokio::sync::watch::Receiver<bool>>);
 
 impl Wake {
-    /// Resolve once a cancel reached the request. Never for an untracked
-    /// request, or for one whose channel closed with no cancel on it.
     pub(crate) async fn cancelled(&self) {
         if let Some(receiver) = &self.0 {
             let mut receiver = receiver.clone();
@@ -550,18 +328,9 @@ impl Wake {
         std::future::pending::<()>().await;
     }
 
-    /// Await `wait` within what is left of `deadline`, unless a cancel
-    /// reaches the request first.
-    ///
     /// The cancel is polled first, so a cancel already latched beats a
     /// `wait` that is ready on the same poll: a request that was told
     /// "cancelled" never takes what it waited for.
-    ///
-    /// # Errors
-    ///
-    /// [`StartRefusal::Cancelled`] when a cancel reached the request, and
-    /// [`StartRefusal::Expired`] when the deadline passed first. Either way
-    /// `wait` is dropped unfinished, so it holds nothing.
     pub(crate) async fn run<F: std::future::Future>(
         &self,
         deadline: Deadline,
@@ -577,38 +346,20 @@ impl Wake {
     }
 }
 
-/// A tracked request's place in the registry while its work waits to start
-/// (ADR-0024, Amendment 2026-11-09).
-///
-/// A route takes one with [`ExecutorPool::pend`] right before it opens the
-/// request's tracker entry, and keeps it until the request ends. So a
-/// cancel by id reaches the request from the moment `/queries` can list it:
-/// its waits race [`Pending::wake`], and a preparation job it runs stops on
-/// [`Pending::stop`].
-///
-/// Dropping it removes its pending entry, if the entry is still there.
-/// After [`ExecutorPool::begin_slot`] promoted the entry, the guard owns
-/// nothing in the registry: the registered slot outlives it and stays
-/// cancellable until the work's own cleanup.
 pub(crate) struct Pending {
     registry: Arc<Mutex<Registry>>,
     id: u64,
-    /// The request's door, for the refusal a cancel ends it with.
     kind: WorkKind,
     cancelled: Arc<AtomicBool>,
     wake: Wake,
-    /// One refusal, told once, however many of the request's waits refuse.
     refusal: RefusalOnce,
 }
 
 impl Pending {
-    /// What wakes this request's waits when a cancel reaches it.
     pub(crate) fn wake(&self) -> &Wake {
         &self.wake
     }
 
-    /// A stop over this request's cancel flag, for a job that runs while
-    /// the request waits: a cancel by id ends the job at its next check.
     pub(crate) fn stop(&self) -> Stop {
         Stop::from_flag(Arc::clone(&self.cancelled))
     }
@@ -620,8 +371,6 @@ impl Pending {
         self.cancelled.load(Ordering::SeqCst)
     }
 
-    /// The answer for a request a cancel ended before its work started: the
-    /// capacity refusal, logged once with reason `cancelled`.
     pub(crate) fn refuse(&self) -> ServerError {
         self.refusal
             .refuse(self.id, self.kind, StartRefusal::Cancelled)
@@ -643,33 +392,17 @@ impl Drop for Pending {
     }
 }
 
-/// A unit of retained physical work, as an operator sees it.
-///
-/// `owner`, `user` and `display` stay crate-internal: which reader may
-/// see the submitter or the DSL is the retained-listing route's decision
-/// ([`crate::handlers::retained_snapshot`]), and an owner id never
-/// reaches the wire at all. Cancellation authorization does not read this
-/// type; it reads the registry directly, through
-/// [`ExecutorPool::owner_of`].
 #[derive(Debug, Clone)]
 pub struct RetainedWork {
     pub id: u64,
     pub kind: WorkKind,
-    /// Whether the work passed its work-start transition.
     pub started: bool,
-    /// How long the work has outlived its request.
     pub retained: Duration,
     pub(crate) owner: WorkOwner,
     pub(crate) user: Option<Arc<str>>,
     pub(crate) display: Option<String>,
 }
 
-/// Every resource one unit of physical work holds, released together.
-///
-/// Constructed before dispatch and moved into the blocking closure, so the
-/// request future cannot own the last reference: a timeout, a dropped
-/// caller, a refusal at startup, a panic and a clean finish all reach the
-/// same `Drop`.
 struct WorkSlot {
     registry: Arc<Mutex<Registry>>,
     id: u64,
@@ -678,41 +411,23 @@ struct WorkSlot {
     /// lock. It outlives the registry entry, so a request that finds the
     /// entry already gone still classifies its own outcome correctly.
     started: Arc<AtomicBool>,
-    /// The registry's cancellation flag for this work, shared so the
-    /// executor can read it without the registry lock
-    /// ([`WorkSlot::cancel_latch`]).
     cancelled: Arc<AtomicBool>,
     executor: Option<Executor>,
     /// `None` for a lane over a recorded run, whose files never change.
-    /// Otherwise taken before the slot exists and released only by its
-    /// `Drop`, so source selection, the input-column probe and the
-    /// statement the probe shapes all read one published file set
-    /// (ADR-0062): a compaction rename cannot land between the probe and
-    /// the execute.
     publication: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     permit: Option<OwnedSemaphorePermit>,
-    /// The query's timing account, when its lane keeps one.
     timing: Option<QueryTiming>,
-    /// How the physical work ended, written by the worker in
-    /// [`WorkSlot::finish`] before this slot drops, for the reclaim event.
     physical: PhysicalOutcome,
-    /// The caller's charges for this work ([`WorkContext::holding`]),
-    /// dropped last.
     holds: Option<Arc<dyn Any + Send + Sync>>,
 }
 
-/// The clock a slot without a timing account books on: records nothing.
 static CLOCK_OFF: PhaseClock = PhaseClock::off();
 
 impl WorkSlot {
-    /// The clock this work books its phases on.
     fn clock(&self) -> &PhaseClock {
         self.timing.as_ref().map_or(&CLOCK_OFF, QueryTiming::clock)
     }
 
-    /// The worker passed its work-start transition: `startup` ends, and
-    /// the account says the work started.
-    ///
     /// Outside [`Self::begin_work`] because that runs under the registry
     /// lock, and the account's lock is never taken inside it.
     fn started_timing(&self) {
@@ -722,15 +437,9 @@ impl WorkSlot {
         }
     }
 
-    /// The worker's last word, before this slot drops: record how the
-    /// physical work ended and close the clock, so its final totals are
-    /// on the shared clock before [`Drop`] takes the registry lock. The
-    /// clock is the one accumulator (ADR-0046): the handler's complete
-    /// account and the reclaim both read it, and no copy of it travels.
-    ///
-    /// Work that never started discards its `startup`: nothing ran, so
-    /// the refusal reports no worker phase. The request may have
-    /// discarded it already, which is a no-op here.
+    /// The worker's last word, before this slot drops: close the clock, so
+    /// its final totals are on the shared clock before [`Drop`] takes the
+    /// registry lock.
     fn finish<T>(&mut self, result: &Result<T, ServerError>) {
         let started = self.started.load(Ordering::SeqCst);
         self.physical = if started {
@@ -750,20 +459,12 @@ impl WorkSlot {
         let _ = clock.close_at(Instant::now());
     }
 
-    /// The executor this work runs on. It never leaves the slot, so no
-    /// panic anywhere in the worker can lose it from the pool.
     fn executor(&self) -> &Executor {
         self.executor
             .as_ref()
             .expect("the executor leaves the slot only in Drop")
     }
 
-    /// Hand `DuckDB`'s interrupt handle to the registry.
-    ///
-    /// Returns false when cancellation was already latched — the caller
-    /// asked for this work to stop before it could be interrupted, so the
-    /// worker must not start it. Publishing under the same lock the
-    /// latch is written in is what makes that answer final.
     fn publish_interrupt(&self, handle: Arc<duckdb::InterruptHandle>) -> bool {
         let mut registry = self.registry.lock();
         match registry.interrupts.get_mut(&self.id) {
@@ -775,33 +476,12 @@ impl WorkSlot {
         }
     }
 
-    /// The flag the executor reads at its bind-to-execute boundary.
-    ///
-    /// `DuckDB`'s interrupt is the first half of stopping work and cannot
-    /// be the whole of it: an interrupt raised while a statement is
-    /// binding may be swallowed, and binding is where an expensive query
-    /// spends its time (ADR-0024). Handing the same flag
-    /// [`Registry::request_cancel`] sets to the engine gives that
-    /// cancellation a second, reliable place to land — after the bind,
-    /// before execution — without a lock on the blocking thread's path.
+    /// An interrupt raised while a statement is binding may be swallowed, and
+    /// binding is where an expensive query spends its time (ADR-0024).
     fn cancel_latch(&self) -> CancelLatch {
         CancelLatch::new(Arc::clone(&self.cancelled))
     }
 
-    /// The work-start transition: the moment a permit becomes physical
-    /// work (ADR-0024).
-    ///
-    /// Runs inside the blocking closure before source discovery or any
-    /// other physical work, and decides 503-vs-504 for the whole request:
-    /// a refusal here means nothing ran, so the answer is a capacity
-    /// refusal; past it an expiry is the ordinary query timeout. Both
-    /// halves are read and the flag is written in one critical section,
-    /// so the classification never depends on which side of a `select!`
-    /// was polled first.
-    ///
-    /// Every lane has a budget, the sampling helper included, so there is
-    /// no escape hatch here for work that could start after its caller
-    /// stopped waiting.
     fn begin_work(&self, deadline: Deadline) -> Result<(), StartRefusal> {
         let mut registry = self.registry.lock();
         if registry
@@ -827,10 +507,7 @@ impl Drop for WorkSlot {
         // (a) Stop being interruptible, return the executor, and stop
         // being retained — one critical section, because an interrupt
         // that fired here would land on the next query to take this
-        // executor. Whether the work was retained, and whether it had
-        // started, are read in the same section the request's
-        // `mark_request_finished` stamps the retention in: that lock is
-        // what decides which side writes the final timing account.
+        // executor.
         let retained = {
             let mut registry = self.registry.lock();
             registry.interrupts.remove(&self.id);
@@ -849,12 +526,6 @@ impl Drop for WorkSlot {
         // observe capacity it cannot use.
         drop(self.publication.take());
         drop(self.permit.take());
-        // (d) Content-free: which work, what kind, how long it outlived
-        // its request, how it ended. Only work that was actually retained
-        // logs — the pair with `query_permit_retained`. The request wrote
-        // a partial account when it stopped waiting on started work, so
-        // this event carries the final totals the worker closed its clock
-        // with; work that never started carries no phases.
         if let Some((retained_for, started)) = retained {
             let totals = if started {
                 self.timing
@@ -876,39 +547,21 @@ impl Drop for WorkSlot {
                 totals: totals.as_ref(),
             });
         }
-        // (e) Last, the caller's charges: a capture's admission slot and
-        // quota reservation (ADR-0057). They stop being charged when the
-        // permit does and never before, so a capture that waits on its
-        // key's slot cannot start while this work still holds an executor.
-        // Dropping them runs the caller's code, which therefore finds
-        // everything this slot held already released.
+        // Last, the caller's charges (ADR-0057). They stop being charged
+        // when the permit does and never before. Dropping them runs the
+        // caller's code, which finds everything this slot held released.
         drop(self.holds.take());
     }
 }
 
-/// What the request learned, under the registry lock, when it stopped
-/// waiting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct RequestEnd {
     /// This call stamped the work retained: its slot was still
     /// registered, so its cleanup has yet to run.
     retained: bool,
-    /// The work passed its work-start transition.
     started: bool,
 }
 
-/// The request side of one unit of work, which may stop waiting before
-/// the work stops running.
-///
-/// Armed for as long as the request future is the one waiting. Dropping it
-/// while armed is a caller that walked away: the work is asked to stop and
-/// its permit is booked as retained, exactly as a timeout does, because
-/// nothing else will run on that path — the request future is already
-/// gone.
-///
-/// While armed it also owns the query's timing account (ADR-0046): a
-/// request that stops waiting is the one side that can write the account
-/// at once. Disarming hands it back to the handler, which has the result.
 struct RequestGuard<'a> {
     pool: &'a ExecutorPool,
     id: u64,
@@ -939,8 +592,6 @@ impl<'a> RequestGuard<'a> {
         }
     }
 
-    /// The work finished first: there is nothing to retain, and the
-    /// handler writes the account from the result.
     fn disarm(&mut self) {
         self.armed = false;
         if let Some(timing) = &self.timing {
@@ -948,8 +599,6 @@ impl<'a> RequestGuard<'a> {
         }
     }
 
-    /// Stop waiting on purpose, at the deadline. Returns whether the work
-    /// had started, which is the caller's 503-vs-504 classification.
     fn abandon(&mut self) -> bool {
         self.armed = false;
         self.pool.cancel_by_id(self.id);
@@ -958,18 +607,6 @@ impl<'a> RequestGuard<'a> {
         end.started
     }
 
-    /// Write the timing account for a request that stopped waiting.
-    ///
-    /// The registry lock already decided it ([`RequestEnd`]), and this
-    /// runs after that lock is released:
-    ///
-    /// - Started and retained: the work is still running, so the account
-    ///   is partial — the completed totals and the phase in flight. The
-    ///   slot's cleanup reports the final totals on the reclaim.
-    /// - Started and not retained: the worker finished and its slot is
-    ///   gone, so there is no reclaim coming and the account is complete.
-    /// - Never started: nothing ran. The account is complete, with no
-    ///   worker phase and `startup` discarded.
     fn settle(&self, end: RequestEnd, if_started: Outcome, if_not_started: Outcome) {
         let Some(timing) = &self.timing else {
             return;
@@ -1010,36 +647,19 @@ impl Drop for RequestGuard<'_> {
     }
 }
 
-/// Write the account of work refused before it was dispatched: the
-/// permit or the publication wait ran out the budget (ADR-0046). The
-/// pool names the refusal where it makes it, so nobody reads it back out
-/// of the 503's text.
 fn account_refused(timing: Option<&QueryTiming>) {
     if let Some(timing) = timing {
         timing.emit_complete(Outcome::CapacityRefused, Instant::now());
     }
 }
 
-/// The one answer a request gets for work that never started, told once
-/// (ADR-0024).
-///
-/// A capacity refusal, not a timeout: nothing ran, so 503 rather than 504,
-/// and no timeout history row. The client-facing text is fixed and says
-/// nothing about the query — whether the budget ran out or a cancellation
-/// beat the start is an operator fact, and it goes to the log.
-///
-/// One refused request can reach two of these: the request future gives
-/// up on its budget, which latches cancellation, and the worker it
-/// released then refuses to start on that latch. Both are the same
-/// refusal, so the FIRST one to arrive logs and names the reason —
-/// whichever actually happened first — and the second is silent. Without
-/// this, one refusal wrote two `query_not_started` events with
-/// contradictory reasons, and an operator counting them counted twice.
+/// One refused request can refuse twice: the request future gives up on
+/// its budget, which latches cancellation, and the worker it released
+/// then refuses to start on that latch. It is one refusal, so the first
+/// to arrive logs and names the reason, and the second is silent.
 #[derive(Clone)]
 struct RefusalOnce {
     logged: Arc<AtomicBool>,
-    /// The pool whose capacity was refused, so a reader can tell two
-    /// pools' identically numbered work apart.
     pool: u64,
 }
 
@@ -1051,7 +671,6 @@ impl RefusalOnce {
         }
     }
 
-    /// The error, logged if nothing has logged this work's refusal yet.
     fn refuse(&self, id: u64, kind: WorkKind, refusal: StartRefusal) -> ServerError {
         if !self.logged.swap(true, Ordering::SeqCst) {
             tracing::info!(
@@ -1075,46 +694,26 @@ impl RefusalOnce {
         }
     }
 
-    /// Whether this work was refused. Read by a request whose worker
-    /// answered first: only a refusal of the start sets it.
     fn refused(&self) -> bool {
         self.logged.load(Ordering::SeqCst)
     }
 }
 
 /// Deterministic control over the blocking worker, for tests only.
-///
-/// The lifecycle races this module has to get right — a request expiring
-/// exactly as its work starts, a cancellation arriving before the interrupt
-/// handle exists, a completion landing on the same instant as a timeout —
-/// are all orderings between an async task and a blocking thread. Proving
-/// one with a sleep proves it on one machine on one day. These gates let a
-/// test park the worker at a named point, observe that it arrived, and
-/// release it, so the ordering is stated rather than raced for.
-///
-/// Compiled for this crate's unit tests and, via the `test-support`
-/// feature, its integration tests. No production consumer enables it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod seam {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Condvar, Mutex as StdMutex};
 
-    /// The payload a [`Table::panic_at`] gate panics with. A distinctive
-    /// string, so a test can prove it reached nowhere a client or a log
-    /// field can see.
     pub const INJECTED_PANIC_PAYLOAD: &str = "zz-test-injected-panic-payload";
 
-    /// A point in the blocking worker a test can hold or fail.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     pub enum Seam {
         /// On the request's own task, once a lane subscribed to its
-        /// request's cancel and before it waits for an executor permit:
-        /// the query, export and capture lanes. The permit wait races a
-        /// cancel that is already latched, so a cancel sent after this
-        /// arrival ends the request in the pool's waits, never in its
-        /// preparation. A test may watch this seam and must never hold
-        /// it: a hold parks a runtime thread, not a blocking worker.
+        /// request's cancel and before it waits for an executor permit. A
+        /// test may watch this seam and must never hold it: a hold parks a
+        /// runtime thread, not a blocking worker.
         Queued,
         /// First statement of the worker, before the interrupt handle is
         /// published and before the work-start transition.
@@ -1181,7 +780,6 @@ pub mod seam {
         RunWriting,
     }
 
-    /// A held (or merely watched) worker seam.
     #[derive(Debug)]
     pub struct Gate {
         open: StdMutex<bool>,
@@ -1191,27 +789,21 @@ pub mod seam {
     }
 
     impl Gate {
-        /// How many workers have reached this seam.
         #[must_use]
         pub fn arrivals(&self) -> usize {
             self.arrivals.load(Ordering::SeqCst)
         }
 
-        /// Let every parked worker through, and every later one straight
-        /// past.
         pub fn release(&self) {
             *self.open.lock().expect("seam gate poisoned") = true;
             self.opened.notify_all();
         }
 
-        /// Wait for [`Gate::release`], however long that takes.
-        ///
-        /// A held worker never gives up on a wall clock (#316): a lapse
-        /// would let a starved test's worker leave the seam on its own
-        /// and answer before the test drove the state the hold pins.
-        /// [`Session`]'s drop releases every gate, displaced ones
-        /// included, so a failing test still frees its workers, and the test runner's slow-timeout
-        /// bounds a test that never drives the release.
+        /// A held worker never gives up on a wall clock: a lapse would let a
+        /// starved test's worker leave the seam on its own and answer before
+        /// the test drove the state the hold pins. [`Session`]'s drop
+        /// releases every gate, displaced ones included, so a failing test
+        /// still frees its workers.
         fn pass(&self) {
             self.arrivals.fetch_add(1, Ordering::SeqCst);
             let mut open = self.open.lock().expect("seam gate poisoned");
@@ -1223,14 +815,9 @@ pub mod seam {
         }
     }
 
-    /// The seams of ONE pool.
-    ///
-    /// Per pool, not per process: gates used to live in a global table,
-    /// so a hold installed by one test parked the workers of every other
-    /// pool alive in the same process — a cross-test panic or a 20-second
-    /// stall under the plain `cargo test` harness, which runs tests in
-    /// threads rather than nextest's separate processes. A pool's clones
-    /// share its table, because they are the same pool.
+    /// The seams of ONE pool, not per process: the plain `cargo test`
+    /// harness runs tests in threads rather than nextest's separate
+    /// processes.
     #[derive(Debug, Default)]
     pub struct Table {
         gates: StdMutex<HashMap<Seam, Arc<Gate>>>,
@@ -1257,8 +844,6 @@ pub mod seam {
             gate
         }
 
-        /// Park every worker of this pool that reaches `seam`, until the
-        /// gate is released.
         #[must_use]
         pub fn hold(&self, seam: Seam) -> Arc<Gate> {
             self.install(
@@ -1272,7 +857,6 @@ pub mod seam {
             )
         }
 
-        /// Count arrivals at `seam` without holding anything.
         #[must_use]
         pub fn watch(&self, seam: Seam) -> Arc<Gate> {
             self.install(
@@ -1286,7 +870,6 @@ pub mod seam {
             )
         }
 
-        /// Panic the worker when it reaches `seam`.
         #[must_use]
         pub fn panic_at(&self, seam: Seam) -> Arc<Gate> {
             self.install(
@@ -1300,8 +883,6 @@ pub mod seam {
             )
         }
 
-        /// The worker's side: free unless this pool's test installed
-        /// something.
         pub(crate) fn reach(&self, seam: Seam) {
             let gate = self
                 .gates
@@ -1314,8 +895,6 @@ pub mod seam {
             }
         }
 
-        /// Let every parked worker out, including one parked at a
-        /// displaced gate, and forget every gate.
         pub fn release_all(&self) {
             let gates = std::mem::take(&mut *self.gates.lock().expect("seam table poisoned"));
             let displaced =
@@ -1326,8 +905,6 @@ pub mod seam {
         }
     }
 
-    /// A test's handle on one pool's seams, released on drop.
-    ///
     /// Dropping releases before forgetting, so a test that fails while a
     /// worker is parked still lets that worker out: the runtime's own
     /// drop waits for blocking tasks, and a gate nobody opens would turn
@@ -1336,19 +913,16 @@ pub mod seam {
     pub struct Session(pub(crate) Arc<Table>);
 
     impl Session {
-        /// Park every worker that reaches `seam`.
         #[must_use]
         pub fn hold(&self, seam: Seam) -> Arc<Gate> {
             self.0.hold(seam)
         }
 
-        /// Count arrivals at `seam` without holding anything.
         #[must_use]
         pub fn watch(&self, seam: Seam) -> Arc<Gate> {
             self.0.watch(seam)
         }
 
-        /// Panic the worker when it reaches `seam`.
         #[must_use]
         pub fn panic_at(&self, seam: Seam) -> Arc<Gate> {
             self.0.panic_at(seam)
@@ -1362,7 +936,6 @@ pub mod seam {
     }
 }
 
-/// The worker's seam call, compiled away entirely in a release build.
 macro_rules! worker_seam {
     ($seams:expr, $seam:ident) => {
         #[cfg(any(test, feature = "test-support"))]
@@ -1372,26 +945,18 @@ macro_rules! worker_seam {
     };
 }
 
-/// Debug info captured from the pool's blocking execution path.
-///
 /// Only populated when `capture_debug` is true (i.e. query log is active).
 #[derive(Debug)]
 pub struct PoolDebugInfo {
     /// The computed source argument passed to `read_parquet()`.
     pub computed_source: String,
-    /// Number of glob patterns in the source list.
     pub glob_count: usize,
-    /// Service name extracted from the DSL, if any.
     pub service_filter: Option<String>,
-    /// Time filter duration in seconds, if any.
     pub time_filter_secs: Option<u64>,
     /// Hot buffer status: "disabled", "empty", or "active".
     pub hot_status: &'static str,
-    /// Hot buffer event count at snapshot time.
     pub hot_events: usize,
-    /// Hot buffer batch count at snapshot time.
     pub hot_batches: usize,
-    /// Hot buffer estimated byte size at snapshot time.
     pub hot_bytes: usize,
     /// Generated SQL (parameterized).
     pub sql: String,
@@ -1399,81 +964,52 @@ pub struct PoolDebugInfo {
     pub params: Vec<String>,
 }
 
-/// Exclusive hold over the whole executor pool (see
-/// [`ExecutorPool::exclusive`]). Dropping it releases every permit at once.
 #[derive(Debug)]
 pub struct PoolExclusive {
     _permits: tokio::sync::OwnedSemaphorePermit,
 }
 
-/// Query result paired with optional debug info.
 #[derive(Debug)]
 pub struct ExecuteOutcome {
-    /// The query result (success or error).
     pub result: Result<QueryResult, ServerError>,
-    /// Debug info, populated only when `capture_debug` was true.
     pub debug: Option<PoolDebugInfo>,
     /// Result columns carrying the `SEVERITY` pin at the end of the
-    /// pipeline, which the human-facing renderers display as `OTel` tokens
-    /// (ADR-0013 ruling 9). [`severity_columns_for`] computes it inside the
-    /// permit-holding blocking task, under the catalog snapshot the run
-    /// executed with, so a repin landing between execution and the response
-    /// can neither token-render `BIGINT` rows nor strip tokens from rows a
-    /// `SEVERITY` pin produced. Empty for a failed, timed-out or
-    /// never-started run: there are no rows to present.
+    /// pipeline (ADR-0013 ruling 9). Empty for a failed, timed-out or
+    /// never-started run.
     pub severity_columns: Vec<String>,
-    /// The final result counted by `_time`, when the work asked
-    /// ([`WorkContext::with_histogram`]). Computed beside
-    /// `severity_columns`, inside the permit-holding blocking task under
-    /// the post phase, before the page is cut. `None` for work that did not
-    /// ask, and for a failed, timed-out or never-started run.
+    /// The final result counted by `_time` before the page is cut, when the
+    /// work asked ([`WorkContext::with_histogram`]).
     pub histogram: Option<EventHistogram>,
 }
 
 /// What a capture reads its stored events from (ADR-0057).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CaptureSource {
-    /// A live window `[start, end)`. The worker selects what `/query`
-    /// selects for the same text (`source::select`), under the publication
-    /// guard, measures the files in it that can hold the window
-    /// (`source::selection_bytes`), and refuses a measure above
-    /// `max_bytes` with [`ServerError::CaptureSourceTooLarge`] before the
-    /// engine runs. The read includes the hot buffer, as `/query`'s does.
+    /// A live window `[start, end)`. The read includes the hot buffer, as
+    /// `/query`'s does.
     Window {
-        /// The resolved window's start, the one spliced into the DSL.
         start: DateTime<Utc>,
-        /// The resolved window's exclusive end, the one spliced into the
-        /// DSL.
         end: DateTime<Utc>,
         /// `[capture] source_max_bytes`.
         max_bytes: u64,
     },
     /// `| from saved`: a source already resolved to a recorded run's
-    /// parquet, read as [`ExecutorPool::execute_with_source`] reads one,
-    /// with no hot buffer and no publication guard. It is not measured:
-    /// the string is the engine's source argument, and the files behind it
-    /// are the resolver's to budget.
-    Resolved {
-        /// The engine's source argument.
-        source: String,
-    },
+    /// parquet, with no hot buffer and no publication guard. It is not
+    /// measured.
+    Resolved { source: String },
 }
 
-/// What a capture's `finish` receives (ADR-0057).
-///
 /// `finish` runs on the worker thread before the slot releases anything,
 /// so the file it writes is written under the permit, on the slot's own
-/// executor, inside the publication guard a window holds, and within the
-/// work's lifetime as cancellation and the retained listing see it.
+/// executor, inside the publication guard a window holds.
 #[derive(Debug)]
 pub struct CaptureInput<'a> {
     /// Every row the executed pipeline produced under the lane's
     /// [`RowCap`], uncut: `finish` makes the capture's own cut and counts
     /// the total from it.
     pub result: QueryResult,
-    /// The slot's executor, for [`Executor::write_capture_parquet`]. Its
-    /// interrupt handle is registered, so a cancellation breaks a `COPY` in
-    /// flight.
+    /// Its interrupt handle is registered, so a cancellation breaks a `COPY`
+    /// in flight.
     pub executor: &'a Executor,
     /// The query's clock: book the file write under [`QueryPhase::Write`].
     pub clock: &'a PhaseClock,
@@ -1483,38 +1019,24 @@ pub struct CaptureInput<'a> {
     /// The bytes a window's source budget measured; `None` for a resolved
     /// source, which is not measured.
     pub source_bytes: Option<u64>,
-    /// The pool's seams, for [`seam::Seam::Writing`].
     #[cfg(any(test, feature = "test-support"))]
     pub seams: &'a seam::Table,
 }
 
-/// A capture's last step: the worker runs it inside the slot on the
-/// executed result ([`CaptureInput`]), and its answer is the lane's.
 pub type CaptureFinish<T> = Box<dyn FnOnce(CaptureInput<'_>) -> Result<T, ServerError> + Send>;
 
 /// The result columns that carry the `SEVERITY` pin at the end of the
-/// pipeline, which the human-facing renderers display as `OTel` tokens
-/// (ADR-0013 ruling 9).
+/// pipeline (ADR-0013 ruling 9).
 ///
-/// `pins` is the root scope of the walk, and it must be the snapshot the
-/// run executed under, never a fresh read: `repin --to severity` can retype
-/// a field mid-flight, so a later snapshot would token-render rows produced
-/// under a `BIGINT`/`VARCHAR` pin, or strip tokens from rows a `SEVERITY`
-/// pin produced.
-///
-/// Presentation only, so an unparseable query (execution reports the parse
-/// error) and an empty catalog both answer "nothing", never an error.
+/// `pins` must be the snapshot the run executed under, never a fresh read:
+/// `repin --to severity` can retype a field mid-flight.
 ///
 /// Call it on the blocking pool, inside the query's permit, never on a
-/// reactor thread: the parse is a second one (the executor already parsed
-/// and emitted), and its cost is the client's choice of DSL, so it belongs
-/// where `max_concurrent` bounds it and the query timeout covers it. It
-/// builds no pattern: the walk reads capture names off the regex syntax
-/// tree. Only a pipe stage can move a pin off the
-/// name it was pinned under (`sev()` included), and a pipe stage needs a
-/// `|`, so a DSL without one is answered from the root scope directly. A
-/// `|` inside a quoted literal or a regex pays the parse and answers
-/// identically: the shortcut only ever errs toward the walk.
+/// reactor thread: its cost is the client's choice of DSL.
+///
+/// Only a pipe stage can move a pin off the name it was pinned under
+/// (`sev()` included), and a pipe stage needs a `|`, so a DSL without one
+/// is answered from the root scope directly.
 ///
 /// # Errors
 /// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
@@ -1538,11 +1060,6 @@ pub(crate) fn severity_columns_for(
     ))
 }
 
-/// A finished run's answer beside its severity columns
-/// ([`severity_columns_for`]), walked under `pins`, the snapshot the run
-/// executed with, and its histogram when `histogram` asks for one
-/// ([`crate::histogram::count`]). A failed run has no rows to present, and
-/// a walk the latch cancels turns the answer into that cancellation.
 fn present(
     result: Result<QueryResult, ServerError>,
     pins: &trawl_core::schema::FieldTypes,
@@ -1571,62 +1088,34 @@ fn present(
     }
 }
 
-/// Pool that bounds concurrent `DuckDB` query execution.
-///
-/// Executors are pre-created at startup and reused across queries.
-/// Each executor holds a connection to the same in-memory `DuckDB`
-/// database, the query database (ADR-0056), sharing cached metadata and
-/// its budgets.
 #[derive(Clone)]
 pub struct ExecutorPool {
     publication: Arc<crate::publication::PublicationGate>,
-    /// Base directory for parquet data (e.g. `/var/lib/trawl/data`).
     base_dir: Arc<str>,
     /// Full recursive glob for queries without a time filter.
     fallback_glob: Arc<str>,
     semaphore: Arc<Semaphore>,
     max_concurrent: usize,
     max_result_rows: usize,
-    /// Monotonic ID counter for tracking active query handles.
     next_id: Arc<AtomicU64>,
-    /// Which pool instance this is, process-wide.
-    ///
-    /// A daemon builds exactly one pool, so in production this is always
-    /// zero and the field is there to say which pool a lifecycle event
-    /// came from. A test process builds many, each with its own id space
-    /// starting at zero, so the pair (`instance`, `query_id`) is what
-    /// identifies a unit of work when several pools are logging at once.
+    /// A test process builds many pools, each with its own id space starting
+    /// at zero, so the pair (`instance`, `query_id`) is what identifies a
+    /// unit of work when several pools are logging at once.
     instance: u64,
-    /// Pending entries, interrupt slots, retained-work accounting and the
-    /// idle executors, under one lock (see [`Registry`]).
     registry: Arc<Mutex<Registry>>,
-    /// Hot buffer for fresh events not yet compacted to parquet.
     hot_buffer: Option<Arc<HotBuffer>>,
     /// Field catalog whose full pin snapshot types every query's
     /// search-stage comparisons. Defaults to an empty catalog; the server
     /// wires the shared cache via [`Self::with_field_catalog`].
     field_catalog: Arc<crate::catalog::FieldCatalog>,
-    /// This pool's worker seams (see [`seam`]). Per pool, so a test
-    /// holding one pool's workers cannot park another's.
     #[cfg(any(test, feature = "test-support"))]
     seams: Arc<seam::Table>,
-    /// A connection to the query database that no permit hands out: the
-    /// source of [`Self::detached_executor`] and of the engine sample's
-    /// connection.
     clone_source: Arc<Mutex<Executor>>,
-    /// The query preparation allowance (ADR-0063), sized from the host's
-    /// cores and this pool's permits.
     preparation: crate::prepare::Preparation,
-    /// The cap on scheduled runs in flight ([`scheduled_cap`]), one
-    /// permit per scheduled [`RunLease`].
     scheduled: Arc<Semaphore>,
-    /// The gate on manual runs in flight ([`manual_cap`]), one entry per
-    /// manual [`RunLease`].
     manual: Arc<ManualGate>,
-    /// The query scratch directory: the query database spills into it, and
-    /// hot-buffer snapshots and export staging files are made in it
-    /// (ADR-0056). Its lock is not held here but by every connection to
-    /// the query database ([`Executor::open_query_database`]), so it stays
+    /// The scratch directory's lock is not held here but by every connection
+    /// to the query database ([`Executor::open_query_database`]), so it stays
     /// held while any worker's connection is open, the pool gone or not.
     scratch: QueryScratch,
     /// The temp directory a [`Self::for_test`] pool's scratch lives in,
@@ -1661,28 +1150,12 @@ impl std::fmt::Debug for ExecutorPool {
     }
 }
 
-/// What one read's rows come from, and so what the live pins may type.
 #[derive(Clone, Copy)]
 enum ReadInput<'a> {
-    /// The corpus, with the hot buffer when the pool has one. The live
-    /// catalog snapshot types every read.
     Corpus(Option<(&'a Arc<HotBuffer>, &'a QueryScratch)>),
-    /// A recorded run: `from saved`, or a capture of one. It is
-    /// self-contained, so no hot buffer is read, and a live pin types
-    /// only a name the run carries (ADR-0062).
     Recorded,
 }
 
-/// Run a query with panic recovery and optional hot buffer union.
-///
-/// The executor is borrowed from the caller's [`WorkSlot`] and never
-/// moves: the slot owns it through every exit, so no panic on this thread
-/// can shrink the pool.
-///
-/// `snapshotted` runs once the hot snapshot is taken and before the
-/// statement, where the capture lane reaches [`seam::Seam::Snapshotted`].
-///
-/// Called inside `spawn_blocking` — all I/O here is synchronous.
 #[allow(clippy::too_many_arguments)]
 fn run_query_blocking(
     executor: &Executor,
@@ -1701,17 +1174,10 @@ fn run_query_blocking(
         ReadInput::Recorded => None,
     };
     let hot_buffer = hot.map(|(buffer, _)| buffer);
-    // Snapshot hot buffer to a temp ndjson file so fresh events
-    // are visible to this query via UNION ALL BY NAME. Returns a
-    // cached file when the buffer hasn't changed since the last snapshot;
-    // the snapshot also carries the catalog pins (∩ observed keys) the
-    // executor conforms the hot branch with.
     let hot_snapshot = hot_source(hot.map_or(Ok(None), |(hb, scratch)| {
         clock.time(QueryPhase::HotSnapshot, || hb.snapshot(scratch))
     }));
 
-    // Capture debug info if requested (query log is active). Its
-    // re-parse and re-emit are the preview's own emission, booked as such.
     let debug = if capture_debug {
         match clock.time(QueryPhase::Emit, || {
             capture_pool_debug(dsl, source, hot_buffer, pins, cancel)
@@ -1728,8 +1194,6 @@ fn run_query_blocking(
     };
     snapshotted();
 
-    // catch_unwind ensures the executor is always returned to the
-    // pool even if DuckDB panics (e.g. corrupt parquet file).
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         if let Some(ref hot) = hot_snapshot {
             // `hot_source` refused a path that is not UTF-8.
@@ -1756,7 +1220,6 @@ fn run_query_blocking(
             .map_err(ServerError::from)
         }
     }));
-    // hot_snapshot drops here → temp file auto-deleted
     let result = match result {
         Ok(r) => r,
         // The payload is dropped unread: it can quote anything DuckDB or
@@ -1767,13 +1230,8 @@ fn run_query_blocking(
     (result, debug)
 }
 
-/// The hot source of one read, from the hot buffer's snapshot: `None` when
-/// there is no buffer or it holds no event.
-///
-/// A snapshot that could not be built, or whose path `DuckDB`'s file reader
-/// cannot take because it is not UTF-8, refuses the read with
-/// [`ServerError::HotSnapshot`] (ADR-0041). Parquet alone would answer
-/// without the newest events, in steady state as after a restart.
+/// A snapshot whose path `DuckDB`'s file reader cannot take because it is
+/// not UTF-8 refuses the read with [`ServerError::HotSnapshot`] (ADR-0041).
 fn hot_source(
     snapshot: std::io::Result<Option<HotSnapshot>>,
 ) -> Result<Option<HotSnapshot>, ServerError> {
@@ -1789,10 +1247,6 @@ fn hot_source(
     }
 }
 
-/// Capture debug info about source selection, hot buffer state, and SQL generation.
-///
-/// This is cheap (re-parse + emit is <1ms) and only runs when the query log is active.
-///
 /// # Errors
 /// [`EngineError::Cancelled`] once `cancel` is latched during the parse.
 fn capture_pool_debug(
@@ -1809,8 +1263,7 @@ fn capture_pool_debug(
     } else {
         1
     };
-    // Re-parse AST to extract filters and emit SQL. Emission runs no
-    // pattern, so the parse builds none.
+    // Emission runs no pattern, so the parse builds none.
     let (service_filter, time_filter_secs, sql, params) =
         if let Ok(ast) = trawl_core::parser::parse_unbuilt_cancellable(dsl, &cancel.stop())? {
             let service = ast.search.groups.first().and_then(|g| {
@@ -1834,13 +1287,7 @@ fn capture_pool_debug(
                 .map(|tf| tf.node.duration.to_seconds());
             // Pin-aware, so the debug-log SQL preview types comparisons the
             // way the executed query does. It is a preview, not a transcript:
-            // it renders the planner's source, and the executor may narrow a
-            // list source's elements (dropping ones no file backs) before it
-            // reads, so the logged source can be wider than the one that ran.
-            // Its `now()` anchor is its own for the same reason: a preview is
-            // not the run, and there is no run's anchor to inherit here. And
-            // it probes no source, so every name binds as written
-            // (`InputColumns::unprobed`).
+            // the logged source can be wider than the one that ran.
             let (sql, params) = match trawl_core::emitter::emit_with_pins(
                 &ast,
                 source,
@@ -1886,27 +1333,14 @@ fn capture_pool_debug(
 }
 
 impl ExecutorPool {
-    /// Publication interlock shared with compaction and rollup.
     #[must_use]
     pub fn publication(&self) -> Arc<crate::publication::PublicationGate> {
         Arc::clone(&self.publication)
     }
 
-    /// Create a pool with the given concurrency limit and base data directory.
-    ///
-    /// Opens the query database in the locked `scratch` directory under
-    /// `budgets` ([`Executor::open_query_database`]), then pre-creates
-    /// `max_concurrent` executors cloned from it, so every query shares one
-    /// spill cap, one memory limit and one thread count (ADR-0056). Every
-    /// connection to that database holds `scratch`, so the directory stays
-    /// locked for as long as any of them is open.
-    ///
     /// # Errors
-    /// The database or its spill directory could not be set up, as when the
-    /// spill directory is not private, or a budget was refused or read back
-    /// differently ([`Executor::open_query_database`]). Fatal at startup:
-    /// the server cannot function without `DuckDB`, and the start fails
-    /// with this error.
+    /// The database or its spill directory could not be set up
+    /// ([`Executor::open_query_database`]). Fatal at startup.
     pub fn new(
         base_dir: String,
         max_concurrent: usize,
@@ -1969,11 +1403,6 @@ impl ExecutorPool {
         })
     }
 
-    /// A pool for tests: [`Self::new`] over a fresh scratch directory in a
-    /// temp directory the pool owns, under the default budgets.
-    ///
-    /// # Errors
-    /// As [`Self::new`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
         base_dir: String,
@@ -1994,10 +1423,6 @@ impl ExecutorPool {
         )
     }
 
-    /// [`Self::for_test`] under `budgets`.
-    ///
-    /// # Errors
-    /// As [`Self::new`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test_with_budgets(
         base_dir: String,
@@ -2027,17 +1452,11 @@ impl ExecutorPool {
         Ok(pool)
     }
 
-    /// The query scratch directory this pool's database spills into.
     #[must_use]
     pub fn scratch(&self) -> &QueryScratch {
         &self.scratch
     }
 
-    /// The connection the engine sample runs on (ADR-0056): cloned from the
-    /// query database, outside every permit, and never in the registry.
-    ///
-    /// # Errors
-    /// The clone failed ([`Executor::diagnostic_connection`]).
     pub fn diagnostic_connection(
         &self,
     ) -> Result<trawl_engine::executor::DiagnosticConnection, trawl_engine::error::EngineError>
@@ -2045,65 +1464,32 @@ impl ExecutorPool {
         self.clone_source.lock().diagnostic_connection()
     }
 
-    /// A connection to the query database that takes no permit.
-    ///
-    /// For work that reads or writes one stored result outside the query
-    /// lanes: the scheduler's result write and the saved-run read. It shares
-    /// the database's budgets and spill directory with every query, so it
-    /// spills nowhere else and counts against the same caps (ADR-0056), but
-    /// it is not interruptible through the pool and holds no permit.
-    ///
-    /// # Errors
-    /// The clone failed ([`Executor::try_clone`]).
+    /// A connection to the query database that takes no permit. It is not
+    /// interruptible through the pool.
     pub fn detached_executor(&self) -> Result<Executor, trawl_engine::error::EngineError> {
         self.clone_source.lock().try_clone()
     }
 
-    /// Take this pool's worker seams for one test (see [`seam`]).
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn seams(&self) -> seam::Session {
         seam::Session(Arc::clone(&self.seams))
     }
 
-    /// The worker's side of [`Self::seams`] for work on a detached
-    /// executor, which has no slot to carry them: a captured result's read.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) fn reach(&self, seam: seam::Seam) {
         self.seams.reach(seam);
     }
 
-    /// Attach the shared field-catalog pin cache. Builder-style, mirroring
-    /// `HotBuffer::with_field_catalog`, so the test call sites that need no
-    /// catalog stay on `new`.
     #[must_use]
     pub fn with_field_catalog(mut self, catalog: Arc<crate::catalog::FieldCatalog>) -> Self {
         self.field_catalog = catalog;
         self
     }
 
-    /// Register one unit of physical work and give it everything it holds.
-    ///
-    /// The permit is already in hand, so an executor is guaranteed: every
-    /// executor is either idle or inside a [`WorkSlot`] whose `Drop`
-    /// returns it before releasing its permit, and that `Drop` runs on
-    /// completion, timeout, caller drop, refusal and panic alike. An empty
-    /// pool here is therefore a broken invariant, not pressure — this
-    /// deliberately does not mint a replacement connection, which would
-    /// silently enlarge the pool past `max_concurrent` and hand the
-    /// cutover's `exclusive()` a false exclusivity.
-    ///
-    /// `display` is the work's DSL, kept for the operator-facing retained
-    /// listing; the helper lanes have none.
-    ///
     /// `work` is taken whole so its holds move into the slot: a hold left
     /// with the request future would be released when the request stops
     /// waiting, while the work may still be running.
-    ///
-    /// A tracked request's pending entry ([`Self::pend`]) is promoted here,
-    /// in the critical section that registers the slot: the slot takes its
-    /// cancel flag, and no cancel can find the id in both maps or in
-    /// neither between the request's waits and its work.
     fn begin_slot(
         &self,
         id: u64,
@@ -2128,10 +1514,6 @@ impl ExecutorPool {
             drop(work);
             return Err(ServerError::Internal("executor pool inconsistent".into()));
         };
-        // Promotion, in the critical section that registers the slot: a
-        // tracked request's flag moves into it, so a cancel latched while
-        // the work waited is the one the worker reads at its work-start
-        // transition. Untracked work starts with a fresh flag.
         let cancelled = registry
             .pending
             .remove(&id)
@@ -2172,18 +1554,6 @@ impl ExecutorPool {
         })
     }
 
-    /// The request stopped waiting while its work may still be running.
-    ///
-    /// Stamps the moment the permit became *retained* — held by work no
-    /// request is waiting on any more — and answers whether that work had
-    /// started, which is the request's 503-vs-504 classification. Reading
-    /// the flag the work-start transition wrote is what keeps that answer
-    /// out of the hands of `select!`'s polling order.
-    ///
-    /// Also answers whether this call retained the work — its slot was
-    /// still registered — which, with `started`, decides who writes the
-    /// timing account: both are read in the critical section
-    /// [`WorkSlot::drop`] reads them in.
     fn mark_request_finished(&self, id: u64, started: &AtomicBool) -> RequestEnd {
         let (entry, started) = {
             let mut registry = self.registry.lock();
@@ -2214,14 +1584,6 @@ impl ExecutorPool {
         RequestEnd { retained, started }
     }
 
-    /// Whose work this is, while it is registered.
-    ///
-    /// The query tracker forgets a query the moment its request records an
-    /// outcome, but the physical work can outlive that (ADR-0024). This
-    /// record lasts until cleanup, so the key that submitted a query it
-    /// has already been told timed out can still ask for it to stop.
-    /// `None` once cleanup ran, or for an id that never existed — callers
-    /// read that as "not yours".
     pub(crate) fn owner_of(&self, id: u64) -> Option<WorkOwner> {
         self.registry
             .lock()
@@ -2230,13 +1592,11 @@ impl ExecutorPool {
             .map(|entry| entry.owner)
     }
 
-    /// How many permits are held by work no request is waiting on.
     #[must_use]
     pub fn retained(&self) -> usize {
         self.registry.lock().retained_count()
     }
 
-    /// The retained work an operator can be shown, newest state as of now.
     #[must_use]
     pub fn retained_work(&self) -> Vec<RetainedWork> {
         let now = Instant::now();
@@ -2259,29 +1619,13 @@ impl ExecutorPool {
             .collect()
     }
 
-    /// Allocate a query id from the pool's counter.
-    ///
-    /// This is the single id authority: callers pass the returned id to
-    /// [`execute`](Self::execute) / [`execute_capped`](Self::execute_capped) /
-    /// [`execute_with_source`](Self::execute_with_source) /
-    /// [`export_parquet`](Self::export_parquet) /
-    /// [`capture`](Self::capture), and — when the query is
-    /// user-visible — to `QueryTracker::start`, so `/queries` listings and
-    /// [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
+    /// The single id authority: pass the returned id to the work and, for
+    /// user-visible work, to `QueryTracker::start`, so `/queries` listings
+    /// and [`cancel_by_id`](Self::cancel_by_id) speak the same id space.
     pub fn allocate_query_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// Put a tracked request in the registry while its work waits to
-    /// start, so a cancel by id reaches it (ADR-0024, Amendment
-    /// 2026-11-09).
-    ///
-    /// A route calls this right before it opens the request's tracker
-    /// entry, and keeps the guard until the request ends. The request's
-    /// own waits race the guard's [`Wake`]; the pool's waits find it by id.
-    /// [`Self::begin_slot`] promotes the entry, cancel flag and all, when
-    /// the work takes its slot. `kind` is the request's door, named in the
-    /// refusal a cancel ends it with.
     pub(crate) fn pend(&self, id: u64, kind: WorkKind) -> Pending {
         let cancelled = Arc::new(AtomicBool::new(false));
         let (wake, receiver) = tokio::sync::watch::channel(false);
@@ -2309,8 +1653,6 @@ impl ExecutorPool {
         }
     }
 
-    /// The wake a lane's waits race for `id`: its pending entry's, or one
-    /// that never fires for an untracked lane.
     fn wake_of(&self, id: u64) -> Wake {
         Wake(
             self.registry
@@ -2321,34 +1663,8 @@ impl ExecutorPool {
         )
     }
 
-    /// Execute a DSL query, blocking on semaphore acquisition if at capacity.
-    ///
-    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id);
-    /// it keys the interrupt slot [`cancel_by_id`](Self::cancel_by_id) latches
-    /// and the lifecycle entry [`retained_work`](Self::retained_work) lists.
-    /// When the request is tracked ([`Self::pend`]), a cancel by id also
-    /// ends the queue and publication waits with a capacity refusal.
-    ///
-    /// `deadline` is the caller's whole budget, stamped once at handler
-    /// entry (ADR-0024). Every wait this lane performs — the queue, the
-    /// publication gate, execution itself — spends from that one instant,
-    /// so a query that queued for most of it does not then get a full
-    /// timeout to run in.
-    ///
-    /// Past the deadline the request answers and stops waiting; the work
-    /// does not stop with it. It is interrupted, and it keeps its permit,
-    /// its publication guard and its executor until it actually ends —
-    /// [`retained`](Self::retained) counts it meanwhile. Whether the answer
-    /// is a 504 timeout or a 503 capacity refusal is decided by the
-    /// worker's own work-start transition, not by this future.
-    ///
-    /// When `capture_debug` is true, captures source selection, hot buffer
-    /// state, and generated SQL for the query debug log.
-    ///
+    /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
     /// Timestamps in the result are UTC.
-    ///
-    /// A result past `max_result_rows` is refused. A lane with a cap of its
-    /// own goes through [`execute_capped`](Self::execute_capped).
     pub async fn execute(
         &self,
         query_id: u64,
@@ -2368,9 +1684,6 @@ impl ExecutorPool {
         .await
     }
 
-    /// [`execute`](Self::execute) under the caller's [`RowCap`] rather
-    /// than the pool's `max_result_rows`: the CSV and JSON exports, which
-    /// cut at their export limit the way the Parquet export does.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn execute_capped(
         &self,
@@ -2387,9 +1700,7 @@ impl ExecutorPool {
         let clock = timing
             .as_ref()
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
-        // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
-        // A cancel by id ends either wait below ([`Self::pend`]).
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
@@ -2403,11 +1714,6 @@ impl ExecutorPool {
             );
         }
 
-        // The queue wait spends the caller's budget like every other wait
-        // (ADR-0024): it used to be measured for the log line only, so a
-        // query could sit here for minutes and still be handed a whole
-        // fresh timeout to run in. The phase guard books the wait however
-        // it ends, the deadline, a cancel and a dropped caller included.
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
@@ -2430,7 +1736,6 @@ impl ExecutorPool {
             }
         };
 
-        // A refusal here drops the permit with this frame: nothing ran.
         let published = {
             let _wait = clock.guard(QueryPhase::PublicationWait);
             wake.run(deadline, self.publication.read()).await
@@ -2452,9 +1757,6 @@ impl ExecutorPool {
             }
         };
 
-        // Everything this work holds, in one guard, moved into the
-        // blocking task below: from here on the request future cannot be
-        // the thing that releases a permit or returns an executor.
         let mut slot = match self.begin_slot(query_id, work, Some(dsl), permit, Some(publication)) {
             Ok(slot) => slot,
             Err(error) => {
@@ -2499,8 +1801,6 @@ impl ExecutorPool {
                     slot.started_timing();
                     worker_seam!(seams, Started);
 
-                    // Test-only: sleep before the query so timeout/cancellation tests
-                    // can reliably win the race against spawn_blocking.
                     #[cfg(any(test, feature = "test-support"))]
                     {
                         let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
@@ -2567,26 +1867,18 @@ impl ExecutorPool {
                     histogram: None,
                 });
                 slot.finish(&outcome.result);
-                // Interrupt deregistered, executor re-idled, publication and
-                // permit released — on this thread, before the answer goes
-                // back.
                 drop(slot);
                 worker_seam!(seams, Released);
                 outcome
             }
         });
 
-        // A caller that walks away (client gone, task aborted) is not a
-        // reason to abandon the work: the guard latches cancellation and
-        // records the retention on the way out.
         let mut request = RequestGuard::new(self, query_id, kind, &started, timing.as_ref());
         tokio::select! {
             join_result = &mut task => {
                 request.disarm();
                 match join_result {
                     Ok(outcome) => {
-                        // The worker refused to start: a capacity refusal,
-                        // named here because the pool made it.
                         if refusal_log.refused() {
                             account_refused(timing.as_ref());
                         }
@@ -2600,10 +1892,6 @@ impl ExecutorPool {
                     },
                 }
             }
-            // The budget is gone. Interrupt, hand the work over to its own
-            // cleanup, and answer with what the work-start transition
-            // recorded: a timeout if it ran, a capacity refusal if the
-            // permit never became work.
             () = tokio::time::sleep_until(deadline.instant()) => {
                 let result = if request.abandon() {
                     Err(ServerError::Timeout)
@@ -2615,14 +1903,7 @@ impl ExecutorPool {
         }
     }
 
-    /// Execute a DSL query with a pre-computed source, skipping glob computation.
-    ///
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
-    ///
-    /// Used for `| from saved` queries where the source is a `read_parquet()`
-    /// expression pointing at scheduled result files, not the normal data dir.
-    /// The hot buffer is intentionally skipped — saved query results are
-    /// self-contained parquet files.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn execute_with_source(
         &self,
@@ -2638,9 +1919,7 @@ impl ExecutorPool {
         let clock = timing
             .as_ref()
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
-        // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
-        // A cancel by id ends the wait below ([`Self::pend`]).
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
@@ -2654,9 +1933,6 @@ impl ExecutorPool {
             );
         }
 
-        // Same budget rule as the ordinary lane. This one takes no
-        // publication guard (ADR-0024 keeps per-lane gate membership as
-        // it is), so the queue and execution are the whole of its wait.
         let semaphore = Arc::clone(&self.semaphore);
         let acquired = {
             let _wait = clock.guard(QueryPhase::PoolWait);
@@ -2729,7 +2005,6 @@ impl ExecutorPool {
                         "using pre-computed source (from saved)"
                     );
 
-                    // No hot buffer — saved query results are self-contained.
                     let clock = slot.clock();
                     let cancel = slot.cancel_latch();
                     let pins = clock.time(QueryPhase::Source, || field_catalog.all());
@@ -2747,12 +2022,8 @@ impl ExecutorPool {
                     );
                     // `dsl` here is what follows `| from saved`, whose `PinScope`
                     // rule clears the scope, so the presentation walk roots in an
-                    // empty catalog: a saved run's stored columns are not typed by
-                    // what this corpus happens to pin now. The comparison pins above
-                    // keep the live snapshot for the names the run carries; a field
-                    // it does not carry takes none (`ReadInput::Recorded`).
-                    // A stored run's rows are not events: the handler
-                    // answers `stored_result` and asks for no count.
+                    // empty catalog. A stored run's rows are not events: the
+                    // handler answers `stored_result` and asks for no count.
                     let (result, severity_columns, _) = present(
                         result,
                         &trawl_core::schema::FieldTypes::new(),
@@ -2835,12 +2106,6 @@ impl ExecutorPool {
             Ok(Ok(permits)) => Ok(PoolExclusive { _permits: permits }),
             Ok(Err(_)) => Err(ServerError::Internal("executor pool shut down".into())),
             Err(_) => {
-                // Name what is in the way. A permit held by work whose
-                // request already answered looks identical from here to a
-                // permit held by a query someone is waiting on, and the
-                // two call for different operator moves: one is a query
-                // to wait out, the other is work to cancel by id
-                // (ADR-0024). Counts only — no ids, no DSL.
                 let retained = self.retained();
                 tracing::warn!(
                     event_type = "pool_exclusive_blocked",
@@ -2855,8 +2120,6 @@ impl ExecutorPool {
         }
     }
 
-    /// Interrupt all currently executing queries. Called during shutdown
-    /// to cancel in-flight `DuckDB` operations before draining connections.
     pub fn cancel_all(&self) {
         let count = {
             let mut registry = self.registry.lock();
@@ -2875,16 +2138,6 @@ impl ExecutorPool {
         }
     }
 
-    /// Request cancellation of one unit of work by id.
-    ///
-    /// True means the work exists and cancellation is now latched — not
-    /// that anything has stopped. Tracked work exists from its request's
-    /// [`Self::pend`]: while it waits to start, the cancel wakes the wait,
-    /// which answers the capacity refusal. Registered work stays
-    /// cancellable for repeat requests while it exists, including after its
-    /// request already timed out, and the latch covers the window before
-    /// the worker publishes an interrupt handle: it is what makes that
-    /// worker refuse to start.
     pub fn cancel_by_id(&self, query_id: u64) -> bool {
         self.registry.lock().request_cancel(query_id)
     }
@@ -2897,20 +2150,15 @@ impl ExecutorPool {
         self.semaphore.available_permits()
     }
 
-    /// The total pool capacity, i.e. the max concurrent queries.
     pub fn capacity(&self) -> usize {
         self.max_concurrent
     }
 
-    /// The query preparation allowance (ADR-0063).
     #[must_use]
     pub fn preparation(&self) -> &crate::prepare::Preparation {
         &self.preparation
     }
 
-    /// Take a scheduled run's lease if one is free, and never wait for
-    /// one: the scheduler claims a due run only while it holds a lease
-    /// (ADR-0018, amended 2026-11-09).
     #[must_use]
     pub fn try_lease_scheduled(&self) -> Option<RunLease> {
         Arc::clone(&self.scheduled)
@@ -2923,35 +2171,24 @@ impl ExecutorPool {
             })
     }
 
-    /// How many scheduled-run leases are free right now.
     #[must_use]
     pub fn scheduled_leases_available(&self) -> usize {
         self.scheduled.available_permits()
     }
 
-    /// How many scheduled-run leases are held right now.
     #[must_use]
     pub fn scheduled_leases_in_use(&self) -> usize {
         self.scheduled_lease_limit()
             .saturating_sub(self.scheduled.available_permits())
     }
 
-    /// The cap on scheduled runs in flight ([`scheduled_cap`]).
     #[must_use]
     pub fn scheduled_lease_limit(&self) -> usize {
         scheduled_cap(self.max_concurrent)
     }
 
-    /// Take a manual run's lease for the caller's key `key_id`, or refuse,
-    /// and never wait (ADR-0018, amended 2026-11-11): one manual run per
-    /// key, [`manual_cap`] across the installation. `estimate` is how long
-    /// the run may take, from which a refusal derives its advisory
-    /// `Retry-After`. The lease's clones share one place, which returns
-    /// when the last of them drops.
-    ///
-    /// # Errors
-    /// [`ManualBusy`] when the key already holds a manual run or the cap
-    /// is full; the refusal holds nothing.
+    /// `estimate` is how long the run may take, from which a refusal derives
+    /// its advisory `Retry-After`.
     pub fn try_lease_manual(
         &self,
         key_id: i64,
@@ -2974,26 +2211,16 @@ impl ExecutorPool {
         })
     }
 
-    /// How many manual-run leases are held right now: one per key holding
-    /// one.
     #[must_use]
     pub fn manual_leases_in_use(&self) -> usize {
         self.manual.holders.lock().len()
     }
 
-    /// The cap on manual runs in flight ([`manual_cap`]).
     #[must_use]
     pub fn manual_lease_limit(&self) -> usize {
         self.manual.limit
     }
 
-    /// Prepare query text on the blocking pool, behind the preparation
-    /// allowance and never behind an executor permit
-    /// ([`crate::prepare::Preparation::run`]).
-    ///
-    /// # Errors
-    ///
-    /// As [`crate::prepare::Preparation::run`].
     pub async fn prepare<T, F>(
         &self,
         deadline: Deadline,
@@ -3011,18 +2238,8 @@ impl ExecutorPool {
         &self.base_dir
     }
 
-    /// Sample distinct values of one field for autocomplete.
-    ///
-    /// A parquet-reading lane like any other, so it funnels through the
-    /// same semaphore [`exclusive`](Self::exclusive) drains, and, like the
-    /// query lanes, expands its glob inside the permit-holding task, so it
-    /// cannot list paths before the repin cutover's per-env swap and read
-    /// them after.
-    ///
     /// `service`, when present, scopes the glob to one service's files; the
     /// caller is responsible for validating the name.
-    /// `deadline` is the caller's whole budget: the queue wait and the
-    /// publication wait both spend from it.
     pub async fn sample_field_values(
         &self,
         field: &str,
@@ -3032,17 +2249,12 @@ impl ExecutorPool {
         work: WorkContext,
     ) -> Result<Vec<String>, ServerError> {
         let kind = work.kind;
-        // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
         let semaphore = Arc::clone(&self.semaphore);
         let id = self.allocate_query_id();
 
-        // ONE acquisition budget across both gates, not one each: two
-        // second-long allowances would let a sample spend two seconds
-        // before reading anything. It is also never longer than what is
-        // left of the caller's own deadline.
         let acquire = Deadline::after(SAMPLE_ACQUIRE_BUDGET.min(deadline.remaining()));
         let permit = acquire
             .run(semaphore.acquire_owned())
@@ -3055,7 +2267,6 @@ impl ExecutorPool {
             .await
             .map_err(|_| refusal_log.refuse(id, kind, StartRefusal::Expired))??;
 
-        // Past acquisition the caller's overall deadline governs again.
         let mut slot = self.begin_slot(id, work, None, permit, Some(publication))?;
         let started = Arc::clone(&slot.started);
         let fallback_glob = Arc::clone(&self.fallback_glob);
@@ -3095,11 +2306,6 @@ impl ExecutorPool {
             }
         });
 
-        // Acquisition is bounded by its own short budget above, but the
-        // sample itself reads parquet and can outrun the caller's deadline
-        // just as a query can. Same handover as the query lanes: interrupt,
-        // leave the work to its own cleanup, and answer with what the
-        // work-start transition recorded.
         let mut request = RequestGuard::new(self, id, kind, &started, None);
         tokio::select! {
             joined = &mut task => {
@@ -3116,17 +2322,7 @@ impl ExecutorPool {
         }
     }
 
-    /// Export query results to Parquet via `DuckDB` `COPY TO`.
-    ///
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
-    ///
-    /// Acquires a pool executor, writes to a temp file, and returns the
-    /// raw bytes with the number of rows written. Respects the hot buffer
-    /// for fresh event visibility.
-    ///
-    /// The same lifecycle as [`execute`](Self::execute): the budget covers
-    /// every wait up to bytes in hand, and an export that outlives its
-    /// request keeps its permit until the `COPY TO` actually stops.
     #[allow(clippy::too_many_lines)]
     pub async fn export_parquet(
         &self,
@@ -3141,9 +2337,7 @@ impl ExecutorPool {
         let clock = timing
             .as_ref()
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
-        // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
-        // A cancel by id ends either wait below ([`Self::pend`]).
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
@@ -3197,8 +2391,6 @@ impl ExecutorPool {
                     slot.started_timing();
                     worker_seam!(seams, Started);
 
-                    // Test-only: sleep before the export so tests can hold
-                    // it running.
                     #[cfg(any(test, feature = "test-support"))]
                     {
                         let delay = TEST_QUERY_DELAY_MS.load(Ordering::Relaxed);
@@ -3213,8 +2405,6 @@ impl ExecutorPool {
                         compute_source(&base_dir, &dsl, &cancel)
                     })?;
 
-                    // Write to a staging file in the query scratch
-                    // directory (ADR-0056), then read it back as bytes.
                     // The error keeps only its kind: `tempfile` appends the
                     // path it tried, and an internal error's text is logged.
                     let tmp = scratch.export_file().map_err(|e| {
@@ -3225,7 +2415,6 @@ impl ExecutorPool {
                     })?;
                     let tmp_path = tmp.path().to_owned();
 
-                    // Snapshot hot buffer for fresh events.
                     let hot_snapshot = hot_source(hot_buffer.as_ref().map_or(Ok(None), |hb| {
                         clock.time(QueryPhase::HotSnapshot, || hb.snapshot(&scratch))
                     }))?;
@@ -3295,33 +2484,8 @@ impl ExecutorPool {
         }
     }
 
-    /// Capture a query's result (ADR-0057): execute `dsl` and run `finish`
-    /// on the result before the slot releases anything, so the capture's
-    /// file is written under the same permit, executor and guard as the
-    /// read that produced it.
-    ///
     /// `query_id` must come from [`allocate_query_id`](Self::allocate_query_id).
-    ///
-    /// The lifecycle is [`execute`](Self::execute)'s with `finish` inside
-    /// it. `deadline` covers the queue, the publication wait, the source
-    /// budget, the execution and `finish` together. Past it the request
-    /// answers, and the work, `finish` included, keeps the permit, the
-    /// publication guard and `work`'s holds until it stops; its answer is
-    /// then dropped. `finish` runs only on a query that succeeded, and a
-    /// panic in it answers [`ServerError::Panicked`].
-    ///
-    /// A [`CaptureSource::Window`] waits for the publication guard and reads
-    /// the hot buffer, as `/query` does. Its worker selects and measures the
-    /// window's source first: a selection over the budget is refused with
-    /// [`ServerError::CaptureSourceTooLarge`] before the hot snapshot is
-    /// taken or the engine runs. A [`CaptureSource::Resolved`] source takes
-    /// neither the guard nor the hot buffer, as
-    /// [`execute_with_source`](Self::execute_with_source) does.
-    ///
-    /// # Errors
-    /// A capacity refusal or a timeout as on the other lanes, the
-    /// publication guard's refusal for a window, a source budget refusal, the
-    /// query's own error, or whatever `finish` answers.
+    /// `finish` runs only on a query that succeeded.
     #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
     pub async fn capture<T: Send + 'static>(
         &self,
@@ -3338,9 +2502,7 @@ impl ExecutorPool {
         let clock = timing
             .as_ref()
             .map_or_else(PhaseClock::off, |timing| timing.clock().clone());
-        // One refusal, told once, however this work ends up refused.
         let refusal_log = RefusalOnce::new(self.instance);
-        // A cancel by id ends either wait below ([`Self::pend`]).
         let wake = self.wake_of(query_id);
         #[cfg(any(test, feature = "test-support"))]
         let seams = Arc::clone(&self.seams);
@@ -3358,10 +2520,6 @@ impl ExecutorPool {
             })?
             .map_err(|_| ServerError::Internal("executor pool shut down".into()))?;
 
-        // A window reads the live corpus, so it waits for the publication
-        // guard as `/query` does. A resolved source reads a recorded run and
-        // takes none, as `execute_with_source` does (ADR-0024 keeps per-lane
-        // gate membership as it is).
         let publication = match &source {
             CaptureSource::Window { .. } => {
                 let published = {
@@ -3403,10 +2561,6 @@ impl ExecutorPool {
                     }
                     slot.started_timing();
 
-                    // The engine reads the selection `/query` reads for this
-                    // text, and the budget is measured over it, under the
-                    // publication guard, and refused before anything is
-                    // scanned (ADR-0057). A cancellation stops the walk.
                     let clock = slot.clock();
                     let (source, source_bytes, input) = match source {
                         CaptureSource::Window {
@@ -3473,9 +2627,6 @@ impl ExecutorPool {
                     );
                     worker_seam!(seams, Returned);
                     let result = result?;
-                    // Still inside the slot: the permit, the executor, its
-                    // interrupt registration and a window's publication
-                    // guard are all held while `finish` writes.
                     let answer = finish(CaptureInput {
                         result,
                         executor: slot.executor(),
@@ -3491,9 +2642,6 @@ impl ExecutorPool {
                 let result =
                     outcome.unwrap_or_else(|_payload| Err(ServerError::Panicked("capture worker")));
                 slot.finish(&result);
-                // Interrupt deregistered, executor re-idled, publication and
-                // permit released, then the holds: on this thread, before the
-                // answer goes back.
                 drop(slot);
                 worker_seam!(seams, Released);
                 result
@@ -3523,8 +2671,6 @@ impl ExecutorPool {
     }
 }
 
-/// The glob over one service's files under the data root `base_dir`,
-/// joined with exactly one separator.
 fn service_glob(base_dir: &str, service: &str) -> String {
     format!("{}/**/{service}.parquet", base_dir.trim_end_matches('/'))
 }
@@ -3534,7 +2680,6 @@ mod tests {
     use super::*;
     use seam::Seam;
 
-    /// Ordinary interactive work, owned by a key.
     const TEST_WORK: WorkContext = WorkContext {
         kind: WorkKind::Query,
         owner: WorkOwner::Key(7),
@@ -3556,10 +2701,6 @@ mod tests {
         pool.registry.lock().idle.len()
     }
 
-    /// Scheduled runs in flight are capped at half the permits, at least
-    /// one (ADR-0018, amended 2026-11-09). A pool's clones share its
-    /// leases, and a lease's clones and holds share one permit, which
-    /// returns when the last of them drops.
     #[test]
     fn scheduled_leases_are_half_the_permits_and_shared() {
         for (permits, cap) in [(1, 1), (2, 1), (3, 1), (4, 2), (5, 2), (8, 4)] {
@@ -3590,10 +2731,6 @@ mod tests {
         assert_eq!(clone.scheduled_leases_available(), 2);
     }
 
-    /// The run gates follow the pool: manual runs in flight are capped at
-    /// a quarter of the permits and scheduled runs at half, each at least
-    /// one (ADR-0018, amended 2026-11-11), and each gate admits exactly
-    /// its limit.
     #[test]
     fn run_gate_limits_follow_the_pool() {
         for (permits, manual, scheduled) in [(1, 1, 1), (2, 1, 1), (3, 1, 1), (4, 1, 2), (8, 2, 4)]
@@ -3633,27 +2770,14 @@ mod tests {
         }
     }
 
-    /// The manual gate takes both limits or neither, under concurrent
-    /// requests from many keys and from repeated keys: the admitted count
-    /// never exceeds the installation-wide limit, a key never holds two
-    /// places, a refused request holds nothing, and the key map holds
-    /// exactly the active leases after every drop. A lease's clones share
-    /// one entry, which stays until the last clone drops. A refusal's
-    /// Retry-After reads the refusing key's own estimate when the key
-    /// holds a place, else the earliest holder's, rounded up and at least
-    /// one second.
     #[test]
     fn manual_gate_acquires_atomically() {
-        // 8 permits: 2 manual places.
         let pool = ExecutorPool::for_test("/nonexistent".into(), 8, 100, None).unwrap();
         assert_eq!(pool.manual_lease_limit(), 2);
         manual_gate_under_contention(&pool);
         manual_gate_one_at_a_time(&pool);
     }
 
-    /// [`manual_gate_acquires_atomically`]'s concurrent phase: 16 threads
-    /// over 6 keys, so most keys are requested from several threads at
-    /// once.
     fn manual_gate_under_contention(pool: &ExecutorPool) {
         use std::sync::Barrier;
         use std::sync::atomic::AtomicUsize;
@@ -3722,10 +2846,6 @@ mod tests {
         );
     }
 
-    /// [`manual_gate_acquires_atomically`]'s sequential phase: the map
-    /// size is the active leases after every drop, a refusal adds
-    /// nothing, clones share one entry, and Retry-After reads the right
-    /// holder.
     fn manual_gate_one_at_a_time(pool: &ExecutorPool) {
         let now = Instant::now();
         let later = pool
@@ -3781,7 +2901,6 @@ mod tests {
         );
         assert_eq!(pool.manual_leases_in_use(), 2, "refusals hold nothing");
 
-        // Clones share one entry, which stays until the last clone drops.
         let clone = earlier.clone();
         let hold = earlier.clone().into_hold();
         drop(earlier);
@@ -3806,7 +2925,6 @@ mod tests {
         assert_eq!(pool.manual_leases_in_use(), 1);
         drop(again);
         assert_eq!(pool.manual_leases_in_use(), 0);
-        // A pool's clones share its gate.
         let other = pool.clone();
         let taken = pool.try_lease_manual(9, Duration::from_secs(5)).unwrap();
         assert!(other.try_lease_manual(9, Duration::from_secs(5)).is_err());
@@ -3815,8 +2933,6 @@ mod tests {
         assert_eq!(other.manual_leases_in_use(), 0);
     }
 
-    /// Nothing is registered: no pending entry, no interrupt slot, no
-    /// lifecycle entry.
     fn registry_is_empty(pool: &ExecutorPool) -> bool {
         let registry = pool.registry.lock();
         registry.pending.is_empty()
@@ -3824,8 +2940,6 @@ mod tests {
             && registry.retained.is_empty()
     }
 
-    /// A pool whose queries answer from a one-event hot buffer, so an
-    /// ordinary query succeeds without a parquet fixture.
     fn hot_pool(max_concurrent: usize) -> ExecutorPool {
         use crate::bus::IngestBatch;
         use crate::hot_buffer::HotBufferConfig;
@@ -3850,14 +2964,11 @@ mod tests {
         ExecutorPool::for_test("/nonexistent".into(), max_concurrent, 100_000, Some(hot)).unwrap()
     }
 
-    /// Wait for a blocking thread to reach a state, without letting paused
-    /// time move.
-    ///
     /// Tokio auto-advances a paused clock only when the scheduler has
     /// nothing ready, so a yield loop pins virtual time exactly where the
     /// test put it while the worker thread makes real progress. The bound
-    /// is the real clock, which is not what any assertion here is about —
-    /// it only turns a deadlock into a failure instead of a hang.
+    /// is the real clock: it only turns a deadlock into a failure instead
+    /// of a hang.
     async fn until(label: &str, mut reached: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
         while !reached() {
@@ -3869,31 +2980,19 @@ mod tests {
         }
     }
 
-    /// Captured `tracing` events for ONE unit of work.
-    ///
     /// A global subscriber, not a thread-local one: the events these
     /// tests are about are emitted from the blocking worker thread, which
-    /// does not inherit `set_default`. The sink is set for one capturing
-    /// test at a time and keeps only the events carrying that test's own
-    /// POOL and `query_id`.
-    ///
-    /// Both halves are needed. Ids start at zero in every pool, so under
-    /// the plain `cargo test` harness, one process running tests in
-    /// threads, filtering on the id alone let a sibling test's refusal of its own
-    /// query 0 land in this test's count, and "exactly one refusal" is a
-    /// count.
-    ///
-    /// The timing events carry no pool: they are kept by the test's own
-    /// `request_id`, which no sibling shares ([`of_timed`]).
+    /// does not inherit `set_default`. A work sink matches POOL and
+    /// `query_id` together: ids start at zero in every pool, and the plain
+    /// `cargo test` harness runs tests in threads. Timing events carry no
+    /// pool: a work sink keeps them by the test's own `request_id`.
     mod capture {
         use std::collections::HashMap;
         use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
         type Events = Arc<StdMutex<Vec<HashMap<String, String>>>>;
 
-        /// Which events a sink keeps.
         enum Keep {
-            /// This pool's `query_id`, or this `request_id`.
             Work {
                 pool: u64,
                 query_id: u64,
@@ -3968,14 +3067,12 @@ mod tests {
             }
         }
 
-        /// The events one unit of work logged while this guard lived.
         pub(super) struct Capture {
             events: Events,
             _turn: tokio::sync::MutexGuard<'static, ()>,
         }
 
         impl Capture {
-            /// Every captured field map whose `event_type` matches.
             pub(super) fn of_type(&self, event_type: &str) -> Vec<HashMap<String, String>> {
                 self.events
                     .lock()
@@ -3993,7 +3090,6 @@ mod tests {
             }
         }
 
-        /// Capture what `pool`'s `query_id` logs until the guard drops.
         pub(super) async fn of_query(pool: &super::ExecutorPool, query_id: u64) -> Capture {
             install(Keep::Work {
                 pool: pool.instance,
@@ -4003,7 +3099,6 @@ mod tests {
             .await
         }
 
-        /// [`of_query`], plus the timing events of `request_id`.
         pub(super) async fn of_timed(
             pool: &super::ExecutorPool,
             query_id: u64,
@@ -4017,7 +3112,6 @@ mod tests {
             .await
         }
 
-        /// Capture every event in the process until the guard drops.
         pub(super) async fn everything() -> Capture {
             install(Keep::Everything).await
         }
@@ -4048,8 +3142,6 @@ mod tests {
         }
     }
 
-    /// Let every spawned task poll before the clock moves.
-    ///
     /// A task registers its timers on its first poll, so advancing paused
     /// time before that would place a deadline the test then never
     /// reaches — and a paused runtime with a blocking thread in flight
@@ -4060,11 +3152,6 @@ mod tests {
         }
     }
 
-    /// The severity presentation metadata is a property of the snapshot the
-    /// run executed under, so a repin landing between execution and the
-    /// response cannot retype the rows it already produced: the same DSL
-    /// answers differently for a `SEVERITY` snapshot and a `BIGINT` one, and
-    /// the executing task walks under the snapshot it ran with.
     #[test]
     fn severity_columns_come_from_the_snapshot_it_is_given() {
         use trawl_core::schema::{CanonicalType, FieldTypes};
@@ -4087,10 +3174,6 @@ mod tests {
         );
     }
 
-    /// The presentation walk and the query log's preview parse on the
-    /// worker under the work's latch: latched, each answers cancelled and
-    /// builds nothing, never its unparseable fallback. A real parse error
-    /// still falls back.
     #[test]
     fn worker_parses_read_the_latch() {
         use trawl_core::schema::FieldTypes;
@@ -4122,10 +3205,6 @@ mod tests {
         );
     }
 
-    /// The pipe-free shortcut answers exactly what the walk answers: with no
-    /// pipeline the terminal scope is the root scope, and a `|` that is only
-    /// regex punctuation still takes the walk.
-    ///
     /// The envelope's own `_severity` is deliberately not named: every
     /// renderer keys that column by name, so the list carries only the
     /// columns a pipeline moved the pin onto (`PinScope::severity_columns`).
@@ -4148,8 +3227,6 @@ mod tests {
             vec!["lvl".to_owned()],
             "a `|` inside a regex costs the parse and answers the same"
         );
-        // A pipeline that drops the column drops the stamp with it, and an
-        // unparseable query answers nothing (execution reports the error).
         assert!(
             severity_columns_for(&pins, "* | table status", &CancelLatch::never())
                 .unwrap()
@@ -4168,11 +3245,6 @@ mod tests {
         );
     }
 
-    /// The stamp rides back on `ExecuteOutcome` from the run's own catalog
-    /// snapshot, taken inside the permit-holding blocking task. Repinning
-    /// the field between the two runs changes the answer, which is the whole
-    /// coherence property: the response describes the pins that produced its
-    /// rows, not the catalog as it stands when the JSON is assembled.
     #[tokio::test]
     async fn execute_stamps_severity_columns_from_the_runs_own_snapshot() {
         use crate::bus::IngestBatch;
@@ -4182,8 +3254,6 @@ mod tests {
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
         catalog.repin("lvl", CanonicalType::Severity);
 
-        // Hot-buffer-only corpus: no parquet under the base dir, so the
-        // query answers from the hot branch and needs no fixture files.
         let hot = Arc::new(
             HotBuffer::new(HotBufferConfig {
                 max_events: 100,
@@ -4191,7 +3261,6 @@ mod tests {
             })
             .with_field_catalog(Arc::clone(&catalog)),
         );
-        // The envelope columns ingest stamps on every event.
         let mut event = serde_json::Map::new();
         event.insert("_time".into(), "2026-01-03T00:05:00Z".into());
         event.insert("_ingested".into(), "2026-01-03T00:05:01Z".into());
@@ -4225,8 +3294,6 @@ mod tests {
             "the run's own snapshot pins `lvl` SEVERITY, so the answer says so"
         );
 
-        // The operator repins it away. The next run's snapshot is the new
-        // one, and its rows are BIGINTs the renderers must not tokenize.
         catalog.repin("lvl", CanonicalType::BigInt);
         let outcome = pool
             .execute(
@@ -4244,10 +3311,6 @@ mod tests {
         );
     }
 
-    /// The histogram rides back on `ExecuteOutcome` from the worker, which
-    /// counts while it still holds the permit: parked just before its
-    /// presentation walks, the work has the pool's only permit. Work that
-    /// did not ask, and a run that failed, carry none.
     #[tokio::test(start_paused = true)]
     async fn execute_carries_the_histogram_from_the_worker() {
         use crate::histogram::HistogramAsk;
@@ -4321,12 +3384,8 @@ mod tests {
         assert_eq!(failed.histogram, None, "a failed run has no rows to count");
     }
 
-    /// A cancel by id that lands once the engine returned, while the
-    /// worker presents, is read by the histogram walk: the answer is the
-    /// engine's cancellation, not the pre-start refusal of a cancel that
-    /// arrives while the work waits, and it carries no histogram. The DSL
-    /// has no `|`, so the severity walk reads no latch: the histogram walk
-    /// is what stops.
+    /// The DSL has no `|`, so the severity walk reads no latch and the
+    /// histogram walk is the one that sees the cancel.
     #[tokio::test(start_paused = true)]
     async fn histogram_walk_stops_on_a_latched_cancel() {
         use crate::histogram::HistogramAsk;
@@ -4366,15 +3425,6 @@ mod tests {
         assert!(outcome.severity_columns.is_empty());
     }
 
-    /// An engine refusal crosses the pool intact, sentence and all.
-    ///
-    /// Nothing between the blocking worker and the caller classifies an
-    /// `EngineError` — the worker converts and the async side only
-    /// replaces the outcome when the deadline beat it — so what the
-    /// engine refused is what the handler answers with. The hot buffer
-    /// is the interesting half: with no parquet under the base dir the
-    /// query is answered hot-only, which is the retry that has no cold
-    /// data to hide and so used to be the one with nothing to stop it.
     #[tokio::test]
     async fn an_engine_refusal_crosses_the_pool_intact() {
         use crate::bus::IngestBatch;
@@ -4483,11 +3533,6 @@ mod tests {
         (dir, hot, pool)
     }
 
-    /// `drop` of a field no event carries is a no-op on the hot lanes too,
-    /// as the live tail answers it (ADR-0001): over cold and hot data, and
-    /// over a hot buffer with no cold data, every row comes back with every
-    /// column. `* EXCLUDE` answered both with an empty result: its refusal
-    /// read as a missing column, and the hot-only retry refused the same way.
     #[tokio::test]
     async fn drop_of_an_absent_field_keeps_every_row_on_the_hot_lanes() {
         use crate::bus::IngestBatch;
@@ -4538,7 +3583,6 @@ mod tests {
         assert_eq!(columns_and_rows(&hot_only, "* | drop nope").await, all);
     }
 
-    /// Rows in a Parquet export's bytes.
     fn parquet_rows(bytes: &[u8]) -> i64 {
         let file = tempfile::Builder::new()
             .suffix(".parquet")
@@ -4558,8 +3602,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A read refused for its hot snapshot: 503 `service_unavailable`, the
-    /// I/O error's kind as its cause.
     async fn assert_snapshot_refusal(error: ServerError, kind: crate::error::CauseKind) {
         assert!(matches!(error, ServerError::HotSnapshot(_)), "{error:?}");
         assert_eq!(error.error_class(), "service_unavailable");
@@ -4576,8 +3618,6 @@ mod tests {
         assert_eq!(body["error"]["code"], "service_unavailable");
     }
 
-    /// A query whose hot snapshot cannot be built refuses with a 503 rather
-    /// than answer from parquet alone (ADR-0041).
     #[tokio::test]
     async fn snapshot_failure_refuses_a_query_instead_of_answering_cold_only() {
         let (_dir, hot, pool) = cold_and_hot_pool().await;
@@ -4603,8 +3643,6 @@ mod tests {
         assert_eq!(rows(query().await), 2, "the fault latched nothing");
     }
 
-    /// An export whose hot snapshot cannot be built refuses with a 503
-    /// rather than export parquet alone (ADR-0041).
     #[tokio::test]
     async fn snapshot_failure_refuses_an_export_instead_of_answering_cold_only() {
         let (_dir, hot, pool) = cold_and_hot_pool().await;
@@ -4633,9 +3671,6 @@ mod tests {
         assert_eq!(rows, 2, "the returned count is the file's");
     }
 
-    /// A snapshot whose path is not UTF-8 cannot be opened by `DuckDB`, so
-    /// the read refuses rather than drop the hot source (ADR-0041). Query
-    /// and export both take their hot source from [`hot_source`].
     #[cfg(unix)]
     #[tokio::test]
     async fn snapshot_failure_on_a_non_utf8_path_refuses_the_read() {
@@ -4664,8 +3699,6 @@ mod tests {
         );
     }
 
-    /// The hot-buffer snapshot files in a pool's scratch directory, by
-    /// size.
     fn snapshot_files(pool: &ExecutorPool) -> Vec<u64> {
         std::fs::read_dir(pool.scratch().path())
             .unwrap()
@@ -4675,24 +3708,13 @@ mod tests {
             .collect()
     }
 
-    /// Snapshots get no byte budget of their own (ADR-0056): at most one
-    /// file per permit plus the cached one exists, each no larger than the
-    /// serialized buffer, however many generations pass while every permit
-    /// holds a snapshot.
-    ///
-    /// Each round parks one export per permit at `Finished`, where it still
-    /// holds its snapshot, and starts each after a fresh insert, so every
-    /// permit holds a different generation's file. A sampler counts the
-    /// files the whole time, including while one round's exports release
-    /// and the next round's take the permits.
     #[tokio::test(flavor = "multi_thread")]
-    #[allow(clippy::too_many_lines)] // one scenario, round by round
+    #[allow(clippy::too_many_lines)]
     async fn snapshot_files_bounded_by_permits() {
         use crate::bus::IngestBatch;
         use crate::hot_buffer::HotBufferConfig;
         use std::sync::atomic::AtomicUsize;
 
-        /// One round's gate and its parked exports.
         type Round = (
             Arc<seam::Gate>,
             Vec<tokio::task::JoinHandle<Result<(Vec<u8>, usize), ServerError>>>,
@@ -4811,10 +3833,6 @@ mod tests {
         );
     }
 
-    /// A run that produced no rows carries no presentation metadata: an
-    /// error and a timeout both stamp nothing, because there is nothing to
-    /// present and the walk's answer would describe a result the caller
-    /// never gets.
     #[tokio::test]
     async fn a_failed_run_stamps_no_severity_columns() {
         let catalog = Arc::new(crate::catalog::FieldCatalog::new());
@@ -4823,7 +3841,6 @@ mod tests {
             .unwrap()
             .with_field_catalog(Arc::clone(&catalog));
 
-        // A parse error: reported by execution, so the walk is skipped.
         let outcome = pool
             .execute(
                 pool.allocate_query_id(),
@@ -4839,14 +3856,8 @@ mod tests {
         // A timeout: the outcome is assembled on the async side, where no
         // snapshot and no walk exist at all. The worker is parked at this
         // pool's own seam rather than slowed by the process-global delay,
-        // which a sibling test can reset out from under this one.
-        //
-        // The clock only moves once the worker is PAST its work-start
-        // transition. A short real deadline used to decide the class by
-        // wall clock: on a loaded runner expiry beat the blocking pool's
-        // own startup and the pool answered with the pre-start capacity
-        // 503, which is the correct classification for work that never
-        // started and not the one this assertion pins.
+        // which a sibling test can reset out from under this one. The clock
+        // only moves once the worker is PAST its work-start transition.
         tokio::time::pause();
         let seams = pool.seams();
         let parked = seams.hold(Seam::Started);
@@ -4894,7 +3905,6 @@ mod tests {
     #[tokio::test]
     async fn pool_respects_concurrency_limit() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
-        // just verifying it doesn't panic with a single permit
         let _ = pool
             .execute(
                 pool.allocate_query_id(),
@@ -4910,8 +3920,6 @@ mod tests {
     async fn pool_reuses_executors() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
 
-        // Run two sequential queries — both should succeed and the pool
-        // should have the same number of idle executors before and after.
         let idle_before = idle_len(&pool);
         let _ = pool
             .execute(
@@ -4945,8 +3953,6 @@ mod tests {
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
-    /// The service-scoped sampling glob is built from the configured root,
-    /// with one separator whatever the root's spelling.
     #[test]
     fn configured_data_root_is_passed_directly() {
         for base in ["/var/lib/trawl/data", "/var/lib/trawl/data/"] {
@@ -4964,22 +3970,10 @@ mod tests {
         assert_eq!(&*pool.fallback_glob, "/var/lib/trawl/data/**/*.parquet");
     }
 
-    /// Waiting in the queue spends the caller's budget (ADR-0024). The
-    /// permit is held for the whole test, so the query never starts: what
-    /// ends the wait is the deadline, and before this it was nothing at
-    /// all — `acquire_owned` had no bound, and a query that finally got a
-    /// permit was handed a full fresh timeout to run in.
-    ///
-    /// Paused time, so the five seconds are virtual and exact. A test
-    /// that slept for them would prove the same thing an hour later.
-    ///
-    /// Nothing ran, so the answer is a capacity refusal rather than a
-    /// query timeout.
     #[tokio::test(start_paused = true)]
     async fn queue_wait_counts_against_the_deadline() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
         let idle_before = idle_len(&pool);
-        // The pool's one permit, held by someone else for the duration.
         let held = pool
             .exclusive(Duration::from_secs(1))
             .await
@@ -5011,10 +4005,6 @@ mod tests {
         drop(held);
     }
 
-    /// The publication gate is the second wait, and it spends the same
-    /// budget: the permit is acquired, then the cutover's writer holds
-    /// the gate until the deadline ends the wait. Still before any work,
-    /// so still a capacity refusal.
     #[tokio::test(start_paused = true)]
     async fn publication_wait_counts_against_the_deadline() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -5112,7 +4102,6 @@ mod tests {
             "the timed-out query still holds its executor"
         );
 
-        // Reclamation follows the work, not the request.
         started.release();
         until("the executor comes back", || {
             idle_len(&pool) == idle_before && pool.available_permits() == 1
@@ -5120,22 +4109,16 @@ mod tests {
         .await;
     }
 
-    /// The cutover's exclusion primitive: `exclusive()` holds every permit,
-    /// so no query can start while the guard lives, and a wedged in-flight
-    /// query bounds out with a timeout instead of starving the cutover
-    /// forever.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_drains_queries_and_blocks_new_ones() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
 
-        // Nothing in flight: exclusivity is immediate.
         let guard = pool
             .exclusive(Duration::from_secs(1))
             .await
             .expect("an idle pool is immediately exclusive");
         assert_eq!(pool.available_permits(), 0, "every permit is held");
 
-        // A query submitted while exclusive must wait, not run.
         let p2 = pool.clone();
         let queued = tokio::spawn(async move {
             p2.execute(
@@ -5155,13 +4138,9 @@ mod tests {
 
         drop(guard);
         let outcome = queued.await.expect("queued query joins");
-        // (The DSL result itself is irrelevant; the point is that it ran.)
         let _ = outcome.result;
     }
 
-    /// Value sampling reads parquet, so it is a permit-taking lane like any
-    /// other — otherwise it could expand its glob before the cutover's
-    /// per-env swap and read after it, sampling a half-swapped corpus.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_blocks_field_value_sampling() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
@@ -5234,9 +4213,6 @@ mod tests {
         drop(writer);
     }
 
-    /// A held query permit starves `exclusive()` past its budget: the
-    /// bounded timeout must surface as `ServerError::Timeout` (mapped to
-    /// the job's `blocked` outcome), never an indefinite wait.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn exclusive_times_out_bounded_while_a_query_runs() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 2, 100_000, None).unwrap();
@@ -5266,16 +4242,11 @@ mod tests {
 
         parked.release();
         let _ = running.await;
-        // And once the query drains, exclusivity succeeds.
         pool.exclusive(Duration::from_secs(2))
             .await
             .expect("drained pool becomes exclusive");
     }
 
-    /// A permit is not work. A worker parked before its work-start
-    /// transition holds everything a running query holds, and if the
-    /// budget runs out there, the answer is a capacity refusal — nothing
-    /// ran, so there is nothing to have timed out (ADR-0024).
     #[tokio::test(start_paused = true)]
     async fn startup_wait_counts_against_the_deadline() {
         let pool = hot_pool(1);
@@ -5333,10 +4304,6 @@ mod tests {
         );
         assert!(registry_is_empty(&pool));
 
-        // One refusal, one event. The request gave up on its budget and
-        // latched cancellation on the way out, and the worker it released
-        // then refused to start on that latch — two paths, one refusal,
-        // and the reason is the one that actually happened.
         let refusals = logged.of_type("query_not_started");
         assert_eq!(
             refusals.len(),
@@ -5350,9 +4317,6 @@ mod tests {
         assert_eq!(refusals[0].get("kind").map(String::as_str), Some("query"));
     }
 
-    /// Work that started and outlived its request is visible as retained
-    /// capacity, stays cancellable while it exists, and gives everything
-    /// back when it ends.
     #[tokio::test(start_paused = true)]
     async fn a_retained_permit_is_visible_and_reclaimed() {
         let pool = hot_pool(2);
@@ -5401,7 +4365,6 @@ mod tests {
         assert!(snapshot[0].started, "this work did start");
         assert_eq!(snapshot[0].owner, WorkOwner::Key(7));
 
-        // The owner can keep asking while the work exists.
         assert!(pool.cancel_by_id(id));
         assert!(pool.cancel_by_id(id), "cancellation is repeatable");
         assert_eq!(pool.owner_of(id), Some(WorkOwner::Key(7)));
@@ -5422,9 +4385,6 @@ mod tests {
         assert_eq!(pool.owner_of(id), None);
     }
 
-    /// A client told its query timed out can still ask for it to stop.
-    /// The request's outcome and the work's life are two different things,
-    /// so the cancellation record has to outlive the response.
     #[tokio::test(start_paused = true)]
     async fn a_timed_out_query_stays_cancellable() {
         let pool = hot_pool(1);
@@ -5456,11 +4416,6 @@ mod tests {
         assert!(!pool.cancel_by_id(id));
     }
 
-    /// The stale-interrupt hazard: an interrupt for a finished query must
-    /// never reach the next query on that executor. Deregistration and
-    /// invocation are the same critical section, so either the
-    /// cancellation finds the old work (and the executor is still its own)
-    /// or it finds nothing at all. Both orders are exercised here.
     #[tokio::test(start_paused = true)]
     async fn cancellation_cannot_interrupt_a_reused_executor() {
         let pool = hot_pool(1);
@@ -5493,8 +4448,6 @@ mod tests {
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
         until("the executor is back", || pool.available_permits() == 1).await;
 
-        // The next query takes that same executor. The old id reaches
-        // nothing, and the new query answers normally.
         assert!(!pool.cancel_by_id(first), "the old slot is gone");
         let second = pool.allocate_query_id();
         let outcome = pool
@@ -5536,10 +4489,6 @@ mod tests {
         assert!(outcome.result.is_ok(), "{:?}", outcome.result);
     }
 
-    /// A cancellation can arrive before the work has an interrupt handle
-    /// to be stopped with. It latches, and the worker refuses to start —
-    /// otherwise the answer would be "cancelled" for a query that then ran
-    /// to completion anyway.
     #[tokio::test(start_paused = true)]
     async fn cancellation_before_the_handle_exists_refuses_the_start() {
         let pool = hot_pool(1);
@@ -5589,8 +4538,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A deadline far past every bound the tests below assert: a request
-    /// that answers before it was ended by its cancel, not its budget.
     fn far() -> Deadline {
         Deadline::after(Duration::from_secs(60))
     }
@@ -5616,10 +4563,6 @@ mod tests {
             .expect("an idle executor is behind the permit")
     }
 
-    /// A query queued behind a held permit is reached by a cancel by id
-    /// (#343). One cancel answers true, the request answers the capacity
-    /// refusal at once, far before its deadline and while the blocker still
-    /// holds the permit, and the worker never sees the query.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_reaches_a_query_queued_for_a_permit() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -5695,9 +4638,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A query that holds the permit and waits for the publication guard
-    /// is reached by a cancel by id (#343): it ends, and the permit is back
-    /// while the cutover's writer still holds the guard.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_during_the_publication_wait_returns_the_permit() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -5747,10 +4687,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A cancel sent after `pend` and before any wait starts ends the first
-    /// wait at once, even with a free permit ready on the first poll: the
-    /// wake reads the latched value before it waits, and it is polled
-    /// first.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_before_the_wait_is_seen_by_the_wait() {
         let pool = hot_pool(1);
@@ -5787,10 +4723,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A pending guard reads its request's cancel: its stop is requested
-    /// once a cancel by id reaches it, so a preparation job running on it
-    /// ends at its next check, and the refusal it answers with is logged
-    /// once with reason `cancelled`, however often it is asked.
     #[tokio::test(start_paused = true)]
     async fn a_pending_guard_stops_and_refuses_on_its_cancel() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -5814,16 +4746,10 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A cancel latched while the work waited survives its promotion: the
-    /// flag moves into the interrupt slot with its identity, and the worker
-    /// refuses at its work-start transition. The id is in exactly one map
-    /// at every step, in both orders of cancel and promotion, and the
-    /// executor both slots used answers the next query normally.
     #[tokio::test(start_paused = true)]
     async fn a_pending_cancel_survives_promotion() {
         let pool = hot_pool(1);
 
-        // Cancel, then promote.
         let id = pool.allocate_query_id();
         let pending = pool.pend(id, WorkKind::Query);
         assert_eq!(maps(&pool, id), (true, false));
@@ -5857,7 +4783,6 @@ mod tests {
         assert_eq!(maps(&pool, id), (false, false));
         assert!(registry_is_empty(&pool));
 
-        // Promote, then cancel: the registered path, on the same flag.
         let id = pool.allocate_query_id();
         let pending = pool.pend(id, WorkKind::Query);
         let slot = promote(&pool, id).await;
@@ -5884,11 +4809,6 @@ mod tests {
         );
     }
 
-    /// A pending entry lives exactly as long as its request's guard, and
-    /// promotion hands its id to the slot: a dropped `Pending` leaves
-    /// nothing to cancel, a request refused at its deadline stays
-    /// cancellable until its guard drops, and a guard dropped after
-    /// promotion leaves the work cancellable until its slot drops.
     #[tokio::test(start_paused = true)]
     async fn a_pending_entry_leaves_with_its_request() {
         let pool = hot_pool(1);
@@ -5945,10 +4865,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A wake whose channel closed with no cancel on it never fires:
-    /// promotion and a dropped guard both close it, and neither is a
-    /// cancel. One closed after a cancel still fires, and an untracked
-    /// request's never does.
     #[tokio::test(start_paused = true)]
     async fn a_closed_wake_is_not_a_cancel() {
         let pool = hot_pool(1);
@@ -5990,8 +4906,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// The resolved-source lane's one wait, the permit, refuses on a
-    /// cancel by id like the corpus lane's.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_reaches_a_resolved_source_query_queued_for_a_permit() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -6040,9 +4954,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A Parquet export is reached by a cancel by id at both of its waits:
-    /// queued for the permit, and holding it while it waits for the
-    /// publication guard.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_reaches_a_parquet_export_at_either_wait() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -6117,10 +5028,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A window capture is reached by a cancel by id at both of its waits,
-    /// the permit and the window's publication guard. Each refusal drops
-    /// the capture's charge with the work that never started, and `finish`
-    /// never runs.
     #[tokio::test(start_paused = true)]
     async fn a_cancel_reaches_a_window_capture_at_either_wait() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
@@ -6212,16 +5119,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A cancellation that lands after the work started stops it at the
-    /// bind-to-execute boundary (ADR-0024).
-    ///
-    /// The interrupt handle is published by then, but an interrupt raised
-    /// while `DuckDB` is binding may be swallowed — which is exactly the
-    /// case the budget exists for, since binding is where an expensive
-    /// query spends its time. The latch the pool shares with the executor
-    /// is the recovery: the worker reads it once binding is over, and the
-    /// request ends cancelled with no rows.
-    ///
     /// There is no seam between the bind and the execution, so the
     /// cancellation is latched with the worker parked at `Started`, one
     /// statement earlier. The engine reads the same flag either way.
@@ -6275,16 +5172,11 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// The start and the expiry can land in either order, and the answer
-    /// is exactly one classification either way — because the work-start
-    /// transition records it under the registry lock, not because a
-    /// `select!` happened to poll one arm first.
     #[tokio::test(start_paused = true)]
     async fn start_and_expiry_race_yields_exactly_one_classification() {
         let pool = hot_pool(2);
         let seams = pool.seams();
 
-        // Expiry first: the worker is still at the door.
         let entry = seams.hold(Seam::Entry);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
@@ -6305,8 +5197,6 @@ mod tests {
         entry.release();
         until("cleanup", || pool.retained() == 0).await;
 
-        // Start first: the worker is past the transition when the budget
-        // runs out.
         let started = seams.hold(Seam::Started);
         let id = pool.allocate_query_id();
         let submitted = pool.clone();
@@ -6337,9 +5227,6 @@ mod tests {
         );
     }
 
-    /// A caller that walks away is not a reason to abandon the work it
-    /// started: the permit stays booked until the query actually stops,
-    /// and it is visible as retained meanwhile.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_caller_retains_and_then_reclaims() {
         let pool = hot_pool(1);
@@ -6384,10 +5271,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A panic anywhere in the worker — before the start, in source
-    /// discovery, or after the answer is in hand — leaves nothing behind.
-    /// The cleanup guard is outside the unwind boundary, so it runs on the
-    /// way out of every one of them.
     #[tokio::test]
     async fn a_panicking_worker_leaks_no_permit_or_executor() {
         let pool = hot_pool(2);
@@ -6423,10 +5306,6 @@ mod tests {
         }
     }
 
-    /// A panic in the worker answers `Panicked`, and the panic's payload
-    /// reaches neither the error's own renderings, the log line the
-    /// response writes, nor the response body (ADR-0040): a payload can
-    /// quote anything the panicking code had in hand.
     #[tokio::test]
     async fn a_pool_panic_answers_panicked_without_its_payload() {
         use axum::response::IntoResponse;
@@ -6500,8 +5379,6 @@ mod tests {
         assert!(!log.contains(sentinel), "payload leaked: {log}");
     }
 
-    /// A completion landing on the same instant as the timeout produces
-    /// one request outcome and one cleanup, never an orphaned slot.
     #[tokio::test(start_paused = true)]
     async fn a_timeout_racing_completion_leaves_no_orphan() {
         let pool = hot_pool(1);
@@ -6522,7 +5399,6 @@ mod tests {
                 )
                 .await
         });
-        // The work is done; only its cleanup is outstanding.
         until("the answer is in hand", || finished.arrivals() == 1).await;
         tokio::time::advance(Duration::from_secs(6)).await;
         let outcome = request.await.expect("the request joins");
@@ -6542,9 +5418,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// Every lane that takes a permit is in the registry under its own
-    /// kind and owner: exports, scheduled runs and captures included, not
-    /// just the interactive query lane.
     #[tokio::test(start_paused = true)]
     async fn every_lane_registers_its_kind_and_owner() {
         let pool = hot_pool(3);
@@ -6635,8 +5508,6 @@ mod tests {
         until("cleanup", || pool.retained() == 0).await;
     }
 
-    /// Nothing accumulates. After a mixed run of every lane the pool is
-    /// back exactly where it started.
     #[tokio::test]
     async fn counts_return_to_baseline() {
         let pool = hot_pool(2);
@@ -6693,13 +5564,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// The sampling helper may not wait like a query (ADR-0024).
-    ///
-    /// The pool's one permit is parked in a worker, so the sample can
-    /// only queue. It gives up after one second of acquisition, no matter
-    /// how long the caller's overall deadline is — and the smaller of the
-    /// two always wins, so a 300 ms caller waits 300 ms. It answers the
-    /// safe capacity refusal, and leaves nothing behind.
     #[tokio::test(start_paused = true)]
     async fn sampling_bounds_its_wait() {
         let pool = hot_pool(1);
@@ -6722,7 +5586,6 @@ mod tests {
         until("the pool's one permit is taken", || parked.arrivals() == 1).await;
         assert_eq!(pool.available_permits(), 0);
 
-        // -- sampling: one second of acquisition under a long deadline --
         let sampler = pool.clone();
         let sample = tokio::spawn(async move {
             sampler
@@ -6753,7 +5616,6 @@ mod tests {
             "expected the safe capacity refusal, got {refused:?}"
         );
 
-        // -- and a shorter overall deadline is the one that governs --
         let sampler = pool.clone();
         let short = tokio::spawn(async move {
             sampler
@@ -6776,8 +5638,6 @@ mod tests {
                 .is_err_and(|e| matches!(&e, ServerError::CapacityNotStarted)),
         );
 
-        // Nothing a refused helper touched is still held: it never got a
-        // permit, so it never registered.
         assert_eq!(pool.retained(), 0);
         assert_eq!(pool.available_permits(), 0, "the query still holds the one");
 
@@ -6791,11 +5651,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// Acquisition is only half of a sample's life. Once it holds a
-    /// permit it reads parquet, and that read has to answer to the
-    /// caller's deadline too (ADR-0024). Otherwise an autocomplete
-    /// request over a huge corpus hangs for as long as the read takes,
-    /// with nothing in the retained count to explain the missing permit.
     #[tokio::test(start_paused = true)]
     async fn a_sample_that_overruns_is_a_timeout_and_stays_retained() {
         let pool = hot_pool(1);
@@ -6817,8 +5672,6 @@ mod tests {
         });
         until("the sample reaches its work", || started.arrivals() == 1).await;
 
-        // Past the work-start transition, so expiry is a timeout the
-        // caller can act on, not the pre-start capacity refusal.
         tokio::time::advance(Duration::from_secs(6)).await;
         let refused = sample
             .await
@@ -6829,7 +5682,6 @@ mod tests {
             "expected a post-start timeout, got {refused:?}"
         );
 
-        // The permit is still out, and the pool says who is holding it.
         let retained = pool.retained_work();
         assert_eq!(pool.retained(), 1);
         assert_eq!(retained.len(), 1);
@@ -6850,10 +5702,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// An export whose staging file cannot be made in the query scratch
-    /// directory fails without naming it (ADR-0056). The error's text is
-    /// what the internal-error log records, and the I/O error `tempfile`
-    /// raises carries the path it tried.
     #[tokio::test]
     async fn a_staging_file_failure_names_no_path() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100, None).unwrap();
@@ -6880,13 +5728,8 @@ mod tests {
         }
     }
 
-    /// A budget exhausted while a text search reads a corpus without
-    /// `_raw` is the query's answer (ADR-0056). The bare word reads the
-    /// absent `_raw` as NULL and searches `message`, and the dedup over a
-    /// million rows runs out of the shared budget. Both lanes, with and
-    /// without a hot buffer, must answer `query_resource_exhausted`: never a
-    /// 400 for the column the corpus lacks, and never a hot-only 200 that
-    /// leaves the cold rows out.
+    /// The bare word reads the absent `_raw` as NULL and searches `message`,
+    /// and the dedup over a million rows runs out of the shared budget.
     #[tokio::test]
     async fn an_exhausted_budget_over_a_rawless_corpus_answers_resource_exhausted() {
         use std::num::{NonZeroU32, NonZeroU64};
@@ -6971,15 +5814,6 @@ mod tests {
         assert!(wrong.is_empty(), "{wrong:#?}");
     }
 
-    /// Work that outlives its request and its pool keeps the query scratch
-    /// directory locked until its connection to the query database closes
-    /// (ADR-0056), whichever lane it came through. A field sample and a
-    /// `from saved` run park past their deadlines; then the pool and the
-    /// engine sampler drop. A second lock on the directory must refuse
-    /// while either worker still holds a connection: taking it would
-    /// reclaim the spill directory the parked database still writes into.
-    /// Once both workers finish, the lock frees, and the database removed
-    /// its own spill directory on the way out.
     #[tokio::test(start_paused = true)]
     async fn a_retained_worker_keeps_the_scratch_locked_past_its_pool() {
         use trawl_engine::scratch::{Reclaimed, ScratchError};
@@ -7069,14 +5903,8 @@ mod tests {
         );
     }
 
-    /// When the cutover cannot take the pool, the log says what is in the
-    /// way — including how much of it is work no request is waiting on
-    /// (ADR-0024). "Two permits held" and "two permits held by abandoned
-    /// work" call for different moves, and only the second is something an
-    /// operator can cancel by id.
     #[tokio::test(start_paused = true)]
     async fn exclusive_names_retained_permits_when_blocked() {
-        /// The bounded wait the cutover gives up after.
         const BUDGET: Duration = Duration::from_millis(20);
 
         use std::sync::Mutex as StdMutex;
@@ -7087,7 +5915,6 @@ mod tests {
         // event is emitted by the caller, on this thread, and it carries
         // no query_id for the shared sink to key on.
 
-        /// One captured event's fields, stringified.
         #[derive(Clone, Default)]
         struct Capture(Arc<StdMutex<Vec<std::collections::HashMap<String, String>>>>);
 
@@ -7169,9 +5996,6 @@ mod tests {
         assert_eq!(blocked.get("capacity").map(String::as_str), Some("1"));
         assert_eq!(blocked.get("timeout_ms").map(String::as_str), Some("20"));
 
-        // The retained reader is inside the publication gate as well as
-        // the semaphore, so a publisher cannot slip past a pool that
-        // merely looks busy: the cutover's exclusion is both halves.
         let publisher = Arc::clone(&pool.publication);
         let publishing = tokio::spawn(async move { publisher.write().await });
         settle().await;
@@ -7180,7 +6004,6 @@ mod tests {
             "retained work still holds its publication read guard"
         );
 
-        // Once the retained work stops, both waits clear.
         parked.release();
         until("the permit comes back", || pool.retained() == 0).await;
         settle().await;
@@ -7197,7 +6020,6 @@ mod tests {
     #[tokio::test]
     async fn cancel_all_clears_interrupts() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
-        // No active queries — cancel_all should be a no-op.
         pool.cancel_all();
         assert!(pool.registry.lock().interrupts.is_empty());
     }
@@ -7229,10 +6051,6 @@ mod tests {
         (seam::Session(table), gate)
     }
 
-    /// A second hold on a seam replaces the first in the table, and a
-    /// worker already parked at the first gate must still leave when the
-    /// session drops. Otherwise a test that fails between the two holds
-    /// hangs its process instead of failing.
     #[test]
     fn dropping_the_session_releases_a_displaced_gate() {
         let table = Arc::new(seam::Table::default());
@@ -7243,7 +6061,6 @@ mod tests {
             worker.reach(Seam::Entry);
             left.send(()).expect("the test is listening");
         });
-        // Hang guard: the worker arrives as soon as its thread runs.
         let deadline = std::time::Instant::now() + crate::test_timing::HANG_GUARD;
         while first.arrivals() == 0 {
             assert!(
@@ -7254,8 +6071,6 @@ mod tests {
         }
         let _second = table.hold(Seam::Entry);
         drop(seam::Session(table));
-        // A buggy table never releases the first gate, so this can only
-        // end by the hang guard.
         leaving
             .recv_timeout(crate::test_timing::HANG_GUARD)
             .expect("the session's drop let the worker parked at the displaced gate out");
@@ -7305,13 +6120,10 @@ mod tests {
         (complete, timings.len() - complete, reclaims)
     }
 
-    /// A capacity refusal writes one complete account with the wait that
-    /// ran out and no worker phase: nothing started (ADR-0046).
     #[tokio::test(start_paused = true)]
     async fn capacity_refusal_reports_wait_phases() {
         let pool = ExecutorPool::for_test("/nonexistent".into(), 1, 100_000, None).unwrap();
 
-        // Refused in the queue: the pool's one permit is held elsewhere.
         let held = pool
             .exclusive(Duration::from_secs(1))
             .await
@@ -7337,8 +6149,6 @@ mod tests {
         drop(capture);
         drop(held);
 
-        // Refused at the publication gate: the permit came, the gate
-        // did not.
         let writer = pool.publication.write().await;
         let id = pool.allocate_query_id();
         let (timing, request_id) = timed(&pool, id);
@@ -7394,10 +6204,6 @@ mod tests {
         }
     }
 
-    /// A timeout while the worker is parked in bind writes the partial
-    /// account at once, naming bind as the phase in flight and booking
-    /// none of it. The reclaim, when the work finally stops, carries the
-    /// worker's final totals under the same ids (ADR-0046).
     #[tokio::test(start_paused = true)]
     async fn timeout_in_bind_reports_active_phase_then_reclaim_totals() {
         let pool = hot_pool(1);
@@ -7481,19 +6287,10 @@ mod tests {
         );
     }
 
-    /// The worker finishing at the deadline writes exactly one final
-    /// account, in either order (ADR-0046): the registry lock decides.
-    ///
-    /// Deadline first: the request stamps the work retained while its
-    /// answer waits for cleanup, writes the partial account, and the
-    /// reclaim carries the totals. Worker first: cleanup already ran and
-    /// deregistered the work before the request heard, so there is no
-    /// reclaim coming and the request's account is complete.
     #[tokio::test(start_paused = true)]
     async fn deadline_finish_race_writes_one_final_account() {
         let pool = hot_pool(1);
 
-        // Deadline, then release.
         let seams = pool.seams();
         let finished = seams.hold(Seam::Finished);
         let id = pool.allocate_query_id();
@@ -7526,7 +6323,6 @@ mod tests {
         drop(capture);
         drop(seams);
 
-        // The worker finished and its slot dropped, then the deadline.
         let seams = pool.seams();
         let released = seams.hold(Seam::Released);
         let id = pool.allocate_query_id();
@@ -7572,9 +6368,6 @@ mod tests {
         assert_eq!(value(&timings[0], "active_query_phase"), None);
     }
 
-    /// A caller that walks away while the worker binds gets the same
-    /// contract as a timeout, as `abandoned`: the partial account now,
-    /// the final totals on the reclaim (ADR-0046).
     #[tokio::test(start_paused = true)]
     async fn abandoned_request_reports_partial_timing() {
         let pool = hot_pool(1);
@@ -7627,10 +6420,6 @@ mod tests {
         assert_eq!(accounts(&capture), (0, 1, 1));
     }
 
-    /// `pool_acquired` is gone from both lanes that wrote it: its one
-    /// datum is `query_pool_wait_us` now. The capture keeps every event
-    /// in the process, the worker thread's included, so an absence here
-    /// is an absence everywhere.
     #[tokio::test]
     async fn pool_acquired_is_gone() {
         let pool = hot_pool(1);
@@ -7672,7 +6461,6 @@ mod tests {
         window_under(u64::MAX)
     }
 
-    /// [`window`] under a budget of `max_bytes`.
     fn window_under(max_bytes: u64) -> CaptureSource {
         CaptureSource::Window {
             start: "2026-01-03T00:00:00Z".parse().unwrap(),
@@ -7681,12 +6469,10 @@ mod tests {
         }
     }
 
-    /// A `finish` that answers the executed result's row count.
     fn rows_of() -> CaptureFinish<usize> {
         Box::new(|input: CaptureInput<'_>| Ok(input.result.rows.len()))
     }
 
-    /// What a capture's charge saw as it dropped.
     #[derive(Debug, Clone, Copy)]
     struct Released {
         at: Instant,
@@ -7696,8 +6482,6 @@ mod tests {
         registered: usize,
     }
 
-    /// A stand-in for a capture's admission slot and quota reservation
-    /// (ADR-0057): it records what the pool still held when it dropped.
     struct Charge {
         registry: Arc<Mutex<Registry>>,
         semaphore: Arc<Semaphore>,
@@ -7722,8 +6506,6 @@ mod tests {
         }
     }
 
-    /// Capture work for `key` carrying a fresh [`Charge`] on `pool`, and
-    /// the charge's record, empty until it drops.
     fn charged(pool: &ExecutorPool, key: i64) -> (WorkContext, Arc<Mutex<Option<Released>>>) {
         let released = Arc::new(Mutex::new(None));
         let charge = Charge {
@@ -7737,7 +6519,6 @@ mod tests {
         )
     }
 
-    /// The bytes of every parquet file under `root`.
     fn stored_parquet_bytes(root: &std::path::Path) -> u64 {
         let mut total = 0;
         for entry in std::fs::read_dir(root).unwrap() {
@@ -7752,11 +6533,6 @@ mod tests {
         total
     }
 
-    /// A capture runs `finish` inside its slot, on the slot's own executor,
-    /// and its charge is released only once the slot gave everything back:
-    /// the permit, the executor and the registration (ADR-0057). The window
-    /// reads the cold row and the hot row, and its budget measured exactly
-    /// the stored files the read selected.
     #[tokio::test]
     async fn a_capture_finishes_inside_its_slot_and_releases_its_charge_after_the_permit() {
         let (dir, _hot, pool) = cold_and_hot_pool().await;
@@ -7822,9 +6598,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A capture whose caller walks away before its work starts never runs
-    /// `finish`, and its charge stays held until the slot it rode in is
-    /// gone (ADR-0057).
     #[tokio::test(start_paused = true)]
     async fn a_capture_dropped_before_it_starts_never_finishes_and_releases_its_charge() {
         let pool = hot_pool(1);
@@ -7888,7 +6661,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// An answer nobody hears: it records that it was dropped.
     struct Unheard(Arc<AtomicBool>);
 
     impl Drop for Unheard {
@@ -7897,9 +6669,6 @@ mod tests {
         }
     }
 
-    /// A `finish` still writing at the deadline: the request answers a
-    /// timeout, the work keeps its permit and its charge until `finish`
-    /// returns, and what `finish` then answers is dropped unheard.
     #[tokio::test(start_paused = true)]
     async fn a_finish_past_the_deadline_times_out_and_holds_its_charge_until_it_returns() {
         let pool = hot_pool(1);
@@ -7958,9 +6727,6 @@ mod tests {
         assert_eq!(released.available_permits, 1);
         assert_eq!(released.idle_executors, baseline_idle);
         assert_eq!(released.registered, 0);
-        // The worker hands its answer back after the slot is gone, and the
-        // runtime drops it there: the request stopped listening at the
-        // deadline.
         until("finish's late answer is dropped, never delivered", || {
             unheard.load(Ordering::SeqCst)
         })
@@ -7969,10 +6735,6 @@ mod tests {
         assert!(registry_is_empty(&pool));
     }
 
-    /// A window over the source budget is refused before the work reaches
-    /// `Started`: no hot snapshot, no engine, no `finish`. The refusal is
-    /// logged once with its counts, and the permit and the charge come
-    /// back (ADR-0057).
     #[tokio::test]
     async fn a_capture_over_its_source_budget_refuses_before_it_starts() {
         let (dir, _hot, pool) = cold_and_hot_pool().await;
@@ -8040,9 +6802,6 @@ mod tests {
         );
     }
 
-    /// A resolved source (`| from saved`) waits for no publication guard and
-    /// reads no hot buffer: it answers with a writer holding the guard, and
-    /// with the stored rows only. A window on the same pool does wait.
     #[tokio::test]
     async fn a_resolved_capture_skips_the_publication_guard_and_the_hot_buffer() {
         let pool = hot_pool(1);
@@ -8104,8 +6863,6 @@ mod tests {
         assert_eq!(pool.available_permits(), pool.capacity());
     }
 
-    /// A panic in `finish` answers `Panicked` and leaks nothing; a query
-    /// that fails never reaches `finish`. Both release the charge.
     #[tokio::test]
     async fn a_failing_capture_releases_everything() {
         let pool = hot_pool(1);

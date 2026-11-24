@@ -4,27 +4,10 @@
 
 //! Refused calls as error text, and caret excerpts (ADR-0058).
 //!
-//! A refused tool call is `isError` with one text block and no
-//! `structuredContent`: the tool's output schema describes success. The
-//! text names trawld's error code and HTTP status, quotes trawld's message,
-//! points a caret excerpt at each diagnostic's span in the text that was
-//! sent, gives the hint, the request id an operator can find the failure
-//! by, and the `Retry-After` wait. A transport failure or a response that
-//! did not parse is named by its class only: no stack trace, no internal
-//! path, no library reason.
-//!
-//! A span is checked before it is used, by
-//! [`trawl_core::text_layout::locate_span`], the rule the web UI's error
-//! notice follows too (ADR-0039): reversed, past the end of the sent text,
-//! or off a character boundary at either end, and the excerpt is dropped
-//! while the message stays. A caret under the wrong character is worse
-//! than none.
-//!
-//! Every error text is at most [`MAX_ERROR_BYTES`], cut on a character
-//! boundary with a marker. An error met after trawld already acted on the
-//! call ([`refusal_after`], [`error_after`]) is built and capped once: it
-//! opens with what trawld did, the lines naming what stands end it before
-//! the trailer, and the cap cuts only what lies between.
+//! A refused tool call has no `structuredContent`: the tool's output schema
+//! describes success. A transport failure or a response that did not parse
+//! is named by its class only: no stack trace, no internal path, no library
+//! reason.
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use trawl_client::{ClientError, ErrorDetail, ErrorSpan, NetworkKind};
@@ -36,27 +19,19 @@ use super::one_line;
 use super::rows::floor_char_boundary;
 use crate::reply::Diagnostic;
 
-/// The most bytes an error text holds.
 pub const MAX_ERROR_BYTES: usize = 8 * 1024;
 
-/// The most diagnostics one error text lists; the rest are counted.
 const MAX_DIAGNOSTICS: usize = 8;
 
-/// Bytes of the sent line an excerpt keeps on each side of the span, and
-/// of the span itself.
 pub const EXCERPT_CONTEXT_BYTES: usize = 60;
 
-/// What a cut error text ends with.
 const CUT_MARKER: &str = "\n…[error text cut at 8192 bytes]";
 
-/// An `isError` result holding `text`, capped at [`MAX_ERROR_BYTES`].
 #[must_use]
 pub fn error_result(text: String) -> CallToolResult {
     CallToolResult::error(vec![ContentBlock::text(cap(text))])
 }
 
-/// `text` cut to at most [`MAX_ERROR_BYTES`] on a character boundary, with
-/// a marker saying it was cut.
 #[must_use]
 pub fn cap(mut text: String) -> String {
     if text.len() <= MAX_ERROR_BYTES {
@@ -68,8 +43,6 @@ pub fn cap(mut text: String) -> String {
     text
 }
 
-/// The `isError` result for `tool` arguments that did not decode into the
-/// tool's input.
 #[must_use]
 pub fn invalid_arguments(tool: &str, error: &serde_json::Error) -> CallToolResult {
     error_result(format!(
@@ -78,27 +51,16 @@ pub fn invalid_arguments(tool: &str, error: &serde_json::Error) -> CallToolResul
     ))
 }
 
-/// The `isError` result for a call to `tool` that trawld refused or that
-/// failed on the way, with `sent` the query text the call sent, if any.
 #[must_use]
 pub fn refusal(tool: &str, error: &ClientError, sent: Option<&str>) -> CallToolResult {
     error_result(refusal_text(tool, error, sent))
 }
 
-/// The text of [`refusal`], capped at [`MAX_ERROR_BYTES`].
-///
-/// The `Retry-After` wait and the request id end the text and survive the
-/// cap: when the text is too long, the head (the code line, trawld's
-/// message and the diagnostics) is cut instead, on a character boundary
-/// with the cut marker.
 #[must_use]
 pub fn refusal_text(tool: &str, error: &ClientError, sent: Option<&str>) -> String {
     refusal_text_with(tool, error, sent, &[])
 }
 
-/// The `isError` result of [`refusal`] with `advice`, lines the tool adds
-/// after trawld's message: what the refusal means for this call and the
-/// call that is the way back.
 #[must_use]
 pub fn refusal_with(
     tool: &str,
@@ -109,8 +71,6 @@ pub fn refusal_with(
     error_result(refusal_text_with(tool, error, sent, advice))
 }
 
-/// [`refusal_text`] with `advice` after trawld's message and diagnostics,
-/// or after the failure line when trawld sent none.
 #[must_use]
 pub fn refusal_text_with(
     tool: &str,
@@ -123,14 +83,6 @@ pub fn refusal_text_with(
     cap_between("", &head.join("\n"), &trailer.join("\n"))
 }
 
-/// The `isError` result for `error`, which `tool` met after trawld already
-/// acted on the call, capped once.
-///
-/// `lead`, the line saying what trawld did, opens the text; `kept`, the
-/// lines naming what stands and how to reach it, follow trawld's message,
-/// before the `Retry-After` wait and the request id. When the text is too
-/// long, only the failure line, trawld's message and the diagnostics
-/// between them are cut. An empty `lead` opens with the failure line.
 #[must_use]
 pub fn refusal_after(
     lead: &str,
@@ -147,17 +99,11 @@ pub fn refusal_after(
     error_result(cap_between(lead, &head.join("\n"), &tail.join("\n")))
 }
 
-/// The `isError` result holding `lead`, then `text`, capped once: `lead`
-/// stays whole and `text` is cut. An empty `lead` is [`error_result`].
 #[must_use]
 pub fn error_after(lead: &str, text: &str) -> CallToolResult {
     error_result(cap_between(lead, text, ""))
 }
 
-/// A refusal's lines: the head (the failure line, trawld's message and
-/// the diagnostics with their excerpts cut from `sent`), and the trailer
-/// (the `Retry-After` wait and the request id), which ends the text and
-/// survives the cap.
 fn refusal_lines(
     tool: &str,
     error: &ClientError,
@@ -214,18 +160,10 @@ fn refusal_lines(
     (head, trailer)
 }
 
-/// `lead`, `head` and `tail`, each on the lines after the one before, an
-/// empty one left out, within [`MAX_ERROR_BYTES`]. When all three do not
-/// fit, `head` is cut on a character boundary and ends with the cut
-/// marker, and `lead` and `tail` stay whole.
-///
 /// A lead and tail always leave room for a head: the longest lead names
 /// two validated ids, and the longest tail a validated result id, a `u32`
 /// wait and a request id trawl-client reads only up to
-/// [`trawl_client::MAX_REQUEST_ID_BYTES`], a few hundred bytes in all. Were
-/// they ever not to, the head goes and the lead is cut from its end
-/// instead, never the tail; only a tail that alone outgrows the cap, which
-/// nothing trawl-client returns can make, is cut from its end by [`cap`].
+/// [`trawl_client::MAX_REQUEST_ID_BYTES`], a few hundred bytes in all.
 fn cap_between(lead: &str, head: &str, tail: &str) -> String {
     let joined = |head: &str| {
         [lead, head, tail]
@@ -261,8 +199,6 @@ fn cap_between(lead: &str, head: &str, tail: &str) -> String {
     }
 }
 
-/// The diagnostics of `details`, each with a caret excerpt cut from `sent`
-/// when its span indexes `sent`.
 #[must_use]
 pub fn diagnostics(sent: &str, details: &[ErrorDetail]) -> Vec<Diagnostic> {
     details
@@ -283,7 +219,6 @@ pub fn diagnostics(sent: &str, details: &[ErrorDetail]) -> Vec<Diagnostic> {
         .collect()
 }
 
-/// Print `diagnostics` as `error:` lines with their excerpts and hints.
 pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<String>) {
     for diagnostic in diagnostics.iter().take(MAX_DIAGNOSTICS) {
         lines.push(format!("error: {}", one_line(&diagnostic.message)));
@@ -304,27 +239,15 @@ pub(crate) fn diagnostic_lines(diagnostics: &[Diagnostic], lines: &mut Vec<Strin
     }
 }
 
-/// A caret excerpt of `sent` at `span`: the line holding the span's start,
-/// then a line whose carets sit under the span.
-///
-/// `None` when the span cannot index `sent` (see the module docs). The
-/// line is cut to [`EXCERPT_CONTEXT_BYTES`] on each side of the span, and
-/// the span to as many, on character boundaries, with `…` where it was
-/// cut. A multi-line text names the line, `line N: `. The caret column
-/// counts display columns as the string width of the text before the span,
-/// so wide characters take two, combining marks none, and an emoji with a
-/// variation selector the columns of its cluster; a tab stays a tab under itself. Any
-/// other character [`is_unsafe_display_char`] names (a control character, a
-/// bidi control, a zero-width or joiner, the byte order mark, the soft
-/// hyphen, a line or paragraph separator) prints as U+FFFD, so the excerpt
-/// stays on its two lines and cannot reorder or hide the text around it.
+/// Any character [`is_unsafe_display_char`] names but the tab prints as
+/// U+FFFD, so the excerpt stays on its two lines and cannot reorder or hide
+/// the text around it.
 #[must_use]
 pub fn excerpt(sent: &str, span: &ErrorSpan) -> Option<String> {
     let at = locate_span(sent, span.start, span.end)?;
     let (line_start, displayed_end) = (at.line_start, at.line_end);
     let (start_on_line, covered_end) = (at.start, at.end);
 
-    // The window, on character boundaries of the sent text.
     let window_start =
         ceil_char_boundary(sent, start_on_line.saturating_sub(EXCERPT_CONTEXT_BYTES))
             .max(line_start);
@@ -371,10 +294,6 @@ fn padding(text: &str) -> String {
         .join("\t")
 }
 
-/// `text` with every character [`is_unsafe_display_char`] names but the
-/// tab as U+FFFD: controls, the bidi controls, zero-widths and joiners, the
-/// byte order mark, the soft hyphen, and the line and paragraph separators.
-///
 /// The tab stays because [`padding`] and the caret count line up on it. The
 /// replacement takes one column, so a character that took none before the
 /// span still moves the caret by the column its replacement prints in.
@@ -390,7 +309,6 @@ fn displayed(text: &str) -> String {
         .collect()
 }
 
-/// The smallest character boundary of `text` at or above `index`.
 fn ceil_char_boundary(text: &str, index: usize) -> usize {
     let mut at = index.min(text.len());
     while !text.is_char_boundary(at) {
@@ -399,7 +317,6 @@ fn ceil_char_boundary(text: &str, index: usize) -> usize {
     at
 }
 
-/// The transport failure's class, as the tail of a sentence.
 fn network_class(kind: NetworkKind) -> &'static str {
     match kind {
         NetworkKind::UntrustedCertificate => {
@@ -415,7 +332,6 @@ fn network_class(kind: NetworkKind) -> &'static str {
     }
 }
 
-/// `second` or `seconds`.
 fn seconds(n: u32) -> &'static str {
     if n == 1 { "second" } else { "seconds" }
 }

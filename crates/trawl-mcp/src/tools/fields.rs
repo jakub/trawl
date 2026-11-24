@@ -6,22 +6,8 @@
 //! result, each with where its facts come from (ADR-0058).
 //!
 //! `source: service` reads two independent records of the service and
-//! keeps them apart, because they count different things:
-//!
-//! - the field catalog scoped to the service (`GET /api/v1/schema/fields`):
-//!   the pinned type, whether the pin is degraded, the rows the catalog
-//!   observed carrying the field in this service and when it last saw one,
-//!   with provenance `catalog_observation`;
-//! - the per-service schema the daemon builds from stored parquet footers
-//!   (`GET /api/v1/schema/services`): the stored type, the rows and the
-//!   null count in those footers, with provenance `parquet_footer`.
-//!
-//! A field both records know prints twice, catalog first. Either record
-//! failing leaves the other, with the outcome naming what failed; both
-//! failing is the catalog's refusal.
-//!
-//! `source: result` reads a zero-row page of the capture for its columns
-//! and column facts, with provenance `capture`: nothing runs again.
+//! keeps them apart, because they count different things. A field both
+//! records know prints twice, catalog first.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -41,10 +27,8 @@ use crate::render::rows::{as_u64, json_string};
 use crate::render::{self, Budget, refusal};
 use crate::reply::{FieldView, FieldsReply, FieldsSource, NextAction, Provenance};
 
-/// The most catalog fields one `source: service` call reads.
 pub const CATALOG_FIELDS_LIMIT: usize = 500;
 
-/// Run `fields` against `backend`.
 pub async fn run<B: Backend>(backend: &B, input: FieldsInput) -> CallToolResult {
     match (input.source, input.service, input.result_id) {
         (FieldsSource::Service, Some(service), None) => for_service(backend, &service).await,
@@ -69,7 +53,6 @@ pub async fn run<B: Backend>(backend: &B, input: FieldsInput) -> CallToolResult 
     }
 }
 
-/// `source: service`.
 async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
     let (catalog, stored) = tokio::join!(
         backend.catalog_fields(Some(service), None, Some(CATALOG_FIELDS_LIMIT)),
@@ -150,7 +133,6 @@ async fn for_service<B: Backend>(backend: &B, service: &str) -> CallToolResult {
     render::fields(reply, Budget::default())
 }
 
-/// One catalog summary as a field view.
 fn catalog_view(summary: &CatalogFieldSummary, degraded: bool) -> FieldView {
     FieldView {
         name: summary.name.clone(),
@@ -166,8 +148,6 @@ fn catalog_view(summary: &CatalogFieldSummary, degraded: bool) -> FieldView {
     }
 }
 
-/// The outcome line of `source: service`: what each record holds, and
-/// which one could not be read.
 fn service_outcome(
     service: &str,
     catalog: &Result<CatalogFieldsResponse, ClientError>,
@@ -218,7 +198,6 @@ fn service_outcome(
     parts.join(" ")
 }
 
-/// `n` and `noun`, the noun plural unless `n` is 1.
 fn counted(n: u64, noun: &str) -> String {
     if n == 1 {
         format!("1 {noun}")
@@ -256,7 +235,6 @@ fn service_search(service: &str) -> Option<String> {
     }
 }
 
-/// `source: result`.
 async fn for_result<B: Backend>(backend: &B, result_id: &str) -> CallToolResult {
     let result = match backend.result_page(result_id, 0, 0, None).await {
         Ok(page) => page.result,
@@ -292,7 +270,6 @@ async fn for_result<B: Backend>(backend: &B, result_id: &str) -> CallToolResult 
     render::fields(reply, Budget::default())
 }
 
-/// A capture's columns, in position order, with the capture's facts.
 fn result_views(result: &CapturedResult) -> Vec<FieldView> {
     result
         .columns

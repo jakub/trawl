@@ -4,15 +4,9 @@
 
 //! `<ErrorBanner/>` — `role="alert"` message strip.
 //!
-//! `role="alert"` is the point: a screen reader announces the message
-//! when it appears, which a plain `<div class="error">` does not.
-//!
-//! Renders nothing while the signal is `None`, so the
-//! conditional-render idiom (`{move || error.get().map(|msg| …)}`)
-//! collapses into a single component invocation. The class is
-//! `.error-banner`, not bare `.error`, because a bare `.error` selector
-//! leaks padding/border onto every element that uses `error` as a state
-//! token (`.status-dot.error`, `.load-hint.error`, …).
+//! The class is `.error-banner`, not bare `.error`, because a bare `.error`
+//! selector leaks padding/border onto every element that uses `error` as a
+//! state token (`.status-dot.error`, `.load-hint.error`, …).
 //!
 //! `id` exists so a control can point `aria-describedby` at the banner:
 //! `role="alert"` announces the message once, the association is what

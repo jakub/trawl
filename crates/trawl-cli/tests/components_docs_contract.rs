@@ -3,11 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The component tables, the executable counts and the source map are
-//! packaging artifacts: they say what a release ships. The Linux tarball
-//! holds `trawl`, `trawld`, `trawl-web` and `fleet-admin`, as
-//! `scripts/release/verify-distribution.py` checks. A shipped executable
-//! that a page leaves out, or a deleted one it still lists, fails here
-//! before it reaches a reader.
+//! packaging artifacts: they say what a release ships.
 
 use std::path::Path;
 
@@ -22,13 +18,10 @@ const RELEASE_DRAFT: &str = include_str!("../../../docs/launch/1.0-release-notes
 
 /// The Linux tarball's executables, in the order the tables list them.
 const EXECUTABLES: [&str; 4] = ["trawl", "trawld", "trawl-web", "fleet-admin"];
-/// The executables in the `trawl-server` package and the container image.
 const SERVER_EXECUTABLES: [&str; 3] = ["trawld", "trawl-web", "fleet-admin"];
 
 const COMPONENT_HEADER: &str = "| Component | Responsibility |";
 
-/// The first cells of a markdown table that starts at `header`, one table
-/// per header line in `doc`.
 fn tables<'a>(doc: &'a str, header: &str) -> Vec<Vec<&'a str>> {
     let lines: Vec<&str> = doc.lines().collect();
     lines
@@ -45,8 +38,8 @@ fn tables<'a>(doc: &'a str, header: &str) -> Vec<Vec<&'a str>> {
         .collect()
 }
 
-/// The backticked first cells of each component table. PostgreSQL is a
-/// component but not an executable, so it is not backticked and drops out.
+/// PostgreSQL is a component but not an executable, so it is not backticked
+/// and drops out.
 fn component_tables(doc: &str) -> Vec<Vec<&str>> {
     tables(doc, COMPONENT_HEADER)
         .into_iter()
@@ -76,8 +69,6 @@ const NUMBER_WORDS: [&str; 10] = [
     "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
 ];
 
-/// Every number, as a word or in digits, that comes right before
-/// "executables" in `doc`.
 fn executable_counts(doc: &str) -> Vec<String> {
     let words: Vec<String> = doc
         .split_whitespace()
@@ -99,8 +90,7 @@ fn executable_counts(doc: &str) -> Vec<String> {
 
 #[test]
 fn every_executable_count_reads_four() {
-    // Each of these sentences counts what a Linux tarball holds. The minimum
-    // keeps the test from passing when a sentence is reworded away.
+    // The minimum keeps the test from passing when a sentence is reworded away.
     for (name, doc, at_least) in [
         ("getting-started/index.md", GETTING_STARTED, 2),
         ("operate/deployment.md", DEPLOYMENT, 1),
@@ -119,7 +109,6 @@ fn every_executable_count_reads_four() {
     }
 }
 
-/// The `/usr/bin/<name>` paths in `cell`.
 fn usr_bin_names(cell: &str) -> Vec<&str> {
     cell.split('`')
         .filter_map(|part| part.strip_prefix("/usr/bin/"))

@@ -3,18 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `search`, `context`, `sightings` and `compare` attached to an
-//! investigation, and `orient`'s open investigations, over a recording
-//! backend (ADR-0059, #310, #309).
-//!
-//! An attached execute sends the session's `seen_seq` with the capture and
-//! prints the activity trawld answers with under the same exactly-once
-//! rules as an append; `validate` ignores the attachment and says so; the
-//! id's shape and the purpose's length are refused before any request;
-//! trawld's refusals name the way back. The correlation reads attach as
-//! `search` does, and a sightings block's lists give way only after the
-//! activity entries do. `orient` lists open investigations
-//! only for a key that may read them, and a list it cannot read is one
-//! line.
+//! investigation, and `orient`'s open investigations (ADR-0059).
 
 mod support;
 
@@ -62,7 +51,6 @@ fn id() -> InvestigationId {
     InvestigationId::parse(INVESTIGATION_ID).unwrap()
 }
 
-/// Two short captured rows, and their first page.
 fn two_rows() -> (CapturedResult, ResultPage) {
     let captured = captured(
         "service=api",
@@ -75,8 +63,6 @@ fn two_rows() -> (CapturedResult, ResultPage) {
     (captured, page)
 }
 
-/// A backend whose capture answers `activity`, kept for the
-/// investigation, with the capture's step at `step_seq`.
 fn attached_backend(activity: Option<Activity>, step_seq: u64) -> Fake {
     let (mut captured, page) = two_rows();
     captured.investigation_id = Some(id());
@@ -93,8 +79,6 @@ fn attached_backend(activity: Option<Activity>, step_seq: u64) -> Fake {
     }
 }
 
-/// An attached backend whose capture, kept with its step at 7, executed
-/// `service=api` and 4096 spaces: a text no 4096-byte reply can print.
 fn unprintable_backend() -> Fake {
     let query = format!("service=api{}", " ".repeat(4096));
     let mut captured = captured(
@@ -146,8 +130,6 @@ fn assert_valid_mirror(result: &CallToolResult) {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-// -- attached search ----------------------------------------------------------------
-
 #[tokio::test]
 async fn an_attached_execute_sends_seen_seq_prints_the_activity_and_advances_seen() {
     let backend = attached_backend(
@@ -192,9 +174,6 @@ async fn an_attached_execute_sends_seen_seq_prints_the_activity_and_advances_see
     assert_valid_mirror(&result);
 }
 
-/// The first attached execute of a session has seen nothing, so it sends
-/// no `seen_seq`; the answer's `step_seq` is where the session starts
-/// following, and the next attached execute sends it.
 #[tokio::test]
 async fn the_first_attached_execute_sends_no_seen_seq_and_says_where_following_starts() {
     let backend = attached_backend(None, 7);
@@ -227,10 +206,6 @@ async fn the_first_attached_execute_sends_no_seen_seq_and_says_where_following_s
     );
 }
 
-/// The first attached execute follows its step only once its reply fitted:
-/// a page that fails after the capture, or a reply that does not fit,
-/// leaves the session as untouched as before the call, and the next call
-/// sends no `seen_seq` again.
 #[tokio::test]
 async fn the_first_attached_execute_follows_its_step_only_after_its_reply_fits() {
     let mut failed_page = attached_backend(None, 7);
@@ -258,10 +233,6 @@ async fn the_first_attached_execute_follows_its_step_only_after_its_reply_fits()
     assert_eq!(seen.lock().await.get(&id()), Some(7), "a fitted reply");
 }
 
-/// An attached capture trawld accepted is a step of the investigation
-/// whatever happens after it: a page that fails, or a reply that does not
-/// fit, is an error that opens by naming the investigation and the result
-/// kept for it.
 #[tokio::test]
 async fn an_attached_search_that_succeeded_but_cannot_print_keeps_its_acknowledgement() {
     let mut failed_page = attached_backend(None, 7);
@@ -288,12 +259,6 @@ async fn an_attached_search_that_succeeded_but_cannot_print_keeps_its_acknowledg
     }
 }
 
-/// A page refusal after an accepted capture is capped once: the
-/// acknowledgement opens the text, the line naming the captured result and
-/// the `retry after` and `request id` lines end it, and only trawld's
-/// message is cut. At the sizes two reviewers found the second cap
-/// clipping the trailer (a 7933-byte 503, a 7965-byte 429 with a wait),
-/// one byte either side, and far past the cap; attached and not.
 #[tokio::test]
 async fn a_page_refusal_after_a_capture_keeps_its_acknowledgement_and_its_trailer() {
     use trawl_client::{ClientError, ErrorEnvelope};
@@ -364,8 +329,6 @@ async fn a_page_refusal_after_a_capture_keeps_its_acknowledgement_and_its_traile
                     "{label}: …{}",
                     &text[text.len().saturating_sub(300)..]
                 );
-                // Whole, the text would be this long; past the cap, only
-                // trawld's message is cut, and the cut says so.
                 let whole = usize::from(attached) * acknowledgement.len()
                     + failure.len()
                     + "\ntrawld says: ".len()
@@ -390,12 +353,6 @@ async fn a_page_refusal_after_a_capture_keeps_its_acknowledgement_and_its_traile
     }
 }
 
-/// The longest lead and tail a page refusal after an accepted capture can
-/// carry leave the head nearly all of the cap, so the cap cuts only
-/// trawld's message: the acknowledgement names two ids of 32 hex digits,
-/// the captured line one, the wait is at most `u32::MAX` seconds or the
-/// longer sentence for none, and trawl-client reads a request id of at most
-/// `MAX_REQUEST_ID_BYTES`, or none at all, which leaves the rest whole.
 #[tokio::test]
 async fn the_longest_lead_and_tail_leave_the_head_nearly_all_of_the_cap() {
     use trawl_client::{ClientError, ErrorEnvelope, MAX_REQUEST_ID_BYTES};
@@ -450,21 +407,16 @@ async fn the_longest_lead_and_tail_leave_the_head_nearly_all_of_the_cap() {
             "…{}",
             &text[text.len().saturating_sub(300)..]
         );
-        // The head of ASCII fills the room the lead and tail leave.
         assert_eq!(text.len(), MAX_ERROR_BYTES, "{retry}");
         longest = longest.max(acknowledgement.len() + CUT.len() + tail.len());
     }
     assert!(longest <= MAX_ERROR_BYTES / 16, "{longest}");
 }
 
-/// An id no trawld mints, which names nothing a read can page.
 const MALFORMED_RESULT_ID: &str = "NOT-A-RESULT-ID\u{202e}";
 
-/// Another investigation than [`INVESTIGATION_ID`].
 const OTHER_INVESTIGATION_ID: &str = "00000000000000000000000000000001";
 
-/// A backend whose attached capture answers result `result_id` kept for
-/// `kept_for`, with its step at 7.
 fn answering(result_id: &str, kept_for: Option<&str>) -> Fake {
     let mut backend = attached_backend(None, 7);
     let (mut captured, page) = two_rows();
@@ -480,11 +432,6 @@ fn answering(result_id: &str, kept_for: Option<&str>) -> Fake {
     backend
 }
 
-/// A capture answer the server cannot stand behind (a result id trawld
-/// does not mint, or a result not kept for the investigation the search
-/// named) is a protocol error: it says what is unknown and that the board
-/// shows what was kept, certifies no result, reads no page, prints no id
-/// trawld sent, and leaves the session as it was.
 #[tokio::test]
 async fn an_attached_capture_answer_for_an_unreadable_or_foreign_result_certifies_nothing() {
     for (label, backend, reason) in [
@@ -531,7 +478,6 @@ async fn an_attached_capture_answer_for_an_unreadable_or_foreign_result_certifie
         assert_eq!(seen.lock().await.get(&id()), Some(4), "{label}");
     }
 
-    // A session that had seen nothing reads the board from its start.
     let backend = answering(MALFORMED_RESULT_ID, Some(INVESTIGATION_ID));
     let seen = Seen::default();
     let result = run(&backend, &seen, execute(json!({}))).await;
@@ -545,8 +491,6 @@ async fn an_attached_capture_answer_for_an_unreadable_or_foreign_result_certifie
     assert_eq!(seen.lock().await.get(&id()), None);
 }
 
-/// An unattached capture answer whose result id trawld does not mint is
-/// an error that prints no id and reads no page.
 #[tokio::test]
 async fn a_capture_answer_with_a_malformed_result_id_reads_no_page() {
     let backend = answering(MALFORMED_RESULT_ID, None);
@@ -561,7 +505,6 @@ async fn a_capture_answer_with_a_malformed_result_id_reads_no_page() {
     assert_eq!(backend.methods(), ["capabilities", "capture"]);
 }
 
-/// The capture calls the backend saw, in order.
 fn captures(backend: &Fake) -> Vec<String> {
     backend
         .calls()
@@ -605,8 +548,6 @@ async fn a_cut_attached_activity_continues_from_the_last_entry_it_printed() {
     assert_valid_mirror(&result);
 }
 
-/// Under a budget that holds the activity or the rows but not both, the
-/// rows give way: every activity entry prints and no continuation is due.
 #[tokio::test]
 async fn rows_give_way_before_activity_entries_do() {
     let captured = captured(
@@ -693,9 +634,6 @@ async fn validate_ignores_the_investigation_and_says_so() {
     assert_valid_mirror(&result);
 }
 
-/// R4: validate says it ignored whatever attachment input the call gave.
-/// A purpose without an investigation is said too, and the mirror invents
-/// no investigation for it.
 #[tokio::test]
 async fn validate_says_it_ignored_a_purpose_given_without_an_investigation() {
     let backend = Fake {
@@ -727,7 +665,6 @@ async fn validate_says_it_ignored_a_purpose_given_without_an_investigation() {
                 "{arguments}: {text}"
             );
         } else {
-            // No investigation to print it beside: the outcome line says it.
             let first = text.lines().next().unwrap();
             assert_eq!(first, format!("The query is valid. Validate {notice}."));
         }
@@ -741,8 +678,6 @@ async fn validate_says_it_ignored_a_purpose_given_without_an_investigation() {
     }
 }
 
-/// R1: an attached search trawld accepted names its investigation and the
-/// result kept for it at every budget, whatever activity it carries.
 #[tokio::test]
 async fn an_attached_execute_names_its_investigation_and_kept_result_at_every_budget() {
     use trawl_api::investigations::{NOTE_MAX_BYTES, PURPOSE_MAX_BYTES};
@@ -869,10 +804,6 @@ async fn a_refused_attached_capture_names_the_way_back_and_moves_nothing() {
     }
 }
 
-/// A search with no investigation reads and writes nothing of the
-/// session's `seen`, so it takes no session lock: while its capture is held
-/// open, an investigation read on the same session completes. The search
-/// then completes once released.
 #[tokio::test]
 async fn an_unattached_search_takes_no_session_lock() {
     let (captured, page) = two_rows();
@@ -936,8 +867,6 @@ async fn an_unattached_search_takes_no_session_lock() {
         backend.calls()
     );
 }
-
-// -- orient ---------------------------------------------------------------------------
 
 fn summary(index: u64, status: InvestigationStatus) -> InvestigationSummary {
     InvestigationSummary {
@@ -1066,14 +995,8 @@ async fn orient_says_in_one_line_when_there_is_no_open_investigation_or_no_list(
     }
 }
 
-// -- attached correlation reads -------------------------------------------------------
-
-/// The id of the result a correlation read captures; the focus row of a
-/// `context` read lives in [`RESULT_ID`].
 const CORRELATED_ID: &str = "abcdef0123456789abcdef0123456789";
 
-/// The three correlation tools, each with the arguments of one read and
-/// the noun its step goes by.
 const CORRELATION_TOOLS: [&str; 3] = ["context", "sightings", "compare"];
 
 fn noun(tool: &str) -> &'static str {
@@ -1101,7 +1024,6 @@ fn correlation_arguments(tool: &str, extra: &Json) -> Json {
     arguments
 }
 
-/// `extra` and the attachment to [`INVESTIGATION_ID`].
 fn attached_to(extra: Json) -> Json {
     let Json::Object(extra) = extra else {
         panic!("extra arguments are an object");
@@ -1111,7 +1033,6 @@ fn attached_to(extra: Json) -> Json {
     arguments
 }
 
-/// Call correlation tool `tool` as `tools/call` routes it.
 async fn call(tool: &str, backend: &Fake, seen: &Seen, arguments: Json) -> CallToolResult {
     let Json::Object(arguments) = arguments else {
         panic!("arguments are an object");
@@ -1121,7 +1042,6 @@ async fn call(tool: &str, backend: &Fake, seen: &Seen, arguments: Json) -> CallT
         .expect("a known tool")
 }
 
-/// The recorded request of `method`, as JSON; the last one.
 fn request_of(backend: &Fake, method: &str) -> Json {
     let call = backend
         .calls()
@@ -1167,7 +1087,6 @@ fn context_facts() -> Correlation {
     })
 }
 
-/// Sightings over `groups` (env, service) groups, with two follow-ups.
 fn sightings_facts(groups: u64) -> Correlation {
     Correlation::Sightings(SightingsFacts {
         literal: "10.0.4.17".to_owned(),
@@ -1224,9 +1143,6 @@ fn compare_facts() -> Correlation {
     })
 }
 
-/// The answer of correlation tool `tool`: a capture of `query` with its
-/// facts and four `message` rows, kept for the investigation; the page
-/// holds the first two.
 fn correlated(tool: &str, query: &str) -> (CapturedResult, ResultPage) {
     let (kind, facts) = match tool {
         "context" => (CaptureKind::Context, context_facts()),
@@ -1248,8 +1164,6 @@ fn correlated(tool: &str, query: &str) -> (CapturedResult, ResultPage) {
     (result, page)
 }
 
-/// A backend whose `tool` read answers `result` with `activity` and its
-/// step at `step_seq`, and whose page is `page`.
 fn correlation_backend(
     tool: &str,
     result: CapturedResult,
@@ -1276,13 +1190,11 @@ fn correlation_backend(
     backend
 }
 
-/// [`correlation_backend`] over [`correlated`]'s answer.
 fn attached_correlation(tool: &str, activity: Option<Activity>, step_seq: u64) -> Fake {
     let (result, page) = correlated(tool, "\"10.0.4.17\"");
     correlation_backend(tool, result, page, activity, Some(step_seq))
 }
 
-/// The acknowledgement an attached `tool` read opens its errors with.
 fn correlation_acknowledgement(tool: &str) -> String {
     format!(
         "Investigation \"{INVESTIGATION_ID}\" recorded this {} as a step and keeps result \
@@ -1338,7 +1250,6 @@ async fn an_attached_context_sends_seen_seq_prints_the_activity_and_advances_see
         )),
         "{text}"
     );
-    // After the result head and the block, before the proposed calls.
     let attached = line_index(text, "investigation: ");
     assert!(line_index(text, "scope used: ") < attached, "{text}");
     assert!(attached < line_index(text, "next: read "), "{text}");
@@ -1353,9 +1264,6 @@ async fn an_attached_context_sends_seen_seq_prints_the_activity_and_advances_see
     assert_valid_output("context", &result);
 }
 
-/// The first attached compare of a session sends no `seen_seq` and follows
-/// its step only once its reply fitted: a page that fails after the read,
-/// or a reply that does not fit, leaves the session untouched.
 #[tokio::test]
 async fn the_first_attached_compare_follows_its_step_only_after_its_reply_fits() {
     let seen = Seen::default();
@@ -1401,11 +1309,6 @@ async fn the_first_attached_compare_follows_its_step_only_after_its_reply_fits()
     );
 }
 
-/// An attached correlation answer the server cannot stand behind (a result
-/// id trawld does not mint, or a result not kept for the investigation the
-/// call named) certifies no result, reads no page, prints no id trawld
-/// sent, and leaves the session as it was. Unattached, a malformed id is
-/// an error that reads no page either.
 #[tokio::test]
 async fn an_attached_correlation_answer_for_an_unreadable_or_foreign_result_certifies_nothing() {
     for tool in CORRELATION_TOOLS {
@@ -1600,11 +1503,6 @@ async fn a_correlation_tool_refuses_a_malformed_attachment_or_a_lone_purpose_bef
     assert!(backend.calls().is_empty(), "{:?}", backend.calls());
 }
 
-/// A correlation read trawld accepted attached is a step whatever happens
-/// after it: a page that fails, a cell that does not encode, an answer
-/// without its facts, or a reply that does not fit is an error that opens
-/// by naming the investigation and the result kept for it, and moves
-/// nothing of the session.
 #[tokio::test]
 async fn an_attached_correlation_read_that_cannot_print_keeps_its_acknowledgement() {
     let mut failed_page = attached_correlation("context", None, 7);
@@ -1648,10 +1546,6 @@ async fn an_attached_correlation_read_that_cannot_print_keeps_its_acknowledgemen
     }
 }
 
-/// Under a budget that cannot hold a sightings block's lists and the
-/// activity both, the activity entries go first, from the end, with the
-/// board read that continues from the last one printed; the lists are cut
-/// only once no entry is left, and the block's meaning stays.
 #[tokio::test]
 async fn an_attached_sightings_cuts_activity_entries_before_its_lists() {
     let activity = |count: u64| Activity {
@@ -1669,8 +1563,6 @@ async fn an_attached_sightings_cuts_activity_entries_before_its_lists() {
     let denominators =
         "field counts are over the 5000 captured matches; service counts are over all 20000";
 
-    // Fifty groups fit the default budget whole; twenty 600-byte entries
-    // beside them do not: entries go, the lists stay whole.
     let backend = sightings(50, 20);
     let seen = Seen::default();
     seen.lock().await.touch(&id(), 1);
@@ -1708,9 +1600,6 @@ async fn an_attached_sightings_cuts_activity_entries_before_its_lists() {
     assert_eq!(seen.lock().await.get(&id()), Some(through));
     assert_valid_output("sightings", &result);
 
-    // Four hundred groups do not fit 4096 bytes: every entry goes before
-    // the lists are cut, and the board read continues from the session's
-    // seq.
     let backend = sightings(400, 6);
     let seen = Seen::default();
     seen.lock().await.touch(&id(), 1);
@@ -1750,10 +1639,6 @@ async fn an_attached_sightings_cuts_activity_entries_before_its_lists() {
     assert_valid_output("sightings", &result);
 }
 
-/// A correlation read with no investigation takes no session lock: while
-/// its read is held open, an investigation read on the same session
-/// completes. An attached one takes the lock before it sends: while the
-/// session is held, it sends nothing.
 #[tokio::test]
 async fn an_unattached_correlation_read_takes_no_session_lock() {
     let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
@@ -1819,9 +1704,6 @@ async fn an_unattached_correlation_read_takes_no_session_lock() {
     drop(held);
 }
 
-/// The follow-up searches an attached sightings read proposes stay on its
-/// investigation and over its frozen bounds; the purpose was this read's,
-/// so none carries it.
 #[tokio::test]
 async fn an_attached_sightings_follow_up_carries_the_investigation_not_the_purpose() {
     let backend = attached_correlation("sightings", None, 7);

@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A stored run's preview when the server refuses the read for resources
-// (ADR-0056, issue #304). The saved-run read runs on the budgeted query
-// database, so a big stored result can answer 503 `query_resource_exhausted`.
-// The same read spends the same budget again, so the preview shows the
-// server's sentence with a manual "Check again" and never polls it again on
-// its own, where any other failed read retries every five seconds.
-
 import { readFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { test, expect, resetScenario, CORPUS, SCHEDULE } from '../fixtures';
@@ -23,7 +16,6 @@ const EXHAUSTED = JSON.parse(
  * failure, so a poll that should not happen has time to show itself. */
 const QUIET_MS = 6_500;
 
-/** One named row of a run drawer's execution receipt, by its term. */
 const receiptOf = (page: Page, detail: Locator) => (name: string) =>
   detail.locator('.receipt .fieldlist > div')
     .filter({ has: page.getByText(name, { exact: true }) })
@@ -55,7 +47,6 @@ test('an exhausted stored-run read shows the sentence and waits for Check again'
   const check = preview.getByRole('button', { name: 'Check again', exact: true });
   await expect(check).toBeVisible();
 
-  // Not a load failure, not an empty result, and not the 409's line.
   await expect(preview.getByText('Retrying automatically', { exact: false })).toHaveCount(0);
   await expect(preview.getByText("Couldn't load", { exact: false })).toHaveCount(0);
   await expect(preview.getByText('No result data (error or still running)')).toHaveCount(0);
@@ -63,29 +54,21 @@ test('an exhausted stored-run read shows the sentence and waits for Check again'
   await expect(preview.locator(SEL.runUnavailable)).toHaveCount(0);
   await expect(preview.locator(SEL.previewRow)).toHaveCount(0);
 
-  // No automatic retry: the one read stays the only one past the poll
-  // interval.
   expect(reads).toBe(1);
   await page.waitForTimeout(QUIET_MS);
   expect(reads).toBe(1);
   await expect(preview.locator(SEL.runExhausted)).toBeVisible();
 
-  // The control asks again by hand, and a refusal is still a refusal.
   await check.click();
   await expect.poll(() => reads).toBe(2);
   await expect(preview.locator(SEL.runExhausted)).toHaveText(EXHAUSTED.error.message);
 
-  // Once the server can answer, the same control brings the rows back.
   refuse = false;
   await check.click();
   await expect(preview.locator(SEL.previewRow).first()).toBeVisible();
   await expect(preview.locator(SEL.runExhausted)).toHaveCount(0);
 });
 
-// The drawer on the runs page prints an execution receipt out of the last
-// read. A run watched to completion has `running` recorded from an earlier
-// poll, and the first read of its finished file is the refusal. That
-// refusal summarises nothing, so the stale `running` must not outlive it.
 test('an exhausted read evicts the running summary it follows', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.clock.install();
@@ -105,8 +88,6 @@ test('an exhausted read evicts the running summary it follows', async ({ page, r
     await route.fulfill({ response, json: body });
   });
 
-  // Hit one is the run still going; from hit two the stored file is too
-  // big for the query budget.
   const running = JSON.parse(await readFile(`${__dirname}/../harness/wire/run-result.json`, 'utf8'));
   running.status = 'running';
   running.finished_at = null;
@@ -132,12 +113,9 @@ test('an exhausted read evicts the running summary it follows', async ({ page, r
   await page.clock.fastForward(5_000);
   await expect.poll(() => reads).toBeGreaterThan(1);
   await expect(detail.locator(SEL.runExhausted)).toHaveText(EXHAUSTED.error.message);
-  // The server confirmed nothing about the run, so neither badge nor
-  // receipt claims an outcome.
   await expect(detail.locator('.sd-ttl .bdg')).toHaveCount(0);
   await expect(field('Outcome')).toHaveText('—');
 
-  // The poll is off: a further interval sends no read.
   const settled = reads;
   await page.clock.fastForward(12_000);
   await page.waitForTimeout(500);

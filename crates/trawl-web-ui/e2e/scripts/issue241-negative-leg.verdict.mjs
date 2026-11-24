@@ -25,14 +25,12 @@ const SPEC = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 't
 const LABEL = 'harness counted a health request';
 const ASSERTION = `'${LABEL}').toBe(0)`;
 
-/** 1-based line of the health-count assertion, found in the spec itself. */
 export function assertionLine(source = fs.readFileSync(SPEC, 'utf8')) {
   const lines = source.split('\n').flatMap((l, i) => (l.includes(ASSERTION) ? [i + 1] : []));
   if (lines.length !== 1) throw new Error(`expected one health assertion in ${SPEC}, found ${lines.length}`);
   return lines[0];
 }
 
-/** Message text before the source excerpt or stack, ANSI codes removed. */
 export function header(message) {
   const plain = message.replace(/\u001b\[[0-9;]*m/g, '');
   const out = [];
@@ -71,8 +69,6 @@ export function classify(report, status, line = assertionLine()) {
   return ['fail', `one test failed at line ${line} on "${LABEL}" (received ${received[1]})`];
 }
 
-/** Overall result from the gate-removed leg (expected fail) and the gated leg
- * (expected pass): [line, exit code]. */
 export function result(leg1, leg2) {
   if (leg1 === 'fail' && leg2 === 'pass')
     return ['RESULT: PASS (the spec fails on its health assertion without the gate and passes with it)', 0];

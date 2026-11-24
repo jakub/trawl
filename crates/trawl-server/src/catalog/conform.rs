@@ -6,86 +6,6 @@
 //! the standing corpus, not only over files written after the catalog pinned
 //! their fields.
 //!
-//! Runs inline at boot, after the storage epoch gate and before the ingest
-//! pipeline and HTTP serving, and only on ingest-enabled nodes (a query-only
-//! node does not own the data root).
-//!
-//! Identity is dual-sided: `catalog_state.catalog_id` in postgres is
-//! mirrored into a `data/CATALOG` marker file. The pass is skipped only
-//! when both sides agree, so a repointed `DATABASE_URL` or a data root
-//! restored from backup shows up as a mismatch and forces a re-run. A
-//! crash mid-pass leaves unrewritten files to be redetected on the next
-//! boot (every rewrite is staged, fsynced and atomically renamed).
-//!
-//! Cost matters, because the pass sits in front of HTTP serving and a lost
-//! marker, a restored data root or a recreated `trawl` database re-arms it
-//! over a corpus of any age: the scan is metadata-only unless a column still
-//! needs a pin vote. Describing a file reads its footer; counting a column
-//! reads the column. Only unpinned fields vote (`most_rows_wins` ignores the
-//! pinned ones), so pins are loaded before the scan, the count query is
-//! narrowed to the voting columns, and a file whose every field is already
-//! pinned skips it entirely. A re-arm against a catalog that already pins the
-//! corpus (the common case: the data and the catalog were always a pair)
-//! therefore costs one footer read per file, not one corpus read. Both phases
-//! emit a `catalog_conform_progress` heartbeat so a long pass is visibly
-//! working rather than indistinguishable from a hang, and every rewrite is
-//! durable on its own, so a boot killed by a supervisor's start timeout
-//! leaves the corpus strictly closer to conformant than it found it.
-//!
-//! Per-path failures are isolated, never boot-fatal: a truncated, bit-rotted
-//! or foreign `.parquet` under the data root, or a whole subdirectory the
-//! walk cannot enumerate, is skipped with a warning and a
-//! `trawl_catalog_conform_skipped_total` bump, as the rollup path sets aside
-//! unreadable inputs rather than wedging. Nothing is moved or deleted (an
-//! operator's stray file is theirs), and since the corpus is then not proven
-//! conformant, completion is not published: the next boot re-runs the pass,
-//! so a transient read failure self-heals and a permanent one keeps warning.
-//! A file the pass runs out of `[ingest] compaction_memory_limit` on is left
-//! the same way and withholds completion too, but it is a resource failure
-//! (`maintenance_resource_exhausted`, ADR-0056), not a skipped path: the file
-//! is sound, and the limit is what needs raising.
-//!
-//! "Foreign" is decided by the path, before the file is ever read
-//! ([`layout_path`]): the pass rewrites a standing file in place, lossily
-//! (every value the `TRY_CAST` cannot read becomes NULL) and irreversibly
-//! (the source is the destination, with no backup, no dry-run and no operator
-//! opt-in), so it may only ever touch files trawl itself wrote. That means a
-//! path that reads back as `{env}/{date}[/{HH}]/{service}.parquet` with every
-//! component passing the injective ingest predicates. A parquet an operator
-//! dropped anywhere else under the data root is skipped exactly like an
-//! unreadable one (same warning, same counter, same withheld completion),
-//! because "readable" is not "mine", and silently rewriting someone else's
-//! file is the destructive surprise [`skip_file`] exists to refuse.
-//!
-//! The pass also backfills `field_services` from the files it adopted. Those
-//! rows are the authority behind `?service=` and the `last_seen` window on
-//! the schema surfaces, and live compaction only ever observes what it
-//! writes, so without the backfill a service whose data is all standing
-//! parquet answers `?service=` with nothing while its pins sit outside every
-//! window forever. The backfill is idempotent (the pass re-runs until the
-//! corpus is proven conformant) and stamped from each file's partition
-//! directory, never `now()`.
-//!
-//! A file a pending publication marker claims (ADR-0041) is skipped the same
-//! way. Boot recovery keeps a marker it cannot resolve, and the marker proves
-//! its publish by the canonical file's exact bytes. Rewriting that canonical,
-//! or deleting its `.parquet.tmp` after a failed rewrite, would turn a
-//! recoverable publish into a permanent identity contradiction. The claims
-//! are read once, before the scan: nothing writes a marker while the pass
-//! runs, because compaction starts after it. A WAL root that cannot be read
-//! fails closed, and the pass skips every file. Either skip withholds
-//! completion, so the next boot conforms the file once its marker resolves.
-//!
-//! A day directory holding a rollup marker is deferred the same way
-//! (ADR-0041 slice 2). Boot rollup recovery runs just before the pass, so a
-//! marker still present is one recovery could not resolve, and the
-//! compaction pass that later recovers it may retire or replace any file of
-//! that day. Markers that cannot be read fail closed like the publication
-//! claims: the pass skips every file. A day whose rollup marker is gone but
-//! whose unlink boot recovery could not make durable is deferred too: after
-//! a power loss the marker may come back, and recovery proves its rollup by
-//! the daily file's exact bytes, which a rewrite would change.
-//!
 //! The repin engine reuses this machinery: `Progress`,
 //! `open_bounded_connection` and the same `layout_path` gate.
 
@@ -110,14 +30,11 @@ const CATALOG_MARKER: &str = trawl_config::CATALOG_MARKER;
 /// `pinned_from` value for pins seeded by the boot pass.
 const BOOT_PIN_SOURCE: &str = "_boot";
 
-/// What one `ensure_conformance` call did.
 #[derive(Debug, Clone, Copy)]
 pub struct ConformSummary {
     /// Whether the pass ran (false = marker and catalog agreed; skipped).
     pub ran: bool,
-    /// Parquet files scanned.
     pub scanned: usize,
-    /// Files rewritten to conform.
     pub rewritten: usize,
     /// Files skipped as unreadable, foreign, claimed by a pending
     /// publication marker or in a day an unresolved rollup marker holds
@@ -149,20 +66,12 @@ struct FileScan {
     /// and must not outvote the same field fully populated elsewhere.
     ///
     /// Zero for an already-pinned column: it holds no vote (`most_rows_wins`
-    /// skips it), so the count is never read and deliberately never taken —
-    /// counting it would read the column off disk for a number nothing uses.
+    /// skips it), so the count is never read and deliberately never taken.
     non_null: Vec<u64>,
 }
 
-/// Heartbeat interval for the per-phase progress log.
 const PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Per-phase progress heartbeat.
-///
-/// The pass blocks HTTP serving, so a long one must be visibly making
-/// progress: without this, an operator watching a multi-thousand-file
-/// corpus cannot tell a working boot from a wedged one (and a supervisor
-/// start timeout looks identical to both).
 pub(crate) struct Progress {
     phase: &'static str,
     total: usize,
@@ -231,31 +140,6 @@ pub enum ArchiveIdentity {
 
 /// Query-only boot gate: prove the standing archive was written by the
 /// catalog this node is connected to.
-///
-/// An ingest-enabled node earns that proof by running the pass above. A
-/// query-only node deliberately does not (it owns nothing under the data
-/// root), yet it still serves `/api/v1/schema`, whose answer is the catalog's
-/// pins rather than a `DESCRIBE`. Pins from an unrelated catalog describe
-/// unrelated columns: point a query-only trawld at a shared or read-only
-/// archive with a fresh `trawl` database and `/schema` advertises the seeded
-/// envelope while queries read entirely different physical columns. So the
-/// same dual-sided marker that lets the pass skip itself is checked here as
-/// a gate.
-///
-/// The refusal is deliberately narrow: only a marker naming another catalog
-/// is fatal, because only that is positive proof of the wrong pairing. A
-/// missing marker proves nothing, and it is an ordinary state, since
-/// [`publish_completion`] withholds the marker whenever the pass skipped a
-/// path (`catalog_conform_incomplete`; an operator's export subtree under the
-/// data root is enough), warns, and serves. Refusing the boot for that same
-/// corpus would make "disable ingest and restart to investigate" a startup
-/// failure curable only by re-enabling ingest, and would answer identical
-/// state with warn-and-serve on one node and fail-closed on the other. So an
-/// unmarked archive returns [`ArchiveIdentity::Unproven`] and the caller
-/// warns, exactly as the ingest node does.
-///
-/// Only the unproven path walks the tree, so a matching marker costs one
-/// `read_to_string`.
 pub async fn verify_archive_identity(
     store: &CatalogStore,
     data_dir: &Path,
@@ -284,8 +168,6 @@ pub async fn verify_archive_identity(
     }
 }
 
-/// What the dual-sided marker says about a data root and a catalog
-/// ([`judge_archive_identity`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IdentityJudgement {
     /// The marker names the catalog.
@@ -372,10 +254,8 @@ pub(crate) fn archive_is_empty(data_dir: &Path) -> bool {
     !walk.parquet
 }
 
-/// What one walk of a data root for parquet saw ([`walk_archive`]).
 #[derive(Debug)]
 pub(crate) struct ArchiveWalk {
-    /// Whether the walk found a parquet file.
     pub(crate) parquet: bool,
     /// The first path the walk could not enumerate, and why. With it set,
     /// `parquet: false` says only that the enumerable part holds none.
@@ -449,8 +329,6 @@ pub async fn ensure_conformance<S: std::hash::BuildHasher + Send + 'static>(
         .into_iter()
         .collect();
 
-    // Phase A (blocking): read the publication claims and the rollup
-    // markers, then enumerate + describe the corpus.
     let (scan, scan_skipped) = {
         let data_dir = data_dir.to_path_buf();
         let wal_dir = wal_dir.to_path_buf();
@@ -491,7 +369,6 @@ pub async fn ensure_conformance<S: std::hash::BuildHasher + Send + 'static>(
     // cannot leave observations claiming files that were never conformed.
     let observations = corpus_observations(&scan, &pins);
 
-    // Phase B (blocking): rewrite the nonconforming files.
     let scanned = scan.len();
     let (rewritten, rewrite_skipped, conflicts) = {
         let data_dir = data_dir.to_path_buf();
@@ -544,12 +421,7 @@ pub async fn ensure_conformance<S: std::hash::BuildHasher + Send + 'static>(
 }
 
 /// Publish completion last: postgres side, then the marker file — and only
-/// when every file was accounted for. Skipped files mean the corpus is not
-/// proven conformant, so the identity stays unpublished and the next boot
-/// re-runs the pass rather than declaring victory forever.
-///
-/// The completion stamp covers both rewrites and service observations. A
-/// skipped path leaves both incomplete, so neither is declared done.
+/// when every file was accounted for.
 async fn publish_completion(
     store: &CatalogStore,
     data_dir: &Path,
@@ -606,8 +478,8 @@ fn skip_file(path: &Path, phase: &str, error: &'static str, cause_kind: Option<C
 /// [`skip_file`] for a path whose scan or rewrite statement failed.
 ///
 /// The failure's text is `DuckDB`'s driver wording, which can quote the
-/// generated SQL and the file's values, so it goes to DEBUG only (ADR-0040,
-/// amended 2026-11-09). The warning carries the failure's class and cause.
+/// generated SQL and the file's values, so it goes to DEBUG only (ADR-0040).
+/// The warning carries the failure's class and cause.
 fn skip_failed(path: &Path, phase: &str, failure: &StatementFailure) {
     metrics::counter!(crate::metrics::CATALOG_CONFORM_SKIPPED_TOTAL).increment(1);
     tracing::debug!(
@@ -667,12 +539,9 @@ async fn record_boot_conflicts(store: &CatalogStore, conflicts: &[FieldConflict]
 
 /// Read the data-root marker, if present.
 ///
-/// Boot collapses every read error into absence, as it always has: an
-/// unreadable marker proves nothing, so it reads like a missing one. On an
-/// ingest node the pass then re-runs and publishing the marker afterwards
-/// surfaces a real fault; a query-only node warns that the archive is
-/// unproven. `trawld --doctor` keeps the typed error instead, through
-/// [`read_marker_with`], so it can say it could not look.
+/// Boot collapses every read error into absence: an unreadable marker
+/// proves nothing, so it reads like a missing one. `trawld --doctor` keeps
+/// the typed error instead, through [`read_marker_with`].
 fn read_marker(data_dir: &Path) -> Option<String> {
     read_marker_with(data_dir, |path| std::fs::read_to_string(path).map(Some))
         .ok()
@@ -730,11 +599,8 @@ pub(crate) fn open_bounded_connection(
 }
 
 /// Enumerate every parquet file under the data root (hourly + daily
-/// rollups, skipping `scheduled/`) and describe each. Returns the readable
-/// files plus the count of paths skipped as unreadable, foreign, claimed by
-/// a pending publication marker or deferred behind a rollup marker — one bad
-/// file, or one unreadable directory, must never take the daemon's boot down
-/// with it.
+/// rollups, skipping `scheduled/`) and describe each readable one. A path
+/// that is unreadable, foreign, claimed or deferred is skipped and counted.
 ///
 /// `claims` is the publication marker scan and `rollups` the day
 /// directories deferred behind a rollup ([`rollup_deferred_days`]). An `Err`
@@ -756,9 +622,7 @@ fn scan_corpus(
     // A directory that cannot be enumerated (permissions, a transient fault,
     // a stale handle) is isolated exactly like an unreadable file rather than
     // aborting the walk — this tree is wider than the corpus (the WAL lives
-    // under the data root by default), and one unreadable corner of it must
-    // not keep the daemon down. It counts as a skip, so the corpus is not
-    // proven conformant and the next boot re-runs.
+    // under the data root by default).
     let (files, walk_errors) = crate::metrics::walk_parquet_files_lossy(data_dir);
     let mut skipped = walk_errors.len();
     for (path, error) in walk_errors {
@@ -837,8 +701,6 @@ fn scan_corpus(
     };
     let conn = open_bounded_connection(data_dir, memory_limit)?;
 
-    // Announce the corpus size up front: the one number that tells an
-    // operator (and a supervisor start-timeout budget) what this boot is in for.
     tracing::info!(
         event_type = "catalog_conform_scan_start",
         files = files.len(),
@@ -1032,12 +894,6 @@ fn scan_file(
 /// field is not pinned yet, i.e. exactly the ones that get a vote in
 /// [`most_rows_wins`].
 ///
-/// A pinned field's count is dead weight — `most_rows_wins` skips it, and
-/// paying for it means reading the column off disk for every file in the
-/// corpus. When this comes back empty (a catalog that already pins every
-/// field the file carries), the file is described from its footer and never
-/// read at all.
-///
 /// The lookup ASCII-case-folds the stored spelling: the catalog holds
 /// folded names only, and a standing `Dur` column is the pinned `dur`
 /// field as far as any vote is concerned.
@@ -1056,11 +912,8 @@ fn voting_columns(schema: &[ColInfo], pinned: &HashMap<String, CanonicalType>) -
 /// not be read as evidence (see [`FileScan::non_null`]).
 ///
 /// Counted in passes of at most [`AGG_CHUNK_COLS`] columns, for the same
-/// reason the pin ladder is chunked: the width is client-chosen, one
-/// aggregate per column over the full width degrades quadratically, and on a
-/// first boot (or a re-arm against an empty catalog) every column votes —
-/// per file, in front of HTTP serving, where a slow pass is indistinguishable
-/// from a hang to a supervisor start timeout.
+/// reason the pin ladder is chunked: the width is client-chosen, and one
+/// aggregate per column over the full width degrades quadratically.
 fn count_non_null(
     conn: &duckdb::Connection,
     safe_path: &str,
@@ -1115,12 +968,6 @@ fn ladder_rank(ty: CanonicalType) -> usize {
 
 /// Seed proposals for unpinned fields: per field, the candidate backed by
 /// the most rows across files wins; ties resolve by ladder order.
-///
-/// A candidate's weight is the number of rows that actually carry a value
-/// for that column (`count(<col>)`), never the file's total row count — an
-/// all-but-empty column in a large file describes no values and so gets no
-/// say over a fully populated column in a smaller one. Since the losers get
-/// `TRY_CAST` to the winner's pin, a misweighted vote is a data loss.
 ///
 /// Votes are grouped by the ASCII-folded name and the proposal carries the
 /// folded spelling: the catalog holds folded names only (ingest folds at
@@ -1235,10 +1082,7 @@ fn corpus_observations(
 /// Rewrite every file whose columns disagree with the pins: `TRY_CAST` to
 /// the pin, staged `.tmp` write, atomic rename. Returns the rewrite count,
 /// the count of files skipped because their rewrite failed, and the conflict
-/// evidence. A file whose footer described cleanly can still be unreadable
-/// further in (corrupt page, bit rot) — that is one skipped file, not a
-/// refusal to boot. A rewrite that runs out of memory is skipped too, as a
-/// resource failure rather than `catalog_conform_skip`.
+/// evidence.
 fn rewrite_nonconforming(
     scan: &[FileScan],
     pins: &HashMap<String, CanonicalType>,
@@ -1499,8 +1343,6 @@ mod tests {
         );
     }
 
-    /// An all-NULL column carries no evidence at all: it must not decide the
-    /// pin against the only column that holds values.
     #[test]
     fn all_null_column_does_not_vote() {
         let corpus = vec![
@@ -1511,7 +1353,6 @@ mod tests {
         assert_eq!(proposals[0].ty, CanonicalType::BigInt);
     }
 
-    /// Already-pinned fields never re-vote.
     #[test]
     fn existing_pins_are_left_alone() {
         let corpus = vec![scan("svc-a", &[("duration", "VARCHAR", 10)])];
@@ -1519,8 +1360,6 @@ mod tests {
         assert!(most_rows_wins(&corpus, &existing).is_empty());
     }
 
-    /// A pinned column has no vote, so its count is never taken — counting it
-    /// would read the column off disk for a number `most_rows_wins` discards.
     #[test]
     fn only_unpinned_columns_are_counted() {
         let file = scan(
@@ -1549,7 +1388,6 @@ mod tests {
         );
     }
 
-    /// One scanned file at a chosen partition instant, carrying `rows` rows.
     fn scan_at(service: &str, hour: u32, rows: u64, cols: &[&str]) -> FileScan {
         FileScan {
             path: PathBuf::from(format!("/data/prod/2026-08-01/{hour:02}/{service}.parquet")),
@@ -1573,9 +1411,7 @@ mod tests {
 
     /// The backfill's shape: one row per (field, service), spanning the
     /// partition instants the corpus actually sits at and weighted by the
-    /// rows the files hold. An unpinned column is never observed — phase B
-    /// drops it, and `field_services`' field axis is bounded by the pin cap
-    /// precisely because only pinned fields land here.
+    /// rows the files hold.
     #[test]
     fn observations_span_the_corpus_and_cover_only_pinned_fields() {
         let corpus = vec![
@@ -1606,9 +1442,6 @@ mod tests {
         );
     }
 
-    /// Standing parquet can carry `Dur` and `dur` as separate physical
-    /// columns of one catalog field: that is one observation counted once,
-    /// not the file's rows charged twice.
     #[test]
     fn case_variant_columns_are_one_observation() {
         let corpus = vec![scan_at("svc-a", 10, 6, &["Dur", "dur"])];
@@ -1732,8 +1565,6 @@ mod tests {
         );
     }
 
-    /// Rollup markers that cannot be read fail closed: any day may hold an
-    /// unresolved rollup, so the pass scans no file at all.
     #[cfg(unix)]
     #[test]
     fn rollup_boot_recovery_failed_scan_makes_conformance_skip_every_file() {
@@ -1838,12 +1669,8 @@ mod tests {
     /// A scan or rewrite failure that is not an I/O error keeps `DuckDB`'s
     /// driver text out of default stdout and out of the telemetry WAL: the
     /// skip warning carries the failure's phase, class and cause, and the
-    /// text goes to DEBUG, which the default filter drops (ADR-0040, amended
-    /// 2026-11-09). A fixed skip reason still reaches WARN.
-    ///
-    /// The driver error is real, and its text carries a sentinel. The fixed
-    /// reason comes from the real scan, over a file in trawl's layout that
-    /// is not parquet.
+    /// text goes to DEBUG, which the default filter drops (ADR-0040). A fixed
+    /// skip reason still reaches WARN.
     #[test]
     fn conform_skip_logs_the_class_not_the_driver_text() {
         use crate::ingest::compaction::StatementFailure;

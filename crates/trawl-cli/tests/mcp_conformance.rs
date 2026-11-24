@@ -3,44 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawl mcp` against a real trawld, in both protocol eras (ADR-0058).
-//!
-//! The server is trawld's own stack, booted in-process by `common` with a
-//! seeded corpus: two services in two environments over two hosts,
-//! ingested through `/api/v1/ingest` and compacted, so searches have rows,
-//! facets, a dominant service, a lagging sender and long cells. The MCP
-//! server is the real `trawl mcp --profile agent` child, started from an
-//! empty environment (only the dynamic loader's search path survives, see
-//! `loader_path`) with a temp `HOME` whose config names the profile:
-//! the server's URL, its pinned certificate and the agent key in the
-//! profile's own table.
-//!
-//! Each child is driven over its pipes with hand-written JSON-RPC lines,
-//! once per era:
-//!
-//! - 2025-11-25: `initialize`, `notifications/initialized`, then
-//!   requests that carry no per-request metadata;
-//! - 2026-07-28: `server/discover`, then requests whose `_meta` carries the
-//!   protocol version and client capabilities the revision requires.
-//!
-//! Both eras list the same tools, in the same order, with the same
-//! schemas, and every tool is called against the seeded server. Every
-//! result is one text block, and a successful one carries a
-//! `structuredContent` that validates against the tool's listed
-//! `outputSchema`. Every stdout line is a JSON-RPC message, and the child
-//! exits 0 once its stdin closes.
-//!
-//! A cancelled search drops its trawld request: the test holds the
-//! corpus's publication write guard so the capture waits, in flight and
-//! listed by `/api/v1/queries`, then sends `notifications/cancelled` and
-//! sees the query recorded as abandoned and no response for its id.
-//!
-//! An expired capture reads as trawld's 410 `result_gone`: the server's
-//! results clock is a fixed one the test moves past the capture's
-//! deadline, so expiry is deterministic, and neither `read` nor `fields`
-//! runs or captures anything to replace it.
-//!
-//! Without `DATABASE_URL` these tests fail rather than skip. The binary is
-//! in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -53,33 +15,24 @@ use common::{Options, Server};
 use serde_json::{Value, json};
 use trawl_server::results::ResultsClock;
 
-/// The origin the link test's server builds search URLs under.
 const LINK_ORIGIN: &str = "https://trawl.example";
 
 /// The `api` events: newest first, half a second apart, so every one is
 /// under [`trawl_mcp::hints::LAG_THRESHOLD_SECS`] old when ingested.
 const API_EVENTS: usize = 340;
 
-/// The `worker` events, twenty minutes behind their arrival.
 const WORKER_EVENTS: usize = 60;
 
-/// Every this many `api` events, one carries a message long enough to be
-/// abbreviated.
 const LONG_EVERY: usize = 25;
 
-/// How far behind its arrival a `worker` event's `_time` is.
 const WORKER_LAG: TimeDelta = TimeDelta::minutes(20);
 
-/// The literal `sightings` looks for: every [`LONG_EVERY`]th `api`
-/// message carries it, and no other event does.
 const SIGHTED: &str = "payload";
 
-/// RFC 3339 with microseconds, in UTC.
 fn rfc3339(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// A server that accepts the corpus's two environments.
 fn options() -> Options {
     Options {
         envs: vec!["prod".to_owned(), "staging".to_owned()],
@@ -87,16 +40,6 @@ fn options() -> Options {
     }
 }
 
-/// Ingest the corpus, compact it into Parquet and the catalog, and fill
-/// the per-service schema cache from it.
-///
-/// - [`API_EVENTS`] of `api` in `prod`, newest at `now`, alternating hosts
-///   `web-1` and `web-2`; every [`LONG_EVERY`]th carries a 1500-byte
-///   message, so a page abbreviates it.
-/// - [`WORKER_EVENTS`] of `worker` in `staging` on `web-2`, each
-///   [`WORKER_LAG`] behind its arrival: the lagging sender.
-///
-/// `api` holds 85 % of the corpus: the dominant service.
 async fn seed(server: &mut Server) -> DateTime<Utc> {
     let now = Utc::now();
     let mut events = Vec::with_capacity(API_EVENTS + WORKER_EVENTS);
@@ -135,7 +78,6 @@ async fn seed(server: &mut Server) -> DateTime<Utc> {
     now
 }
 
-/// The lines of `text` after its `rows from captured row N:` line.
 fn row_lines(text: &str) -> Vec<&str> {
     text.lines()
         .skip_while(|line| !line.starts_with("rows from captured row "))
@@ -143,14 +85,12 @@ fn row_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// The hint lines of `text`, without their `hint: ` prefix.
 fn hints(text: &str) -> Vec<&str> {
     text.lines()
         .filter_map(|line| line.strip_prefix("hint: "))
         .collect()
 }
 
-/// The proposed `read` call of `structured` with `action`.
 fn next_action<'a>(structured: &'a Value, action: &str) -> Option<&'a Value> {
     structured["next_actions"]
         .as_array()?
@@ -158,14 +98,12 @@ fn next_action<'a>(structured: &'a Value, action: &str) -> Option<&'a Value> {
         .find(|next| next["tool"] == "read" && next["arguments"]["action"] == action)
 }
 
-/// An RFC 3339 instant.
 fn instant(text: &Value) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(text.as_str().unwrap_or_else(|| panic!("not text: {text}")))
         .unwrap_or_else(|e| panic!("not RFC 3339 ({e}): {text}"))
         .with_timezone(&Utc)
 }
 
-/// The cell of `view`'s printed `row` under the column named `name`.
 fn cell_of<'a>(view: &'a Value, row: usize, name: &str) -> &'a Value {
     let position = view["columns"]
         .as_array()
@@ -209,8 +147,6 @@ async fn executions(server: &Server) -> (Vec<u64>, Vec<u64>, Vec<String>) {
     )
 }
 
-/// Drive every tool through `era` against `server`, whose `link_origin`
-/// is [`LINK_ORIGIN`]; returns the listed tools.
 #[allow(clippy::too_many_lines)] // one session, each call asserted in order
 async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) -> Vec<Value> {
     let case = format!("era {}", era.version());
@@ -239,7 +175,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         Era::Discover => assert_eq!(ping["error"]["code"], -32601, "{case}: {ping}"),
     }
 
-    // orient: the installation, in UTC, naming what was seeded.
     let orient = mcp.call("orient", json!({})).await;
     assert!(!orient.is_error, "{case}: {}", orient.text);
     let mirror = orient.structured.as_ref().unwrap();
@@ -269,7 +204,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         orient.text
     );
 
-    // fields of a service, from the catalog the compaction filled.
     let fields = mcp
         .call("fields", json!({"source": "service", "service": "api"}))
         .await;
@@ -283,8 +217,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     assert!(names.contains(&"host"), "{case}: {}", fields.text);
     assert!(names.contains(&"message"), "{case}: {}", fields.text);
 
-    // validate: a valid query, and an invalid one that is still a
-    // successful call, with a caret under the error.
     let valid = mcp
         .call(
             "search",
@@ -317,8 +249,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     assert!(excerpt.contains('^'), "{case}: {excerpt}");
     assert!(invalid.text.contains('^'), "{case}: {}", invalid.text);
 
-    // A call the run would refuse is invalid here too: the verdict names
-    // it, prints its hint once, proposes no execute, and runs nothing.
     let before = executions(server).await;
     for (query, message, hint) in [
         (
@@ -391,8 +321,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         "{case}: validation ran nothing and captured nothing"
     );
 
-    // execute over everything: rows, facets, the search URL, and the
-    // dominant service named over the captured rows.
     let all = mcp
         .call("search", json!({"mode": "execute", "query": "last=1h"}))
         .await;
@@ -401,8 +329,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     let view = &reply["result"];
     let total = API_EVENTS + WORKER_EVENTS;
     assert_eq!(view["rows_captured"], total, "{case}: {}", all.text);
-    // The response read the default rows; the ones it printed and the
-    // ones it dropped to fit the default budget make them up.
     let printed = view["rows"].as_array().unwrap().len();
     assert!(printed > 0, "{case}: {}", all.text);
     assert_eq!(row_lines(&all.text).len(), printed, "{case}: {}", all.text);
@@ -447,7 +373,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         all.text
     );
 
-    // The executed bounds are the capture's.
     let result_id = view["result_id"].as_str().unwrap().to_owned();
     let listed = server
         .client(&server.agent_token)
@@ -472,7 +397,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         "{case}"
     );
 
-    // The lagging sender, over the rows the response read.
     let worker = mcp
         .call(
             "search",
@@ -488,8 +412,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         worker.text
     );
 
-    // No rows in the bounds: the nearest bounds holding data for the same
-    // search.
     let empty_query = format!(
         "service=api earliest=\"{}\" latest=\"{}\"",
         rfc3339(now - TimeDelta::hours(3)),
@@ -513,9 +435,7 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         empty.text
     );
 
-    // Wide rows under a small budget: the renderer drops rows, and the
-    // page continuation starts after the rows the text printed. 12288
-    // bytes prints about a dozen rows at every column; every budget
+    // 12288 bytes prints about a dozen rows at every column; every budget
     // measured from 6656 to 24576 dropped rows and kept the continuation.
     let small = mcp
         .call(
@@ -551,8 +471,7 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     );
     let captured_columns = small_view["columns"].as_array().unwrap().len();
 
-    // At 4096 bytes no row prints at every column: a row prints with a
-    // suffix of the columns cut, and the reply says what it dropped.
+    // At 4096 bytes no row prints at every column.
     let tight = mcp
         .call(
             "search",
@@ -583,8 +502,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
             tight.text
         );
     }
-    // The cut row holds the same cells, at the same positions, as the row
-    // the full-width reply printed.
     let full_rows = small_view["rows"].as_array().unwrap();
     for (row, full) in rows.iter().zip(full_rows) {
         let cells = row.as_array().unwrap();
@@ -636,7 +553,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         None => assert!(calls_dropped, "{case}: {}", tight.text),
     }
 
-    // read never runs the query again.
     let before = executions(server).await;
     let page = mcp
         .call(
@@ -760,9 +676,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         context.text
     );
 
-    // sightings of a literal every LONG_EVERYth `api` message carries:
-    // one (env, service) group, the newest at `now`, the oldest
-    // 325 half-seconds before it, all in `message`.
     let sighted: Vec<usize> = (0..API_EVENTS).step_by(LONG_EVERY).collect();
     let matches = sighted.len();
     let oldest =
@@ -895,7 +808,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         );
     }
 
-    // read of the sightings capture: page 0 carries the same block.
     let sighted_page = mcp
         .call(
             "read",
@@ -920,7 +832,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         sighted_page.text
     );
 
-    // A DSL reference section.
     let section = mcp
         .request("resources/read", json!({"uri": "trawl://dsl/search-stage"}))
         .await;
@@ -934,8 +845,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         "{case}: {section}"
     );
 
-    // investigation: the agent key holds no investigation permission, so
-    // trawld's 403 is a tool error naming the permission the action needs.
     let investigations = mcp.call("investigation", json!({"action": "list"})).await;
     assert!(investigations.is_error, "{case}: {}", investigations.raw);
     assert!(
@@ -946,8 +855,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
         investigations.text
     );
 
-    // A well-formed id that names no result is the server's 404, as a
-    // tool error.
     let gone = mcp
         .call(
             "read",
@@ -975,8 +882,6 @@ async fn every_tool(server: &Server, home: &Path, era: Era, now: DateTime<Utc>) 
     tools
 }
 
-/// Both eras list the same tools, in the same order, with the same
-/// schemas, and call every tool against a seeded trawld.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_tool_answers_in_both_protocol_eras() {
     let mut server = Server::start_with(Options {
@@ -997,8 +902,6 @@ async fn every_tool_answers_in_both_protocol_eras() {
     server.stop().await;
 }
 
-/// The id of the query `/api/v1/queries` lists active whose text holds
-/// `marker`, if any.
 async fn active_capture(server: &Server, marker: &str) -> Option<u64> {
     let queries = server
         .client(&server.admin_token)
@@ -1012,7 +915,6 @@ async fn active_capture(server: &Server, marker: &str) -> Option<u64> {
         .map(|q| q.snapshot.id)
 }
 
-/// Poll `probe` until it answers `Some`, failing after [`DEADLINE`].
 async fn until<T, F, Fut>(what: &str, mut probe: F) -> T
 where
     F: FnMut() -> Fut,
@@ -1028,9 +930,6 @@ where
     }
 }
 
-/// Without `link_origin` the search says why it has no URL; a cancelled
-/// search drops its trawld request, which the server records as
-/// abandoned, and the child sends no response for it. In both eras.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cancelled_search_drops_its_server_query_in_both_eras() {
     let mut server = Server::start_with(options()).await;
@@ -1100,7 +999,6 @@ async fn a_cancelled_search_drops_its_server_query_in_both_eras() {
         .await;
         drop(held);
 
-        // The session goes on; the cancelled request is never answered.
         mcp.list_tools().await;
         let finished = mcp.finish().await;
         finished.assert_clean(&case);
@@ -1123,9 +1021,6 @@ async fn a_cancelled_search_drops_its_server_query_in_both_eras() {
     server.stop().await;
 }
 
-/// A capture past its deadline is trawld's 410 `result_gone` to `read`
-/// and to `fields`, as a tool error, and neither runs a query or captures
-/// a replacement. In both eras.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_expired_capture_reads_as_result_gone_in_both_eras() {
     let clock = ResultsClock::fixed(Utc::now());

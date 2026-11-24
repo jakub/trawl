@@ -4,14 +4,8 @@
 
 //! Parse arbitrary DSL text and, for every input the parser accepts,
 //! format it through the checked renderer (ADR-0061).
-//!
-//! The claim under test: formatting never changes what a query means.
-//! The checked renderer returns text whose reparse has the query's
-//! canonical form, or refuses as too long. An unfaithful refusal is a
-//! formatter defect, so it fails here. The reparse, the comparison and a
-//! second format run here as well, rather than being trusted to the
-//! renderer under test: the returned text reparses to the same canonical
-//! form, and formatting it again gives the same text.
+//! The reparse, the comparison and a second format run here as well,
+//! rather than being trusted to the renderer under test.
 
 #![no_main]
 

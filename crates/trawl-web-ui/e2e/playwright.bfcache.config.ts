@@ -24,8 +24,7 @@ export default defineConfig({
     ...devices['Desktop Chrome'],
     channel: 'chromium',
     launchOptions: { ignoreDefaultArgs: ['--disable-back-forward-cache'] },
-    // Trace recording can perturb BFCache. The tests attach their explicit
-    // document lifecycle and server request evidence on both pass and fail.
+    // Trace recording can perturb BFCache.
     trace: 'off',
     screenshot: 'only-on-failure',
   },

@@ -2,20 +2,16 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! History, Saved, and Schema panel key handling.
-
 use crossterm::event::{self, KeyCode, KeyModifiers};
 
 use super::super::App;
 use super::super::state::{Focus, MainTab, Popup, SavedFocus, ScheduleForm};
 
 impl App {
-    /// Handle key events for the History tab panel.
     pub(crate) fn handle_panel_history_key(&mut self, key: event::KeyEvent) {
         let item_count = self.history_cache.as_ref().map_or(0, |h| h.entries.len());
 
         match (key.modifiers, key.code) {
-            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.switch_to_main_tab(MainTab::Query);
             }
@@ -25,7 +21,6 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
                 self.panel.history_selected = (self.panel.history_selected + 1).min(item_count - 1);
             }
-            // Enter: load selected query into editor, switch to Query tab
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let selected = self.panel.history_selected;
                 let query_text = self
@@ -48,9 +43,6 @@ impl App {
         }
     }
 
-    /// Handle key events for the Saved tab panel.
-    ///
-    /// Dispatches to sub-handlers based on the current `SavedFocus`.
     pub(crate) fn handle_panel_saved_key(&mut self, key: event::KeyEvent) {
         match self.panel.saved_focus {
             SavedFocus::List => self.handle_saved_list_key(key),
@@ -59,9 +51,8 @@ impl App {
         }
     }
 
-    /// Select the saved query at `index`, clamped to the list. The detail
-    /// survives only while it belongs to the selected saved query; otherwise
-    /// it is dropped, which also abandons its pending request.
+    /// The detail survives only while it belongs to the selected saved query;
+    /// otherwise it is dropped, which also abandons its pending request.
     pub(crate) fn select_saved(&mut self, index: usize) {
         let queries = self.saved_cache.as_ref().map_or(&[][..], |s| &s.queries);
         let index = index.min(queries.len().saturating_sub(1));
@@ -78,12 +69,10 @@ impl App {
         }
     }
 
-    /// Key handling for `SavedFocus::List` — the left-pane saved query list.
     fn handle_saved_list_key(&mut self, key: event::KeyEvent) {
         let item_count = self.saved_cache.as_ref().map_or(0, |s| s.queries.len());
 
         match (key.modifiers, key.code) {
-            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.switch_to_main_tab(MainTab::Query);
             }
@@ -93,7 +82,6 @@ impl App {
             (KeyModifiers::NONE, KeyCode::Down) if item_count > 0 => {
                 self.select_saved(self.panel.saved_selected + 1);
             }
-            // Right / Enter: open detail pane with run history
             (KeyModifiers::NONE, KeyCode::Enter | KeyCode::Right) => {
                 let selected = self.panel.saved_selected;
                 if let Some(ref saved) = self.saved_cache
@@ -114,7 +102,6 @@ impl App {
                     self.fetch_runs(entry.id, token);
                 }
             }
-            // Delete: confirm deletion
             (KeyModifiers::NONE, KeyCode::Delete | KeyCode::Backspace) => {
                 let selected = self.panel.saved_selected;
                 if let Some(ref saved) = self.saved_cache
@@ -126,7 +113,6 @@ impl App {
                     });
                 }
             }
-            // Schedule: open set-schedule popup
             (KeyModifiers::NONE, KeyCode::Char('s')) => {
                 let selected = self.panel.saved_selected;
                 if let Some(ref saved) = self.saved_cache
@@ -143,12 +129,10 @@ impl App {
         }
     }
 
-    /// Key handling for `SavedFocus::Detail` — the right-pane run history list.
     fn handle_saved_detail_key(&mut self, key: event::KeyEvent) {
         let run_count = self.panel.saved_detail.as_ref().map_or(0, |d| d.runs.len());
 
         match (key.modifiers, key.code) {
-            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.switch_to_main_tab(MainTab::Query);
             }
@@ -164,12 +148,10 @@ impl App {
                     detail.run_selected = (detail.run_selected + 1).min(run_count - 1);
                 }
             }
-            // Left: back to list
             (KeyModifiers::NONE, KeyCode::Left) => {
                 self.panel.saved_detail = None;
                 self.panel.saved_focus = SavedFocus::List;
             }
-            // Enter: load run result
             (KeyModifiers::NONE, KeyCode::Enter) => {
                 let token = self.panel.next_token();
                 if let Some(ref mut detail) = self.panel.saved_detail
@@ -181,7 +163,6 @@ impl App {
                     self.fetch_run_result(saved_id, run_id, token);
                 }
             }
-            // q: pre-fill editor with `| from saved` reference
             (KeyModifiers::NONE, KeyCode::Char('q')) => {
                 self.prefill_from_saved_run();
             }
@@ -189,10 +170,8 @@ impl App {
         }
     }
 
-    /// Key handling for `SavedFocus::RunResults` — viewing a run's result table.
     fn handle_saved_run_results_key(&mut self, key: event::KeyEvent) {
         match (key.modifiers, key.code) {
-            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.switch_to_main_tab(MainTab::Query);
             }
@@ -210,7 +189,6 @@ impl App {
                     }
                 }
             }
-            // Left: back to detail
             (KeyModifiers::NONE, KeyCode::Left) => {
                 if let Some(ref mut detail) = self.panel.saved_detail {
                     detail.result = None;
@@ -218,7 +196,6 @@ impl App {
                 }
                 self.panel.saved_focus = SavedFocus::Detail;
             }
-            // q: pre-fill editor with `| from saved` reference
             (KeyModifiers::NONE, KeyCode::Char('q')) => {
                 self.prefill_from_saved_run();
             }
@@ -226,11 +203,6 @@ impl App {
         }
     }
 
-    /// Pre-fill the editor with `| from saved {name} run={id}` and switch to Query tab.
-    ///
-    /// The name and run come from what the detail shows: its saved query,
-    /// and the displayed run's id in the result view or the highlighted run
-    /// in the run list.
     fn prefill_from_saved_run(&mut self) {
         let Some(ref saved) = self.saved_cache else {
             return;
@@ -260,7 +232,6 @@ impl App {
         editor.move_to_line_end();
         self.tab.mark_editor_dirty();
 
-        // Reset saved tab state
         self.panel.saved_detail = None;
         self.panel.saved_focus = SavedFocus::List;
 
@@ -268,36 +239,30 @@ impl App {
         self.focus = Focus::Editor;
     }
 
-    /// Handle key events for the Schema tab panel.
     pub(crate) fn handle_panel_schema_key(&mut self, key: event::KeyEvent) {
         let Some(schema) = self.panel.schema.as_ref() else {
             return;
         };
 
-        // Filter input mode captures all keys.
         if schema.filter_active {
             self.handle_schema_filter_key(key);
             return;
         }
 
         match (key.modifiers, key.code) {
-            // Tab: switch back to Query tab
             (KeyModifiers::NONE, KeyCode::Tab) => {
                 self.switch_to_main_tab(MainTab::Query);
             }
-            // '/' or Ctrl+P: activate filter
             (KeyModifiers::NONE, KeyCode::Char('/'))
             | (KeyModifiers::CONTROL, KeyCode::Char('p')) => {
                 if let Some(s) = self.panel.schema.as_mut() {
                     s.filter_active = true;
                 }
             }
-            // Delegate to tree navigation
             _ => self.handle_schema_tree_key(key),
         }
     }
 
-    /// Handle key events for the schema filter input.
     fn handle_schema_filter_key(&mut self, key: event::KeyEvent) {
         let Some(schema) = self.panel.schema.as_mut() else {
             return;
@@ -327,7 +292,6 @@ impl App {
     }
 }
 
-/// The editor must quote display names with the same rules as the DSL formatter.
 pub(crate) fn saved_run_query(name: &str, run_id: Option<i64>) -> String {
     let name = trawl_core::format::format_saved_name(name);
     if let Some(id) = run_id {

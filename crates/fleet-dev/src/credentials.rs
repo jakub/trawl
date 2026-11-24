@@ -178,8 +178,6 @@ pub fn database_url(
     url.set_password(Some(password.expose()))
         .map_err(|()| Error::InvalidArgument("CNPG password cannot be URL-encoded".to_owned()))?;
     url.set_path(database);
-    // Do not allow SQLx's opportunistic TLS default to downgrade remote CNPG
-    // connections to plaintext.
     url.query_pairs_mut().append_pair("sslmode", "require");
     Ok(SecretValue::new(url.into()))
 }

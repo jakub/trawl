@@ -2,9 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! [`RowCap`] against real `DuckDB`: a refusing cap refuses, a cutting cap
-//! cuts, and a cutting cap never cuts the rows a kv tail aggregates.
-//!
 //! A row count cannot tell a `LIMIT` `DuckDB` applied from a cut made after
 //! it built the whole result, so the pushdown is read off the statement
 //! the lane actually prepared ([`prepare_probe::last_statement`]).
@@ -17,8 +14,6 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, RowCap, prepare_probe};
 use trawl_engine::value::{QueryResult, Value};
 
-/// Six events, `k=a` three times and `k=b` three times, where `read_json`
-/// can reach them.
 fn six_events() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -32,9 +27,6 @@ fn six_events() -> (tempfile::TempDir, String) {
     (dir, glob)
 }
 
-/// Six events with distinct `k`, 1 to 6 in `n` order, written out of `n`
-/// order. The largest `k` is the last event in `n` order, so the top of
-/// all six and the top of the first three are different rows.
 fn six_keys() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -82,8 +74,6 @@ fn truncate_keeps_the_first_rows_of_a_sql_pipeline() {
         "the first two rows in the pipeline's order"
     );
 
-    // `tail_input` bounds only what a kv tail reads: a SQL pipeline past
-    // it is still cut, not refused.
     let past_tail_input = run("*", &glob, cap).expect("a SQL pipeline is never refused");
     assert_eq!(past_tail_input.rows.len(), 2);
 
@@ -103,7 +93,6 @@ fn truncate_keeps_the_first_rows_of_a_sql_pipeline() {
 fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
     let (_dir, glob) = six_events();
 
-    // A count over every event, not over the first one.
     let counted = run(
         "* | extract kv | stats count() as c",
         &glob,
@@ -115,7 +104,6 @@ fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
     .expect("six events fit the tail's input bound");
     assert_eq!(counted.rows, vec![vec![Value::Integer(6)]]);
 
-    // Two groups out, one kept.
     let grouped = run(
         "* | extract kv | stats count() by k",
         &glob,
@@ -127,7 +115,6 @@ fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
     .expect("the tail's answer is cut");
     assert_eq!(grouped.rows.len(), 1);
 
-    // Cutting the input would publish a wrong count, so it is refused.
     let refused = run(
         "* | extract kv | stats count() as c",
         &glob,
@@ -142,10 +129,6 @@ fn truncate_cuts_a_kv_tail_answer_but_never_its_input() {
     );
 }
 
-/// The tail sorts, then takes its `head`, and only then does the cap cut
-/// its answer, so the one row kept is the top row of all six, not of the
-/// first three. The SQL read under the tail still refuses an input past
-/// `tail_input`.
 #[test]
 fn truncate_cuts_a_sorted_kv_tail_after_the_sort() {
     let (_dir, glob) = six_keys();
@@ -188,8 +171,6 @@ fn truncate_cuts_a_sorted_kv_tail_after_the_sort() {
     );
 }
 
-/// Run `dsl` under `cap` and return the SQL the lane handed `DuckDB`.
-///
 /// The lane runs on this thread and the probe keeps each thread's last
 /// statement, so nothing another test binds can land in between.
 fn prepared(dsl: &str, glob: &str, cap: RowCap) -> String {
@@ -208,8 +189,6 @@ fn truncate_reaches_duckdb_as_a_limit_and_refuse_does_not() {
         "the interactive lane runs the emitted SQL untouched: {refused}"
     );
 
-    // The same emitted SQL, wrapped: the cut happens inside DuckDB, and the
-    // wrapper adds no placeholder to the parameters the search binds.
     let truncated = prepared(
         dsl,
         &glob,

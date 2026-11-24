@@ -7,9 +7,6 @@ rust-version.workspace = true
 license.workspace = true
 publish.workspace = true
 
-# Never add trawl-server here, not even as a dev-dependency: every call
-# must cross trawl-client and the API's guards (ADR-0058). A test holds
-# the normal dependency graph free of it.
 [dependencies]
 trawl-api = { workspace = true }
 trawl-client = { workspace = true }
@@ -29,8 +26,6 @@ unicode-width = { workspace = true }
 
 [dev-dependencies]
 jsonschema = { workspace = true }
-# `pattern::thread_builds`, which the unit test
-# `hints::tests::hints_build_no_regex_from_stored_text` counts.
 trawl-core = { workspace = true, features = ["test-support"] }
 proptest = { workspace = true }
 

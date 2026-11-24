@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Layer 5: pipe stage parsers.
-//!
-//! Each pipe stage (`stats`, `where`, `sort`, `limit`, `table`) has its own
-//! parser function. The pipeline parser chains them with `|` separators.
 
 use chumsky::prelude::*;
 
@@ -22,11 +19,7 @@ use crate::parser::primitives::{
     quoted_string, raw_quoted_string, spanned, uint,
 };
 
-/// Parse an aggregation expression like `count()`, `avg(duration)`,
-/// or `count() as total`.
 fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra<'src>> + Clone {
-    // The function head takes the unquoted production, because a function
-    // name is not a field name (ADR-0013 §7).
     plain_name()
         .then_ignore(just('(').spaced())
         .then(expr().separated_by(just(',').spaced()).collect::<Vec<_>>())
@@ -45,7 +38,6 @@ fn agg_expr<'src>() -> impl Parser<'src, ParserInput<'src>, AggExpr, ParserExtra
         .labelled("aggregation expression")
 }
 
-/// Parse a `stats` stage: `stats agg(, agg)* by field(, field)*`
 fn stats_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("stats")
@@ -77,7 +69,6 @@ fn stats_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("stats stage")
 }
 
-/// Parse a `where` stage: `where expr`
 fn where_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("where")
@@ -87,7 +78,6 @@ fn where_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("where stage")
 }
 
-/// Parse a sort field: optional `-` prefix for descending.
 fn sort_field<'src>() -> impl Parser<'src, ParserInput<'src>, SortField, ParserExtra<'src>> + Clone
 {
     just('-')
@@ -104,7 +94,6 @@ fn sort_field<'src>() -> impl Parser<'src, ParserInput<'src>, SortField, ParserE
         .labelled("sort field")
 }
 
-/// Parse a `sort` stage: `sort field(, field)*`
 fn sort_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("sort")
@@ -119,7 +108,6 @@ fn sort_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("sort stage")
 }
 
-/// Parse a `limit` stage: `limit N`
 fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("limit")
@@ -134,7 +122,6 @@ fn limit_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("limit stage")
 }
 
-/// Parse a `head` stage: alias for `limit N`.
 fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("head")
@@ -149,7 +136,6 @@ fn head_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("head stage")
 }
 
-/// Parse a `tail` stage: `tail N` — last N rows.
 fn tail_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("tail")
@@ -159,7 +145,6 @@ fn tail_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("tail stage")
 }
 
-/// Parse a `table` stage: `table field(, field)*`
 fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("table")
@@ -179,7 +164,6 @@ fn table_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("table stage")
 }
 
-/// Parse a `fields` stage: alias for `table field(, field)*`.
 fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("fields")
@@ -199,7 +183,6 @@ fn fields_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parse
         .labelled("fields stage")
 }
 
-/// Parse a `top` stage: `top N field [by field(, field)*]`
 fn top_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("top")
         .spaced()
@@ -221,7 +204,6 @@ fn top_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
         .labelled("top stage")
 }
 
-/// Parse a `rare` stage: `rare N field [by field(, field)*]`
 fn rare_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("rare")
@@ -244,7 +226,6 @@ fn rare_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("rare stage")
 }
 
-/// Parse a `drop` stage: `drop field(, field)*`
 fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("drop")
@@ -259,12 +240,6 @@ fn drop_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("drop stage")
 }
 
-/// A field name the pipeline writes: a `let`/`eval` target, a `rename`
-/// target, or an explicit aggregate alias (`stats`/`eventstats`/
-/// `timechart`/`pivot` all mint their output column through `as`).
-/// Trawl's `_` namespace is sealed at both doors (ADR-0013 §5): ingest
-/// strips the prefix off an incoming key, so a name the DSL minted there
-/// would be a column ingest can never carry.
 fn assignment_target<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     field_name().try_map(|name, span| {
@@ -282,7 +257,6 @@ fn assignment_target<'src>()
     })
 }
 
-/// Parse a `let` / `eval` assignment: `field = expr`.
 fn let_assignment<'src>()
 -> impl Parser<'src, ParserInput<'src>, (String, Spanned<Expr>), ParserExtra<'src>> + Clone {
     assignment_target()
@@ -308,7 +282,6 @@ fn let_assignments<'src>(
         })
 }
 
-/// Parse a `let` stage: `let field = expr [, field = expr]*`
 fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("let")
         .spaced()
@@ -322,7 +295,6 @@ fn let_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserEx
         .labelled("let stage")
 }
 
-/// Parse an `eval` stage: alias for `let field = expr [, field = expr]*`.
 fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("eval")
@@ -337,16 +309,11 @@ fn eval_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
         .labelled("eval stage")
 }
 
-/// Parse an extract/rex stage from a given keyword.
-///
-/// Both `extract` and `rex` support the same syntax:
-/// `KEYWORD "pattern" [from field]` or `KEYWORD kv [sep="X"] [from field]`
 fn extract_like_stage<'src>(
     kw: &'static str,
 ) -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     let from_clause = keyword("from").spaced().ignore_then(field_name()).or_not();
 
-    // Optional `sep="X"` clause — a quoted single character.
     let sep_clause = keyword("sep")
         .then(just('='))
         .ignore_then(raw_quoted_string())
@@ -365,7 +332,7 @@ fn extract_like_stage<'src>(
                     let mut chars = s.chars();
                     let c = chars.next()?;
                     if chars.next().is_some() {
-                        None // multi-char — will fall back to default
+                        None
                     } else {
                         Some(c)
                     }
@@ -400,21 +367,15 @@ fn extract_like_stage<'src>(
     choice((kv_mode, regex_mode)).labelled("extract stage")
 }
 
-/// Parse an `extract` stage: `extract "pattern" [from field]` or `extract kv [from field]`
 fn extract_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     extract_like_stage("extract")
 }
 
-/// Parse a `rex` stage: alias for `extract`.
 fn rex_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     extract_like_stage("rex")
 }
 
-/// Parse a `dedup` stage: `dedup [field(, field)*]`
-///
-/// Bare `dedup` (no fields) removes exact duplicate rows.
-/// With fields, keeps the most recent row per unique field combination.
 fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     keyword("dedup")
@@ -431,12 +392,6 @@ fn dedup_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, Parser
         .labelled("dedup stage")
 }
 
-/// Parse a `timechart` stage:
-/// `timechart [on field] [span=DURATION] agg(, agg)* [by field(, field)*]`
-///
-/// The clause order is canonical, not free: `on` precedes `span=`, so
-/// `timechart span=1h on x` is a parse error rather than a second spelling
-/// of the same stage.
 fn timechart_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
     keyword("timechart")
@@ -608,13 +563,8 @@ fn eventstats_stage<'src>()
         .labelled("eventstats stage")
 }
 
-/// Parse a `from saved` stage: `from saved <name> [run=latest|all|N]`
-///
-/// Name is a bare identifier or a quoted string. The optional `run=` clause
-/// selects which run(s) to load: `latest` (default), `all`, or a numeric ID.
 fn from_saved_stage<'src>()
 -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone {
-    // A saved-query name is not a field either — no backticks.
     let name = choice((quoted_string(), plain_name())).labelled("saved query name");
 
     let run_selector = keyword("run")
@@ -637,7 +587,6 @@ fn from_saved_stage<'src>()
         .labelled("from saved stage")
 }
 
-/// Parse a single pipe stage.
 fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserExtra<'src>> + Clone
 {
     choice((
@@ -667,8 +616,6 @@ fn pipe_stage<'src>() -> impl Parser<'src, ParserInput<'src>, PipeStage, ParserE
     .labelled("pipe stage")
 }
 
-/// Parse the pipeline: `("|" pipe_stage)*`.
-/// Returns a vec of spanned pipe stages.
 pub(crate) fn pipeline<'src>()
 -> impl Parser<'src, ParserInput<'src>, Vec<Spanned<PipeStage>>, ParserExtra<'src>> + Clone {
     just('|')
@@ -785,8 +732,6 @@ mod tests {
         assert!(matches!(result[3].node, PipeStage::Limit(_)));
     }
 
-    // ── head (alias for limit) ────────────────────────────────────────
-
     #[test]
     fn test_head() {
         let input = "| head 10";
@@ -797,8 +742,6 @@ mod tests {
             other => panic!("expected Limit, got {other:?}"),
         }
     }
-
-    // ── fields (alias for table) ────────────────────────────────────
 
     #[test]
     fn test_fields() {
@@ -820,8 +763,6 @@ mod tests {
         }
     }
 
-    // ── splunk eval alias (alias for let) ───────────────────────────
-
     #[test]
     fn test_splunk_eval_alias() {
         let input = "| eval msg_len = length(message)";
@@ -842,8 +783,6 @@ mod tests {
             other => panic!("expected Let, got {other:?}"),
         }
     }
-
-    // ── rex (alias for extract) ─────────────────────────────────────
 
     #[test]
     fn test_rex_regex() {
@@ -872,8 +811,6 @@ mod tests {
             other => panic!("expected Extract, got {other:?}"),
         }
     }
-
-    // ── top ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_top_basic() {
@@ -904,8 +841,6 @@ mod tests {
         }
     }
 
-    // ── rare ────────────────────────────────────────────────────────────
-
     #[test]
     fn test_rare_basic() {
         let input = "| rare 5 status";
@@ -934,8 +869,6 @@ mod tests {
         }
     }
 
-    // ── drop ────────────────────────────────────────────────────────────
-
     #[test]
     fn test_drop_single() {
         let input = "| drop host";
@@ -962,8 +895,6 @@ mod tests {
             other => panic!("expected Drop, got {other:?}"),
         }
     }
-
-    // ── let ─────────────────────────────────────────────────────────────
 
     #[test]
     fn test_let_arithmetic() {
@@ -1013,8 +944,6 @@ mod tests {
             other => panic!("expected Let, got {other:?}"),
         }
     }
-
-    // ── extract ─────────────────────────────────────────────────────────
 
     #[test]
     fn test_extract_regex() {
@@ -1081,8 +1010,6 @@ mod tests {
         }
     }
 
-    // ── dedup ───────────────────────────────────────────────────────────
-
     #[test]
     fn test_dedup_bare() {
         let input = "| dedup";
@@ -1118,8 +1045,6 @@ mod tests {
             other => panic!("expected Dedup, got {other:?}"),
         }
     }
-
-    // ── timechart ───────────────────────────────────────────────────────
 
     #[test]
     fn test_timechart_with_span() {
@@ -1165,8 +1090,6 @@ mod tests {
         }
     }
 
-    // ── pivot ───────────────────────────────────────────────────────────
-
     #[test]
     fn test_pivot_basic() {
         let input = "| pivot count() on service";
@@ -1195,8 +1118,6 @@ mod tests {
         }
     }
 
-    // ── tail ────────────────────────────────────────────────────────────
-
     #[test]
     fn test_tail() {
         let input = "| tail 5";
@@ -1207,8 +1128,6 @@ mod tests {
             other => panic!("expected Tail, got {other:?}"),
         }
     }
-
-    // ── rename ──────────────────────────────────────────────────────────
 
     #[test]
     fn test_rename_single() {
@@ -1242,10 +1161,6 @@ mod tests {
         }
     }
 
-    // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
-
-    /// Backticks are accepted in every field-name position: a gap in the
-    /// coverage would mean the name you type is not always reachable.
     #[test]
     fn backticks_are_accepted_in_every_field_position() {
         let cases: &[(&str, &str)] = &[
@@ -1286,8 +1201,6 @@ mod tests {
         }
     }
 
-    /// Quoting is not an escape from policy: `is_reserved_name` refuses
-    /// every write position (ADR-0013 §5).
     #[test]
     fn backticks_do_not_unseal_the_reserved_namespace() {
         for dsl in [
@@ -1304,8 +1217,6 @@ mod tests {
         }
     }
 
-    /// Function names are not fields and take no backticks: the
-    /// aggregate head parses through the unquoted production.
     #[test]
     fn aggregate_function_names_take_no_backticks() {
         assert!(pipeline().parse("| stats `count`()").into_result().is_err());
@@ -1317,7 +1228,6 @@ mod tests {
         );
     }
 
-    /// Saved-query names are not fields either.
     #[test]
     fn saved_query_names_take_no_backticks() {
         assert!(
@@ -1327,8 +1237,6 @@ mod tests {
                 .is_err()
         );
     }
-
-    // ── from saved ──────────────────────────────────────────────────────
 
     #[test]
     fn test_from_saved_bare_name() {

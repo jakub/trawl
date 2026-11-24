@@ -3,38 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<Atmosphere/>` — the WebGL mesh-gradient backdrop.
-//!
-//! Lifecycle follows trawl-web-ui's `components/chart.rs` idiom:
-//! `NodeRef` div + `StoredValue<Option<ShaderHandle>>` + one `Effect`
-//! that constructs on first run and pushes uniform updates thereafter,
-//! with `on_cleanup` disposing the mount. Theme flips re-color the same
-//! mount via `setUniforms`, never a remount.
-//!
-//! Degradation is silent by design:
-//! - WebGL2 unavailable → `create_shader` returns `None`; a `failed`
-//!   latch stops further attempts and the `.atmosphere` CSS floor
-//!   (`background: var(--bg)`, theme-reactive) is all that paints.
-//! - `prefers-reduced-motion: reduce` → speed 0; the vendored package
-//!   stops its rAF loop entirely at speed 0, so a static frame costs
-//!   nothing per frame.
-//! - a lost WebGL context is a permanent static floor: the vendored
-//!   wrapper hides the dead canvas so the `.atmosphere` CSS floor shows
-//!   through, and there is deliberately no `webglcontextrestored`
-//!   remount, because for a decorative backdrop the recovery machinery
-//!   costs more than the pixels are worth (ADR-0012).
-//!
-//! The host `<div class="atmosphere">` is `aria-hidden` decoration —
-//! fixed, full-viewport, `z-index: -1`, `pointer-events: none` (see
-//! the `.atmosphere` section of `fleet-ui.css`). Consumers compose
-//! content above it, e.g. coastwatch's login card.
-//!
-//! Mounting this costs a consumer one feature flag and the component.
-//! The vendored JS rides along as a compile-time wasm-bindgen snippet,
-//! needing no build wiring, but linking that snippet is what the
-//! default-off `atmosphere` feature gates, so a consumer that wants the
-//! backdrop declares `fleet-ui = { …, features = ["atmosphere"] }`
-//! (Trunk apps: `data-cargo-features` on the `rel="rust"` link). See
-//! the module doc of [`super::interop`].
 
 use leptos::html::Div;
 use leptos::prelude::*;
@@ -49,12 +17,9 @@ use crate::theme::Theme;
 pub fn Atmosphere(#[prop(into)] theme: Signal<Theme>) -> impl IntoView {
     let node_ref = NodeRef::<Div>::new();
     let handle: StoredValue<Option<ShaderHandle>, LocalStorage> = StoredValue::new_local(None);
-    // Latched on a failed construction (WebGL2 unavailable): the
-    // capability does not come back, so theme flips must not retry.
     let failed = StoredValue::new(false);
     let reduced_motion = use_media_query("(prefers-reduced-motion: reduce)");
 
-    // Mount on first run; re-color in place when the theme changes.
     Effect::new(move |_| {
         let Some(element) = node_ref.get() else {
             return;
@@ -68,9 +33,6 @@ pub fn Atmosphere(#[prop(into)] theme: Signal<Theme>) -> impl IntoView {
                 h.set_uniforms(theme_update(theme_now));
             } else {
                 let html_el: web_sys::HtmlElement = (*element).clone().unchecked_into();
-                // Untracked: the reduced-motion Effect below owns
-                // reactivity on the media query — tracking it here
-                // too would be redundant.
                 let speed = if reduced_motion.get_untracked() {
                     0.0
                 } else {
@@ -88,7 +50,6 @@ pub fn Atmosphere(#[prop(into)] theme: Signal<Theme>) -> impl IntoView {
         });
     });
 
-    // prefers-reduced-motion, live: 0 stops the rAF loop entirely.
     Effect::new(move |_| {
         let reduced = reduced_motion.get();
         handle.update_value(|slot| {

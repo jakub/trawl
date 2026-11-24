@@ -3,21 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Generic `/api/v1/*` → trawld pass-through.
-//!
-//! Forwards the browser's request to upstream trawld, replacing the
-//! session cookie with `Authorization: Bearer <token>`. The response
-//! body, status, and most headers are mirrored back to the browser.
-//!
-//! Exceptions:
-//! - `/api/v1/ingest` is blocked outright (never exposed to browsers).
-//!   The block matches that exact path only: `/api/v1/ingest/preview`
-//!   forwards like any other call, with the session's bearer token
-//!   (ADR-0049).
-//! - `/api/v1/stream` is handled by the SSE-specific handler in
-//!   `routes::stream`, which streams bytes rather than buffering.
-//! - Hop-by-hop headers are stripped (connection, upgrade, te, etc.).
-//! - An upstream 3xx becomes the proxy's own 502, and `Location` never
-//!   reaches the browser; see `refuse_redirect`.
 
 use axum::body::{Body, Bytes, HttpBody as _};
 use axum::extract::{Request, State};
@@ -33,8 +18,6 @@ use crate::middleware::body_deadline::BodyDeadlineElapsed;
 use crate::middleware::session_extractor::Auth;
 use crate::state::AppState;
 
-/// The setting the proxy's body limit comes from, as trawld's 413 names
-/// it.
 pub const BODY_LIMIT_SETTING: &str = "[server] max_request_body_bytes";
 
 /// Headers that are hop-by-hop per RFC 7230 §6.1 and MUST NOT be forwarded
@@ -51,13 +34,10 @@ const HOP_BY_HOP: &[&str] = &[
     "host",
 ];
 
-/// Always-404 handler for blocked or unknown browser API paths: the
-/// `not_found` envelope, uncached (ADR-0066).
 pub async fn not_found() -> Response {
     envelope(StatusCode::NOT_FOUND, ErrorCode::NotFound, "not found")
 }
 
-/// The browser never ingests, so keep that path outside the generic proxy.
 pub async fn block_ingest() -> Response {
     not_found().await
 }
@@ -79,24 +59,14 @@ async fn do_forward(
 
     // CSRF defense already ran: `auth` is here, which means the request
     // either carried a valid bearer header (no cookie, so not a CSRF
-    // target) or passed the origin guard in the `Session` extractor
-    // (ADR-0016). The guard used to be an explicit call right here, which
-    // covered this forwarder and nothing else; the SSE handlers take the
-    // same `Auth` and had no such call, so a foreign page could stream the
-    // victim's logs. Owning the check in the extractor is what makes the
-    // rule hold for every cookie route, including the next one.
+    // target) or passed the origin guard in the `Session` extractor.
     let upstream_uri = build_upstream_uri(state.upstream_url(), &parts.uri)?;
 
-    // The body carries its budget reservation inside the `Bytes`: it is
-    // released when the last reference to the allocation drops, wherever
-    // that is. For a body trawld reads, that is before its response head.
-    // For one trawld leaves unread, it is when the connection ends.
     let body_bytes =
         collect_body(&parts.headers, body, state.limits(), state.body_budget()).await?;
 
     // After every local check, so a request refused here never waits on
-    // the pin file. This one client carries the request and its streamed
-    // response body.
+    // the pin file.
     let http = state.upstream_client().await?;
 
     let mut upstream_req = http
@@ -116,7 +86,6 @@ async fn do_forward(
     }
 
     if !body_bytes.is_empty() {
-        // `Bytes` into reqwest as it is: no copy of the buffered body.
         upstream_req = upstream_req.body(body_bytes);
     }
 
@@ -125,18 +94,6 @@ async fn do_forward(
     relay_response(upstream_resp, &auth)
 }
 
-/// Copy an upstream answer to the browser as it came: its status, its
-/// end-to-end headers through [`copy_response_headers`], and its body
-/// bytes, under the proxy-wide cookie rule. Nothing is retried or
-/// rewritten, so a refusal such as trawld's 503 `request_limit_reached`
-/// keeps its `Cache-Control` and request id (ADR-0054).
-///
-/// The generic forwarder relays every answer this way, and the SSE
-/// handlers every non-2xx one. A caller refuses a redirect first
-/// ([`refuse_redirect`]).
-///
-/// # Errors
-/// [`ProxyError::Internal`] when the response cannot be built.
 pub(crate) fn relay_response(
     upstream_resp: reqwest::Response,
     auth: &Auth,
@@ -158,20 +115,6 @@ pub(crate) fn relay_response(
         .map_err(|e| ProxyError::Internal(format!("response build: {e}")))
 }
 
-/// Whether a proxied upstream response should clear the shared
-/// `fleet_session` cookie, and with what directive; `None` leaves the
-/// cookie untouched.
-///
-/// The one home of the proxy-path 401/403 cookie rule (ADR-0004), consulted
-/// by both the generic forwarder and the SSE handler so a newly added
-/// proxied path can't silently diverge.
-///
-/// Always `None`: proxied responses never own cookie lifecycle. A trawld
-/// `401` means the upstream credential is invalid, revoked, or expired; a
-/// `403` means the valid key lacks a trawl grant or the permission for that
-/// route and may still carry grants for sibling apps. `auth::me` owns cookie
-/// clearing through the permission-free upstream `/whoami`. `_status` and
-/// `_auth` remain available if that policy changes.
 #[must_use]
 pub(crate) fn clear_cookie_for_proxied_response(
     _status: StatusCode,
@@ -180,18 +123,12 @@ pub(crate) fn clear_cookie_for_proxied_response(
     None
 }
 
-/// Turn an upstream redirect into an upstream error.
-///
-/// trawld never redirects, and the client follows no redirect (see
-/// [`AppState::from_config`]). Mirroring the 3xx would let the browser
-/// follow it instead: a `Location` naming another port on the browser's
-/// host would carry the host-scoped session cookie there, since a
-/// cookie's scope ignores the port. Every 3xx is refused, 304
+/// trawld never redirects, and the client follows no redirect. Mirroring the
+/// 3xx would let the browser follow it instead: a `Location` naming another
+/// port on the browser's host would carry the host-scoped session cookie
+/// there, since a cookie's scope ignores the port. Every 3xx is refused, 304
 /// included: trawld sends no validators, so a 304 is not an answer it
-/// gives. Shared by every route that relays an upstream status.
-///
-/// # Errors
-/// [`ProxyError::Upstream`] for any 3xx, which answers 502.
+/// gives.
 pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyError> {
     if status.is_redirection() {
         return Err(ProxyError::Upstream(
@@ -201,34 +138,6 @@ pub(crate) fn refuse_redirect(status: reqwest::StatusCode) -> Result<(), ProxyEr
     Ok(())
 }
 
-/// Buffer a request body whole, within the proxy's body limit and its
-/// body budget.
-///
-/// A `Content-Length` past the limit is refused before a byte is read,
-/// and a body found over the limit while it streams in is refused at the
-/// byte that crosses it: 413 `request_too_large`, with trawld's sentence.
-/// Before a byte is read the body's worst case is reserved from the
-/// budget (`body_budget`): its declared length, or the whole limit when
-/// it declares none. A body the budget cannot cover now is refused 503
-/// `request_limit_reached`, and a body larger than the whole budget,
-/// which only a limit above the budget allows, is refused 413 naming
-/// the budget. The buffer is allocated at the reservation and never
-/// grows past it, so the reservation is the memory. One copy is made,
-/// from each chunk as it arrives into that buffer, and the buffer goes
-/// to reqwest as the `Bytes` it is frozen into, with the reservation
-/// inside ([`ReservedBody`]): the budget is given back when the last
-/// reference to the allocation drops, reqwest's retry copy and hyper's
-/// write queue included, and not before. The body deadline is the
-/// router's (`middleware::body_deadline`); a read that fails because it
-/// passed is 408 `timeout` here, the answer the layer gives whatever a
-/// handler makes of it. None of these refusals contacts trawld. The
-/// count the request holds is released with the refusal, as with any
-/// response head, and so is the reservation, since no body outlives one.
-///
-/// # Errors
-/// [`ProxyError::RequestTooLarge`], [`ProxyError::BodyBudgetFull`],
-/// [`ProxyError::BodyTimeout`], or [`ProxyError::BadRequest`] when the
-/// body cannot be read or is longer than the length it declared.
 async fn collect_body(
     headers: &HeaderMap,
     body: Body,
@@ -236,9 +145,6 @@ async fn collect_body(
     budget: &BodyBudget,
 ) -> Result<Bytes, ProxyError> {
     let limit = limits.request_body_bytes;
-    // What one body may hold: the limit, or the budget when the limit is
-    // the larger of the two, since the budget could never cover more.
-    // The 413 names whichever bound was crossed first.
     let (cap, cap_name) = if limits.body_budget_bytes < limit {
         (limits.body_budget_bytes, BODY_BUDGET_NAME)
     } else {
@@ -292,8 +198,6 @@ async fn collect_body(
         }
         buffer.extend_from_slice(&chunk);
     }
-    // `Bytes` takes the vector's allocation as it is, no copy, and the
-    // reservation with it.
     Ok(Bytes::from_owner(ReservedBody {
         bytes: buffer,
         _reservation: reservation,
@@ -301,19 +205,7 @@ async fn collect_body(
 }
 
 /// A buffered request body and the budget it was charged, as one owner
-/// for the `Bytes` reqwest sends.
-///
-/// `Bytes::from_owner` drops the owner when the last `Bytes` that refers
-/// to it drops, so the reservation lives exactly as long as the
-/// allocation. Every reference counts: reqwest keeps one for a retry
-/// until the response head, and hyper keeps the body queued, zero-copy,
-/// until the connection has written it. A body trawld never reads, on a
-/// route that ignores it, therefore keeps its budget until the connection
-/// is torn down, where a reservation dropped at the response head let a
-/// caller hold many such bodies while the budget showed them free
-/// (ADR-0054, amended 2026-10-18). A stream body that owned the
-/// reservation would not do: hyper drops the body object once its queue
-/// has taken the chunks, while the queue still holds the allocation.
+/// for the `Bytes` reqwest sends (ADR-0054).
 struct ReservedBody {
     bytes: Vec<u8>,
     _reservation: BodyReservation,
@@ -325,12 +217,6 @@ impl AsRef<[u8]> for ReservedBody {
     }
 }
 
-/// Compose the upstream URL: the configured base followed by the
-/// browser's own path and query, verbatim.
-///
-/// The proxy relays one namespace only (`/api/v1/*` to trawld's own
-/// `/api/v1/*`), so there is no prefix rewriting: what the browser asked
-/// for is what upstream sees.
 fn build_upstream_uri(base: &str, orig: &Uri) -> Result<String, ProxyError> {
     let path_and_query = orig
         .path_and_query()
@@ -387,9 +273,6 @@ mod tests {
     use crate::test_support::{HandUpstream, TlsUpstream, wedge_body_bytes, wedge_body_bytes_for};
     use crate::test_timing::{frozen, until};
 
-    /// The browser origin these fixtures answer on. The CSRF tests below
-    /// send it verbatim; anything else is a foreign origin by definition,
-    /// which is the whole of ADR-0016's policy.
     const TEST_ORIGIN: &str = "https://trawl.fleet.test";
 
     fn state_pointing_at(upstream: &TlsUpstream) -> AppState {
@@ -406,8 +289,6 @@ mod tests {
         routes::build(state)
     }
 
-    /// The production router over a state pointing at the hand upstream,
-    /// under a request count of `count`.
     fn counted_app(upstream: &HandUpstream, count: usize) -> Router {
         let web = WebConfig {
             allow_insecure_cookies: true,
@@ -421,8 +302,6 @@ mod tests {
         )
     }
 
-    /// [`counted_app`] with `adjust` applied to the resolved config
-    /// first, so a test can shrink a limit or a deadline.
     fn limited_app(
         upstream: &HandUpstream,
         count: usize,
@@ -431,8 +310,6 @@ mod tests {
         limited_app_under(upstream, RequestCount::new(count), adjust)
     }
 
-    /// [`limited_app`] under a count the test built itself, so it can
-    /// watch the count fill.
     fn limited_app_under(
         upstream: &HandUpstream,
         count: RequestCount,
@@ -448,8 +325,6 @@ mod tests {
         routes::build_with_count(AppState::from_config(cfg).unwrap(), count)
     }
 
-    /// A state over the hand upstream with `adjust` applied to its
-    /// resolved config, kept by the test so it can watch the body budget.
     fn limited_state(
         upstream: &HandUpstream,
         adjust: impl FnOnce(&mut ResolvedConfig),
@@ -464,16 +339,12 @@ mod tests {
         AppState::from_config(cfg).unwrap()
     }
 
-    /// A bearer POST to `path` whose body starts and never finishes: one
-    /// byte, then nothing, forever, with no length declared.
     fn stalled_post(path: &str) -> Request<Body> {
         let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
             .chain(futures::stream::pending());
         bearer_post(path, Body::from_stream(stalled))
     }
 
-    /// A login whose body starts and never finishes: one byte, then
-    /// nothing, forever. It carries no token, so anyone can send it.
     fn stalled_login() -> Request<Body> {
         let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
             .chain(futures::stream::pending());
@@ -486,7 +357,6 @@ mod tests {
             .unwrap()
     }
 
-    /// A bearer POST of `body` to `path`.
     fn bearer_post(path: &str, body: Body) -> Request<Body> {
         Request::builder()
             .method("POST")
@@ -497,10 +367,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Assert `resp` is one of the proxy's envelope refusals: `status`,
-    /// the `trawl_api` envelope with `code` and exactly `message`,
-    /// `Cache-Control: no-store` and no cookie change. Returns nothing a
-    /// caller needs; the body is consumed.
     async fn assert_envelope_refusal(
         resp: Response,
         status: StatusCode,
@@ -524,7 +390,6 @@ mod tests {
         assert_eq!(envelope.error.message, message);
     }
 
-    /// A bearer GET of `path`, the simplest counted request.
     fn bearer_get(path: &str) -> Request<Body> {
         Request::builder()
             .method("GET")
@@ -534,9 +399,6 @@ mod tests {
             .unwrap()
     }
 
-    /// Assert `resp` is the proxy's own 503 `request_limit_reached`: the
-    /// envelope with a message naming trawl-web, `Cache-Control:
-    /// no-store`, no `Retry-After` and no cookie change.
     async fn assert_proxy_request_limit_refusal(resp: Response) {
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         let headers = resp.headers().clone();
@@ -572,9 +434,6 @@ mod tests {
         );
     }
 
-    /// Over the count, the proxy answers its own 503 at once and sends
-    /// nothing to trawld; the held requests finish, and the count is free
-    /// again afterwards.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_requests_over_the_count_get_503_request_limit_reached() {
         let upstream = HandUpstream::start().await;
@@ -596,7 +455,6 @@ mod tests {
         .expect("the refusal is immediate")
         .unwrap();
         assert_proxy_request_limit_refusal(refused).await;
-        // Nothing for the refused request reached trawld, then or later.
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             upstream.seen(),
@@ -614,8 +472,6 @@ mod tests {
         assert_eq!(upstream.seen().len(), 3);
     }
 
-    /// With the count full, `/healthz` still answers: the probes are
-    /// outside the count.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_healthz_is_never_counted() {
         let upstream = HandUpstream::start().await;
@@ -625,8 +481,6 @@ mod tests {
         let held = tokio::spawn(app.clone().oneshot(bearer_get("/api/v1/schema")));
         upstream.wait_for_requests(1).await;
 
-        // Under a deadline: a proxy without the count would forward this
-        // to the held upstream and wait there instead of failing.
         let refused = tokio::time::timeout(
             Duration::from_secs(5),
             app.clone().oneshot(bearer_get("/api/v1/stats")),
@@ -661,8 +515,6 @@ mod tests {
         assert_eq!(held.await.unwrap().unwrap().status(), StatusCode::OK);
     }
 
-    /// The count is given back at the response head: an open server-sent
-    /// event stream, whose body is still flowing, holds no count.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_count_is_released_at_the_response_head() {
         let upstream = HandUpstream::start().await;
@@ -678,7 +530,6 @@ mod tests {
             stream.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/event-stream"
         );
-        // The stream is open: an event arrives.
         let mut body = stream.into_body().into_data_stream();
         let first =
             tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut body))
@@ -688,15 +539,12 @@ mod tests {
                 .unwrap();
         assert!(first.starts_with(b"data: "), "{first:?}");
 
-        // With the only count's request still streaming, another request
-        // is admitted.
         let next = app.oneshot(bearer_get("/api/v1/schema")).await.unwrap();
         assert_eq!(
             next.status(),
             StatusCode::OK,
             "an open stream held the count past its head"
         );
-        // And the stream is still flowing afterwards.
         let later =
             tokio::time::timeout(Duration::from_secs(5), futures::StreamExt::next(&mut body))
                 .await
@@ -707,17 +555,12 @@ mod tests {
         drop(body);
     }
 
-    /// A body over `[server] max_request_body_bytes` is answered 413
-    /// `request_too_large` with trawld's own sentence, whether its length
-    /// was announced or found while it streamed in, and trawld is never
-    /// called. A body exactly at the limit goes through.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_over_server_limit_gets_413_without_upstream_call() {
         let upstream = HandUpstream::start().await;
         let app = limited_app(&upstream, 4, |cfg| cfg.limits.request_body_bytes = 64);
         let sentence = "request body exceeds [server] max_request_body_bytes (64 bytes)";
 
-        // Announced: refused on the header alone.
         let announced = Request::builder()
             .method("POST")
             .uri("/api/v1/search")
@@ -735,7 +578,6 @@ mod tests {
         )
         .await;
 
-        // Unannounced: refused at the byte that crosses the limit.
         let chunks = futures::stream::iter([
             Ok::<_, std::io::Error>(Bytes::from(vec![b'x'; 60])),
             Ok(Bytes::from(vec![b'x'; 5])),
@@ -754,7 +596,6 @@ mod tests {
         .await;
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
 
-        // At the limit: forwarded.
         let resp = app
             .oneshot(bearer_post("/api/v1/search", Body::from(vec![b'x'; 64])))
             .await
@@ -764,8 +605,6 @@ mod tests {
         assert_eq!(upstream.seen(), ["POST /api/v1/search"]);
     }
 
-    /// The default limit is trawld's default, so a proxy resolved without
-    /// a `[server]` section refuses what a default trawld would.
     #[test]
     fn proxy_body_limit_defaults_to_trawld_default() {
         let limits = crate::config::ProxyLimits::from_server(None);
@@ -777,9 +616,6 @@ mod tests {
         assert_eq!(limits.upstream_head_timeout, Duration::from_secs(40));
     }
 
-    /// A trawld that has not sent a response head by the deadline is
-    /// answered 504 `timeout` with the envelope, and the count is free
-    /// again.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_returns_504_timeout_when_upstream_head_is_late() {
         let upstream = HandUpstream::start().await;
@@ -809,7 +645,6 @@ mod tests {
         )
         .await;
 
-        // The only count is free again, and a released upstream answers.
         upstream.release();
         let next = tokio::time::timeout(
             Duration::from_secs(5),
@@ -821,8 +656,6 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
-    /// The head deadline covers the head only: a server-sent event stream
-    /// whose head arrived in time keeps flowing well past the deadline.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_sse_outlives_the_head_deadline() {
         let upstream = HandUpstream::start().await;
@@ -855,8 +688,6 @@ mod tests {
         );
     }
 
-    /// A login body over 16 KiB is answered 413 `request_too_large` with
-    /// the login limit named, and trawld is never asked about the key.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_body_over_limit_is_refused() {
         let upstream = HandUpstream::start().await;
@@ -882,11 +713,6 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
-    /// A login whose declared `Content-Length` is over 16 KiB is answered
-    /// 413 `request_too_large` whatever its content type: the refusal
-    /// comes before the `Json` extractor, which would otherwise answer a
-    /// non-JSON type 415 without ever consulting the limit. At exactly the
-    /// limit the request is the extractor's, so a wrong type is still 415.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_declared_length_over_limit_is_refused_for_any_content_type() {
         let upstream = HandUpstream::start().await;
@@ -927,11 +753,6 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
-    /// A login body streamed with no declared length is held to the limit
-    /// by the middleware's own read: over it, the body is answered 413
-    /// `request_too_large` whatever its content type. A non-JSON type no
-    /// longer hides the size, since the extractor would answer it 415
-    /// before reading any of it.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_chunked_body_over_limit_is_refused() {
         let upstream = HandUpstream::start().await;
@@ -961,10 +782,8 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
-    /// Serve `app` through the production listener on a loopback port, so
-    /// a request reaches it through hyper's HTTP/1.1 parser as a real
-    /// client's does: `Router::oneshot` skips the framing rules that
-    /// decide which headers the router sees.
+    /// `Router::oneshot` skips the framing rules that decide which headers
+    /// the router sees.
     async fn serve_on_loopback(
         app: Router,
     ) -> (
@@ -988,9 +807,6 @@ mod tests {
         (addr, shutdown, task)
     }
 
-    /// One HTTP/1.1 login POST written to `addr` as `head_lines` (each
-    /// without its CRLF) and the chunked `chunks`, then read to the
-    /// close: the status code and the body of the answer.
     async fn raw_chunked_login(
         addr: std::net::SocketAddr,
         head_lines: &[&str],
@@ -1032,11 +848,6 @@ mod tests {
         (status, body.to_owned())
     }
 
-    /// A chunked login body over 16 KiB is answered 413 `request_too_large`
-    /// through the production listener, whatever its content type, and
-    /// trawld is never contacted: with no `Content-Length` to read, the
-    /// size is only known by reading the body, and a `text/plain` one
-    /// used to be answered 415 before any of it was.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_chunked_plain_text_over_limit_is_413_on_the_wire() {
         let upstream = HandUpstream::start().await;
@@ -1065,11 +876,8 @@ mod tests {
         task.abort();
     }
 
-    /// A login that carries both `Transfer-Encoding: chunked` and a
-    /// `Content-Length` over 16 KiB is answered 413 in either header
-    /// order. hyper gives the chunked framing precedence and hands the
-    /// router no `Content-Length`, so the declared length cannot be what
-    /// refuses it.
+    /// hyper gives the chunked framing precedence and hands the router no
+    /// `Content-Length`, so the declared length cannot be what refuses it.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_chunked_with_content_length_over_limit_is_413_in_either_order() {
         let upstream = HandUpstream::start().await;
@@ -1098,8 +906,6 @@ mod tests {
         task.abort();
     }
 
-    /// A chunked JSON login within the limit still reaches trawld and
-    /// mints the cookie, through the production listener.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_chunked_json_within_limit_succeeds_on_the_wire() {
         let upstream = HandUpstream::start().await;
@@ -1119,9 +925,6 @@ mod tests {
         task.abort();
     }
 
-    /// A login whose body stalls after its head is still answered 408
-    /// `timeout` at the body deadline through the production listener,
-    /// although the login middleware now reads the body itself.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_stalled_body_is_408_on_the_wire() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -1157,7 +960,6 @@ mod tests {
         task.abort();
     }
 
-    /// A well-formed JSON login still reaches trawld and mints the cookie.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_login_within_limit_still_succeeds() {
         let upstream = HandUpstream::start().await;
@@ -1178,9 +980,6 @@ mod tests {
         assert_eq!(upstream.seen(), ["GET /api/v1/whoami"]);
     }
 
-    /// A forwarded body that stops arriving is answered 408 `timeout` at
-    /// the body deadline, trawld is never called, and the request's count
-    /// is free again for the next request.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_collection_deadline_releases_slot() {
         let upstream = HandUpstream::start().await;
@@ -1188,7 +987,6 @@ mod tests {
             cfg.limits.body_read_timeout = Duration::from_millis(200);
         });
 
-        // One chunk, then nothing, forever.
         let stalled = futures::stream::once(async { Ok::<_, std::io::Error>(Bytes::from("{")) })
             .chain(futures::stream::pending());
         let started = std::time::Instant::now();
@@ -1214,7 +1012,6 @@ mod tests {
         .await;
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
 
-        // The only count is free again.
         let next = tokio::time::timeout(
             Duration::from_secs(5),
             app.oneshot(bearer_get("/api/v1/schema")),
@@ -1225,11 +1022,6 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
-    /// A login whose body stops arriving is answered 408 `timeout` at the
-    /// body deadline like the forwarder's, trawld is never asked, and the
-    /// count is free again. The deadline is the router's, not one
-    /// handler's: login reads its body through axum's `Json`, which has
-    /// no deadline of its own, and it is the route anyone can send.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_stalled_login_body_releases_slot_and_answers_408() {
         let upstream = HandUpstream::start().await;
@@ -1257,7 +1049,6 @@ mod tests {
         .await;
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
 
-        // The only count is free again.
         let next = tokio::time::timeout(
             Duration::from_secs(5),
             app.oneshot(bearer_get("/api/v1/schema")),
@@ -1268,18 +1059,6 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
-    /// Sixty-four stalled login bodies, the whole production count, hold
-    /// it only until the deadline. While they stall, the next request is
-    /// refused; at the deadline every one of them is answered 408; and
-    /// the request after them is served. No token is needed to send a
-    /// login, so without the deadline this is a pre-authentication
-    /// lockout of every route but `/healthz`.
-    ///
-    /// The clock is paused, so every login holds its count until the test
-    /// advances past the deadline, however slowly the 64 tasks start. The
-    /// request after the deadline crosses real loopback TLS inside
-    /// `frozen`, so the clock cannot jump while it waits. Residual
-    /// exposure: the real-clock hang guard on each wait.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_stalled_logins_release_the_whole_count_at_the_deadline() {
         const DEADLINE: Duration = Duration::from_millis(500);
@@ -1292,13 +1071,11 @@ mod tests {
         let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_login())))
             .collect();
-        // Every stalled login has taken a count.
         until("every stalled login took a count", || {
             count.available() == 0
         })
         .await;
 
-        // Full: the next request is refused at once, not queued.
         let refused = frozen(
             "the refusal",
             app.clone().oneshot(bearer_get("/api/v1/schema")),
@@ -1307,7 +1084,6 @@ mod tests {
         .unwrap();
         assert_proxy_request_limit_refusal(refused).await;
 
-        // The deadline answers every stalled login and frees its count.
         tokio::time::advance(DEADLINE + Duration::from_millis(10)).await;
         for login in stalled {
             let resp = frozen("the deadline answered the stalled login", login)
@@ -1338,20 +1114,6 @@ mod tests {
         assert_eq!(next.status(), StatusCode::OK, "the count was not released");
     }
 
-    /// The bodies the proxy buffers share one budget of
-    /// [`PROXY_BODY_BUDGET`] bytes, whatever the body limit. At an 8 MiB
-    /// limit the budget admits sixteen bodies of unknown length, each
-    /// reserved at the limit; the seventeenth is refused at once with the
-    /// proxy's 503, as is a two-byte body, because nothing is left. A
-    /// request with no body reserves nothing and is served while the
-    /// budget is full. At the deadline the stalled bodies give the
-    /// budget back whole.
-    ///
-    /// The clock is paused, so no stalled body reaches its deadline until
-    /// the test advances past it. The bodiless request and the request
-    /// after the deadline cross real loopback TLS inside `frozen`, so the
-    /// clock cannot jump while they wait. Residual exposure: that real
-    /// loopback TLS, under the real-clock hang guard.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_body_budget_bounds_buffered_bodies_at_an_8_mib_limit() {
         const LIMIT: usize = 8 * 1024 * 1024;
@@ -1370,7 +1132,6 @@ mod tests {
         let stalled: Vec<_> = (0..ADMITTED)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
             .collect();
-        // Every stalled body has reserved its share of the budget.
         until("every stalled body reserved the limit", || {
             budget.available() == 0
         })
@@ -1381,8 +1142,6 @@ mod tests {
             "the count still has room: the budget is what is full"
         );
 
-        // Full: one more body of unknown length is refused at once, and
-        // so is a declared two-byte body.
         for request in [
             stalled_post("/api/v1/search"),
             bearer_post("/api/v1/search", Body::from("{}")),
@@ -1392,7 +1151,6 @@ mod tests {
                 .unwrap();
             assert_proxy_request_limit_refusal(refused).await;
         }
-        // A request without a body reserves nothing.
         let bodiless = frozen(
             "the bodiless request",
             app.clone().oneshot(bearer_get("/api/v1/schema")),
@@ -1405,7 +1163,6 @@ mod tests {
             "a bodiless request was charged"
         );
 
-        // The deadline answers every stalled body and frees its reservation.
         tokio::time::advance(DEADLINE + Duration::from_millis(10)).await;
         for post in stalled {
             let resp = frozen("the deadline answered the stalled body", post)
@@ -1444,15 +1201,6 @@ mod tests {
         );
     }
 
-    /// A declared body is charged its own length, no more, and gives it
-    /// back once trawld has taken it and answered: with 600 of a 1024-byte
-    /// budget held by a body trawld has not answered, a 500-byte body is
-    /// refused at once and a 400-byte one is admitted. Both reservations
-    /// return when trawld answers, since it read both bodies first.
-    ///
-    /// It waits on the requests trawld has seen and on the held answer,
-    /// never on elapsed time. Residual exposure: real sockets, under
-    /// real-clock hang guards.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_budget_charges_the_declared_length_until_the_body_is_sent_and_answered() {
         let upstream = HandUpstream::start().await;
@@ -1512,49 +1260,23 @@ mod tests {
         );
     }
 
-    /// The body that wedges is sized from the host's `tcp_wmem` maximum
-    /// (R9-8): four times it, rounded up to a whole MiB, never under
-    /// 16 MiB, and 16 MiB where the file cannot be read or parsed.
     #[test]
     fn wedge_body_is_sized_from_the_hosts_send_buffer_maximum() {
         const MIB: usize = 1024 * 1024;
-        // Stock Linux: a 4 MiB maximum, 4 x 4 MiB is the floor itself.
         assert_eq!(
             wedge_body_bytes_for(Some("4096\t16384\t4194304\n")),
             16 * MIB
         );
-        // A host that autotunes further gets a body four times as big.
         assert_eq!(wedge_body_bytes_for(Some("4096 131072 6291456")), 24 * MIB);
         assert_eq!(wedge_body_bytes_for(Some("4096 87380 33554432")), 128 * MIB);
-        // Rounded up to a whole MiB, never down.
         assert_eq!(wedge_body_bytes_for(Some("4096 87380 5242881")), 21 * MIB);
-        // A small maximum still gets the floor.
         assert_eq!(wedge_body_bytes_for(Some("4096 16384 1048576")), 16 * MIB);
-        // Anything unreadable is the floor, the non-Linux path included.
         for unreadable in [None, Some(""), Some("4096 16384"), Some("4096 16384 many")] {
             assert_eq!(wedge_body_bytes_for(unreadable), 16 * MIB, "{unreadable:?}");
         }
         assert!(wedge_body_bytes() >= 16 * MIB);
     }
 
-    /// The budget is held as long as the body allocation lives, not until
-    /// the response head (R8-7). The flood route answers its head before
-    /// it reads a byte of the body and never reads it, as trawld leaves a
-    /// body its handler ignores, and the browser here never reads the
-    /// response, so both ends block on their writes and most of the body
-    /// stays in hyper's write queue, zero-copy, behind the sockets. The
-    /// fixture's sockets are locked at 128 KiB and the proxy's send
-    /// buffer autotunes to the host's `tcp_wmem` maximum at most, so the
-    /// body, sized at four times that maximum with a 16 MiB floor
-    /// ([`wedge_body_bytes`]), can never be absorbed. After the head the budget still shows the
-    /// body charged: a second body the remainder cannot cover is refused
-    /// at once and never reaches trawld, and one it covers is served.
-    ///
-    /// The wedge is real kernel socket buffering
-    /// ([`crate::test_support::NARROW_SOCKET_BUFFER`] on the fixture's
-    /// sockets), which no virtual clock controls, so the test runs on real
-    /// time. Residual exposure: kernel buffering and real time, under
-    /// real-clock hang guards.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_budget_is_held_while_the_sent_body_is_still_queued() {
         let size = wedge_body_bytes();
@@ -1621,15 +1343,6 @@ mod tests {
         drop(wedged);
     }
 
-    /// A send trawld never takes ends at the head deadline (R8-7): every
-    /// connection the proxy opens to trawld carries `TCP_USER_TIMEOUT` at
-    /// [`ProxyLimits::upstream_head_timeout`], so the kernel closes a
-    /// connection whose queued bytes trawld has not taken for that long.
-    /// hyper drops the connection's write queue with it, which frees the
-    /// body and its reservation, and the browser's held response ends in
-    /// an error instead of hanging. The teardown comes no earlier than
-    /// the deadline and within a few seconds of it. Linux, Android and
-    /// Fuchsia only: the option exists nowhere else.
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_wedged_send_is_torn_down_at_the_head_deadline() {
@@ -1710,16 +1423,8 @@ mod tests {
         );
     }
 
-    /// At the default limit the count fills before the budget: sixty-four
-    /// stalled bodies take the whole count and an eighth of the budget,
-    /// and the sixty-fifth request is the count's refusal. The defaults
-    /// behave as they did before the budget.
-    ///
     /// The count middleware takes a count before the body reserves the
-    /// budget, so the test waits on the budget itself. The clock is
-    /// paused, so no stalled body reaches its deadline until the test
-    /// advances past it. Residual exposure: the real-clock hang guard on
-    /// each wait.
+    /// budget, so the test waits on the budget itself.
     #[tokio::test(flavor = "current_thread", start_paused = true)]
     async fn proxy_body_budget_never_refuses_before_the_count_at_the_default_limit() {
         const DEADLINE: Duration = Duration::from_millis(500);
@@ -1741,7 +1446,6 @@ mod tests {
         let stalled: Vec<_> = (0..PROXY_MAX_REQUESTS)
             .map(|_| tokio::spawn(app.clone().oneshot(stalled_post("/api/v1/search"))))
             .collect();
-        // Each body of unknown length has reserved the limit.
         until("every stalled body reserved the limit", || {
             budget.available() == PROXY_BODY_BUDGET - PROXY_MAX_REQUESTS * limit
         })
@@ -1768,10 +1472,6 @@ mod tests {
         assert_eq!(upstream.seen(), Vec::<String>::new(), "trawld was called");
     }
 
-    /// A limit above the budget leaves the budget as the most one body
-    /// can hold, since the budget could never cover more: a body past it
-    /// is refused 413 naming the proxy body budget, announced or found
-    /// while it streams in, and a body at it goes through.
     #[tokio::test(flavor = "multi_thread")]
     async fn proxy_body_past_the_budget_gets_413_naming_the_budget() {
         let upstream = HandUpstream::start().await;
@@ -1914,9 +1614,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// A body that arrives in several chunks reaches trawld whole and in
-    /// order: the chunks are collected into the one buffer the forwarder
-    /// hands reqwest.
     #[tokio::test]
     async fn forward_sends_a_chunked_body_whole() {
         let upstream = TlsUpstream::start().await;
@@ -1973,7 +1670,6 @@ mod tests {
 
         let cookie = login_and_get_cookie(app.clone(), &upstream).await;
 
-        // Even a logged-in user cannot reach /ingest through the proxy.
         for method_name in &["GET", "POST", "PUT", "DELETE"] {
             let req = Request::builder()
                 .method(*method_name)
@@ -1989,8 +1685,6 @@ mod tests {
             );
         }
 
-        // The 404 is local: no request for the ingest path ever reaches
-        // upstream. Filter by path, since the login above hits /whoami.
         let relayed: Vec<String> = upstream
             .mock()
             .received_requests()
@@ -2006,8 +1700,6 @@ mod tests {
         );
     }
 
-    /// The blocked ingest path and every unknown browser API path answer
-    /// trawl-web's own 404 envelope, uncached, and never reach upstream.
     #[tokio::test]
     async fn blocked_and_unknown_api_paths_answer_the_not_found_envelope() {
         let upstream = TlsUpstream::start().await;
@@ -2057,10 +1749,6 @@ mod tests {
 
     #[tokio::test]
     async fn ingest_preview_forwards_with_session_bearer() {
-        // The exact-path ingest block must not swallow its preview child
-        // (ADR-0049): the generic forwarder relays it with the session's
-        // bearer token, the body bytes and the query string intact, and
-        // mirrors the upstream's no-store header and body.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2132,11 +1820,6 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_forwards_request_limit_refusal() {
-        // trawld's 503 `request_limit_reached` (ADR-0054) reaches the
-        // browser as trawld sent it: status, body bytes, `Cache-Control`
-        // and request id. The proxy never retries it: trawld refused the
-        // request before any handler ran, and a retry is the caller's
-        // call, with backoff.
         let upstream = TlsUpstream::start().await;
         let app = build_app(state_pointing_at(&upstream));
         let cookie = login_and_get_cookie(app.clone(), &upstream).await;
@@ -2200,9 +1883,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_strips_upstream_set_cookie_headers() {
-        // trawld is a backend API — it must not set cookies in the
-        // browser context. The proxy strips all Set-Cookie headers
-        // from upstream responses to prevent cookie shadowing.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2280,12 +1960,8 @@ mod tests {
         );
     }
 
-    // -- upstream auth mapping ---------------------------------------------
-
     #[tokio::test]
     async fn forward_upstream_401_with_session_preserves_cookie() {
-        // A proxied 401 means the upstream key is dead, but cookie clearing
-        // belongs to `auth::me`, not an arbitrary proxied request.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2314,8 +1990,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_upstream_403_preserves_cookie() {
-        // A valid key missing either a trawl grant or this route's permission
-        // may still hold grants for sibling apps. Preserve the shared cookie.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2344,8 +2018,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_upstream_401_with_bearer_does_not_clear() {
-        // Bearer clients hold no cookie — a clear directive would be
-        // meaningless noise (and confusing for API clients).
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2437,15 +2109,9 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     }
 
-    // -- CSRF / origin validation on mutating proxy routes ----------------
-
     #[tokio::test]
     async fn forward_rejects_cookie_authed_sibling_origin_mutation() {
-        // The shared `fleet_session` cookie is SameSite=Lax, so the browser
-        // attaches it to same-site *sibling*-origin POSTs (a compromised
-        // sibling.fleet… forging a write to trawl.fleet…). Present-only
-        // Origin validation must reject it before the victim's bearer token
-        // reaches trawld. No upstream mock is mounted for the route: a 403
+        // No upstream mock is mounted for the route: a 403
         // (not a forwarded 404) proves the request was blocked at the proxy.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
@@ -2472,8 +2138,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_allows_cookie_authed_same_origin_mutation() {
-        // Same-origin POST from the SPA carries a matching Origin and must
-        // pass through to upstream.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2501,9 +2165,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_allows_cookie_authed_mutation_without_origin() {
-        // Present-only semantics: a request carrying no Origin header (some
-        // same-origin navigations, non-browser cookie clients) is allowed —
-        // the Session extractor still validates the cookie itself.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);
@@ -2529,9 +2190,6 @@ mod tests {
 
     #[tokio::test]
     async fn forward_bearer_cross_origin_mutation_is_allowed() {
-        // Bearer clients (CLI/API) hold no cookie and are not CSRF targets —
-        // the origin guard must not apply to them even on a "cross-origin"
-        // (irrelevant, header-set) POST.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = build_app(state);

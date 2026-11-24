@@ -3,34 +3,21 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The big-integer fixtures `big-integers.spec.ts` serves, produced by
-//! the result wire's own encoder (issue #214).
+//! the result wire's own encoder.
 //!
 //! A big integer is the case a hand-typed fixture gets wrong: a JSON
 //! number past 2^53 reads back as a different number in any JavaScript
 //! tool that touches it, and a decimal string written by hand can drift
-//! from the canonical spelling the decoder insists on. So these bodies
-//! are never typed. Each test below builds the response from `Value`s,
-//! encodes it with `trawl_api`'s serde, and requires the committed file
-//! to be exactly that text.
-//!
-//! To change a fixture, change the rows here and rewrite the files:
-//!
-//! ```sh
-//! TRAWL_E2E_WRITE_FIXTURES=1 cargo nextest run -p trawl-web-ui --test e2e_big_integer_fixtures
-//! ```
+//! from the canonical spelling the decoder insists on.
 
 use std::path::PathBuf;
 
 use trawl_api::value::{Column, ColumnType, QueryResult, Value};
 use trawl_api::{PaginationMeta, QueryExecution, QueryResponse};
 
-/// 2^53 + 1: the first integer an IEEE double cannot hold.
 const ABOVE_2_53: i64 = 9_007_199_254_740_993;
-/// 2^63: the first integer past `i64`, so it lands as `UInt`.
 const TWO_63: u64 = 9_223_372_036_854_775_808;
 
-/// The cells in ascending order, null first, as the grid's sort puts
-/// them: the order `big-integers.spec.ts` reads back.
 const ASCENDING: [&str; 5] = [
     "-9007199254740993",
     "9007199254740993",
@@ -118,8 +105,6 @@ fn rows_fixture() -> QueryResponse {
     })
 }
 
-/// `stats count() by host`: one big count per group, for the exact
-/// table and the categorical chart.
 fn stats_by_fixture() -> QueryResponse {
     response(QueryResult {
         columns: vec![
@@ -135,8 +120,6 @@ fn stats_by_fixture() -> QueryResponse {
     })
 }
 
-/// `timechart span=1h count()`: four hourly buckets of big counts, for
-/// the series chart.
 fn timechart_fixture() -> QueryResponse {
     response(QueryResult {
         columns: vec![
@@ -158,8 +141,6 @@ fn wire_path(name: &str) -> PathBuf {
         .join(format!("{name}.json"))
 }
 
-/// The committed file is the encoder's output, byte for byte, and it
-/// decodes back to the same cells.
 fn golden(name: &str, fixture: &QueryResponse) {
     let encoded = serde_json::to_string_pretty(fixture).expect("the fixture encodes") + "\n";
     let path = wire_path(name);
@@ -208,8 +189,6 @@ fn the_big_integer_rows_fixture_is_the_encoders_output() {
     golden("query-big-integers", &fixture);
     assert_no_bare_big_number("query-big-integers");
 
-    // Each magnitude lands in the variant the SPA classifies by: the two
-    // past `i64::MAX` as `UInt`, the rest as `Integer`.
     let bytes: Vec<&Value> = fixture.result.rows.iter().map(|r| &r[2]).collect();
     assert!(matches!(bytes[0], Value::UInt(u64::MAX)));
     assert!(matches!(bytes[3], Value::UInt(TWO_63)));

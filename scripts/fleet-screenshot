@@ -4,8 +4,6 @@
 # Identifies the correct iTerm2 window by tracing fleet's PID from the
 # driver socket → TTY → iTerm2 session → CGWindowID → screencapture.
 #
-# Usage: fleet-screenshot [--socket PATH] [OUTPUT]
-#
 # Exit codes:
 #   0 — success (prints output path to stdout)
 #   1 — fleet not found or not running with --driver
@@ -13,8 +11,6 @@
 #   3 — screenshot capture failed
 
 set -euo pipefail
-
-# -- argument parsing ----------------------------------------------------------
 
 SOCKET="$HOME/.config/fleet/driver.sock"
 OUTPUT="/tmp/fleet-screenshot.png"
@@ -49,8 +45,6 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-# -- step 1: find fleet PID from driver socket --------------------------------
-
 if [[ ! -S "$SOCKET" ]]; then
     echo "error: driver socket not found at $SOCKET" >&2
     echo "       start fleet with --driver to enable the socket" >&2
@@ -64,8 +58,6 @@ if [[ -z "$FLEET_PID" ]]; then
     exit 1
 fi
 
-# -- step 2: get fleet's controlling TTY ---------------------------------------
-
 FLEET_TTY_RAW=$(ps -o tty= -p "$FLEET_PID" 2>/dev/null | tr -d ' ')
 
 if [[ -z "$FLEET_TTY_RAW" ]] || [[ "$FLEET_TTY_RAW" == "??" ]]; then
@@ -74,8 +66,6 @@ if [[ -z "$FLEET_TTY_RAW" ]] || [[ "$FLEET_TTY_RAW" == "??" ]]; then
 fi
 
 FLEET_TTY="/dev/$FLEET_TTY_RAW"
-
-# -- step 3: find iTerm2 window containing this TTY via AppleScript ------------
 
 BOUNDS=$(osascript <<APPLESCRIPT 2>/dev/null || true
 tell application "iTerm2"
@@ -99,12 +89,9 @@ if [[ -z "$BOUNDS" ]]; then
     exit 2
 fi
 
-# Parse bounds: "left,top,right,bottom" → individual values.
 IFS=',' read -r LEFT TOP RIGHT BOTTOM <<< "$BOUNDS"
 WIDTH=$((RIGHT - LEFT))
 HEIGHT=$((BOTTOM - TOP))
-
-# -- step 4: find CGWindowID by matching bounds --------------------------------
 
 WINDOW_ID=$(swift - "$LEFT" "$TOP" "$WIDTH" "$HEIGHT" 2>/dev/null <<'SWIFT' || true
 import CoreGraphics
@@ -145,8 +132,6 @@ exit(1)
 SWIFT
 )
 
-# -- step 5: capture -----------------------------------------------------------
-
 SHADOW_FLAG="-o"
 if [[ "$SHADOW" == true ]]; then
     SHADOW_FLAG=""
@@ -160,7 +145,6 @@ if [[ -n "$WINDOW_ID" ]]; then
     fi
 fi
 
-# Fallback: region capture using AppleScript bounds.
 echo "warning: CGWindowID lookup failed, falling back to region capture" >&2
 if screencapture -R "${LEFT},${TOP},${WIDTH},${HEIGHT}" -x -t png "$OUTPUT" 2>/dev/null; then
     echo "$OUTPUT"

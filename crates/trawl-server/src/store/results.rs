@@ -4,12 +4,9 @@
 
 //! Postgres-backed metadata for captured results (ADR-0057).
 //!
-//! One `captured_results` row describes one immutable capture: who owns it,
-//! when it stops being readable, what ran, its typed columns, and the size
-//! and blake3 digest of its parquet file. The file itself lives under the
-//! results root; this store never touches it. Statements that retire rows
-//! return what the caller must unlink, and drop each row's facts document
-//! in the same statement (`drop_facts!`).
+//! The file itself lives under the results root; this store never touches
+//! it. Statements that retire rows return what the caller must unlink, and
+//! drop each row's facts document in the same statement (`drop_facts!`).
 //!
 //! Every statement that compares against the current time binds `now` as a
 //! parameter and none reads SQL `now()`, so the caller's injected clock
@@ -18,20 +15,11 @@
 //! A row is live while it is `kept`, or `temporary` with `expires_at > now`.
 //! A temporary row past its deadline is no longer live even before a sweep
 //! or a read marks it `expired`. Only temporary rows count toward the
-//! capture quotas (ADR-0057) and are listed to their owner: a kept row
-//! belongs to an investigation, is charged to the evidence budget instead
-//! (ADR-0059), and is pruned only when its investigation's retention ends.
+//! capture quotas.
 //!
-//! The JSON documents, `columns`, `column_facts` and a correlation read's
-//! `correlation`, are stored as text, encoded and decoded with the
-//! trawl-api types. The facts arrive encoded ([`FactsDocument`]): the
-//! capture measured that text against its bound, and the store writes the
-//! same text and counts its length as `metadata_bytes`. Not as JSONB, which refuses `\u0000`: a column name, a
-//! listed value or a sightings literal is any string, and a capture holding
-//! one must commit like any other. A row whose metadata does not decode is
-//! a [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
-//! that names the column, never a panic. So is a `kind` the store does not
-//! know.
+//! The JSON documents are stored as text. Not as JSONB, which refuses
+//! `\u0000`: a column name, a listed value or a sightings literal is any
+//! string, and a capture holding one must commit like any other.
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
@@ -47,9 +35,6 @@ use super::history::bind_u64;
 use super::investigations::{self, InvestigationStore, LockWait, RetentionRule, WriteTx};
 use crate::deadline::Deadline;
 
-/// A row predicate: the result is a temporary capture still live at `$N`.
-/// Spelled once so the list, both usage reads, the boot key walk and the
-/// prune agree on what the capture quotas count. Kept rows never match.
 macro_rules! temporary_live_at {
     ($now:literal) => {
         concat!("(state = 'temporary' AND expires_at > ", $now, ")")
@@ -57,12 +42,8 @@ macro_rules! temporary_live_at {
 }
 
 /// The `SET` assignments that drop a row's facts document as the row
-/// stops being live. Its file goes too, unlinked by the caller from the
-/// [`ExpiredFile`]s the statement returns, so no row whose file is gone
-/// keeps its facts, in the table or in any sum. Spelled once, so every
-/// statement that retires a row while keeping it (expiry, the quota prune,
-/// the evidence prune and the investigation delete) agrees. A read of the
-/// row answers from its state, gone, and never shows its facts.
+/// stops being live, so no row whose file is gone keeps its facts, in the
+/// table or in any sum.
 macro_rules! drop_facts {
     () => {
         "correlation = NULL, metadata_bytes = 0"
@@ -70,8 +51,6 @@ macro_rules! drop_facts {
 }
 pub(super) use drop_facts;
 
-/// `SELECT` every column of `captured_results`, and the `retain_until` of
-/// the investigation a row is attached to, followed by `$tail`.
 macro_rules! select_rows {
     ($tail:expr) => {
         concat!(
@@ -97,64 +76,47 @@ pub struct FactsDocument {
 }
 
 impl FactsDocument {
-    /// Encode `facts` as the trawl-api JSON the table stores.
-    ///
-    /// # Errors
-    /// The facts do not encode as JSON.
     pub fn encode(facts: Correlation) -> Result<Self, serde_json::Error> {
         let text = serde_json::to_string(&facts)?;
         Ok(Self { facts, text })
     }
 
-    /// The facts.
     #[must_use]
     pub const fn facts(&self) -> &Correlation {
         &self.facts
     }
 
-    /// The facts, without their text.
     #[must_use]
     pub fn into_facts(self) -> Correlation {
         self.facts
     }
 
-    /// The stored text's length in bytes: the row's `metadata_bytes`.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         u64::try_from(self.text.len()).unwrap_or(u64::MAX)
     }
 }
 
-/// A capture to record: `temporary` with a deadline, or `kept` from its
-/// commit when it is attached to an investigation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewCapture {
     /// 32 lowercase hex digits; the file's name too.
     pub id: String,
-    /// The fleet key that made the capture.
     pub key_id: i64,
-    /// When the capture committed.
     pub created_at: DateTime<Utc>,
     /// When the temporary capture stops being readable. Not stored for a
     /// kept capture, which has no deadline of its own.
     pub expires_at: DateTime<Utc>,
-    /// The query text as the caller sent it.
     pub query: String,
-    /// The text that ran.
     pub executed_query: String,
-    /// Where the rows came from.
     pub source: ResultSource,
-    /// Which rule kept the rows.
     pub shape: ResultShape,
     /// The resolved inclusive start; `None` for a stored source.
     pub earliest: Option<DateTime<Utc>>,
     /// The resolved exclusive end; `None` for a stored source.
     pub latest: Option<DateTime<Utc>>,
-    /// The columns in stored positional order.
     pub columns: Vec<ResultColumn>,
     /// Facts per column, positional with `columns`.
     pub column_facts: Vec<ColumnFacts>,
-    /// Rows the file holds.
     pub captured_rows: u64,
     /// Rows the executed query produced before the capture cut.
     pub total_rows: u64,
@@ -164,77 +126,52 @@ pub struct NewCapture {
     pub file_bytes: u64,
     /// The file's blake3 digest; `None` exactly when there is no file.
     pub digest: Option<[u8; 32]>,
-    /// The stored file's layout version.
     pub format_version: u16,
     /// The investigation the capture is attached to (ADR-0059). `Some`
     /// records the row `kept`, with no deadline, and only through
     /// [`ResultsStore::insert_kept`]; `None` records it `temporary` until
     /// `expires_at`.
     pub investigation_id: Option<InvestigationId>,
-    /// Which read made the capture.
     pub kind: CaptureKind,
-    /// The facts a correlation read computed, encoded; `None` for a search.
-    /// Their text's length is stored as `metadata_bytes`.
     pub correlation: Option<FactsDocument>,
 }
 
 impl NewCapture {
-    /// Bytes of the facts document; zero for a search.
     #[must_use]
     pub fn metadata_bytes(&self) -> u64 {
         self.correlation.as_ref().map_or(0, FactsDocument::bytes)
     }
 }
 
-/// One `captured_results` row, in any state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CaptureRow {
-    /// 32 lowercase hex digits.
     pub id: String,
-    /// The owning fleet key.
     pub key_id: i64,
-    /// When the capture committed.
     pub created_at: DateTime<Utc>,
     /// The deadline; `None` exactly when the row is `kept`.
     pub expires_at: Option<DateTime<Utc>>,
     /// When the result stopped being readable; set exactly when the row is
     /// `expired` (its deadline) or `pruned` (the prune time).
     pub gone_at: Option<DateTime<Utc>>,
-    /// The lifecycle state.
     pub state: ResultState,
-    /// The query text as the caller sent it.
     pub query: String,
-    /// The text that ran.
     pub executed_query: String,
-    /// Where the rows came from.
     pub source: ResultSource,
-    /// Which rule kept the rows.
     pub shape: ResultShape,
-    /// The resolved inclusive start; `None` for a stored source.
     pub earliest: Option<DateTime<Utc>>,
-    /// The resolved exclusive end; `None` for a stored source.
     pub latest: Option<DateTime<Utc>>,
-    /// The columns in stored positional order.
     pub columns: Vec<ResultColumn>,
-    /// Facts per column, positional with `columns`.
     pub column_facts: Vec<ColumnFacts>,
-    /// Rows the file holds.
     pub captured_rows: u64,
-    /// Rows the executed query produced before the capture cut.
     pub total_rows: u64,
-    /// Bytes of wire JSON over every captured cell.
     pub wire_bytes: u64,
-    /// Bytes of the parquet file; zero when there is no file.
     pub file_bytes: u64,
     /// Bytes of the stored facts document; zero for a search, and for a
-    /// gone row, whose facts went with its file. The quota and the evidence
-    /// budgets count them with `file_bytes` ([`Self::stored_bytes`]).
+    /// gone row, whose facts went with its file.
     pub metadata_bytes: u64,
-    /// The file's blake3 digest; `None` exactly when there is no file.
     pub digest: Option<[u8; 32]>,
     /// Whether the file was found absent after the row committed.
     pub file_missing: bool,
-    /// The stored file's layout version.
     pub format_version: u16,
     /// The investigation holding a kept result, or that held a pruned one
     /// (ADR-0059). Cleared when the investigation is deleted.
@@ -243,7 +180,6 @@ pub struct CaptureRow {
     /// as the row: a kept row read at or past it is due for the prune.
     /// `None` without an investigation. Never on the wire.
     pub retain_until: Option<DateTime<Utc>>,
-    /// Which read made the capture.
     pub kind: CaptureKind,
     /// The facts a correlation read computed; `None` for a search, and for
     /// a gone row, whose facts went with its file.
@@ -259,8 +195,6 @@ impl CaptureRow {
         self.file_bytes.saturating_add(self.metadata_bytes)
     }
 
-    /// The row as the wire spells it: RFC 3339 UTC timestamps with
-    /// microseconds, and `truncated` derived from the row counts.
     #[must_use]
     pub fn to_wire(&self) -> CapturedResult {
         CapturedResult {
@@ -289,10 +223,8 @@ impl CaptureRow {
     }
 }
 
-/// What [`ResultsStore::insert`] did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureInsert {
-    /// The row is recorded.
     Inserted,
     /// A row with this id already exists (23505 on `captured_results_pkey`)
     /// and nothing was written. Ids are random 128-bit values, so this is a
@@ -301,59 +233,43 @@ pub enum CaptureInsert {
     IdTaken,
 }
 
-/// The step an attached capture's kept insert fills
-/// ([`ResultsStore::insert_kept`]).
 #[derive(Debug, Clone, Copy)]
 pub struct KeptStep<'a> {
-    /// The step's entry in the investigation's log.
     pub seq: u64,
-    /// The outcome it records: the capture's success.
     pub outcome: &'a StepOutcome,
     /// How far the write slides the evidence clock.
     pub retention: RetentionRule,
 }
 
-/// What [`ResultsStore::insert_kept`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeptInsert {
     /// The row is recorded kept, its step filled and the investigation
     /// advanced. `pruned` are the files of what the due-write rule pruned,
     /// for the caller to unlink.
     Inserted {
-        /// The pruned evidence's files.
         pruned: Vec<ExpiredFile>,
     },
-    /// A row with this id already exists and nothing was written, as for
-    /// [`CaptureInsert::IdTaken`].
     IdTaken,
     /// The step already has an outcome, so nothing was written: the work
     /// that would be kept is no longer the step's.
     StepSettled,
 }
 
-/// Committed live usage: how many results and how many bytes they store.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Usage {
-    /// Live results.
     pub results: u64,
-    /// Sum of their `file_bytes` and `metadata_bytes`: each file and the
-    /// facts document stored beside it.
     pub bytes: u64,
 }
 
-/// A retired result whose file the caller must unlink.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExpiredFile {
-    /// The result id, which is also the file's name.
     pub id: String,
-    /// The file's size, zero when the result has no file.
     pub file_bytes: u64,
 }
 
 /// Faults a test injects into a capture's row commit, so the capture
 /// service's answer to an insert whose outcome it cannot learn is proven
-/// rather than reasoned about (ADR-0057; the service's `commit`), the way
-/// the pool's seams prove its orderings.
+/// rather than reasoned about (ADR-0057; the service's `commit`).
 ///
 /// The insert faults queue: [`Faults::fail_next_insert`],
 /// [`Faults::land_next_insert_late`] and [`Faults::hold_next_commit`] each
@@ -363,9 +279,6 @@ pub struct ExpiredFile {
 /// [`Faults::fail_next_insert`]: fault::Faults::fail_next_insert
 /// [`Faults::land_next_insert_late`]: fault::Faults::land_next_insert_late
 /// [`Faults::hold_next_commit`]: fault::Faults::hold_next_commit
-///
-/// Compiled for this crate's unit tests and, via the `test-support`
-/// feature, its integration tests. No production consumer enables it.
 #[cfg(any(test, feature = "test-support"))]
 pub mod fault {
     use std::collections::VecDeque;
@@ -439,7 +352,6 @@ pub mod fault {
         pub landed: oneshot::Receiver<bool>,
     }
 
-    /// The insert's half of a [`LateInsert`].
     #[derive(Debug)]
     pub(super) struct LandingInsert {
         release: oneshot::Receiver<()>,
@@ -494,7 +406,6 @@ pub mod fault {
         pub landed: oneshot::Receiver<bool>,
     }
 
-    /// The insert's half of a [`CommitHold`].
     #[derive(Debug)]
     pub(super) struct HeldCommit {
         conn: PgConnection,
@@ -555,7 +466,6 @@ pub mod fault {
         pub settled: oneshot::Receiver<()>,
     }
 
-    /// The capture service's half of a [`GraceHold`].
     #[derive(Debug)]
     pub struct HeldGrace {
         parked: oneshot::Sender<()>,
@@ -573,14 +483,10 @@ pub mod fault {
         }
     }
 
-    /// What one armed insert meets.
     #[derive(Debug)]
     pub(super) enum Armed {
-        /// [`Faults::fail_next_insert`].
         Fail(InsertFault),
-        /// [`Faults::land_next_insert_late`].
         Late(LandingInsert),
-        /// [`Faults::hold_next_commit`].
         Held(HeldCommit),
     }
 
@@ -642,7 +548,6 @@ pub mod fault {
             InsertHold { parked, release }
         }
 
-        /// Wait out a held insert, if this one is held.
         pub(super) async fn wait_if_held(&self) {
             let held = self.held_insert.lock().take();
             if let Some((parked, release)) = held {
@@ -661,7 +566,6 @@ pub mod fault {
             ExpiryHold { parked, release }
         }
 
-        /// Wait out a held expiry, if this one is held.
         pub(super) async fn wait_if_expiry_held(&self) {
             let held = self.held_expiry.lock().take();
             if let Some((parked, release)) = held {
@@ -681,7 +585,6 @@ pub mod fault {
             EvidenceEndHold { parked, release }
         }
 
-        /// Wait out a held evidence check, if this one is held.
         pub(crate) async fn wait_if_evidence_end_held(&self) {
             let held = self.held_evidence_end.lock().take();
             if let Some((parked, release)) = held {
@@ -745,7 +648,6 @@ pub mod fault {
             }
         }
 
-        /// The held grace, if one is armed.
         pub(crate) fn take_grace(&self) -> Option<HeldGrace> {
             self.held_grace.lock().take()
         }
@@ -758,12 +660,10 @@ pub mod fault {
             self.citings.lock().push_back(fault);
         }
 
-        /// What the next promotion meets.
         pub(crate) fn take_citing(&self) -> Option<InsertFault> {
             self.citings.lock().pop_front()
         }
 
-        /// Whether this read of row `id` fails, disarming it if so.
         pub(super) fn take_unreadable(&self, id: &str) -> bool {
             let mut unreadable = self.unreadable.lock();
             let fails = unreadable.as_deref() == Some(id);
@@ -781,19 +681,14 @@ pub mod fault {
     }
 }
 
-/// Postgres-backed storage for captured-result metadata. Cheap to clone
-/// (shared pool).
 #[derive(Debug, Clone)]
 pub struct ResultsStore {
     pool: PgPool,
-    /// Faults a test injected ([`fault`]); clones share them.
     #[cfg(any(test, feature = "test-support"))]
     faults: std::sync::Arc<fault::Faults>,
 }
 
 impl ResultsStore {
-    /// Wrap the shared app-state pool, which must point at a migrated trawl
-    /// app-state database.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -802,8 +697,6 @@ impl ResultsStore {
         }
     }
 
-    /// This store's fault table, shared by its clones: the one the server's
-    /// captured-results state reads through.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn faults(&self) -> &fault::Faults {
@@ -815,11 +708,6 @@ impl ResultsStore {
     /// A row that names an investigation is refused with
     /// [`StoreError::Validation`]: a kept row is recorded only by
     /// [`Self::insert_kept`], inside its investigation's lock.
-    ///
-    /// A row that breaks a table constraint (a malformed id, a digest
-    /// without a file) is a server fault and surfaces as
-    /// [`StoreError::Unavailable`] carrying the database error, which names
-    /// the constraint.
     pub async fn insert(&self, row: &NewCapture) -> Result<CaptureInsert, StoreError> {
         if row.investigation_id.is_some() {
             return Err(StoreError::Validation(
@@ -859,27 +747,15 @@ impl ResultsStore {
     /// the investigation's next sequence, in one transaction.
     ///
     /// The transaction locks the investigation row `FOR UPDATE` before it
-    /// touches `captured_results`, through the due-write rule's
-    /// [`investigations::lock_for_write`]: evidence whose deadline ended is
-    /// pruned first, so the new row never joins evidence that should be
-    /// gone, and the row's foreign key finds its key share already
-    /// covered. Investigation before results is the order every
-    /// transaction that takes both locks uses
+    /// touches `captured_results`. Investigation before results is the order
+    /// every transaction that takes both locks uses
     /// ([`Self::prune_evidence`], [`InvestigationStore::delete`]); a
     /// statement that locked a result first and then waited on the
-    /// investigation would deadlock with them. Once the step is filled and
-    /// the clock slid, an investigation whose deadline is pinned at its
-    /// ceiling is still due, and the rule prunes again, the new row
-    /// included.
+    /// investigation would deadlock with them.
     ///
-    /// `row.created_at` is the write's instant. The transaction does not
-    /// read the investigation's status: work admitted while it was open
-    /// finishes and records its outcome after a close. A missing
-    /// investigation is [`StoreError::InvestigationNotFound`]; a taken id
-    /// is [`KeptInsert::IdTaken`] and a step with an outcome
-    /// [`KeptInsert::StepSettled`], each with nothing written. The
-    /// [`fault`] table's [`fault::Faults::fail_next_insert`] and
-    /// [`fault::Faults::hold_next_insert`] apply as to [`Self::insert`].
+    /// The transaction does not read the investigation's status: work
+    /// admitted while it was open finishes and records its outcome after a
+    /// close.
     pub async fn insert_kept(
         &self,
         row: &NewCapture,
@@ -1013,8 +889,6 @@ impl ResultsStore {
         InvestigationStore::new(self.pool.clone())
     }
 
-    /// The row `id` owned by `key_id`, in any state. Another key's result
-    /// reads as absent.
     pub async fn get(&self, id: &str, key_id: i64) -> Result<Option<CaptureRow>, StoreError> {
         #[cfg(any(test, feature = "test-support"))]
         if self.faults.take_unreadable(id) {
@@ -1028,11 +902,6 @@ impl ResultsStore {
         Ok(row.as_ref().map(decode_row).transpose()?)
     }
 
-    /// The row `id` as an investigation reader holding `key_id` reads it
-    /// (ADR-0059): the key's own row in any state, or another key's row
-    /// that is evidence of an investigation, kept or pruned by its
-    /// retention. Another key's temporary, expired or quota-pruned row
-    /// reads as absent, the same as no row.
     pub async fn get_readable(
         &self,
         id: &str,
@@ -1053,9 +922,6 @@ impl ResultsStore {
         Ok(row.as_ref().map(decode_row).transpose()?)
     }
 
-    /// The key's live temporary results at `now`, newest first: the
-    /// owner's recovery list. A kept result is reached through its
-    /// investigation instead.
     pub async fn list(
         &self,
         key_id: i64,
@@ -1076,10 +942,6 @@ impl ResultsStore {
     /// Mark one temporary result `expired` because a read found it past its
     /// deadline. Its `gone_at` is the deadline, not `now`: the tombstone
     /// clock starts at the instant the result was lost.
-    ///
-    /// Only a temporary row with `expires_at <= now` changes, so a call can
-    /// never retire a live result early. Returns whether a row changed; a
-    /// second call returns `false`.
     pub async fn mark_expired(&self, id: &str, now: DateTime<Utc>) -> Result<bool, StoreError> {
         #[cfg(any(test, feature = "test-support"))]
         self.faults.wait_if_expiry_held().await;
@@ -1096,10 +958,6 @@ impl ResultsStore {
         Ok(changed == 1)
     }
 
-    /// Mark every temporary result past its deadline at `now` as `expired`,
-    /// with `gone_at` at its deadline, in one statement. Returns the files
-    /// to unlink.
-    ///
     /// The statement locks the due rows in id order, the order a promotion
     /// locks the results it cites, and skips any row another transaction
     /// holds, so it never waits on a writer that may be waiting on it. A
@@ -1179,10 +1037,6 @@ impl ResultsStore {
         Ok(decode_usage(&row)?)
     }
 
-    /// The installation's committed live temporary usage at `now`, across
-    /// every key.
-    ///
-    /// Committed rows only, as for [`Self::usage`].
     pub async fn installation_usage(&self, now: DateTime<Utc>) -> Result<Usage, StoreError> {
         let row = sqlx::query(concat!(
             "SELECT count(*) AS results,
@@ -1214,7 +1068,6 @@ impl ResultsStore {
         .await?)
     }
 
-    /// [`Self::earliest_expiry`] across every key.
     pub async fn installation_earliest_expiry(
         &self,
         now: DateTime<Utc>,
@@ -1245,8 +1098,6 @@ impl ResultsStore {
             .map_err(StoreError::from)
     }
 
-    /// The keys holding a live temporary result at `now`, ascending, for
-    /// boot's per-key quota pass.
     pub async fn live_keys(&self, now: DateTime<Utc>) -> Result<Vec<i64>, StoreError> {
         Ok(sqlx::query_scalar(concat!(
             "SELECT DISTINCT key_id FROM captured_results WHERE ",
@@ -1265,10 +1116,6 @@ impl ResultsStore {
     /// Pruned rows get `gone_at = now`. Returns the files to unlink, oldest
     /// first.
     ///
-    /// Kept results neither count toward the usage nor are pruned here:
-    /// they are evidence, bounded by the evidence budget and pruned when
-    /// their investigation's retention ends ([`Self::prune_evidence`]).
-    ///
     /// The key's live temporary rows are read `FOR UPDATE` and pruned in
     /// the same transaction, so a concurrent expiry or prune of those rows
     /// waits for it. A capture committed meanwhile is not counted; boot
@@ -1284,11 +1131,7 @@ impl ResultsStore {
             .await
     }
 
-    /// [`Self::prune_oldest`] across every key: prune the installation's
-    /// oldest temporary results, whoever owns them, until its live
-    /// temporary usage at `now` is at most `keep_results` results and
-    /// `keep_bytes` bytes. Kept results neither count nor are pruned, as
-    /// for one key.
+    /// [`Self::prune_oldest`] across every key.
     ///
     /// Every live temporary row is read `FOR UPDATE`; boot runs this after
     /// the per-key pass and before the server takes captures.
@@ -1344,14 +1187,9 @@ impl ResultsStore {
         self.prune_evidence_waiting(now, LockWait::Unbounded).await
     }
 
-    /// [`Self::prune_evidence`], waiting no later than `deadline`: the
-    /// capture gate's binding evidence pass prunes so before it counts
-    /// ([`crate::results::charge`], "Evidence"). The wait for a connection,
-    /// the `BEGIN`, each due investigation's lock and every statement end
-    /// at the deadline with nothing pruned ([`StoreError::WaitExpired`]),
-    /// bounded by Postgres and by the client alike, as the investigation
-    /// writes that admit work are ([`investigations`] module docs). The
-    /// commit is never cut short.
+    /// [`Self::prune_evidence`], waiting no later than `deadline`. A wait that
+    /// expires prunes nothing ([`StoreError::WaitExpired`]). The commit is
+    /// never cut short.
     pub async fn prune_evidence_until(
         &self,
         now: DateTime<Utc>,
@@ -1361,9 +1199,6 @@ impl ResultsStore {
             .await
     }
 
-    /// [`Self::prune_evidence`] in a transaction that waits as `wait`
-    /// allows, each of its two statements bounded on its own
-    /// ([`WriteTx::run`]).
     async fn prune_evidence_waiting(
         &self,
         now: DateTime<Utc>,
@@ -1405,8 +1240,6 @@ impl ResultsStore {
         prune_locked_evidence(tx, &due, now).await
     }
 
-    /// Prune the oldest temporary results of `key_id`, or of the whole
-    /// installation for `None`, down to the limits.
     async fn prune(
         &self,
         key_id: Option<i64>,
@@ -1484,16 +1317,11 @@ impl ResultsStore {
 
 /// Promote the key's own live temporary result `id` to kept evidence of
 /// `investigation` (ADR-0059), inside the caller's transaction, which
-/// holds the investigation's lock ([`investigations::lock_for_write`]):
-/// the whole result, no copy. It loses its deadline and leaves the
-/// capture quota.
-///
-/// One conditional statement, so it succeeds once: a result past its
-/// deadline at `now`, another key's, one already kept, one gone, or one
-/// whose file is missing does not change and the call returns `false`. Only inside the
-/// investigation's lock: an update that locked the result first and then
-/// waited on the investigation for its foreign key would attach evidence
-/// behind a prune of that investigation that could not see it.
+/// holds the investigation's lock ([`investigations::lock_for_write`]).
+/// Only inside the investigation's lock: an update that locked the result
+/// first and then waited on the investigation for its foreign key would
+/// attach evidence behind a prune of that investigation that could not
+/// see it.
 pub(crate) async fn promote_in(
     tx: &mut WriteTx,
     id: &str,
@@ -1525,8 +1353,6 @@ pub(crate) async fn promote_in(
     Ok(changed == 1)
 }
 
-/// The state of result `id` and the investigation it is attached to, read
-/// inside the caller's transaction; `None` when no row has the id.
 pub(crate) async fn attachment_in(
     tx: &mut WriteTx,
     id: &str,
@@ -1595,8 +1421,6 @@ async fn prune_locked_evidence(
     Ok(rows.iter().map(decode_file).collect::<Result<_, _>>()?)
 }
 
-/// The values of a [`NewCapture`] that the table stores in another shape.
-/// The facts are already encoded ([`FactsDocument`]).
 struct Encoded {
     format_version: i16,
     columns: String,
@@ -1612,8 +1436,6 @@ impl Encoded {
             ))
         })?;
         let columns = serde_json::to_string(&row.columns).map_err(|e| {
-            // A public message names no serde_json text (ADR-0040,
-            // amendment of 2026-11-08).
             tracing::debug!(error = %e, "a capture's columns did not encode");
             StoreError::Validation("columns do not encode".to_owned())
         })?;
@@ -1629,8 +1451,6 @@ impl Encoded {
     }
 }
 
-/// The insert of `row` as one statement: autocommitted on a pool, inside
-/// the open transaction of a connection that holds one.
 async fn run_insert<'e>(
     executor: impl sqlx::PgExecutor<'e>,
     row: &NewCapture,
@@ -1680,7 +1500,6 @@ async fn run_insert<'e>(
     .await
 }
 
-/// A timestamp as the wire spells it.
 pub(super) fn wire_time(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
@@ -1708,7 +1527,6 @@ fn shape_str(shape: ResultShape) -> &'static str {
     }
 }
 
-/// A decode failure in the named column.
 fn column_error(
     column: &str,
     source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -1751,7 +1569,6 @@ fn decode_json<T: serde::de::DeserializeOwned>(
     serde_json::from_str(&text).map_err(|e| column_error(column, e))
 }
 
-/// A nullable JSON document: NULL decodes to `None`.
 fn decode_json_opt<T: serde::de::DeserializeOwned>(
     row: &PgRow,
     column: &str,

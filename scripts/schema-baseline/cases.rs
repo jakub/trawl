@@ -1,5 +1,4 @@
 //! Real PostgreSQL checks shared by the two independent schema owners.
-//! Every database here belongs to `sqlx::test` on an explicitly owned instance.
 use super::{BASELINE, NEW_DIR, OLD_DIR, REFERENCE_AMENDMENT, SchemaError, migrate, seed_old};
 use sqlx::{
     Connection as _, Executor as _, PgConnection, PgPool,
@@ -56,7 +55,6 @@ async fn catalog(conn: &mut PgConnection) -> Vec<(String, String)> {
     .await
     .unwrap();
     for sequence in sequences {
-        // quote_ident produced the identifier; values are never interpolated.
         let query = format!("SELECT jsonb_build_array(last_value,is_called)::text FROM {sequence}");
         let state: String = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
             .fetch_one(&mut *conn)
@@ -100,7 +98,6 @@ pub(super) async fn snapshot(pool: &PgPool) -> (Vec<(String, String)>, Vec<(Stri
     .unwrap();
     let mut rows = Vec::new();
     for (name, kind) in relations {
-        // Identifiers come from quote_ident, never untrusted query text.
         let query = if kind == "S" {
             format!("SELECT jsonb_build_array(last_value,is_called)::text FROM {name}")
         } else {
@@ -130,8 +127,6 @@ async fn initial_schema_matches_final_old_catalog(pool: PgPool) {
         .await
         .unwrap();
     old.run(&mut conn).await.unwrap();
-    // Apply only the owner's explicit fresh-schema amendments. Historical
-    // fixtures remain immutable; all resulting catalog entries still compare.
     if !REFERENCE_AMENDMENT.is_empty() {
         conn.execute(REFERENCE_AMENDMENT).await.unwrap();
     }
@@ -146,8 +141,7 @@ async fn initial_schema_matches_final_old_catalog(pool: PgPool) {
         candidate, reference,
         "final columns, constraints, indexes, and sequences differ"
     );
-    // Every non-ledger seed row must match. Normalize only the two generated
-    // timestamps/UUID values whose values are intentionally fresh per database.
+    // Normalize only generated values that are intentionally fresh per database.
     let tables:Vec<String>=sqlx::query_scalar("SELECT quote_ident(tablename) FROM pg_tables WHERE schemaname='candidate' AND tablename <> '_sqlx_migrations' ORDER BY tablename")
         .fetch_all(&mut conn).await.unwrap();
     for table in tables {
@@ -312,8 +306,6 @@ async fn fresh_restart_preserves_history_and_forward_migrations_work(pool: PgPoo
 /// clock, so this is real time.
 const HANG_GUARD: Duration = Duration::from_secs(120);
 
-/// Poll `probe` every 10 ms until it answers, failing as a hang after
-/// [`HANG_GUARD`] of real time.
 async fn until_live<T>(what: &str, mut probe: impl AsyncFnMut() -> Option<T>) -> T {
     let start = std::time::Instant::now();
     loop {
@@ -328,20 +320,10 @@ async fn until_live<T>(what: &str, mut probe: impl AsyncFnMut() -> Option<T>) ->
     }
 }
 
-/// A migration cancelled while it waits on the advisory lock never hands its
-/// lock-holding connection back: once its backend has exited, a retry
-/// migrates.
-///
-/// The migration is cancelled only after `pg_locks` shows its backend
-/// waiting, so the cancel always lands inside the lock wait. A backend
-/// blocked in `pg_advisory_lock` does not notice its client's close until
-/// the lock is granted: it stays in `pg_stat_activity` while the blocker
-/// holds the lock, then takes the lock and exits. So the blocker is released
-/// first, and the test then waits for that backend to leave. A cancelled
-/// connection that went back to a pool, still holding the lock, would never
-/// leave.
-///
-/// Residual exposure: each wait ends at [`HANG_GUARD`] of real time.
+/// A backend blocked in `pg_advisory_lock` does not notice its client's close
+/// until the lock is granted, so the blocker is released first, and the test
+/// then waits for that backend to leave. A cancelled connection that went
+/// back to a pool, still holding the lock, would never leave.
 #[sqlx::test(migrations = false)]
 async fn cancelled_lock_wait_does_not_recycle_a_locked_connection(pool: PgPool) {
     let mut observer = pool.acquire().await.unwrap();
@@ -386,8 +368,6 @@ async fn cancelled_lock_wait_does_not_recycle_a_locked_connection(pool: PgPool) 
         .unwrap();
 }
 
-/// An unlocked emptiness probe is not authority: another migration-lock holder
-/// can publish application state while a runner waits for that same lock.
 #[sqlx::test(migrations = false)]
 async fn admission_observes_state_created_while_waiting_for_the_lock(pool: PgPool) {
     let mut blocker = pool.acquire().await.unwrap().detach();

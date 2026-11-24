@@ -24,9 +24,7 @@ fail() {
 }
 
 # systemd ignores whitespace around a directive's '=' (systemd.syntax(7)), so
-# `AmbientCapabilities = CAP_SYS_PTRACE` grants the capability just as surely as
-# the unspaced form. Every check below that looks for a directive has to see
-# both spellings, or the guard passes on the file it was written to catch.
+# `AmbientCapabilities = CAP_SYS_PTRACE` grants the capability.
 # Only the FIRST '=' is normalized: systemd strips whitespace around the
 # directive separator, not inside the value, so `Environment=A = b` sets A to
 # the string "A = b" and must not be folded.
@@ -34,7 +32,6 @@ normalize_directives() { # normalize_directives <file>
   sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/^([^=]*[^=[:space:]])[[:space:]]*=[[:space:]]*/\1=/' "$1"
 }
 
-# -- 1. postinst is valid POSIX sh -----------------------------------------
 
 if ! sh -n "$postinst" 2>/tmp/packaging-sh-n.$$; then
   msg=$(cat /tmp/packaging-sh-n.$$)
@@ -43,8 +40,6 @@ if ! sh -n "$postinst" 2>/tmp/packaging-sh-n.$$; then
 fi
 rm -f /tmp/packaging-sh-n.$$
 
-# -- 2. the default unit stays untouched: no active capability grant, and -
-#       no mention of the crash-dump env vars anywhere ---------------------
 
 if grep -E '^[[:space:]]*(AmbientCapabilities|CapabilityBoundingSet)[[:space:]]*=' "$service" >/dev/null; then
   fail "crates/trawl-server/debian/trawld.service sets AmbientCapabilities or CapabilityBoundingSet directly — the crash-dump grant belongs in the opt-in debian/crashdump.conf drop-in, not the default unit"
@@ -53,13 +48,11 @@ if grep -F 'TRAWL_CRASH_DUMP_' "$service" >/dev/null; then
   fail "crates/trawl-server/debian/trawld.service mentions TRAWL_CRASH_DUMP_ — the default unit must carry no reference, commented or not"
 fi
 
-# -- 3. the default env file carries no active crash-dump assignment ------
 
 if grep -vE '^[[:space:]]*#' "$default_env" | grep -E 'TRAWL_CRASH_DUMP_[A-Za-z_]*[[:space:]]*=' >/dev/null; then
   fail "crates/trawl-server/debian/trawld.default sets a TRAWL_CRASH_DUMP_* variable uncommented — the unit's EnvironmentFile would make it part of the effective default"
 fi
 
-# -- 4. the sandboxing the drop-in depends on is still in place -----------
 
 if ! grep -Eq '^[[:space:]]*ProtectSystem[[:space:]]*=[[:space:]]*strict[[:space:]]*$' "$service"; then
   fail "crates/trawl-server/debian/trawld.service dropped ProtectSystem=strict — the crash-dump drop-in relies on that sandbox"
@@ -68,8 +61,6 @@ if ! grep -E '^[[:space:]]*ReadWritePaths[[:space:]]*=.*/var/lib/trawl' "$servic
   fail "crates/trawl-server/debian/trawld.service has no ReadWritePaths covering /var/lib/trawl — the crash-dump drop-in writes under that tree"
 fi
 
-# systemd reapplies these modes on every start. Keep exactly one active value
-# of each, and leave the web unit without a competing directory owner.
 state_modes=$(grep -Ec '^[[:space:]]*StateDirectoryMode[[:space:]]*=[[:space:]]*0750[[:space:]]*$' "$service" || true)
 log_modes=$(grep -Ec '^[[:space:]]*LogsDirectoryMode[[:space:]]*=[[:space:]]*0700[[:space:]]*$' "$service" || true)
 [[ "$state_modes" -eq 1 ]] || fail "trawld.service needs exactly one active StateDirectoryMode=0750"
@@ -82,7 +73,6 @@ if grep -Eq '^[[:space:]]*(StateDirectory|LogsDirectory|StateDirectoryMode|LogsD
   fail "trawl-web.service must not declare StateDirectory or LogsDirectory directives"
 fi
 
-# -- 5. crashdump.conf carries exactly the four directive lines, in order -
 
 if [[ ! -f "$crashdump_conf" ]]; then
   fail "crates/trawl-server/debian/crashdump.conf is missing"
@@ -110,20 +100,11 @@ for i in "${!expected_lines[@]}"; do
   fi
 done
 
-# -- 6. the Cargo.toml asset ships the example as documentation only ------
 
 asset_pattern='\[[[:space:]]*"debian/crashdump\.conf"[[:space:]]*,[[:space:]]*"usr/share/doc/trawl-server/examples/crashdump\.conf"[[:space:]]*,[[:space:]]*"644"[[:space:]]*\]'
 if ! grep -Eq "$asset_pattern" "$cargo_toml"; then
   fail "crates/trawl-server/Cargo.toml is missing the asset triple [\"debian/crashdump.conf\", \"$asset_dest\", \"644\"]"
 fi
-# The old spelling of this rule named two literal prefixes, which left every
-# other place systemd reads units from wide open: /lib/systemd/system (still a
-# real path on non-usrmerged systems and a symlinked alias everywhere else),
-# /etc/systemd/user, /usr/lib/systemd/system-preset, and a drop-in directory for
-# any unit but trawld. Walk the asset destinations instead and refuse anything
-# systemd reads, allowing only the two unit files the package legitimately owns.
-# Whatever the crash-dump example ships as, it is documentation, never
-# pre-installed configuration.
 packaged_units="usr/lib/systemd/system/trawld.service usr/lib/systemd/system/trawl-web.service"
 while IFS= read -r asset_line; do
   dest=$(printf '%s' "$asset_line" | sed -E 's/^[^"]*"[^"]+"[^"]*"([^"]+)".*/\1/')
@@ -140,11 +121,7 @@ done < <(grep -E '^[[:space:]]*\[[[:space:]]*"' "$cargo_toml")
 
 # For assets landing in sysusers.d or tmpfiles.d, cargo-deb generates a
 # `systemd-sysusers <name>` / `systemd-tmpfiles --create <name>` call in postinst
-# and derives <name> from the asset's SOURCE path via with_extension("conf"). If
-# that derivation does not land on the file the asset actually installs, the
-# generated call names a file nobody installed, systemd-sysusers exits 1, and
-# dpkg leaves the package half-configured. The rule: source stem + ".conf" must
-# equal the destination filename.
+# and derives <name> from the asset's SOURCE path via with_extension("conf").
 generated_dirs=0
 while IFS= read -r asset_line; do
   src=$(printf '%s' "$asset_line" | sed -E 's/^[^"]*"([^"]+)".*/\1/')
@@ -162,8 +139,6 @@ if [[ "$generated_dirs" -lt 2 ]]; then
   fail "crates/trawl-server/Cargo.toml has $generated_dirs sysusers.d/tmpfiles.d assets, expected both (the trawl user and the crash-dump directory)"
 fi
 
-# -- 7. drift guard: the drop-in's env var names and retain default track -
-#       the crate's own constants, not a hand-copied literal -------------
 
 dir_env=$(grep -oE 'const DIR_ENV: &str = "[^"]*"' "$imp_rs" | sed -E 's/.*"([^"]*)".*/\1/')
 retain_env=$(grep -oE 'const RETAIN_ENV: &str = "[^"]*"' "$imp_rs" | sed -E 's/.*"([^"]*)".*/\1/')
@@ -198,7 +173,6 @@ if [[ "$retain_value" != "$default_retain" ]]; then
   fail "crates/trawl-server/debian/crashdump.conf sets the retain default to '$retain_value', but crates/trawl-crashdump/src/imp.rs's DEFAULT_RETAIN is '$default_retain'"
 fi
 
-# -- 8. cross-channel parity: deb, chart and postinst agree on the path ---
 
 chart_block=$(awk '/^crashDump:$/{flag=1; next} flag && /^[^[:space:]]/{flag=0} flag' "$values_yaml")
 chart_mount=$(echo "$chart_block" | grep -E '^[[:space:]]*mountPath:' | sed -E 's/^[[:space:]]*mountPath:[[:space:]]*//' | head -1)
@@ -217,20 +191,9 @@ if [[ "$chart_retain" != "$retain_value" ]]; then
   fail "crates/trawl-server/debian/crashdump.conf's TRAWL_CRASH_DUMP_RETAIN ('$retain_value') disagrees with chart/trawl/values.yaml's crashDump.retain default ('$chart_retain')"
 fi
 
-# The dump directory is created by systemd-tmpfiles, not by postinst's own
-# shell. tmpfiles walks the path with O_NOFOLLOW, which a check-then-`install -d`
-# pair cannot do: during an upgrade the still-running trawld owns the parent and
-# could swap the directory for a symlink between the two steps.
-# `d=` and not plain `d`: the `=` suffix is what removes a wrong-type object
-# squatting at the path. Without it a regular file there survives, postinst
-# still succeeds, and capture dies on EEXIST at the worst possible moment.
 if ! grep -Eq "^d=[[:space:]]+${dir_value}[[:space:]]+0700[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)" "$tmpfiles_conf"; then
   fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'd= $dir_value 0700 trawl trawl -' (the '=' enforces the type; plain 'd' leaves a file or symlink in place)"
 fi
-# trawl-web runs as the same trawl user with /var/lib/trawl writable, so without
-# this line the browser-facing proxy can read and replace minidumps, which are
-# verbatim copies of trawld's memory. The mask covers the subdirectory only:
-# /var/lib/trawl/web.cookie has to stay reachable or the proxy will not start.
 if ! grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?${dir_value}[[:space:]]*$" "$web_service"; then
   fail "crates/trawl-server/debian/trawl-web.service does not mask '$dir_value' with InaccessiblePaths — the third denial, after the separate uid and the 0700 mode"
 fi
@@ -238,10 +201,6 @@ if grep -Eq "^[[:space:]]*InaccessiblePaths[[:space:]]*=[[:space:]]*-?/var/lib/t
   fail "crates/trawl-server/debian/trawl-web.service masks the whole of /var/lib/trawl — that hides web.cookie too and the proxy cannot start"
 fi
 
-# The mask alone is not enough and never was. Running the proxy as the trawl
-# user leaves /proc/<trawld-pid>/root as a way around it: same uid passes the
-# kernel's ptrace check, and inside trawld's mount namespace nothing is masked.
-# A separate uid is what closes that, so the two settings are checked together.
 if ! grep -Eq '^[[:space:]]*User[[:space:]]*=[[:space:]]*trawl-web[[:space:]]*$' "$web_service"; then
   fail "crates/trawl-server/debian/trawl-web.service does not set User=trawl-web — as the trawl user the proxy reaches the dumps through /proc/<trawld-pid>/root regardless of InaccessiblePaths"
 fi
@@ -251,27 +210,9 @@ fi
 if ! grep -Eq '^[[:space:]]*m[[:space:]]+trawl-web[[:space:]]+trawl[[:space:]]*$' "$sysusers_conf"; then
   fail "crates/trawl-server/debian/trawl.sysusers does not add trawl-web to the trawl group — the proxy would not be able to read /var/lib/trawl/web.cookie or /etc/trawl/trawld.toml"
 fi
-# The key is group-readable on purpose, and only because the group has one
-# other member. A recursive or wider grant would hand it to everyone. It has to
-# come from tmpfiles: trawl owns /var/lib/trawl, so a root chown of a path under
-# it follows any symlink planted there, and a planted `web.cookie -> /etc/shadow`
-# would come back 0640 trawl:trawl.
 if ! grep -Eq '^z[[:space:]]+/var/lib/trawl/web\.cookie[[:space:]]+0640[[:space:]]+trawl[[:space:]]+trawl([[:space:]]|$)' "$tmpfiles_conf"; then
   fail "crates/trawl-server/debian/trawl.tmpfiles does not carry 'z /var/lib/trawl/web.cookie 0640 trawl trawl -' — trawl-web reads the key through the trawl group and needs it group-readable"
 fi
-# Nothing that prescribes commands may chown or chmod either path. Both live
-# inside /var/lib/trawl, which the trawl user owns, so anything running as that
-# user can replace an entry with a symlink and a root chown or chmod follows it.
-# Measured: a planted `web.cookie -> /root/decoy` plus a redirect and a chown
-# left the decoy holding the new session key, owned trawl:trawl 0640.
-#
-# The safe forms are the tmpfiles entries in debian/trawl.tmpfiles, which open
-# with O_NOFOLLOW, and `install`, which replaces the destination rather than
-# writing through a link. This rule covers the maintainer scripts and every docs
-# page, because an operator following a runbook is running the same root shell a
-# maintainer script does. packaging.sh and the harness are excluded: they name
-# these commands to refuse them, and the harness runs them as measurement inside
-# a throwaway container.
 guard_files=()
 while IFS= read -r guard_file; do
   guard_files+=("$guard_file")
@@ -291,16 +232,11 @@ $hit"
   fi
 done
 
-# The access guide tells an operator to overwrite that same key by hand for a
-# shared session, which bypasses tmpfiles entirely. If it says 0600, following
-# it leaves a key trawl-web cannot read and a proxy that will not start.
 if [[ ! -f "$access_page" ]]; then
   fail "docs/src/content/docs/operate/access.md is missing — it carries the by-hand key install that has to agree with the packaged mode"
 fi
 # Mode-form agnostic on purpose: the guide installs the key rather than
-# chmodding it, and the next rewrite may reach for something else again. What
-# has to hold is that the line putting the key in place names 0640 and no line
-# putting it in place names 0600.
+# chmodding it, and the next rewrite may reach for something else again.
 if ! grep -E '/var/lib/trawl/web\.cookie' "$access_page" | grep -Eq '(^|[^0-9])0640([^0-9]|$)'; then
   fail "docs/src/content/docs/operate/access.md does not put /var/lib/trawl/web.cookie in place as 0640 — trawl-web reads it through the trawl group and a key it cannot read stops the proxy starting"
 fi
@@ -317,7 +253,6 @@ if grep -Eq "install[[:space:]]+-d.*${dir_value}" "$postinst"; then
   fail "crates/trawl-server/debian/postinst creates '$dir_value' with 'install -d' — that is the check-then-act race systemd-tmpfiles replaced"
 fi
 
-# -- 9. the docs page documents the drop-in verbatim -----------------------
 
 if [[ ! -f "$docs_page" ]]; then
   fail "docs/src/content/docs/reference/crash-dumps.md is missing — the crash-dump docs page has not landed yet"
@@ -335,15 +270,6 @@ if ! grep -Fq -- "$asset_dest" "$docs_page"; then
   fail "docs/src/content/docs/reference/crash-dumps.md does not mention '$asset_dest'"
 fi
 
-# -- 10. both units install disabled and stopped ---------------------------
-#
-# The shipped trawld.toml holds CHANGE_ME database URLs, so a unit started at
-# install time can only fail and restart every RestartSec. cargo-deb turns
-# `enable = false, start = false` into a postinst that neither enables nor
-# starts on a fresh install, re-enables a unit the operator already enabled,
-# and try-restarts a running unit on upgrade. The verify job in
-# .github/workflows/linux-distribution.yml checks the installed result on a
-# host running systemd.
 
 units_block=$(awk '/^[[:space:]]*systemd-units[[:space:]]*=[[:space:]]*\[/{flag=1} flag{print} flag && /^[[:space:]]*\][[:space:]]*$/{exit}' "$cargo_toml")
 if [[ -z "$units_block" ]]; then
@@ -369,15 +295,6 @@ if ! grep -Fq 'systemctl enable --now trawld trawl-web' "$postinst"; then
   fail "crates/trawl-server/debian/postinst does not tell the operator to run 'systemctl enable --now trawld trawl-web' after setting the database URLs"
 fi
 
-# -- 11. trawl-web verifies trawld by pinning its generated certificate ---
-#
-# Without a pin, trawl-web checks trawld's self-signed certificate against the
-# platform roots and every sign-in fails. The package pins the file trawld
-# generates. trawl-web has no switch that skips verification (ADR-0048), so no
-# packaged file may name the removed one, not even in a comment that tells an
-# operator how to turn it on. trawl-web's config tests check that the pin
-# resolves; trawl-server's tls.rs tests check that the path is the file trawld
-# writes.
 
 web_section=$(awk '/^\[web\][[:space:]]*$/{flag=1; next} flag && /^\[/{flag=0} flag' "$packaged_config")
 if [[ -z "$web_section" ]]; then
@@ -392,10 +309,6 @@ if naming=$(cd "$repo_root" && grep -rlF -- "$removed_switch" crates/trawl-serve
   fail "these files under crates/trawl-server/debian name the removed $removed_switch switch: ${naming//$'\n'/, }"
 fi
 
-# -- 12. resource ceilings match the chart's (ADR-0056) --------------------
-#
-# Exactly one active value of each, after normalizing the spacing systemd
-# ignores, so a second directive cannot quietly override the first.
 
 assert_one_directive() { # assert_one_directive <unit> <name> <directive> <value>
   local unit=$1 name=$2 directive=$3 value=$4 active

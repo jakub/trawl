@@ -2,30 +2,15 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure button variant. No `leptos`, no `web_sys` — builds on every
-//! target so the per-variant CSS-class fragment and the full class
-//! composition in [`btn_class`] are exercised by native unit tests
-//! (mirrors [`crate::toast::kinds`]).
-
-/// Visual variant. Maps onto the CSS classes shipped in
-/// `styles/fleet-ui.css`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Variant {
     Primary,
     Secondary,
     Danger,
-    /// The large accent form primary (bare `.btn`) — the login page's
-    /// submit button. Distinct from [`Variant::Primary`], which is the
-    /// compact `.btn-pri` used in modal footers and toolbars.
     Form,
 }
 
 impl Variant {
-    /// CSS class rendered by `<Btn>` (`class="{css_class} [btn-full]"`).
-    /// The contract with fleet-ui.css's `.btn-pri` / `.btn-sec` /
-    /// `.btn-danger` / `.btn` selectors. Public (like
-    /// [`ToastKind::as_class`](crate::ToastKind::as_class)) so it stays
-    /// nameable from native code and isn't dead-code on non-wasm builds.
     #[must_use]
     pub fn css_class(self) -> &'static str {
         match self {
@@ -37,18 +22,11 @@ impl Variant {
     }
 }
 
-/// Size axis, orthogonal to [`Variant`]. Maps onto the `.btn-sm` /
-/// `.btn-xs` classes shipped in `styles/fleet-ui.css`.
-///
-/// The two non-default sizes behave differently by CSS design, and
-/// [`btn_class`] encodes that asymmetry:
-///
-/// * [`Size::Xs`] is a true modifier (`font-size` + `padding` only) and
-///   composes with the variant class: `btn-sec btn-xs`.
-/// * [`Size::Sm`] is a self-contained compact style — `.btn-sm` carries
-///   its own background/border/hover — so it renders standalone and the
-///   variant class is suppressed; composing the two would alter the
-///   hover background.
+/// [`Size::Xs`] is a true modifier (`font-size` + `padding` only) and
+/// composes with the variant class: `btn-sec btn-xs`. [`Size::Sm`] is a
+/// self-contained compact style — `.btn-sm` carries its own
+/// background/border/hover — so it renders standalone and the variant class
+/// is suppressed; composing the two would alter the hover background.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Size {
     #[default]
@@ -58,8 +36,6 @@ pub enum Size {
 }
 
 impl Size {
-    /// CSS class fragment appended (or, for `Sm`, substituted) by
-    /// [`btn_class`]. `None` for the default size.
     #[must_use]
     pub fn css_suffix(self) -> Option<&'static str> {
         match self {
@@ -70,10 +46,6 @@ impl Size {
     }
 }
 
-/// Compose the full `class` attribute rendered by `<Btn>`. Pure, so the
-/// variant/size/full interaction — including the `Sm`-standalone rule —
-/// is locked by native unit tests. Order is variant-then-size
-/// (`btn-sec btn-xs`).
 #[must_use]
 pub fn btn_class(variant: Variant, size: Size, full: bool) -> String {
     let base = match size {
@@ -109,7 +81,6 @@ mod tests {
 
     #[test]
     fn btn_class_composition() {
-        // Default size: variant class alone, `btn-full` appended when full.
         assert_eq!(
             btn_class(Variant::Secondary, Size::Default, false),
             "btn-sec"
@@ -119,7 +90,6 @@ mod tests {
             "btn btn-full"
         );
 
-        // Xs is a true modifier: composes variant-then-size.
         assert_eq!(
             btn_class(Variant::Secondary, Size::Xs, false),
             "btn-sec btn-xs"
@@ -129,10 +99,6 @@ mod tests {
             "btn-pri btn-xs"
         );
 
-        // Sm is not a modifier: `.btn-sm` in the stylesheet is a
-        // self-contained compact style (own background/border/hover).
-        // Emitting `btn-sec btn-sm` would change the hover background,
-        // so Sm suppresses the variant class entirely.
         assert_eq!(btn_class(Variant::Secondary, Size::Sm, false), "btn-sm");
     }
 }

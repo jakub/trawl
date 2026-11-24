@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Full-width panel content for non-Query tabs (History, Schema, Saved).
-
 use std::collections::HashSet;
 
 use ratatui::Frame;
@@ -23,7 +21,6 @@ use trawl_api::zone::{DisplayZone, Presented, present, present_human};
 use trawl_core::sanitize::sanitize_display_text;
 use trawl_core::text_layout::{cells, fit_cells, pad_cells};
 
-/// Render panel content based on the active `MainTab`.
 pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     let theme = &app.theme;
 
@@ -44,12 +41,10 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     match app.main_tab {
         MainTab::Schema => {
             if let Some(ref schema) = app.panel.schema {
-                // Horizontal split: tree (55%) | detail pane (45%).
                 let [tree_col, detail_col] =
                     Layout::horizontal([Constraint::Percentage(55), Constraint::Percentage(45)])
                         .areas(inner);
 
-                // Left side: filter bar + tree.
                 let [filter_area, tree_area] =
                     Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(tree_col);
 
@@ -62,7 +57,7 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                 );
                 render_schema_tree(schema, theme, frame, tree_area);
 
-                // Right side: detail pane (1-col left padding clears the scrollbar).
+                // 1-col left padding clears the scrollbar.
                 let detail_inset = Rect {
                     x: detail_col.x + 1,
                     width: detail_col.width.saturating_sub(1),
@@ -82,7 +77,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
                         .style(Style::default().fg(theme.text_muted));
                     frame.render_widget(paragraph, inner);
                 } else {
-                    // Horizontal split: list (55%) | detail pane (45%).
                     let [list_col, detail_col] = Layout::horizontal([
                         Constraint::Percentage(55),
                         Constraint::Percentage(45),
@@ -103,7 +97,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>, area: Rect) {
     }
 }
 
-/// Render the filter input bar for schema search.
 fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let style = if active {
         Style::default().fg(theme.text_accent)
@@ -125,33 +118,27 @@ fn render_filter_bar(filter: &str, active: bool, theme: &Theme, frame: &mut Fram
     frame.render_widget(paragraph, area);
 }
 
-// ---------------------------------------------------------------------------
-// Schema tree view
-// ---------------------------------------------------------------------------
-
-/// A node in the flattened schema tree (computed at render time).
 #[derive(Debug)]
 enum TreeNode<'a> {
-    /// Common fields section header.
-    CommonHeader { field_count: usize },
-    /// A common field (present across many services).
-    CommonField { name: &'a str, data_type: &'a str },
-    /// A service row.
+    CommonHeader {
+        field_count: usize,
+    },
+    CommonField {
+        name: &'a str,
+        data_type: &'a str,
+    },
     Service {
         name: &'a str,
         expanded: bool,
         field_count: usize,
     },
-    /// A field within a specific service (unique to that service).
     ServiceField {
         name: &'a str,
         data_type: &'a str,
-        /// Non-null coverage display string (e.g. "99%", "< 1%", "0%").
         coverage: Option<(String, Color)>,
     },
 }
 
-/// Flatten the schema tree into a linear list for rendering.
 fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a>> {
     let filter = schema.filter.to_lowercase();
     let common_names: HashSet<&str> = schema
@@ -162,7 +149,6 @@ fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a
 
     let mut nodes = Vec::new();
 
-    // Common fields section.
     if !schema.common_fields.is_empty() {
         let visible_common: Vec<_> = schema
             .common_fields
@@ -183,7 +169,6 @@ fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a
         }
     }
 
-    // Per-service rows.
     for svc in &schema.services {
         let unique_fields: Vec<_> = svc
             .columns
@@ -216,7 +201,6 @@ fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a
                     if non_null == 0 {
                         Some(("  0%".to_owned(), theme.status_error))
                     } else if pct_100 == 0 {
-                        // Non-zero but rounds to 0% → show "< 1%"
                         Some(("< 1%".to_owned(), theme.status_error))
                     } else {
                         #[allow(clippy::cast_possible_truncation)]
@@ -244,7 +228,6 @@ fn flatten_tree<'a>(schema: &'a SchemaBrowser, theme: &Theme) -> Vec<TreeNode<'a
     nodes
 }
 
-/// Color for a data type badge.
 fn type_color(data_type: &str, theme: &Theme) -> Color {
     let dt = data_type.to_uppercase();
     if dt.starts_with("VARCHAR") || dt.starts_with("TEXT") || dt.starts_with("STRING") {
@@ -272,7 +255,6 @@ fn type_color(data_type: &str, theme: &Theme) -> Color {
     }
 }
 
-/// Render the schema tree view.
 #[allow(clippy::too_many_lines)]
 fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let nodes = flatten_tree(schema, theme);
@@ -294,7 +276,6 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
     let visible_height = area.height as usize;
     let needs_scrollbar = total > visible_height;
 
-    // Shrink list area when scrollbar is visible to avoid text overlap.
     let list_area = if needs_scrollbar {
         Rect {
             width: area.width.saturating_sub(2), // 1 gap + 1 scrollbar track
@@ -328,11 +309,6 @@ fn render_schema_tree(schema: &SchemaBrowser, theme: &Theme, frame: &mut Frame<'
     }
 }
 
-/// One schema tree row, fitted to `width` display cells.
-///
-/// Names come from senders, so each is cut by display cells after the
-/// row's fixed parts (indent, arrow, type and coverage columns, count) are
-/// reserved. A width too narrow for the fixed parts leaves the name empty.
 fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> {
     match node {
         TreeNode::CommonHeader { field_count } => Line::from(Span::styled(
@@ -342,7 +318,6 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
                 .add_modifier(Modifier::BOLD),
         )),
         TreeNode::CommonField { name, data_type } => {
-            // Layout: "  " + name + " " + type.
             let type_str = abbreviate_type(data_type);
             let tc = type_color(data_type, theme);
             let max_name = width.saturating_sub(2 + 1 + cells(&type_str));
@@ -364,13 +339,10 @@ fn tree_line(node: &TreeNode<'_>, theme: &Theme, width: usize) -> Line<'static> 
             let type_str = abbreviate_type(data_type);
             let tc = type_color(data_type, theme);
 
-            // Column layout: "   " + name (padded) + " " + type (4) + " " + coverage (4) + " "
-            // A fallback type label wider than its column takes its cells
-            // from the name.
             let indent = 3usize;
             let type_width = cells(&type_str).max(4);
             let cov_width = 4usize;
-            let trailing = 1usize; // padding before detail pane border
+            let trailing = 1usize;
             let overhead = indent + 1 + type_width + 1 + cov_width + trailing;
             let max_name = width.saturating_sub(overhead);
             // Both columns advance by their budget, whatever the cells the
@@ -426,10 +398,6 @@ fn advancing_by_cells(text: String) -> String {
     span_advancing(text, column)
 }
 
-/// Compute scroll offset for center-locked scrolling.
-///
-/// The selected item stays at the vertical midpoint of the visible area,
-/// with context visible above and below.
 fn compute_center_offset(selected: usize, visible_height: usize, total: usize) -> usize {
     if total <= visible_height {
         return 0;
@@ -439,7 +407,6 @@ fn compute_center_offset(selected: usize, visible_height: usize, total: usize) -
     ideal.min(max_offset)
 }
 
-/// Abbreviate a `DuckDB` type name for compact display.
 fn abbreviate_type(data_type: &str) -> String {
     let dt = data_type.to_uppercase();
     if dt.starts_with("VARCHAR") {
@@ -461,15 +428,9 @@ fn abbreviate_type(data_type: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// History list
-// ---------------------------------------------------------------------------
-
-/// Render history entries in the left pane (relative time + truncated query).
 fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let selected = app.panel.history_selected;
 
-    // Caller handles None / empty — we always have entries here.
     let history = app.history_cache.as_ref().expect("history_cache populated");
 
     let items: Vec<ListItem<'_>> = history
@@ -508,8 +469,6 @@ fn render_history_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
     }
 }
 
-/// One history row: `"{4-char time}  {query…}  "`, the query flattened to
-/// one line and cut to what the time, gap and trailing room leave of `width`.
 /// The trailing room also clears the scrollbar drawn over the last column.
 fn history_line(
     entry: &trawl_api::HistoryEntryResponse,
@@ -518,7 +477,7 @@ fn history_line(
 ) -> Line<'static> {
     const TIME_WIDTH: usize = 4;
     const GAP: usize = 2;
-    const TRAILING: usize = 2; // padding before detail pane
+    const TRAILING: usize = 2;
 
     let max_query = width.saturating_sub(TIME_WIDTH + GAP + TRAILING);
     let time_str = format_relative_time(&entry.executed_at);
@@ -531,9 +490,6 @@ fn history_line(
     ])
 }
 
-/// Format an ISO 8601 timestamp as a compact relative time from now.
-///
-/// Returns a 4-char right-justified string like `" 30m"`, `"  4h"`, `"  2d"`.
 fn format_relative_time(iso_timestamp: &str) -> String {
     use chrono::{DateTime, Utc};
 
@@ -558,14 +514,9 @@ fn format_relative_time(iso_timestamp: &str) -> String {
     format!("{label:>4}")
 }
 
-/// Render a report run's covered window as `[start .. end)` in `zone`.
-///
-/// Bounds are half-open, so the closing bracket is deliberate. Each bound is
+/// Bounds are half-open, so the closing `)` is deliberate. Each bound is
 /// a [`format_instant`], with its own offset, seconds and any fractional
-/// part, since schedule edits can re-anchor a boundary between minutes. When
-/// both bounds converted and show the same date, the end drops its date,
-/// which is the common case for a tiled window; its offset stays, so nothing
-/// is hidden.
+/// part, since schedule edits can re-anchor a boundary between minutes.
 fn format_run_window(start: &str, end: &str, zone: DisplayZone) -> String {
     let from = format_instant(start, zone);
     let to = format_instant(end, zone);
@@ -579,27 +530,16 @@ fn format_run_window(start: &str, end: &str, zone: DisplayZone) -> String {
     format!("[{from} .. {to})")
 }
 
-/// `shown`, the [`format_instant`] reading of `wire`, split into its date and
-/// the rest, or `None` unless `zone` converted `wire`: text passed through,
-/// an infinity and an instant the zone could not place keep their whole
-/// reading.
 fn converted_date<'a>(wire: &str, shown: &'a str, zone: DisplayZone) -> Option<(&'a str, &'a str)> {
     matches!(present(wire, zone), Some(Presented::Converted(_)))
         .then(|| shown.split_once(' '))
         .flatten()
 }
 
-/// A wire timestamp in `zone`, with its offset, seconds and any fraction.
-/// Text that is not a wire timestamp shows as sent, sanitized, rather than
-/// guessed at, so an unexpected wire value is visible and cannot drive the
-/// terminal.
 fn format_instant(wire: &str, zone: DisplayZone) -> String {
     present_human(wire, zone).unwrap_or_else(|| sanitize_display_text(wire))
 }
 
-/// The schedule's window mode as a badge suffix for the saved-query list:
-/// `[1h]` in query mode, `[1h since_last]` or `[1h window 2h]` when the
-/// schedule owns the report window (ADR-0018 ruling 6).
 fn format_schedule_badge(sched: &trawl_api::ScheduleResponse) -> String {
     match sched.window.as_deref() {
         None => format!(" [{}]", sched.interval),
@@ -608,13 +548,6 @@ fn format_schedule_badge(sched: &trawl_api::ScheduleResponse) -> String {
     }
 }
 
-/// The schedule's report-window detail line, or `None` in query mode, where
-/// the saved DSL carries its own time bounds and the scheduler owns nothing.
-///
-/// A zero lag is left out: it is the default and printing `lag 0s` would spend
-/// a line saying nothing. `covered through` is the `since_last` watermark, so
-/// it is absent for a fixed window and for a schedule that has not yet had a
-/// successful run; when present it reads in `zone`.
 fn format_schedule_window(
     sched: &trawl_api::ScheduleResponse,
     zone: DisplayZone,
@@ -635,11 +568,6 @@ fn format_schedule_window(
     Some(parts.join(", "))
 }
 
-// ---------------------------------------------------------------------------
-// Saved queries list
-// ---------------------------------------------------------------------------
-
-/// Render the saved tab as a two-pane layout: list (left) + detail/runs (right).
 #[allow(clippy::too_many_lines)]
 fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(ref saved) = app.saved_cache else {
@@ -656,7 +584,6 @@ fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rec
         return;
     }
 
-    // Two-pane horizontal split: list (45%) | detail (55%).
     let [list_col, detail_col] =
         Layout::horizontal([Constraint::Percentage(45), Constraint::Percentage(55)]).areas(area);
 
@@ -664,7 +591,6 @@ fn render_saved_panel(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rec
     render_saved_detail(app, theme, frame, detail_col);
 }
 
-/// Render the left-pane saved query list.
 fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let selected = app.panel.saved_selected;
     let is_focused = app.panel.saved_focus == SavedFocus::List;
@@ -679,7 +605,6 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
         .queries
         .iter()
         .map(|entry| {
-            // Each part's cells, and a span that advances by them.
             let mut suffix_width = 0;
             let mut suffixes = Vec::new();
             if let Some(ref sched) = entry.schedule {
@@ -748,10 +673,8 @@ fn render_saved_list(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect
     }
 }
 
-/// Render the right-pane detail view for the selected saved query.
 #[allow(clippy::too_many_lines)]
 fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
-    // Inset 1 col from the left to visually separate from the list pane.
     let area = Rect {
         x: area.x + 1,
         width: area.width.saturating_sub(1),
@@ -760,7 +683,6 @@ fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
 
     match app.panel.saved_focus {
         SavedFocus::List => {
-            // Show a hint when no detail pane is active.
             let hint = Paragraph::new("Enter/\u{2192} to view run history")
                 .style(Style::default().fg(theme.text_muted));
             frame.render_widget(hint, area);
@@ -774,9 +696,7 @@ fn render_saved_detail(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Re
     }
 }
 
-/// The schedule's run budget for the detail `runs` line: the lifetime claim
-/// count alone without a cap, `N/M` under a cap, and `spent N/M` once the
-/// budget is spent. N can exceed M after the cap is lowered; it shows as is.
+/// `total_runs` can exceed the cap after the cap is lowered; it shows as is.
 fn run_budget(sched: &trawl_api::ScheduleResponse) -> String {
     match sched.max_runs {
         None => sched.total_runs.to_string(),
@@ -785,7 +705,6 @@ fn run_budget(sched: &trawl_api::ScheduleResponse) -> String {
     }
 }
 
-/// Render the detail view: query info header + run history sub-list.
 #[allow(clippy::too_many_lines)]
 fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(ref saved) = app.saved_cache else {
@@ -802,7 +721,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // -- name --
     lines.push(Line::from(Span::styled(
         sanitize_display_text(&entry.name),
         Style::default()
@@ -810,7 +728,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
             .add_modifier(Modifier::BOLD),
     )));
 
-    // -- separator --
     #[allow(clippy::cast_possible_truncation)]
     let sep_width = area.width.min(40) as usize;
     lines.push(Line::from(Span::styled(
@@ -818,7 +735,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         Style::default().fg(theme.text_muted),
     )));
 
-    // -- query DSL --
     let label_style = Style::default().fg(theme.text_muted);
     let value_style = Style::default().fg(theme.text_primary);
     lines.push(Line::from(vec![
@@ -829,7 +745,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         ),
     ]));
 
-    // -- schedule info --
     if let Some(ref sched) = entry.schedule {
         let enabled_str = if sched.enabled { "enabled" } else { "paused" };
         lines.push(Line::from(vec![
@@ -843,8 +758,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
                 value_style,
             ),
         ]));
-        // Continuation lines under the `sched` label: what the scheduler owns
-        // of the report window, then the fire cursor every schedule has.
         if let Some(window) = format_schedule_window(sched, app.display_zone) {
             lines.push(Line::from(vec![
                 Span::styled("       ", label_style),
@@ -874,7 +787,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
 
     lines.push(Line::default());
 
-    // -- runs sub-list header --
     let Some(ref detail) = app.panel.saved_detail else {
         lines.push(Line::from(Span::styled(
             "loading runs...",
@@ -916,8 +828,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
         Style::default().fg(theme.text_muted),
     )));
 
-    // Render the header as a paragraph, then the run list below it.
-    let header_height = header_lines + 1; // +1 for the runs header
+    let header_height = header_lines + 1;
     #[allow(clippy::cast_possible_truncation)]
     let header_h = (header_height as u16).min(area.height);
     let [header_area, list_area] =
@@ -961,10 +872,7 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
 
             // The window trails everything else: a narrow pane truncates the
             // Line from the right, and the status, id and time are what an
-            // operator scans first. A run with no window (query mode, or one
-            // from before the schedule grew a window) renders nothing here —
-            // silence is how "no window" differs from `window_truncated:
-            // Some(false)`, which shows its bounds with no marker.
+            // operator scans first.
             if let Some(ref kind) = run.window_kind {
                 spans.push(Span::styled(
                     advancing_by_cells(format!("  {}", sanitize_display_text(kind))),
@@ -1019,7 +927,6 @@ fn render_saved_detail_inner(app: &App, theme: &Theme, frame: &mut Frame<'_>, ar
     }
 }
 
-/// Render run results in a simple table view.
 #[allow(clippy::too_many_lines)]
 fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, area: Rect) {
     let Some(ref detail) = app.panel.saved_detail else {
@@ -1046,7 +953,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
 
     let mut lines: Vec<Line<'static>> = Vec::new();
 
-    // -- title --
     lines.push(Line::from(Span::styled(
         title_str,
         Style::default()
@@ -1054,7 +960,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
             .add_modifier(Modifier::BOLD),
     )));
 
-    // -- the rows on screen (windowed by scroll offset) --
     // After the title: the header, the separator and the footer.
     #[allow(clippy::cast_possible_truncation)]
     let visible_rows = (area.height as usize).saturating_sub(lines.len() + 3);
@@ -1062,7 +967,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
     let start = detail.result_scroll.min(total_rows);
     let end = (start + visible_rows).min(total_rows);
 
-    // -- column headers --
     let col_widths = run_result_widths(result, start..end, app.display_zone);
     let header_spans: Vec<Span<'static>> = result
         .columns
@@ -1079,7 +983,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
         .collect();
     lines.push(Line::from(header_spans));
 
-    // -- separator --
     #[allow(clippy::cast_possible_truncation)]
     let sep_width = area.width as usize;
     lines.push(Line::from(Span::styled(
@@ -1087,7 +990,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
         Style::default().fg(theme.text_muted),
     )));
 
-    // -- data rows --
     for row in &result.rows[start..end] {
         let row_spans: Vec<Span<'static>> = row
             .iter()
@@ -1103,7 +1005,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
         lines.push(Line::from(row_spans));
     }
 
-    // -- scroll indicator --
     if total_rows > visible_rows {
         lines.push(Line::from(Span::styled(
             format!(
@@ -1123,11 +1024,6 @@ fn render_saved_run_results(app: &App, theme: &Theme, frame: &mut Frame<'_>, are
 /// The widest a run result column gets, in display cells.
 const RUN_RESULT_COLUMN_CAP: usize = 30;
 
-/// Display-cell widths of the run result columns.
-///
-/// Widths sample the header and the first 100 rows, so a wider value further
-/// down renders cut. Each sample is measured as it would render at the cap.
-///
 /// A timestamp column is the exception. Its offset is at the end, and a cut
 /// there would hide the zone the instant reads in, so each instant is
 /// measured whole, and the rows on screen (`visible`) are measured with the
@@ -1164,8 +1060,6 @@ fn run_result_widths(
         .collect()
 }
 
-/// A run result cell as the table shows it: an instant in `zone` with its
-/// own offset, any other cell through [`format_value`].
 fn run_result_text(
     column: &trawl_api::value::Column,
     val: &trawl_api::value::Value,
@@ -1174,15 +1068,12 @@ fn run_result_text(
     trawl_api::zone::present_cell(&column.ty, val, zone).unwrap_or_else(|| format_value(val))
 }
 
-/// One run result cell: `text` cut and padded to `width` display cells, then
-/// the two-cell gap before the next column.
 fn run_result_cell(text: &str, width: usize) -> String {
     let mut cell = pad_cells(text, width);
     cell.push_str("  ");
     cell
 }
 
-/// Format a `Value` for display in the run results table.
 fn format_value(val: &trawl_api::value::Value) -> String {
     match val {
         trawl_api::value::Value::Null => "NULL".to_owned(),
@@ -1268,8 +1159,6 @@ mod tests {
         );
     }
 
-    /// One UTC day, but midnight at `+05:30` falls inside it: the dates as
-    /// displayed differ, so the end keeps its date.
     #[test]
     fn run_window_crossing_midnight_in_the_display_zone_keeps_both_dates() {
         assert_eq!(
@@ -1282,8 +1171,6 @@ mod tests {
         );
     }
 
-    /// A window inside one displayed day drops the end's date and keeps
-    /// both offsets.
     #[test]
     fn run_window_on_one_displayed_day_drops_the_end_date() {
         assert_eq!(
@@ -1296,8 +1183,6 @@ mod tests {
         );
     }
 
-    /// An offset-bearing bound is read as the instant it names and shown in
-    /// the display zone, so two runs are always read on the same clock.
     #[test]
     fn run_window_shows_an_offset_bound_in_the_display_zone() {
         assert_eq!(
@@ -1326,8 +1211,6 @@ mod tests {
         );
     }
 
-    /// A bound that is not a wire timestamp shows as sent, sanitized, and the
-    /// other bound keeps its date: no guessed instant, no shared day.
     #[test]
     fn run_window_passes_through_an_unparseable_bound() {
         assert_eq!(
@@ -1338,8 +1221,6 @@ mod tests {
             format_run_window("2026-03-14T02:00:00Z", "", zone("UTC")),
             "[2026-03-14 02:00:00 +00:00 .. )"
         );
-        // Text that only looks like a reading on the same day keeps its
-        // date beside a converted bound.
         assert_eq!(
             format_run_window("2026-03-14T02:00:00Z", "2026-03-14 later", zone("UTC")),
             "[2026-03-14 02:00:00 +00:00 .. 2026-03-14 later)"
@@ -1358,12 +1239,9 @@ mod tests {
     /// `TZ` the parent chose.
     const BERLIN_CHILD: &str = "TRAWL_PANELS_BERLIN_CHILD";
 
-    /// Under `TZ=Europe/Berlin` with the display zone `local`, a window over
-    /// the fall-back night keeps each bound's own offset, and since both
-    /// read 2026-10-25 the end drops only its date. The machine zone is per
-    /// process, so this test binary re-runs itself with the ignored
-    /// [`tui_instants_dst_child_under_berlin`] selected and `TZ` set. The
-    /// parent fails if the child fails or never ran.
+    /// The machine zone is per process, so this test binary re-runs itself
+    /// with the ignored [`tui_instants_dst_child_under_berlin`] selected and
+    /// `TZ` set. The parent fails if the child fails or never ran.
     #[test]
     fn tui_instants_keep_their_dst_offsets() {
         const CHILD: &str = "tui::ui::panels::tests::tui_instants_dst_child_under_berlin";
@@ -1401,8 +1279,6 @@ mod tests {
         );
     }
 
-    /// A schedule on a one-hour interval, with the ADR-0018 window fields
-    /// under the test's control.
     fn schedule(
         window: Option<&str>,
         lag: Option<(&str, u64)>,
@@ -1441,7 +1317,6 @@ mod tests {
         );
     }
 
-    /// A zero lag is the default in force, not a value worth a line.
     #[test]
     fn schedule_window_omits_a_zero_lag() {
         let sched = schedule(Some("2h"), Some(("0s", 0)), None);
@@ -1451,7 +1326,6 @@ mod tests {
         );
     }
 
-    /// A fixed window keeps no watermark, so there is nothing to print.
     #[test]
     fn schedule_window_omits_an_absent_watermark() {
         let sched = schedule(Some("2h"), Some(("5m", 300)), None);
@@ -1507,8 +1381,6 @@ mod saved_name_tests {
     use ratatui::{Terminal, backend::TestBackend};
     use unicode_width::UnicodeWidthStr as _;
 
-    /// A saved name is sanitized before it is measured, so U+FFFD counts as
-    /// the cell it takes on the fast path and on the clipping path.
     #[test]
     fn saved_name_sanitizes_before_fit() {
         assert_eq!(fit_cells("nm\u{202e}x", 10), "nm\u{fffd}x");
@@ -1593,9 +1465,6 @@ mod unicode_tests {
     use crate::tui::state::{CommonField, SavedDetailState};
     use crate::tui::tests::test_app;
 
-    /// Sender-controlled names a cut must not split: accented, CJK, a
-    /// combining mark, an emoji with its variation selector, and a bidi
-    /// override with a control character.
     const FIXTURES: &[&str] = &[
         "résumé_ñ",
         "日本語フィールド",
@@ -1604,7 +1473,6 @@ mod unicode_tests {
         "a\u{202E}b\u{7}c_bidi",
     ];
 
-    /// Widths from nothing to past every fixture's natural width.
     const WIDTHS: std::ops::RangeInclusive<u16> = 0..=48;
 
     fn text_of(line: &Line<'_>) -> String {
@@ -1665,9 +1533,6 @@ mod unicode_tests {
         schema
     }
 
-    /// Every schema tree row keeps its name inside the cells left after the
-    /// row's fixed parts, and a service field's name column is exactly that
-    /// wide so the type column lines up.
     #[test]
     fn unicode_panels_survive_resize_schema_tree() {
         let schema = schema();
@@ -1709,7 +1574,6 @@ mod unicode_tests {
         }
     }
 
-    /// The fallback type label is cut by display cells, not bytes.
     #[test]
     fn unicode_panels_survive_resize_type_label() {
         assert_eq!(abbreviate_type("DÉCIMAL(18,3)"), format!("DÉCIM{MARKER}"));
@@ -1744,8 +1608,6 @@ mod unicode_tests {
             .collect()
     }
 
-    /// A history row's query keeps inside what the time, the gap and the
-    /// trailing room leave, and the row inside the pane once those fit.
     #[test]
     fn unicode_panels_survive_resize_history() {
         let queries = history_queries();
@@ -1825,8 +1687,6 @@ mod unicode_tests {
         app
     }
 
-    /// Saved-run headers and cells are each exactly their column's width
-    /// plus the gap, and no column passes the cap.
     #[test]
     fn unicode_panels_survive_resize_saved_run() {
         let rows = FIXTURES
@@ -1873,9 +1733,6 @@ mod unicode_tests {
         }
     }
 
-    /// Columns holding CJK, accented and combining text, with a header and a
-    /// value past the 30-cell cap: on every rendered row each column starts
-    /// on the same cell.
     #[test]
     fn unicode_result_columns_align() {
         let rows = vec![
@@ -1981,10 +1838,6 @@ mod unicode_tests {
 
     /// The schema tree draws through a ratatui `List`, which advances each
     /// span by its unicode-width, not by the cells its clusters draw in.
-    /// With `ｶﾞ`, `لا`, a combining accent and an emoji selector in a field
-    /// name, the type column still starts on the `host` row's cell, and
-    /// each name's glyphs end before it, at a width where every name fits
-    /// and at one where they are cut, on every row selected and not.
     #[test]
     fn list_rows_keep_column_alignment() {
         const NAMES: [&str; 5] = ["host", "ｶﾞｶﾞ", "لالا", "e\u{301}e\u{301}", "❤\u{FE0F}x"];
@@ -2057,8 +1910,7 @@ mod unicode_tests {
         }
     }
 
-    /// Row `y`'s cell symbols, one per cell. A cell hidden behind a
-    /// two-cell glyph reads as a space.
+    /// A cell hidden behind a two-cell glyph reads as a space.
     fn row_symbols(terminal: &Terminal<TestBackend>, y: u16) -> Vec<String> {
         let buffer = terminal.backend().buffer();
         (0..buffer.area.width)
@@ -2066,7 +1918,6 @@ mod unicode_tests {
             .collect()
     }
 
-    /// `symbols`, then spaces to `width` cells.
     fn padded_row(symbols: &[&str], width: usize) -> Vec<String> {
         let mut row: Vec<String> = symbols.iter().map(|s| (*s).to_owned()).collect();
         row.resize(width, " ".to_owned());
@@ -2074,10 +1925,7 @@ mod unicode_tests {
     }
 
     /// The same five names as `list_rows_keep_column_alignment`, in one
-    /// service, so every one is promoted to a common field. A common
-    /// field's row is ragged: its type follows the name's cells, one
-    /// space after them, on every row selected and not, where the names
-    /// fit and where they are cut.
+    /// service, so every one is promoted to a common field.
     #[test]
     fn common_field_rows_keep_the_type_after_the_name() {
         const NAMES: [&str; 5] = ["host", "ｶﾞｶﾞ", "لالا", "e\u{301}e\u{301}", "❤\u{FE0F}x"];
@@ -2137,7 +1985,6 @@ mod unicode_tests {
         }
     }
 
-    /// A service row's field count follows the name's cells.
     #[test]
     fn service_row_count_follows_the_name() {
         let mut schema = SchemaBrowser::new(vec![trawl_api::ServiceSchema {
@@ -2237,9 +2084,6 @@ mod unicode_tests {
         }
     }
 
-    /// A saved row's schedule badge and run icon follow the name's cells,
-    /// and the icon follows the badge's, where the name fits and where it
-    /// is cut, on every row selected and not.
     #[test]
     fn saved_rows_keep_suffixes_after_sender_text() {
         let mut app = test_app();
@@ -2285,8 +2129,6 @@ mod unicode_tests {
         }
     }
 
-    /// A run row's window kind is sender text, and the marker after it
-    /// follows its cells.
     #[test]
     fn run_rows_keep_the_marker_after_the_window_kind() {
         let mut app = test_app();

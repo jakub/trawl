@@ -42,8 +42,6 @@ for unit in "${units[@]}"; do
   fi
 done
 
-# 1. Fresh install: nothing enabled, nothing started, and the operator is told
-#    what to do next.
 log="$(mktemp)"
 sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
   "${runtime_deb[0]}" "${server_deb[0]}" 2>&1 | tee "$log"
@@ -60,8 +58,7 @@ if grep -Fq "$enable_hint" "$log"; then
 fi
 expect_state enabled inactive "upgrade over enabled units"
 
-# 3. Boot both services against disposable local databases and inspect actual
-#    stored files. CI checks out only scripts/release, so use packaged binaries.
+# CI checks out only scripts/release, so use packaged binaries.
 umask 077
 scratch="$(mktemp -d)"
 probe="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/host-debian-probe.py"
@@ -381,10 +378,8 @@ assert_file_blocks_web "$parquet"
 probe_as trawl can-read "$parquet"
 wait_until "browser sign-in and stored-event query" 60 --error-file "$scratch/signin-query.stderr" signin_query_ready
 
-# 3b. A real capture through the API writes the results root (ADR-0057). The
-#     root is trawld's own, owner-only like the data root, and the captured
-#     file is owner-only inside it. The query matches the event ingested above,
-#     so the capture has columns and its file always exists.
+# The query matches the event ingested above, so the capture has columns and
+# its file always exists.
 results_root=/var/lib/trawl/data.results
 capture_query='service="host-ci" last=24h | stats count()'
 
@@ -437,9 +432,6 @@ assert len(page["positions"]) == len(page["page"]["columns"]), "positions do not
 echo "captured page $result_id decodes ok"
 
 # trawld --doctor runs as the service user: as root it samples no access.
-# Its server.data.root row judges every storage root, so an owner-only results
-# root leaves it complete with no reason, and a results root opened to group
-# and other makes it complete with will_tighten, naming the root.
 doctor_row() { # doctor_row <expected reason> [expected detail text]
   (cd / && sudo -u trawl bash -c \
     'set -a; . /etc/default/trawld; set +a; exec /usr/bin/trawld --doctor --config /etc/trawl/trawld.toml --format json' \
@@ -525,7 +517,6 @@ wait_until "trawl-web health after upgrade" 60 web_healthy
 wait_until "browser sign-in and query after upgrade" 60 --error-file "$scratch/signin-query.stderr" signin_query_ready
 echo "host owner-only storage assertions passed"
 
-# 5. Purge removes the units and every enable or mask link.
 sudo DEBIAN_FRONTEND=noninteractive apt-get purge -y trawl-server
 leftovers="$(find /etc/systemd/system -name 'trawld.service' -o -name 'trawl-web.service')"
 [[ -z "$leftovers" ]] || fail "purge left systemd links behind: $leftovers"

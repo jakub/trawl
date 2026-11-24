@@ -4,35 +4,24 @@
 
 //! Property test: `eval_expr` returns. That is the whole assertion.
 //!
-//! The streaming evaluator runs inside an SSE subscription and inside the
-//! `rust_stages` batch tail, over values a client chose. A panic there is
-//! not a wrong answer — it unwinds a live subscription (or a query task)
-//! on one adversarial event, which is a different failure class from the
-//! divergences `scalar_parity.rs` hunts. So this test says nothing about
-//! which value comes back: the value contract belongs to the parity
-//! harness, and duplicating it here would make two owners of one rule.
+//! A panic in the streaming evaluator unwinds a live subscription on one
+//! adversarial event. This test says nothing about which value comes back:
+//! the value contract belongs to `scalar_parity.rs`.
 //!
 //! It matters that this runs in the debug profile, where Rust's overflow
 //! checks are live: unchecked integer arithmetic would make
 //! `9223372036854775807 + 1` a debug panic and a release wrap, and this
 //! is the only build that observes the difference.
 //!
-//! Two entry points, because they reach different values. The parsed-DSL
-//! path is what a user's query really is; the AST path is the only way to
-//! feed the evaluator values the DSL grammar (and JSON) cannot spell —
-//! `inf`, `NaN`, `i64::MIN` as a literal rather than a subtraction.
+//! The AST path is the only way to feed the evaluator values the DSL
+//! grammar (and JSON) cannot spell — `inf`, `NaN`, `i64::MIN` as a literal
+//! rather than a subtraction.
 
 use serde_json::{Map, Value};
 use trawl_core::ast::{BinaryOp, Expr, FloatLiteral, LiteralValue, PipeStage, Spanned, UnaryOp};
 use trawl_core::eval::{EvalValue, PatternTable, eval_expr};
 use trawl_core::parser;
 use trawl_core::pattern::Preparer;
-
-// ── Deterministic RNG ────────────────────────────────────────────────
-//
-// splitmix64, the same generator `tests/scalar_parity.rs` uses, under its
-// own seed. Deterministic on purpose: a panic found here has to be
-// reproducible from the seed alone.
 
 struct Rng {
     state: u64,
@@ -61,14 +50,8 @@ impl Rng {
     }
 }
 
-// ── The hostile corpus ───────────────────────────────────────────────
-
-/// Integers at the edges where checked arithmetic, negation and `abs`
-/// have no answer.
 const INTS: &[i64] = &[i64::MIN, i64::MIN + 1, -1, 0, 1, i64::MAX - 1, i64::MAX];
 
-/// Doubles spanning the IEEE specials, both zeros, and the magnitudes
-/// where a cast to `i64` would be undefined.
 const FLOATS: &[f64] = &[
     f64::NEG_INFINITY,
     -f64::MAX,
@@ -82,10 +65,6 @@ const FLOATS: &[f64] = &[
     f64::MIN_POSITIVE,
 ];
 
-/// Texts a coercion might reach for: empty, numeric-looking, regex
-/// metacharacters, and the hostile timestamp corpus (malformed offsets,
-/// impossible components, non-ASCII digits) — every one of them a string
-/// some scalar will try to read as a number, a pattern or an instant.
 const STRINGS: &[&str] = &[
     "",
     " ",
@@ -113,7 +92,6 @@ const STRINGS: &[&str] = &[
     "٢٠٢٤-٠١-٠١",
     "24:00:00",
     "-9999999999-01-01",
-    // The timestamp keywords, which are instants rather than dates.
     "infinity",
     "-infinity",
     "inf",
@@ -122,18 +100,15 @@ const STRINGS: &[&str] = &[
     "epoch",
     "-epoch",
     "epoch ",
-    // chrono's calendar bounds, either side of them.
     "262143-12-31 23:59:59",
     "262144-01-01 00:00:00",
     "-262143-01-01 00:00:00",
     "9999-12-31 23:59:59.999999999",
-    // Offsets: complete, malformed, out of range.
     "2026-01-15 10:20:30+00:00",
     "2026-01-15 10:20:30+99:99",
     "2026-01-15 10:20:30+0530",
     "2026-01-15 10:20:30 UTC",
     "2026-01-15 10:20:30 Asia/Kolkata",
-    // The BOOLEAN cast vocabulary, and texts just outside it.
     "true",
     "TRUE",
     "t",
@@ -143,20 +118,12 @@ const STRINGS: &[&str] = &[
     " true ",
 ];
 
-/// A string long enough that a length- or index-driven scalar cannot be
-/// exercised by the short corpus alone. Kept at 4 KiB rather than
-/// megabytes: composition can nest it several deep in one expression,
-/// and the cost of a genuinely huge one buys no new code path.
 fn huge_string() -> String {
     "übung".repeat(1024)
 }
 
-/// The bounds-abusive integers a scalar's second argument can take —
-/// `round`'s precision, `substr`'s start and length, `split`'s index.
 const ABUSIVE_BOUNDS: &[i64] = &[i64::MIN, -1_000_000, -1, 0, 1, 1_000_000, i64::MAX];
 
-/// Documents the json door is fed — ones that parse (so the renderer
-/// runs) and ones that do not (so its error path does).
 const JSON_DOCUMENTS: &[&str] = &[
     r#"{"a":1}"#,
     r#"{"a":1e300}"#,
@@ -169,18 +136,12 @@ const JSON_DOCUMENTS: &[&str] = &[
     "[1,2]",
     "0",
     r#""bare string""#,
-    // …and the shapes that do not parse at all.
     "{",
     "[a-",
     "",
     "not-json",
 ];
 
-/// Paths for the same door: each form the shared check accepts
-/// (ADR-0017, amendment of 2026-11-13), including ones that reach
-/// nothing. A refused path never reaches eval through a query;
-/// [`a_refused_json_path_reaching_eval_selects_nothing`] feeds those
-/// directly.
 const JSON_PATHS: &[&str] = &[
     "$",
     "",
@@ -202,8 +163,6 @@ const JSON_PATHS: &[&str] = &[
     "not-a-path",
 ];
 
-/// Scalars whose arity is 1 and whose argument is the composed
-/// subexpression.
 const UNARY_SCALARS: &[&str] = &[
     "abs",
     "ceil",
@@ -223,8 +182,6 @@ const UNARY_SCALARS: &[&str] = &[
     "sev",
 ];
 
-/// The event the expressions read: every value shape a wire event can
-/// carry, including the ones `EvalValue::from` maps onto `Null`.
 fn hostile_event() -> Map<String, Value> {
     let mut event = Map::new();
     event.insert("service".into(), Value::String("nginx".into()));
@@ -260,9 +217,6 @@ fn hostile_event() -> Map<String, Value> {
     event
 }
 
-/// The field names the generator may reference — the event's own keys
-/// plus one it does not carry (an absent field is NULL, and NULL
-/// propagation is a code path).
 const FIELDS: &[&str] = &[
     "service",
     "empty",
@@ -281,8 +235,6 @@ const FIELDS: &[&str] = &[
     "far_ts",
     "absent_field",
 ];
-
-// ── AST composition ──────────────────────────────────────────────────
 
 fn spanned(node: Expr) -> Spanned<Expr> {
     Spanned::new(node, 0..0)
@@ -316,8 +268,6 @@ fn leaf(rng: &mut Rng) -> Spanned<Expr> {
         0 => literal(LiteralValue::Int(*rng.pick(INTS))),
         1 => {
             let value = *rng.pick(FLOATS);
-            // The source token beside the value, as the parser hands one
-            // over — `FloatLiteral` carries both.
             literal(LiteralValue::Float(FloatLiteral::new(
                 value,
                 format!("{value:?}"),
@@ -332,11 +282,9 @@ fn leaf(rng: &mut Rng) -> Spanned<Expr> {
     }
 }
 
-/// One binary operator over composed operands, `depth` deep. A pattern
-/// operator's right side is literal text or the stage never compiles
-/// (`literal_operand`), so a composed one would only ever be skipped.
-/// Drawing it from the same texts `leaf` draws from lets the evaluator
-/// see the operator at all.
+/// A pattern operator's right side is literal text or the stage never
+/// compiles (`literal_operand`), so a composed one would only ever be
+/// skipped.
 fn binary(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     let lhs = compose(rng, depth - 1);
     let op = *rng.pick(BINARY_OPS);
@@ -356,7 +304,6 @@ fn binary(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     })
 }
 
-/// One randomly composed expression, at most `depth` operators deep.
 fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
     if depth == 0 {
         return leaf(rng);
@@ -380,8 +327,6 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
             })
         }
         4 => call(rng.pick(UNARY_SCALARS), vec![compose(rng, depth - 1)]),
-        // Bounds-abusive second (and third) arguments: the window
-        // arithmetic in `substr`, `round`'s precision, `split`'s index.
         5 => call(
             "round",
             vec![
@@ -411,8 +356,6 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
                 "$.a.b",
                 "not-a-unit",
             ]);
-            // `strftime` takes the value first, the rest take it second
-            // — both orders reach a different guard.
             let args = if matches!(name, "strftime" | "strptime") {
                 vec![
                     compose(rng, depth - 1),
@@ -426,16 +369,11 @@ fn compose(rng: &mut Rng, depth: usize) -> Spanned<Expr> {
             };
             call(name, args)
         }
-        // The json door: the most parser-shaped code here — it decodes a
-        // document, walks a pointer and renders what it finds, and the
-        // renderer scans text tracking string state. The document and
-        // the path are drawn together, because pairing them by lottery
-        // (a path against a format string, say) never reaches the
-        // renderer at all.
+        // The document and the path are drawn together, because pairing them
+        // by lottery never reaches the json renderer at all.
         9 => {
             let name = *rng.pick(&["json_extract", "json", "json_extract_string", "json_valid"]);
             let document = if rng.range(4) == 0 {
-                // Still a hostile arbitrary expression some of the time.
                 compose(rng, depth - 1)
             } else {
                 literal(LiteralValue::String(
@@ -471,18 +409,10 @@ fn call(name: &str, args: Vec<Spanned<Expr>>) -> Spanned<Expr> {
     })
 }
 
-/// Prepare `expression`'s patterns as a compiled stage would, then
-/// evaluate it, and say whether it did. A computed or unbuildable pattern
-/// is refused at preparation, which is an outcome like any other: the
-/// stage never compiles, so there is nothing to evaluate. The callers
-/// count only the `true` answers, so a run that skips every tree cannot
-/// pass as one that evaluated them.
 fn eval_where_prepared(expression: &Spanned<Expr>, event: &trawl_core::row::Row) -> bool {
     eval_prepared(expression, event).is_some()
 }
 
-/// [`eval_where_prepared`]'s answer: `None` when the patterns do not
-/// prepare, else what `eval_expr` returned.
 fn eval_prepared(
     expression: &Spanned<Expr>,
     event: &trawl_core::row::Row,
@@ -496,10 +426,6 @@ fn eval_prepared(
     ))
 }
 
-/// A path the shared check refuses never reaches eval through a query.
-/// One that reaches it anyway (fuzz, an internal caller) selects nothing:
-/// never the root, never a parsed prefix, never a bare key read from the
-/// failed rooted text.
 #[test]
 fn a_refused_json_path_reaching_eval_selects_nothing() {
     let event = trawl_core::row::from_json(&hostile_event());
@@ -540,8 +466,6 @@ fn eval_returns_for_every_composed_expression() {
     let mut evaluated = 0_u32;
     for _ in 0..4_000 {
         let expression = compose(&mut rng, 4);
-        // The only assertion: control comes back. Which value it carries
-        // is `scalar_parity.rs`'s question, not this test's.
         evaluated += u32::from(eval_where_prepared(&expression, &event));
     }
     // A tree whose patterns do not prepare is skipped, not evaluated. This
@@ -554,10 +478,6 @@ fn eval_returns_for_every_composed_expression() {
     );
 }
 
-// ── The parsed-DSL path ──────────────────────────────────────────────
-
-/// Literal tokens the DSL grammar accepts, chosen to reach the same
-/// edges the AST corpus does through real source text.
 const DSL_ATOMS: &[&str] = &[
     "9223372036854775807",
     "-9223372036854775807",
@@ -598,7 +518,6 @@ const DSL_OPS: &[&str] = &[
     "+", "-", "*", "/", "%", "==", "!=", ">", ">=", "<", "<=", "and", "or", "matches", "like",
 ];
 
-/// A DSL expression built from the atoms above, at most `depth` deep.
 fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
     if depth == 0 {
         return (*rng.pick(DSL_ATOMS)).to_string();
@@ -618,9 +537,6 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
             rng.pick(UNARY_SCALARS),
             compose_dsl(rng, depth - 1)
         ),
-        // The two-argument date scalars, whose unit/format argument is a
-        // closed vocabulary the generator draws from — including the
-        // units and formats that reject.
         6 => {
             let inner = compose_dsl(rng, depth - 1);
             match rng.range(4) {
@@ -648,10 +564,6 @@ fn compose_dsl(rng: &mut Rng, depth: usize) -> String {
             compose_dsl(rng, depth - 1),
             rng.pick(ABUSIVE_BOUNDS)
         ),
-        // The json door through the parser, document and path drawn
-        // together so the renderer is reached rather than only its
-        // error path. The document is escaped as the DSL spells a
-        // string literal.
         7 => format!(
             r#"{}("{}", "{}")"#,
             rng.pick(&["json_extract", "json_extract_string", "json"]),
@@ -671,9 +583,6 @@ fn eval_returns_for_every_parsed_dsl_expression() {
     let mut evaluated = 0_u32;
     for _ in 0..4_000 {
         let dsl = format!("* | let x = {}", compose_dsl(&mut rng, 3));
-        // A rejected generated string is a parse outcome, not a panic —
-        // this generator is deliberately loose about types and arities,
-        // which the parser and the pipeline are entitled to refuse.
         let Ok(query) = parser::parse(&dsl) else {
             continue;
         };

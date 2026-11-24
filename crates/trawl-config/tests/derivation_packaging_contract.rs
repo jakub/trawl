@@ -4,20 +4,9 @@
 
 //! The derivation-source packaging contract (ADR-0013).
 //!
-//! `severity_from` and `time_from` decide what `_severity` and `_time`
-//! read, and the answer must not depend on how trawl was installed. Five
-//! places state that default — the code, the annotated `trawld.reference.toml`, the
-//! Debian example, the Helm chart and the configuration reference — and
-//! this test makes them one fact instead of five. Precedent:
-//! `crates/trawl-web/tests/log_filter_contract.rs`.
-//!
 //! Reading convention: the packaged TOMLs and the docs page state the
 //! default first and any typed-form example after it, so "the first
-//! declaration in the file" is well-defined. The chart is live YAML, and
-//! is read through `helm template` when helm is on PATH — the real
-//! rendering, list plumbing included — falling back to `values.yaml`
-//! only when the binary is missing. A chart that fails to render is a
-//! failure, never a skip.
+//! declaration in the file" is well-defined.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -40,13 +29,8 @@ fn read(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The double-quoted strings in a TOML array literal, in order.
-///
 /// Deliberately not a TOML parse: the packaged files state their defaults
-/// as commented-out lines, which is the whole idiom of those files (every
-/// knob is shown at its default, commented out). The default lines hold
-/// bare strings only — the typed `{ field = … }` form appears only in the
-/// examples this function is never pointed at.
+/// as commented-out lines.
 fn quoted_strings(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -59,7 +43,6 @@ fn quoted_strings(line: &str) -> Vec<String> {
     out
 }
 
-/// The first declaration of `key` in a TOML file, commented or not.
 fn toml_default(source: &str, key: &str, origin: &str) -> Vec<String> {
     let marker = format!("{key} = [");
     let line = source
@@ -70,11 +53,6 @@ fn toml_default(source: &str, key: &str, origin: &str) -> Vec<String> {
     quoted_strings(line)
 }
 
-/// The first scalar declaration of `key` in a TOML file, commented or not.
-///
-/// Same idiom as `toml_default`: the packaged files show every knob at its
-/// default, commented out. Prose comments never begin with `key = `, so the
-/// first line that does is the declaration.
 fn toml_scalar(source: &str, key: &str, origin: &str) -> String {
     let marker = format!("{key} = ");
     source
@@ -86,8 +64,6 @@ fn toml_scalar(source: &str, key: &str, origin: &str) -> String {
         .to_owned()
 }
 
-/// The value of a scalar nested under `parent:` → `key:` in a simple YAML
-/// file, without a trailing comment.
 fn yaml_scalar(values: &str, parent: &str, key: &str) -> String {
     let parent_marker = format!("{parent}:");
     let key_marker = format!("{key}:");
@@ -104,9 +80,6 @@ fn yaml_scalar(values: &str, parent: &str, key: &str) -> String {
         .to_owned()
 }
 
-/// Every declaration of `key` in a TOML file — the default and each
-/// example — with the leading comment marker stripped, so an example can
-/// be handed back to the real deserializer.
 fn toml_declarations<'a>(source: &'a str, key: &str) -> Vec<&'a str> {
     let marker = format!("{key} = [");
     source
@@ -116,7 +89,6 @@ fn toml_declarations<'a>(source: &'a str, key: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The items of a simple YAML list nested under `parent:` → `key:`.
 fn yaml_list(values: &str, parent: &str, key: &str) -> Vec<String> {
     let parent_marker = format!("{parent}:");
     let key_marker = format!("{key}:");
@@ -138,9 +110,6 @@ fn yaml_list(values: &str, parent: &str, key: &str) -> Vec<String> {
     out
 }
 
-/// The chart's `templates/configmap.yaml` as rendered by `helm template`, or
-/// `None` when the binary is missing. A chart that fails to render is a
-/// failure, never a skip.
 fn rendered_configmap() -> Option<String> {
     let chart = repo_root().join("chart/trawl");
     let rendered = Command::new("helm")
@@ -172,7 +141,6 @@ fn rendered_configmap() -> Option<String> {
     }
 }
 
-/// What the chart actually installs, rendered when possible.
 fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
     match rendered_configmap() {
         Some(manifest) => toml_default(&manifest, key, "the rendered chart ConfigMap"),
@@ -180,7 +148,6 @@ fn chart_defaults(key: &str, values_key: &str) -> Vec<String> {
     }
 }
 
-/// The scalar counterpart of `chart_defaults`, under `config.server`.
 fn chart_server_scalar(key: &str, values_key: &str) -> String {
     match rendered_configmap() {
         Some(manifest) => toml_scalar(&manifest, key, "the rendered chart ConfigMap"),
@@ -188,17 +155,12 @@ fn chart_server_scalar(key: &str, values_key: &str) -> String {
     }
 }
 
-/// The bare-string spellings of a configured list, for comparison with
-/// the packaged defaults.
 fn spellings(specs: &[DerivationSourceSpec]) -> Vec<String> {
     specs.iter().map(|s| s.field().to_owned()).collect()
 }
 
 #[test]
 fn the_code_default_is_what_ingest_config_deserializes_to() {
-    // The `#[serde(default = …)]` plumbing and the published constants
-    // are two statements of one list; an omitted `[ingest]` block must
-    // land on exactly the constants the packaging quotes.
     let config: IngestConfig = toml::from_str("").expect("an empty ingest block must load");
     assert_eq!(spellings(&config.severity_from), DEFAULT_SEVERITY_FROM);
     assert_eq!(spellings(&config.time_from), DEFAULT_TIME_FROM);
@@ -278,9 +240,6 @@ fn every_packaging_artifact_states_the_same_derivation_defaults() {
     }
 }
 
-/// `[server] max_concurrent_requests` is one number stated in the code, the
-/// annotated reference, the Debian example and the chart (ADR-0054). A drift
-/// between them ships an install whose documented limit is not its limit.
 #[test]
 fn every_packaging_artifact_states_the_same_request_limit_default() {
     let expected = DEFAULT_MAX_CONCURRENT_REQUESTS.to_string();
@@ -319,9 +278,6 @@ fn every_packaging_artifact_states_the_same_request_limit_default() {
     }
 }
 
-/// The typed-form examples are the syslog-over-HTTP forwarder's whole
-/// documentation, so a stale or mistyped one is worse than none: it
-/// would be copied into a `trawld.toml` and refuse to boot.
 #[test]
 fn every_documented_typed_example_actually_loads() {
     let sources = [

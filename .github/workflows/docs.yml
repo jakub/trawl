@@ -47,8 +47,6 @@ on:
 permissions:
   contents: read
 
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -124,7 +122,6 @@ jobs:
           # Development previews expire quickly; release evidence keeps the repository default.
           retention-days: ${{ inputs.release-tag == '' && 7 || 0 }}
 
-  # Syntax-checks the deployment guide's nginx recipe in a pinned nginx image.
   # Skipped for a release so that a Docker Hub outage cannot block its docs.
   nginx-recipe:
     if: ${{ !inputs.release-tag }}

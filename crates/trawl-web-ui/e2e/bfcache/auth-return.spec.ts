@@ -60,7 +60,6 @@ for (const departure of ['explicit logout', 'automatic 401'] as const) {
         const readsBefore = authServer.requests.filter(req => req.path === '/api/auth/me').length;
         await page.goBack({ waitUntil: 'commit' });
         if (departure === 'explicit logout') {
-          // These cases are the mandatory cached-heap regression proof.
           await expect.poll(() => lifecycle.some(event => event.kind === 'pageshow' && event.persisted && event.id === oldId)).toBe(true);
         }
         await expect.poll(() => authServer.pendingMe).toBe(1);
@@ -73,8 +72,6 @@ for (const departure of ['explicit logout', 'automatic 401'] as const) {
         // Either path must reach a fresh document and its real session gate.
         expect(authServer.requests.filter(req => req.path === '/api/auth/me').length).toBe(readsBefore + 1);
         expect(await page.evaluate(() => (window as unknown as { authDocumentId: string }).authDocumentId)).not.toBe(oldId);
-        // Fresh document, session gate still pending: no previous rows or
-        // identity can appear while the current cookie is being checked.
         await expect(page.locator('.runs-table, .nets-table')).toHaveCount(0);
         await expect(page.getByText('previous-identity', { exact: true })).toHaveCount(0);
         await expect(page.getByText('Checking your session…', { exact: true })).toBeVisible();

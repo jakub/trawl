@@ -2,13 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Direct Nets actions use native keyboard navigation and retain dialog focus.
 import { test, expect, resetScenario, SCHEDULE } from '../fixtures';
 import { SEL, COPY } from '../selectors';
 
 test('Nets actions are visible, tabbable and restore delete focus', async ({ page, request }) => {
-  // The windowed net under `schedule`: its row carries all three direct
-  // actions, Run now included, because it has a schedule to fire.
   await resetScenario(request, 'schedule');
   await page.goto('/jobs/nets');
   await expect(page.getByRole('columnheader', { name: 'Actions' })).toBeVisible();

@@ -1,9 +1,3 @@
-# Dev postgres backing the pg test suites (fleet-auth / fleet-admin /
-# trawl-server integration tests, pre-push hook, and coastwatch's fleet-auth
-# tests via the fleet-auth-dev container).
-#
-#   docker compose -f docker-compose.dev.yml up -d
-#
 # Durability is deliberately OFF (fsync etc.) and the data dirs are tmpfs:
 # these instances exist to make per-test CREATE DATABASE cheap. Never point
 # anything stateful at them.
@@ -32,7 +26,6 @@ services:
     tmpfs:
       - /var/lib/postgresql
 
-  # Dedicated cluster for the --no-default-features suite (see header).
   fleet-auth-dev-nd:
     image: postgres:18
     container_name: fleet-auth-dev-nd

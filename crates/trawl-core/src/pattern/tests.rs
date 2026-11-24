@@ -20,20 +20,11 @@ const TRY_FROM: &str = concat!("Regex", "::try_from");
 /// The crate's name in any spelling: a path, a `use`, or an alias.
 const AUTOMATA: &str = concat!("regex_", "automata");
 const PREPARER_NEW: &str = concat!("Preparer", "::new");
-/// A checking ledger, which `parse` opens.
 const PREPARER_CHECK: &str = concat!("Preparer", "::check");
-/// `parse::<…Regex…>`, counted by [`turbofish_regex_parses`].
 const PARSE_TURBOFISH: &str = concat!("parse", "::<…Regex…>");
-/// `<…Regex… as …>::from_str` or `::try_from`, counted by
-/// [`qualified_regex_conversions`].
 const QUALIFIED: &str = concat!("<…Reg", "ex… as …>::from_str or ::try_from");
-/// A `.parse()` in a `let` whose type names a `Regex`, counted by
-/// [`let_typed_regex_parses`].
 const LET_PARSE: &str = concat!("let …: …Reg", "ex… = ….parse()");
-/// A regex-automata builder method that compiles a program, counted by
-/// [`automata_builds`].
 const AUTOMATA_BUILD: &str = concat!("regex_", "automata build");
-/// regex-automata's cache pool module, which holds `Pool`.
 const POOL: &str = concat!("util::", "pool");
 
 const NEEDLES: [&str; 10] = [
@@ -49,11 +40,9 @@ const NEEDLES: [&str; 10] = [
     POOL,
 ];
 
-/// The regex-automata builder methods [`AUTOMATA_BUILD`] counts: the
-/// meta, Thompson, lazy-DFA, `PikeVM`, backtracker, one-pass and dense
-/// builders all compile through one of them. A bare `.build(` is too
-/// common a name to count; the builder it closes is named in a path the
-/// [`AUTOMATA`] needle counts, and clippy resolves the call itself.
+/// A bare `.build(` is too common a name to count; the builder it closes is
+/// named in a path the [`AUTOMATA`] needle counts, and clippy resolves the
+/// call itself.
 const AUTOMATA_BUILDERS: [&str; 5] = [
     concat!("build_from", "_hir("),
     concat!("build_many_from", "_hir("),
@@ -62,7 +51,6 @@ const AUTOMATA_BUILDERS: [&str; 5] = [
     concat!("new_from", "_nfa("),
 ];
 
-/// How many regex-automata builder calls `text` spells.
 fn automata_builds(text: &str) -> usize {
     AUTOMATA_BUILDERS
         .iter()
@@ -70,15 +58,6 @@ fn automata_builds(text: &str) -> usize {
         .sum()
 }
 
-/// Every place in the workspace that builds a regex, names regex-automata
-/// or opens a ledger, by file and spelling.
-///
-/// The clippy `disallowed-methods` rule bans the builders outside
-/// `pattern/mod.rs`, which holds the one build. It cannot see `FromStr`
-/// or `TryFrom`, and a `Preparer` is legal anywhere, so this list is what
-/// shows where ledgers begin: a ledger opened per event or per call
-/// builds again each time.
-///
 /// Three tests build outside the owner's build site on purpose, each
 /// under an `#[expect]` of its own. `pattern/tests.rs` builds a twin with
 /// the lazy DFA off, to show the owner's build kept it on.
@@ -149,7 +128,6 @@ const INVENTORY: &[(&str, &str, usize)] = &[
     ),
 ];
 
-/// The workspace root: two levels above this crate's manifest.
 fn workspace_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -157,8 +135,6 @@ fn workspace_root() -> &'static Path {
         .expect("trawl-core sits two levels under the workspace root")
 }
 
-/// Every `.rs` file under `dir`, skipping build output, vendored
-/// JavaScript and dot directories (`.git`, other worktrees, scratch).
 fn rust_sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let mut entries: Vec<_> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
@@ -178,7 +154,6 @@ fn rust_sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     }
 }
 
-/// How many `parse::<T>` turbofishes in `text` name a `Regex` in `T`.
 fn turbofish_regex_parses(text: &str) -> usize {
     text.match_indices(concat!("parse", "::<"))
         .filter(|(at, opener)| {
@@ -188,9 +163,6 @@ fn turbofish_regex_parses(text: &str) -> usize {
         .count()
 }
 
-/// How many fully qualified `from_str` and `try_from` calls in `text`
-/// name a `Regex` as their self type: `<regex::Regex as FromStr>::from_str`,
-/// `<regex::bytes::Regex as TryFrom<String>>::try_from`, or `<Regex>::…`.
 fn qualified_regex_conversions(text: &str) -> usize {
     [">::from_str", ">::try_from"]
         .into_iter()
@@ -199,9 +171,6 @@ fn qualified_regex_conversions(text: &str) -> usize {
         .count()
 }
 
-/// The self type of the qualified path that the last `>` of `head` closes:
-/// `T` in `<T as Trait>` or in `<T>`. `None` when no `<` opens it inside
-/// the statement.
 fn qualified_self_type(head: &str) -> Option<&str> {
     let bytes = head.as_bytes();
     let mut depth = 0usize;
@@ -224,10 +193,6 @@ fn qualified_self_type(head: &str) -> Option<&str> {
     None
 }
 
-/// How many `.parse()` calls in `text` sit in a `let` statement whose type
-/// annotation names a `Regex`, such as `let re: regex::Regex = s.parse()?;`
-/// or `let re: Result<Regex, _> = s.parse();`. The statement may span
-/// lines.
 fn let_typed_regex_parses(text: &str) -> usize {
     text.match_indices("let ")
         .filter(|&(at, _)| {
@@ -247,9 +212,6 @@ fn let_typed_regex_parses(text: &str) -> usize {
         .sum()
 }
 
-/// `rest` up to the `;` that ends its statement, or up to the bracket that
-/// closes the block around it. Nested brackets, string literals and
-/// character literals do not end it.
 fn statement(rest: &str) -> &str {
     let mut depth = 0usize;
     let mut in_string = false;
@@ -266,8 +228,6 @@ fn statement(rest: &str) -> &str {
             continue;
         }
         match c {
-            // A character literal, such as `')'`, `';'` or `'"'`, neither
-            // opens a bracket nor a string nor ends the statement.
             '\'' => {
                 if let Some(len) = char_literal_len(&rest[i..]) {
                     while chars.next_if(|&(j, _)| j < i + len).is_some() {}
@@ -286,17 +246,11 @@ fn statement(rest: &str) -> &str {
     rest
 }
 
-/// The byte length of the character literal that opens `text`, which
-/// starts at a `'`: `'x'`, or an escape such as `'\''`, `'\\'`, `'\x3b'`
-/// or `'\u{29}'`. `None` for a lifetime such as `'a` or `'static`, which
-/// has no closing quote after one character.
 fn char_literal_len(text: &str) -> Option<usize> {
     let mut chars = text.char_indices().skip(1);
     let (_, first) = chars.next()?;
     let (end, close) = match first {
         '\'' => return None,
-        // The escaped character, then any hex digits and braces of a
-        // `\x` or `\u{…}` escape, then the closing quote.
         '\\' => {
             chars.next()?;
             chars.find(|&(_, c)| !(c.is_ascii_hexdigit() || c == '{' || c == '}'))?
@@ -306,8 +260,6 @@ fn char_literal_len(text: &str) -> Option<usize> {
     (close == '\'').then_some(end + 1)
 }
 
-/// Where the `=` that assigns a `let` statement's value sits: not part of
-/// `==`, `=>`, `<=`, `>=` or `!=`.
 fn assignment(statement: &str) -> Option<usize> {
     let bytes = statement.as_bytes();
     (0..bytes.len()).find(|&i| {
@@ -320,8 +272,6 @@ fn assignment(statement: &str) -> Option<usize> {
     })
 }
 
-/// Where the `:` that opens a binding's type annotation sits: a colon
-/// that is not half of a `::` path separator.
 fn lone_colon(binding: &str) -> Option<usize> {
     let bytes = binding.as_bytes();
     (0..bytes.len()).find(|&i| {
@@ -331,19 +281,6 @@ fn lone_colon(binding: &str) -> Option<usize> {
     })
 }
 
-/// The construction sites in one source file, by spelling. Comment lines
-/// are skipped. A trait-based build names no builder, so the scan counts
-/// the spellings that reach `FromStr` or `TryFrom` for a `Regex` too: the
-/// contiguous `Regex::from_str` and `Regex::try_from`, a `parse::<…>`
-/// turbofish, a fully qualified call, and a `.parse()` whose `let` names
-/// the type. Clippy's `disallowed-methods` cannot see any of these.
-///
-/// regex-automata has no trait-based build, and clippy bans its builders,
-/// its pooled searches and its `Pool` by resolved path. The scan lists
-/// every file that names the crate, which a program, a pool or a search of
-/// its own needs, since the owner never lends out its program, and counts
-/// the builder calls in each, so a new build in a listed file still
-/// changes the inventory.
 fn construction_sites(text: &str) -> BTreeMap<&'static str, usize> {
     let code: String = text
         .lines()
@@ -362,10 +299,6 @@ fn construction_sites(text: &str) -> BTreeMap<&'static str, usize> {
     sites
 }
 
-/// The scanner counts every spelling that builds a `Regex` through a
-/// trait, for `regex::Regex` and `regex::bytes::Regex` alike, and nothing
-/// that builds another type. Each fixture splits the type's name, so this
-/// file's own text never matches one.
 #[test]
 fn the_inventory_counts_every_trait_based_build() {
     let sites: &[(&str, &str)] = &[
@@ -388,8 +321,6 @@ fn the_inventory_counts_every_trait_based_build() {
             ),
             LET_PARSE,
         ),
-        // A character literal that holds a bracket or a `;` neither
-        // closes nor ends the statement around it.
         (
             concat!("let re: regex::Reg", "ex = s.trim_matches(')').parse()?;"),
             LET_PARSE,
@@ -456,10 +387,6 @@ fn the_inventory_counts_every_trait_based_build() {
     }
 }
 
-/// An escaped character literal is one literal, and a lifetime is not a
-/// literal at all, so neither throws the `let` scan off the statement
-/// around it. Each fixture splits the type's name, so this file's own text
-/// never matches one.
 #[test]
 fn the_inventory_reads_escaped_literals_and_lifetimes() {
     let sites = [
@@ -485,10 +412,6 @@ fn the_inventory_reads_escaped_literals_and_lifetimes() {
     }
 }
 
-/// The scanner counts every regex-automata spelling it can see: a path or
-/// an alias that names the crate, each builder method that compiles a
-/// program, and the cache pool's module. Each fixture splits the spelling,
-/// so this file's own text never matches one.
 #[test]
 fn the_inventory_counts_automata_spellings() {
     let sites: &[(&str, &[(&str, usize)])] = &[
@@ -534,11 +457,6 @@ fn the_inventory_counts_automata_spellings() {
     }
 }
 
-/// The construction sites in the workspace sources: `src`, `tests`,
-/// `benches`, `examples`, build scripts, `xtask`, the fuzz targets and
-/// scripts, comment lines excluded. Any of them builds through a crate
-/// the lint does not cover the moment it is compiled, so the walk takes
-/// every Rust file there is.
 #[test]
 fn construction_inventory() {
     let root = workspace_root();
@@ -586,14 +504,6 @@ fn construction_inventory() {
     );
 }
 
-/// A query of `MAX_QUERY_PATTERNS` regexes that each compile past the
-/// size limit costs one failed build, not one per site, and still
-/// reports the size error over the first.
-///
-/// The same body at every site builds once because the ledger
-/// remembers it, and each site reports it. Distinct bodies show the
-/// stop: after the first fails for size, the rest are never built, so
-/// only the first is reported.
 #[test]
 fn a_failed_build_stops_construction() {
     let n = parser::MAX_QUERY_PATTERNS;
@@ -619,7 +529,6 @@ fn a_failed_build_stops_construction() {
     }
 }
 
-/// `parse(input)`, and how many regexes it built.
 fn parse_counting_builds(
     input: &str,
 ) -> (Result<crate::ast::Query, Vec<parser::ParseError>>, usize) {
@@ -628,32 +537,12 @@ fn parse_counting_builds(
     (result, thread_builds() - before)
 }
 
-/// A search list of `copies` copies of the regex `body`.
 fn copies_of(body: &str, copies: u64) -> String {
     let element = format!("/{body}/");
     let copies = usize::try_from(copies).expect("a small count");
     format!("f={}", vec![element.as_str(); copies].join(","))
 }
 
-/// Every pattern ADR-0063 calibrates lands where the calibration put it
-/// once the parser reads it: the translation budget refuses the measured
-/// attacks, summed over the query, with nothing built, and admits the
-/// ordinary patterns, the `log_regexes` corpus and every regex in
-/// `dsl.md`.
-///
-/// The attacks: 63 bodies of `(?i)` and 64 `\p{Any}` or `\p{Ll}`,
-/// full-range brackets, and 63 bodies of 40 `(?i)[^\x00-\x{10FFFE}]`, a
-/// negated range whose complement is one character. Each is as many
-/// bodies as the query cap holds.
-///
-/// A body both budgets admit is built, and the compiled-size limit can
-/// still refuse it: `dsl.md` says `\w{3,30}` does not fit, and neither
-/// do 64 `\w`. Every copy of such a body reports the one failed build.
-///
-/// The walk prices a nested class's fold, so the calibration still names
-/// X8, 64 `(?i)[a[^b]]`, as a translation attack. The parser refuses its
-/// nested classes first (`class_set_syntax_is_refused`), so it never
-/// reaches the budget.
 #[test]
 fn translation_budget() {
     use super::price::calibration::{Verdict, calibration_cases};
@@ -691,8 +580,6 @@ fn translation_budget() {
             }
             Verdict::Admitted => {
                 assert!(result.is_ok(), "{label}: {result:?}");
-                // One ledger: every copy after the first is answered from
-                // what it built.
                 assert_eq!(builds, 1, "{label}");
             }
             Verdict::RefusedByTranslation => {
@@ -729,9 +616,6 @@ fn translation_budget() {
     }
 }
 
-/// The budget is per query: two bodies that together cost exactly the
-/// limit are admitted, and one unit more is refused over the body that
-/// takes the sum past it, with the whole query's cost in the message.
 #[test]
 fn translation_budget_sums_the_query_exactly_to_its_limit() {
     use super::price::MAX_TRANSLATION_UNITS;
@@ -770,10 +654,6 @@ fn translation_budget_sums_the_query_exactly_to_its_limit() {
     assert_eq!(&input[errors[0].span.clone()], format!("/{over}/"));
 }
 
-/// The repeat budget refuses a pattern that repeats to more than 64
-/// positions, at its own site and with a hint, before anything builds,
-/// and admits the ordinary counted repeats. Each atom is one position, so
-/// 64 literals are the limit, spelled out or counted.
 #[test]
 fn repeat_budget() {
     for body in [
@@ -819,9 +699,6 @@ fn repeat_budget() {
     }
 }
 
-/// The repeat budget holds at every pattern site, for the regex a glob or
-/// `like` operand stands for too: 65 positions are refused over the
-/// operand as written, and 64 are admitted.
 #[test]
 fn repeat_budget_holds_at_every_site() {
     type Site = fn(&str) -> (String, String);
@@ -888,11 +765,6 @@ fn repeat_budget_holds_at_every_site() {
     }
 }
 
-/// Every node that compiles to work counts toward the repeat budget, so a
-/// pattern cannot hide its cost in nodes that match no character: eight
-/// `\B` before each of 62 classes, or 490 empty capture groups before 32
-/// positions. Each is refused at every regex site before anything
-/// builds, with its whole count in the message.
 #[test]
 fn assertions_and_capture_groups_count_toward_the_repeat_budget() {
     let assertions = format!("𐐨(?:{}[𐐨𐐩𐐪]){{62}}𐐪", r"\B".repeat(8));
@@ -919,14 +791,7 @@ fn assertions_and_capture_groups_count_toward_the_repeat_budget() {
     }
 }
 
-/// A repeat is a node of its own and counts one position more than its
-/// operand, so wrapping a class in `(?:…)*` or `(?:…)?` again and again
-/// cannot hide the splits each wrapper compiles to. 120 such wrappers
-/// around a 4-byte class, counted 62 times after a `\B`, once priced at
-/// 64 positions: over 65 536 Deseret letters one call took about 4.5 s
-/// with `*` and about 2.4 s with `?`. Each spelling, lazy ones included,
-/// is refused before anything builds. `{0,1}` is longer to write, so 100
-/// of its wrappers fill the body limit.
+/// `{0,1}` is longer to write, so 100 of its wrappers fill the body limit.
 #[test]
 fn nested_repetitions_count_toward_the_repeat_budget() {
     for (op, depth) in [
@@ -960,11 +825,6 @@ fn nested_repetitions_count_toward_the_repeat_budget() {
     }
 }
 
-/// An alternation of `n` branches compiles to `n - 1` splits, which an
-/// enclosing repeat copies, so each `|` counts one position. Review round
-/// 3's body (F7) hid three of them under `{0,2}` and once priced at 64
-/// positions: over 65 536 Deseret letters one `DuckDB` call took about
-/// 450 ms. It is refused before anything builds, at 70.
 #[test]
 fn alternation_splits_count_toward_the_repeat_budget() {
     let body = super::price::calibration::unequal_alternation();
@@ -981,11 +841,6 @@ fn alternation_splits_count_toward_the_repeat_budget() {
     assert_eq!(&input[errors[0].span.clone()], format!("/{body}/"));
 }
 
-/// Bodies whose classes the Rust engine and RE2 read differently: a
-/// class nested in a bracketed class, or a class set operation. The first
-/// four admitted the repeat budget before the refusal, and RE2 compiled
-/// them into a larger program than the walk priced (review round 4):
-/// over 65 536 Deseret letters one `DuckDB` call took 0.40 to 0.94 s.
 fn class_set_bodies() -> Vec<String> {
     vec![
         r"\B(?:[\pL~~\pL]?){30}\PL".to_string(),
@@ -1020,13 +875,6 @@ const REGEX_BODY_SITES: [BodySite; 4] = [
     }),
 ];
 
-/// A class nested in a bracketed class and the class set operators `&&`,
-/// `--` and `~~` are refused in every regex body, at its own site, by
-/// `parse` and `parse_unbuilt` alike, before anything builds. RE2, which
-/// runs every batch regex, reads them as plain characters: the first `]`
-/// closes the class, and each operand joins one union. The two lanes would
-/// then match different text, and RE2 would compile a program the walk
-/// never priced.
 #[test]
 fn class_set_syntax_is_refused() {
     for body in class_set_bodies() {
@@ -1048,9 +896,6 @@ fn class_set_syntax_is_refused() {
     }
 }
 
-/// A class that only escapes a `&`, `-`, `[` or `]`, or holds a POSIX
-/// class, nests nothing and operates on nothing, and both engines read it
-/// alike. Each parses at every regex site.
 #[test]
 fn escaped_and_posix_classes_are_not_class_set_syntax() {
     for body in [
@@ -1074,8 +919,6 @@ fn escaped_and_posix_classes_are_not_class_set_syntax() {
     }
 }
 
-/// The live plan refuses class set syntax for an operand no parser
-/// checked, as it refuses a computed one, and builds nothing for it.
 #[test]
 fn the_live_compile_refuses_class_set_syntax() {
     use crate::ast::{BinaryOp, Expr, LiteralValue, Spanned};
@@ -1105,11 +948,6 @@ fn the_live_compile_refuses_class_set_syntax() {
     }
 }
 
-/// A `like` or `ilike` operand never becomes class set syntax: its
-/// translation escapes every `[` and `]`, so it holds no class at all.
-/// A glob's translation writes each class as byte escapes, and the batch
-/// lane runs a glob as `DuckDB`'s GLOB, never RE2, so the refusal is for
-/// regex bodies alone.
 #[test]
 fn like_operands_never_become_class_set_syntax() {
     let operand = "[a[b]]&&x--y~~[c&&a]%_";
@@ -1125,7 +963,6 @@ fn like_operands_never_become_class_set_syntax() {
     assert!(parser::parse("host=[a[b]]*").is_ok());
 }
 
-/// `body`'s batch-engine view.
 fn batch_view(body: &str) -> String {
     let ast = regex_syntax::ast::parse::Parser::new()
         .parse(body)
@@ -1133,15 +970,6 @@ fn batch_view(body: &str) -> String {
     re2::view(&ast)
 }
 
-/// The view writes `\w`, `\d` and `\s` as RE2's ASCII classes, negated as
-/// written and inside a bracket too, and each word assertion under
-/// `(?-u:…)`, so the Rust engine compiles it the way RE2 compiles the
-/// body. Every other node prints back as written. The view is the program
-/// that runs in the live lane and the kv tail, and a nested class in it is
-/// the Rust engine's union, which matches what RE2 matches for the class
-/// the body wrote. The one difference is an empty match on `\B` inside a
-/// multi-byte character, which RE2 finds and the view does not
-/// ([`regex_class_view_premise`]).
 #[test]
 fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
     const WORD: &str = r"[\x30-\x39\x41-\x5A\x5F\x61-\x7A]";
@@ -1169,9 +997,6 @@ fn the_batch_view_reads_perl_classes_and_word_assertions_as_ascii() {
     }
 }
 
-/// What the view compiles to is what makes it a measure: `\w{20}` is
-/// about 1 MiB in Rust and about 2 KiB as RE2 reads it, and a body with
-/// no Perl class or word assertion is its own view.
 #[test]
 fn the_batch_view_compiles_to_what_re2_compiles() {
     let mut ledger = preparer();
@@ -1185,25 +1010,19 @@ fn the_batch_view_compiles_to_what_re2_compiles() {
         .compiled_bytes(PatternKind::Regex, r"\pL{4}")
         .expect("measures");
     assert_eq!(ledger.batch_compiled_bytes(r"\pL{4}"), Ok(rust));
-    // The measure is the smallest limit the build fits.
     let hir = parse_hir(r"\pL{4}", PatternKind::Regex).expect("parses");
     assert!(compile(&hir, rust).is_ok());
     assert!(compile(&hir, rust - 1).is_err());
 }
 
 /// Bodies whose program fits 1 MiB in Rust and whose batch-engine view
-/// compiles past 512 KiB. FIX6 timed each in RE2's NFA over 65 536
-/// Deseret letters: 0.71 s, 0.46 s (review round 3's F7 core under 0
-/// wrappers, beside this twin) and 0.45 s a call.
+/// compiles past 512 KiB.
 const BATCH_TOO_LARGE: [&str; 3] = [
     r"\B(?:\pL?){23}\PL",
     r"\B(?:\pL|(?:\pL)?|(?:(?:\pL){0,2}){0,2}){0,2}\PL",
     r"\B(?:\pL?){15}\PL",
 ];
 
-/// A regex body whose program the batch engine compiles past
-/// `MAX_BATCH_COMPILED_BYTES` is refused at every regex site, with its
-/// own message and hint, by `parse` and by the live plan, after one build.
 /// `parse_unbuilt` builds nothing, so it cannot measure the program and
 /// admits the body, as it admits one only the 1 MiB limit refuses.
 #[test]
@@ -1257,9 +1076,6 @@ fn batch_engine_cap() {
     }
 }
 
-/// The cap sits between counts of one family: eleven `\pL?` compile to
-/// a view under 512 KiB and are admitted, twelve are over and refused.
-/// A body over 1 MiB in Rust keeps the 1 MiB message, whatever its view.
 #[test]
 fn batch_engine_cap_edge() {
     let mut measure = preparer();
@@ -1276,18 +1092,13 @@ fn batch_engine_cap_edge() {
         assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE, "{body}");
     }
 
-    // The plain repeat dsl.md uses: twelve `\pL` fit, thirteen are over.
     assert!(parser::parse(r"msg=/\pL{12}/").is_ok());
     let errors = parser::parse(r"msg=/\pL{13}/").expect_err(r"\pL{13}");
     assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
 }
 
-/// A batch-view failure stops construction as a 1 MiB failure does:
-/// distinct bodies, each over 512 KiB in its view, cost one failed
-/// build, and only the first is reported.
 #[test]
 fn a_failed_batch_build_stops_construction() {
-    // `\pL{13}` and a numeral: distinct bodies, each refused by the view.
     let sites: Vec<String> = (0..8).map(|i| format!(r"/\pL{{13}}{i}/")).collect();
     let input = format!("f={}", sites.join(","));
     let (result, builds) = parse_counting_builds(&input);
@@ -1299,10 +1110,6 @@ fn a_failed_batch_build_stops_construction() {
     assert_eq!(errors[0].span, first);
 }
 
-/// Every example FIX6 pinned at the cap is admitted: what dsl.md and the
-/// calibration corpus write, `\w` and `\d` included, because RE2 reads
-/// them as ASCII. `\w{3,30}` is not: its Rust program is over 1 MiB,
-/// whatever RE2 compiles.
 #[test]
 fn every_pinned_example_fits_the_batch_engine() {
     for body in [
@@ -1334,10 +1141,6 @@ fn every_pinned_example_fits_the_batch_engine() {
     assert_eq!(errors[0].message, MSG_REGEX_TOO_LARGE);
 }
 
-/// One build prepares one pattern. A regex body whose view differs from it
-/// compiles twice, the program and the view, and both counters count the
-/// pair once. A view over the cap stops the ledger as a program over
-/// 1 MiB does.
 #[test]
 fn a_build_compiles_the_program_and_its_view_once() {
     let mut ledger = preparer();
@@ -1361,9 +1164,6 @@ fn a_build_compiles_the_program_and_its_view_once() {
     assert_eq!(ledger.builds(), 5);
 }
 
-/// The stop after a size failure covers the batch-engine cap: 256
-/// distinct bodies that each compile past it in RE2 cost one failed
-/// build, and the first carries the error.
 #[test]
 fn a_batch_size_failure_stops_construction() {
     let n = parser::MAX_QUERY_PATTERNS;
@@ -1379,7 +1179,6 @@ fn a_batch_size_failure_stops_construction() {
     assert_eq!(errors[0].message, MSG_BATCH_TOO_LARGE);
 }
 
-/// The one error `input` parses to, which must be the pattern cap's.
 fn pattern_cap_refusal(input: &str) -> parser::ParseError {
     let errors = parser::parse(input).expect_err("over the cap");
     assert_eq!(errors.len(), 1, "{errors:?}");
@@ -1401,12 +1200,6 @@ fn named_groups(from: usize, n: usize) -> String {
     })
 }
 
-/// An `extract` charges `max(1, named groups)` toward
-/// `MAX_QUERY_PATTERNS` (ADR-0063), because the batch lane emits one
-/// `regexp_extract` per named group. Unnamed groups charge nothing of
-/// their own toward the cap. Exactly the cap, spread across bodies that
-/// each fit the body limit and the repeat budget, is admitted, and one charge more is refused over the
-/// stage that carries it.
 #[test]
 fn extract_groups_count_toward_the_pattern_cap() {
     let n = parser::MAX_QUERY_PATTERNS;
@@ -1419,14 +1212,11 @@ fn extract_groups_count_toward_the_pattern_cap() {
     let at_cap = format!("* {}", stages.join(" "));
     assert!(parser::parse(&at_cap).is_ok(), "{at_cap:.80}");
 
-    // A body with no named group still charges one.
     let over = format!("{at_cap} | extract \"(a)\"");
     let error = pattern_cap_refusal(&over);
     assert!(error.message.contains(&format!("({} ", n + 1)), "{error:?}");
     assert_eq!(&over[error.span], "extract \"(a)\"");
 
-    // Beside other patterns: the extract that crosses the cap carries
-    // the error, and its unnamed groups add nothing.
     let globs: Vec<String> = (0..n - 2).map(|i| format!("g{i}*")).collect();
     let globs = format!("f={}", globs.join(","));
     let two = "| extract \"(a)(?P<x>b)(c)(?P<y>d)\"";
@@ -1435,15 +1225,12 @@ fn extract_groups_count_toward_the_pattern_cap() {
     let over = format!("{globs} {three}");
     let error = pattern_cap_refusal(&over);
     assert_eq!(&over[error.span], &three[2..]);
-    // `extract kv` builds no regex and charges nothing.
     assert!(parser::parse(&format!("{globs} {two} | extract kv")).is_ok());
 }
 
 /// An `extract` body, its batch copy, and each named group's index there.
 type MixedExtract = (&'static str, &'static str, &'static [(&'static str, u32)]);
 
-/// Mixed `extract` bodies: unnamed groups before, around and beside named
-/// ones.
 const MIXED_EXTRACTS: &[MixedExtract] = &[
     (
         "(a|b)(?P<x>b)-(?P<y>c)",
@@ -1467,11 +1254,6 @@ const MIXED_EXTRACTS: &[MixedExtract] = &[
     ),
 ];
 
-/// `DuckDB`'s struct-form `regexp_extract` reads the k-th capture group
-/// as its k-th field. The batch copy of an `extract` body has every
-/// unnamed group made non-capturing, so its named groups are numbered 1
-/// to n in order, whatever unnamed groups sit before or around them. A
-/// body with no unnamed group binds as written.
 #[test]
 fn a_batch_extract_numbers_named_groups_among_themselves() {
     for (body, regex, named) in MIXED_EXTRACTS {
@@ -1494,9 +1276,6 @@ fn a_batch_extract_numbers_named_groups_among_themselves() {
     assert!(batch_extract("(").is_err());
 }
 
-/// A group's kind never changes what a regex matches, so the batch copy
-/// matches what the body matches, and each named group reads the same
-/// text.
 #[test]
 fn a_batch_extract_matches_what_its_body_matches() {
     let subjects = ["ab-c", "j", "abcdefghij", "7cdcd", "Kc", "x7c", "", "bb-cc"];
@@ -1528,15 +1307,12 @@ fn preparer() -> Preparer {
     Preparer::new()
 }
 
-/// A ledger builds each `(kind, text)` once and counts what it built, a
-/// failure included.
 #[test]
 fn a_ledger_builds_each_pattern_once() {
     let mut ledger = preparer();
     let before = thread_builds();
     assert!(ledger.build(PatternKind::Regex, "a+").is_ok());
     assert!(ledger.build(PatternKind::Regex, "a+").is_ok());
-    // The same text as another kind is another pattern.
     assert!(ledger.build(PatternKind::Like, "a+").is_ok());
     let unknown = ledger.build(PatternKind::Regex, r"\p{Nope}").err();
     assert!(
@@ -1548,10 +1324,6 @@ fn a_ledger_builds_each_pattern_once() {
     assert_eq!(thread_builds() - before, 3);
 }
 
-/// A search that panics while it holds a pattern's cache poisons the lock
-/// and can leave the cache in any state, here one built for another
-/// program. The next search starts from a fresh cache, clears the poison,
-/// and matches and captures as a new pattern does.
 #[test]
 fn a_poisoned_cache_starts_afresh() {
     let mut ledger = preparer();
@@ -1584,8 +1356,6 @@ fn a_poisoned_cache_starts_afresh() {
     assert!(captures.name("nope").is_none());
 }
 
-/// After a build fails for size, a new pattern is not built, but one the
-/// ledger already holds still answers.
 #[test]
 fn a_ledger_stops_after_a_size_failure() {
     let mut ledger = preparer();
@@ -1598,16 +1368,12 @@ fn a_ledger_stops_after_a_size_failure() {
     assert_eq!(ledger.builds(), 2);
 }
 
-/// A metered ledger whose budget never refuses, for a test that builds
-/// more than one query holds.
 fn unmetered() -> Preparer {
     let mut ledger = preparer();
     ledger.budget = usize::MAX;
     ledger
 }
 
-/// Every body the charge is calibrated over: the corpus, then the
-/// Unicode table.
 fn calibration_bodies() -> impl Iterator<Item = &'static str> {
     charge::LOG_REGEXES
         .iter()
@@ -1615,8 +1381,6 @@ fn calibration_bodies() -> impl Iterator<Item = &'static str> {
         .copied()
 }
 
-/// A twin of the program `body` runs at `capacity`, with the lazy DFA
-/// off: the program of its batch-engine view.
 #[expect(
     clippy::disallowed_methods,
     reason = "a twin with the lazy DFA off, built only to tell whether the owner's build kept it on"
@@ -1629,9 +1393,6 @@ fn without_lazy_dfa(body: &str, capacity: usize) -> meta::Regex {
         .expect("the view compiles under 1 MiB")
 }
 
-/// Every pattern of the corpus and the Unicode table builds with its lazy
-/// DFA on, at the capacity its charge sizes.
-///
 /// Below a lazy DFA's minimum capacity meta turns it off without an
 /// error, and the matching falls back to the Pike VM. A fresh cache sums
 /// every engine's cache, and one with the lazy DFA off holds none of its
@@ -1670,14 +1431,6 @@ const HEAVY: [&str; 7] = [
     r"(\pL{12})6",
 ];
 
-/// The whole corpus fits one query at the shipped budget, and the
-/// [`HEAVY`] bodies do not: the last is refused.
-///
-/// A query whose patterns charge exactly the budget, less one build
-/// transient, is admitted. One byte less of budget refuses it at the
-/// build that takes the sum past, with a resource refusal that stops the
-/// ledger: a new pattern is not built and gets the same refusal, and a
-/// pattern built before it still answers.
 #[test]
 fn query_budget_exact_and_one_over() {
     let bodies = charge::LOG_REGEXES;
@@ -1749,17 +1502,11 @@ fn query_budget_exact_and_one_over() {
         "nothing builds after the stop"
     );
 
-    // A capacity refusal, not the query text's fault: the sentence quotes
-    // no pattern.
     let sentence = refused.to_string();
     assert_eq!(sentence, MSG_REGEX_BUDGET);
     assert!(bodies.iter().all(|body| !sentence.contains(body)));
 }
 
-/// Check mode builds what a metered ledger builds and keeps only the
-/// verdict. It meters no budget, so it admits patterns a metered ledger
-/// refuses for their charge, and every other verdict is the metered one.
-/// `parse` checks, and the live filter prepares metered.
 #[test]
 fn check_mode_meters_nothing() {
     use crate::filter::CompiledFilter;
@@ -1832,19 +1579,11 @@ fn check_mode_meters_nothing() {
 /// ceiling, and a change that makes programs grow does not.
 const PROGRAM_CEILING: usize = 3 << 19;
 
-/// What each pattern of the corpus and the Unicode table charges for its
-/// caches and scratch, in bytes, term by term, with the lazy-DFA capacity
-/// it builds with and the forward minimum that capacity comes from, both
-/// read from the program that runs: its batch-engine view's. A
-/// dependency bump or a changed constant that moves one shows here as a
-/// diff.
-///
 /// The program term is not in the snapshot. It is the program's
 /// `memory_usage`, which counts the prefilter meta picked, and that choice
 /// follows the CPU's vector support: AVX2 on the reference host, and
-/// perhaps not on a CI runner. Every term in the snapshot comes from the
-/// NFA alone, so it reads the same on every host. The program term is
-/// held under [`PROGRAM_CEILING`] instead.
+/// perhaps not on a CI runner. The program term is held under
+/// [`PROGRAM_CEILING`] instead.
 #[test]
 fn corpus_charges() {
     use std::fmt::Write as _;
@@ -1876,13 +1615,10 @@ fn corpus_charges() {
     insta::assert_snapshot!(table);
 }
 
-/// `n` bytes as the reservation counts them.
 fn bytes(n: usize) -> u64 {
     u64::try_from(n).expect("a size fits in u64")
 }
 
-/// A metered ledger whose budget never refuses, holding from a
-/// reservation of its own with `limit` bytes.
 fn reserving(limit: u64) -> (Preparer, &'static memory::RegexReservation) {
     let reservation = memory::private_reservation(limit);
     let mut ledger = unmetered();
@@ -1890,11 +1626,6 @@ fn reserving(limit: u64) -> (Preparer, &'static memory::RegexReservation) {
     (ledger, reservation)
 }
 
-/// A batch statement's RE2 allowance is held by its query's ledger until
-/// the ledger drops, and a second statement's resizes it in place. No
-/// allowance holds nothing. One past the query's cap is a budget refusal,
-/// one the reservation cannot hold now a reservation refusal, and either
-/// leaves what was held as it was.
 #[test]
 fn the_re2_allowance_is_held_until_the_ledger_drops() {
     let (mut ledger, pool) = reserving(1000);
@@ -1916,10 +1647,6 @@ fn the_re2_allowance_is_held_until_the_ledger_drops() {
     assert_eq!((pool.holds(), pool.releases()), (2, 2));
 }
 
-/// One query's cap covers its RE2 allowance and its patterns' charges
-/// together, with a build transient: a cap that holds all three exactly
-/// admits the build, and one byte less refuses it for the budget and
-/// returns what the build held.
 #[test]
 fn the_query_cap_counts_the_allowance_beside_the_charges() {
     let body = r"\d{1,3}(\.\d{1,3}){3}";
@@ -1950,11 +1677,6 @@ fn the_query_cap_counts_the_allowance_beside_the_charges() {
     }
 }
 
-/// A query whose RE2 allowance leaves less than a build transient of its
-/// cap is refused for its budget before the build holds or builds
-/// anything. The refusal is the budget one even when the shared
-/// reservation has no room for the transient, because the query could
-/// never run as written.
 #[test]
 fn a_build_past_the_cap_is_refused_before_it_holds_a_transient() {
     let transient = bytes(BUILD_TRANSIENT);
@@ -1976,9 +1698,6 @@ fn a_build_past_the_cap_is_refused_before_it_holds_a_transient() {
     }
 }
 
-/// A pattern holds its charge from the reservation while any clone of it
-/// lives, the ledger's own among them, and returns it exactly once when
-/// the last clone drops.
 #[test]
 fn a_hold_is_released_once_on_drop() {
     let (mut ledger, pool) = reserving(u64::MAX);
@@ -1997,9 +1716,6 @@ fn a_hold_is_released_once_on_drop() {
     assert_eq!((pool.holds(), pool.releases()), (1, 1));
 }
 
-/// A thread that panics in a match, holding the pattern's cache and its
-/// only clone, unwinds through the pattern's drop, and the hold comes
-/// back once.
 #[test]
 fn a_hold_is_released_on_unwind() {
     let (mut ledger, pool) = reserving(u64::MAX);
@@ -2016,17 +1732,11 @@ fn a_hold_is_released_on_unwind() {
     assert_eq!((pool.holds(), pool.releases()), (1, 1));
 }
 
-/// Every refusal returns what the refused build held and leaves the
-/// reservation where it stood: a transient that does not fit, a charge
-/// that does not, a charge over the budget, a build that fails, and a
-/// class set refusal, which holds nothing. A reservation refusal stops
-/// the ledger as a budget refusal does.
 #[test]
 fn a_refused_build_leaves_the_reservation_where_it_started() {
     let transient = bytes(BUILD_TRANSIENT);
     let reservation = PatternError::Resources(RegexRefusal::Reservation);
 
-    // The transient does not fit: nothing holds and nothing builds.
     let (mut ledger, pool) = reserving(transient - 1);
     assert_eq!(
         ledger.build(PatternKind::Regex, "a+").err(),
@@ -2040,7 +1750,6 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     );
     assert_eq!((pool.reserved(), pool.holds()), (0, 0));
 
-    // The transient fits and the charge does not: `(\pL{12})` charges more.
     let heavy = r"(\pL{12})";
     let charge = unmetered()
         .build(PatternKind::Regex, heavy)
@@ -2062,8 +1771,6 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     assert_eq!(pool.reserved(), 0);
     assert_eq!((pool.holds(), pool.releases()), (1, 1));
 
-    // Over the budget, after a pattern that fits: the one that fits keeps
-    // its hold, and the refused one returns the transient it held.
     let (mut ledger, pool) = reserving(u64::MAX);
     let kept = ledger.build(PatternKind::Regex, r"\w{20}").expect("fits");
     let before = pool.reserved();
@@ -2077,8 +1784,6 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     assert_eq!(pool.reserved(), 0);
     assert_eq!((pool.holds(), pool.releases()), (2, 2));
 
-    // A build that fails, for syntax or for size, and a refusal before any
-    // build.
     let (mut ledger, pool) = reserving(u64::MAX);
     assert!(matches!(
         ledger.build(PatternKind::Regex, r"\p{Nope}"),
@@ -2100,10 +1805,6 @@ fn a_refused_build_leaves_the_reservation_where_it_started() {
     );
 }
 
-/// A query's filter and plan prepare through one ledger. A pattern both
-/// read is built and charged once, the reservation holds what the ledger
-/// charged for as long as the query lives, and every hold comes back
-/// when it drops.
 #[test]
 fn one_ledger_holds_a_shared_pattern_once() {
     use crate::filter::CompiledFilter;
@@ -2144,13 +1845,6 @@ fn one_ledger_holds_a_shared_pattern_once() {
     assert_eq!((pool.holds(), pool.releases()), (2, 2));
 }
 
-/// A regex body whose batch-engine view differs from it runs the view's
-/// program and is charged for that program alone: `\w{20}` charges what a
-/// build of its view text charges, less than the program of the body as
-/// written would. The ledger holds that charge once however often the
-/// body is asked for, a build cancelled before it starts holds nothing,
-/// and once the ledger and every returned pattern drop, the reservation
-/// is back where it started.
 #[test]
 fn regex_class_resource_ownership() {
     let body = r"\w{20}";
@@ -2208,9 +1902,6 @@ fn regex_class_resource_ownership() {
     assert_eq!((pool.reserved(), pool.holds()), (0, 0), "nothing held");
 }
 
-/// A paused reservation parks a metered build once its pattern's charge
-/// is held, before the ledger answers. The charge, not the transient, is
-/// what is held there.
 #[test]
 fn a_build_pauses_after_its_charge() {
     let (mut ledger, pool) = reserving(u64::MAX);
@@ -2233,12 +1924,6 @@ fn a_build_pauses_after_its_charge() {
     assert_eq!((pool.holds(), pool.releases()), (1, 1));
 }
 
-/// A preparation stops at its next cancellation point (ADR-0063). Its
-/// first build parks once its charge is held, and the stop is requested
-/// there. That build answers, and every later one answers the
-/// cancellation, not a verdict on its pattern, the pattern the ledger
-/// already holds included. The ledger's own count shows no further build,
-/// and nothing more is held: no transient, no charge.
 #[test]
 fn preparation_observes_cancellation_between_builds() {
     let (ledger, pool) = reserving(u64::MAX);
@@ -2275,10 +1960,6 @@ fn preparation_observes_cancellation_between_builds() {
     );
 }
 
-/// A build reads its stop once its pattern is translated, before it
-/// compiles anything: a requested stop answers the cancellation where the
-/// compile would refuse the size, for a program alone and for a regex body
-/// whose batch view differs from it.
 #[test]
 fn a_build_reads_its_stop_before_it_compiles() {
     let body = r"\w{64}";
@@ -2300,9 +1981,6 @@ fn a_build_reads_its_stop_before_it_compiles() {
     }
 }
 
-/// A pattern carries its ledger's stop and reads it before each search
-/// (ADR-0063). Once the stop is requested, `is_match` and `captures`
-/// answer the cancellation, and no search runs.
 #[test]
 fn a_requested_stop_cancels_every_search() {
     let stop = crate::cancel::Stop::new();
@@ -2320,9 +1998,6 @@ fn a_requested_stop_cancels_every_search() {
     assert_eq!(thread_regex_calls(), before, "no search ran");
 }
 
-/// A stop requested between two searches lets the first run and ends the
-/// work at the second, which runs no search: the check sits between regex
-/// calls and never inside one.
 #[test]
 fn a_stop_between_searches_ends_at_the_next() {
     let stop = crate::cancel::Stop::new();
@@ -2335,8 +2010,6 @@ fn a_stop_between_searches_ends_at_the_next() {
     assert_eq!(thread_regex_calls() - before, 1, "only the first searched");
 }
 
-/// Each kind matches as its lane always has: `like` and `ilike` anchor
-/// the whole value, `ilike` ignores case, a glob crosses newlines.
 #[test]
 fn each_kind_matches_its_dialect() {
     let mut ledger = preparer();
@@ -2356,8 +2029,6 @@ fn each_kind_matches_its_dialect() {
     assert!(!is_match(PatternKind::Glob, "b*", "abc"));
 }
 
-/// The like translation, byte for byte: `%` and `_` become `.*` and `.`,
-/// every regex metacharacter is escaped, and `ilike` prefixes `(?i)`.
 #[test]
 fn like_translation_is_unchanged() {
     assert_eq!(like_to_regex("a%b_c", false), "^a.*b.c$");
@@ -2368,9 +2039,6 @@ fn like_translation_is_unchanged() {
     assert_eq!(like_to_regex("a%", true), "(?i)^a.*$");
 }
 
-/// A glob's translation, byte for byte: every glob byte is a `\xNN`
-/// escape, `*` and `?` are `.*` and `.` over bytes, and a class is the
-/// positive class of its byte set's runs.
 #[test]
 fn glob_conversion_star() {
     assert_eq!(glob_to_regex("*.txt"), r"(?s-u:^.*\x2E\x74\x78\x74$)");
@@ -2407,11 +2075,9 @@ fn glob_conversion_escapes_every_byte() {
     assert_eq!(glob_to_regex(""), "(?s-u:^$)");
 }
 
-/// A glob is priced and limited in byte mode as any pattern is. The
-/// repeat walk counts a glob's bytes: `é` is two positions, so 30 of them
+/// The repeat walk counts a glob's bytes: `é` is two positions, so 30 of them
 /// and a `*` are `^`, 60 bytes, `.*` and `$`, 64 positions, at the budget,
 /// and 31 are 66, over it. Read as characters, 31 would be 35 and pass.
-/// An admitted glob and a malformed one each build with a charge.
 #[test]
 fn glob_byte_mode_is_priced() {
     let at = format!("{}*", "é".repeat(30));
@@ -2423,7 +2089,6 @@ fn glob_byte_mode_is_priced() {
         errors[0].message,
         format!("{MSG_REPEAT_BUDGET} (66 positions, max 64)")
     );
-    // One byte past `at` is one position past the budget.
     let errors = parser::parse(&format!("f={at}a")).expect_err("one past the budget");
     assert_eq!(
         errors[0].message,
@@ -2438,8 +2103,6 @@ fn glob_byte_mode_is_priced() {
     }
 }
 
-/// A malformed glob, or one whose class holds no byte, is the one regex
-/// that matches nothing.
 #[test]
 fn glob_conversion_malformed_matches_nothing() {
     for glob in [r"x\", "[", "[a-]", "[]", "[!]", "a[z-a]*", "*[", "[a-]]"] {
@@ -2483,10 +2146,6 @@ fn capture_names_lists_named_groups_in_order() {
     assert_eq!(thread_builds(), before, "capture_names built a regex");
 }
 
-/// The subjects the regex-class premise runs every body over: the
-/// non-ASCII characters where the Rust engine's Unicode classes and RE2's
-/// ASCII ones part, ASCII controls, and composites that put a non-ASCII
-/// character next to a word character or a line end.
 const PREMISE_SUBJECTS: [&str; 29] = [
     "\u{663}",
     "\u{e9}",
@@ -2519,8 +2178,6 @@ const PREMISE_SUBJECTS: [&str; 29] = [
     "aK",
 ];
 
-/// `text` as its code points, `U+…` each, so a mismatch report names
-/// the subject whatever it holds.
 fn code_points(text: &str) -> String {
     if text.is_empty() {
         return "(empty)".to_owned();
@@ -2531,8 +2188,6 @@ fn code_points(text: &str) -> String {
         .join(" ")
 }
 
-/// `body` under each case-folding form the premise checks: as written,
-/// under `(?i)`, and scoped `(?i:…)` followed by an unscoped copy.
 fn premise_case_forms(body: &str) -> [String; 3] {
     [
         body.to_owned(),
@@ -2541,7 +2196,6 @@ fn premise_case_forms(body: &str) -> [String; 3] {
     ]
 }
 
-/// The premise's bodies, each with its construct family.
 fn premise_bodies() -> Vec<(String, String)> {
     let mut bodies = Vec::new();
     for class in [r"\d", r"\D", r"\w", r"\W", r"\s", r"\S"] {
@@ -2580,9 +2234,7 @@ fn premise_bodies() -> Vec<(String, String)> {
     bodies
 }
 
-/// `body`'s view, built as `prepare` builds a view: parsed as a regex
-/// body and compiled under [`MAX_BATCH_COMPILED_BYTES`] with the meta
-/// configuration every pattern uses.
+/// `body`'s view, built as `prepare` builds a view.
 fn premise_view_program(body: &str) -> Result<(String, meta::Regex), String> {
     let ast = regex_syntax::ast::parse::Parser::new()
         .parse(body)
@@ -2595,27 +2247,15 @@ fn premise_view_program(body: &str) -> Result<(String, meta::Regex), String> {
     Ok((view, regex))
 }
 
-/// The bundled `DuckDB`'s version, for a mismatch report.
 fn duckdb_version(conn: &duckdb::Connection) -> String {
     conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0))
         .unwrap_or_else(|e| format!("(version unknown: {e})"))
 }
 
-/// The premise bodies that can match empty on `\B`, before their case
-/// forms ([`premise_case_forms`]).
 const EMPTY_NON_BOUNDARY_FORMS: [&str; 2] = [r"\B", r"x*\B"];
 
-/// The premise subjects that put one multi-byte character between two
-/// ASCII word characters.
 const SPLIT_WORD_SUBJECTS: [&str; 4] = ["x\u{e9}y", "x\u{663}y", "x\u{212a}y", "x\u{17f}y"];
 
-/// The rows where the view and `DuckDB` answer differently, all accepted:
-/// every case form of [`EMPTY_NON_BOUNDARY_FORMS`] over every
-/// [`SPLIT_WORD_SUBJECTS`] subject. RE2 tests an assertion at every byte
-/// offset, so an empty match on `\B` can sit inside a multi-byte
-/// character and `DuckDB` answers true. The view runs with
-/// `utf8_empty(true)`, which never places an empty match inside a
-/// character, so it answers false.
 fn empty_non_boundary_rows() -> BTreeSet<(String, &'static str)> {
     EMPTY_NON_BOUNDARY_FORMS
         .iter()
@@ -2624,15 +2264,6 @@ fn empty_non_boundary_rows() -> BTreeSet<(String, &'static str)> {
         .collect()
 }
 
-/// The view of a regex body reads `\d \D \w \W \s \S`, `\b` and `\B` as
-/// the bundled `DuckDB` (RE2) reads the body itself. Each row runs the
-/// view, compiled as `prepare` compiles it, as an unanchored match over a
-/// subject, and asks `DuckDB` `regexp_matches(subject, body)` with the
-/// original body bound, as the batch lane binds it. The rows that disagree
-/// must be exactly [`empty_non_boundary_rows`], each `DuckDB` true and the
-/// view false: a disagreement outside that set fails, and so does a row of
-/// it that now agrees. Every unexpected row is reported, not just the
-/// first.
 #[test]
 fn regex_class_view_premise() {
     let split_word = |subject: &str| {
@@ -2726,10 +2357,6 @@ fn regex_class_view_premise() {
     );
 }
 
-/// Each named group of `batch`, in its order, as the view program
-/// `regex` captures it over `subject`: null for no match, a group that
-/// takes no part and an empty capture. A span that splits a character is
-/// an error, not a panic.
 fn premise_view_captures(
     regex: &meta::Regex,
     batch: &BatchExtract,
@@ -2760,13 +2387,6 @@ fn premise_view_captures(
         .collect()
 }
 
-/// The view of an `extract` body captures what the bundled `DuckDB`
-/// captures from the body. Each row reads every named group of the
-/// view's program by name, as the live lane does, against the struct
-/// form of `regexp_extract` over the body's batch copy, as the emitter
-/// writes it. Both read a group that takes no part in the match, a row
-/// that does not match and an empty capture as null, as the product
-/// does. A capture whose span splits a character is a mismatch row.
 #[test]
 fn regex_class_view_capture_premise() {
     let conn = duckdb::Connection::open_in_memory().expect("in-memory duckdb");
@@ -2849,10 +2469,9 @@ fn regex_class_view_capture_premise() {
     );
 }
 
-/// The accepted empty `\B` difference also reaches a capture. RE2 takes
-/// the empty alternative between the bytes of the character, so the named
-/// group takes no part. The view cannot match there, so it goes on and
-/// captures `y`. The reference documents this row.
+/// RE2 takes the empty alternative between the bytes of the character, so
+/// the named group takes no part. The view cannot match there, so it goes
+/// on and captures `y`.
 #[test]
 fn regex_class_view_capture_differs_on_an_empty_non_boundary() {
     let body = r"(?:\B|(?P<n>y))";

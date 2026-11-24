@@ -2,24 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Send to investigation from Search (ADR-0057, ADR-0059, #311). The
-// `investigations-writer` session holds `investigation_write` beside
-// both read grants, and `investigationSearch` makes every search answer
-// the `query-send-rows` events inside the `_time` bounds of its text, in
-// stored order; a capture keeps the same events inside its window, newest
-// first as trawld sorts raw events (harness/server.mjs). So the rows a
-// capture keeps equal the rows Search showed, as a set, only when the
-// request carries the window Search ran. The stub records each
-// `POST /api/v1/results` body in `captures` and, for the served board,
-// appends the human's step and stores the result so the evidence viewer
-// pages it.
-//
-// The dialog sends the search Search ran: the response's own query state,
-// read as the range-free text and a half-open window by the shared codec,
-// so a fixed `[from, to]` is sent as `[from, to + 1 µs)`. A moving range
-// is pinned to `execution.started_at` (`2026-09-15T12:34:56Z` in every
-// stubbed answer), Search runs again on the pinned range, and that search
-// is sent.
+// Send to investigation from Search (ADR-0059). `investigationSearch`
+// makes every search answer the `query-send-rows` events inside the
+// `_time` bounds of its text, in stored order; a capture keeps the same
+// events inside its window, newest first as trawld sorts raw events
+// (harness/server.mjs). So the rows a capture keeps equal the rows Search
+// showed, as a set, only when the request carries the window Search ran.
 
 import { test, expect } from '../fixtures';
 import { SEL, COPY } from '../selectors';
@@ -58,7 +46,6 @@ function trailing(page: Pg): Loc {
   return page.locator('.tabs-actions');
 }
 
-/** The rows a results table shows, cell by cell, without its controls. */
 async function tableRows(rows: Loc): Promise<string[][]> {
   return rows.evaluateAll((trs) => trs.map((tr) =>
     Array.from(tr.querySelectorAll('td:not(.exp-col):not(.inv-keep-col)'), (td) => (td.textContent ?? '').trim())));
@@ -86,7 +73,6 @@ async function openSearch(page: Pg, path: string, rows = ABSOLUTE_ROWS) {
   await expect(searchRows(page)).toHaveCount(rows);
 }
 
-/** Every row the evidence viewer pages, in the order it pages them. */
 async function viewerRows(viewer: Loc, rows: Loc): Promise<string[][]> {
   const kept: string[][] = [];
   const summary = viewer.locator('.results-summary');
@@ -101,7 +87,6 @@ async function viewerRows(viewer: Loc, rows: Loc): Promise<string[][]> {
   }
 }
 
-/** Rows as a set: the same events, whatever order they came in. */
 function asSet(rows: string[][]): string[] {
   return rows.map((row) => JSON.stringify(row)).sort();
 }
@@ -120,13 +105,11 @@ test('a fixed range sends the executed text and its half-open window, and the bo
   expect(shown).toHaveLength(ABSOLUTE_ROWS);
 
   const dialog = await openDialog(page);
-  // No default target: nothing is sent until a person picks one.
   await expect(dialog.getByRole('radio', { checked: true })).toHaveCount(0);
   const send = dialog.getByRole('button', { name: 'Send', exact: true });
   await expect(send).toBeDisabled();
   await expect(dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` })).toBeVisible();
   await expect(dialog.getByRole('radio', { name: `${OTHER_TITLE} c0ffee00` })).toBeVisible();
-  // The exact text and window the capture carries.
   await expect(dialog.locator('.send-query')).toHaveText('status>=500');
   await expect(dialog.locator('.send-window')).toHaveText(
     'From 2026-09-15T12:00:00.000000Z up to, not including, 2026-09-15T12:30:00.000001Z');
@@ -160,9 +143,6 @@ test('a fixed range sends the executed text and its half-open window, and the bo
   const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
   const rows = viewer.getByRole('region', { name: `Rows of result ${FIRST_CAPTURE.slice(0, 8)}` });
   await expect(viewer.locator('.results-summary')).toContainText(`1–3 of ${ABSOLUTE_ROWS}`);
-  // The same events Search showed. A capture sorts raw events newest
-  // first while Search showed them in stored order, so they are compared
-  // as sets.
   const kept = await viewerRows(viewer, rows);
   expect(asSet(kept)).toEqual(asSet(shown));
   expect(await queries(request)).toHaveLength(1);
@@ -212,8 +192,6 @@ test('a moving range is pinned to when the search ran, run again, and that searc
 
   await expect(page.locator('.toast').filter({ hasText: 'Sent to investigation' })).toContainText(`Step 10 in ${BOARD_TITLE}`);
   await expect(page).toHaveURL(/r=2026-09-15T12:19:56Z\.\.2026-09-15T12:34:56Z/);
-  // Search shows the pinned range's four events, and the capture keeps
-  // those four.
   await expect(searchRows(page)).toHaveCount(4);
   await page.goto(`/investigations/${BOARD}`);
   const step = page.locator('.inv-page').getByRole('list', { name: 'Steps' }).locator('> li')
@@ -222,7 +200,6 @@ test('a moving range is pinned to when the search ran, run again, and that searc
   await step.getByRole('button', { name: `View the rows of result ${FIRST_CAPTURE.slice(0, 8)}` }).click();
   const viewer = page.getByRole('dialog', { name: `Result ${FIRST_CAPTURE.slice(0, 8)}` });
   await expect(viewer.locator('.results-summary')).toContainText('1–3 of 4');
-  // Search ran twice: the quick range, then the pinned absolute one.
   expect(await queries(request)).toEqual([
     'last=15m status>=500',
     '_time>="2026-09-15T12:19:56Z" _time<="2026-09-15T12:34:56Z" status>=500',
@@ -263,7 +240,6 @@ test('a query whose own time clause moves is not sent, and nothing offers to sen
   await expect(dialog.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
   await expect(dialog.getByRole('button', { name: 'Pin and re-run' })).toHaveCount(0);
   await expect(dialog.locator('.send-query')).toHaveCount(0);
-  // Ctrl+Enter submits the dialog: still nothing is sent.
   await dialog.getByLabel('Purpose (optional)').fill('A moving hour');
   await dialog.getByLabel('Purpose (optional)').press('Control+Enter');
   await page.waitForTimeout(500);
@@ -273,8 +249,6 @@ test('a query whose own time clause moves is not sent, and nothing offers to sen
 
 test('a range longer than one capture may cover is neither pinned nor sent', async ({ page, request }) => {
   await as(request, 'investigations-writer');
-  // The 7-day preset pins to seven days and a microsecond, past trawld's
-  // default `[capture] max_span_secs` of seven days.
   await openSearch(page, '/search?q=status%3E%3D500&r=7d', 10);
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
@@ -288,7 +262,6 @@ test('a range longer than one capture may cover is neither pinned nor sent', asy
   expect(await queries(request)).toHaveLength(1);
   await expect(page).toHaveURL(/r=7d/);
 
-  // A fixed range is held to the limit the server advertises too.
   await as(request, 'investigations-writer', true, { captureMaxSpanSecs: 600 });
   await openSearch(page, ABSOLUTE);
   const fixed = await openDialog(page);
@@ -328,7 +301,6 @@ test('the dialog sends the accepted search, not the draft in the editor', async 
     window: { earliest: '2026-09-15T12:00:00.000000Z', latest: '2026-09-15T12:30:00.000001Z' },
     investigation: { id: OTHER },
   }]);
-  // The draft is still the draft.
   await expect(editor).toHaveText('status>=500 host=web-01');
 });
 
@@ -338,7 +310,6 @@ test('a target closed meanwhile keeps the input and lists the open investigation
   const dialog = await openDialog(page);
   await dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` }).check();
   await dialog.getByLabel('Purpose (optional)').fill('Before it closed');
-  // The agent closes the investigation while the dialog is open.
   const closed = await request.post('/__ctl/investigation/write', {
     data: { entries: [{ payload: { kind: 'status', status: 'closed' } }] },
   });
@@ -370,11 +341,9 @@ test('an answer lost on the way back is an unknown outcome, and nothing is sent 
   await expect(dialog.getByRole('button', { name: 'Send', exact: true })).toHaveCount(0);
   await expect(dialog.getByLabel('Purpose (optional)')).toHaveValue('Lost on the way back');
   await expect(dialog.getByRole('radio', { name: `${BOARD_TITLE} 5f0c1a2b` })).toBeChecked();
-  // Nothing sends it again by itself.
   await page.waitForTimeout(1_500);
   expect(await captures(request)).toHaveLength(1);
 
-  // The board says whether it landed: here it did.
   await dialog.getByRole('link', { name: 'Open the board' }).click();
   await expect(page).toHaveURL(`/investigations/${BOARD}`);
   await expect(page.locator('.inv-page').getByRole('list', { name: 'Steps' }).locator('> li')

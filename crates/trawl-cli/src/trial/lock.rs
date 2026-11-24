@@ -9,26 +9,16 @@
 //! inode it opened, and unlinking would let the next arrival lock a fresh
 //! inode alongside it.
 //!
-//! The lock belongs to the open file description, and the kernel releases
-//! it when the last descriptor for it closes. Its descriptor is
-//! inheritable ([`share_with_children`]), so every `docker` child, and the
-//! Compose plugin that child runs, holds the lock too. A `trawl` killed
-//! mid-command (SIGKILL runs no destructor, so no child is killed on drop)
-//! therefore leaves its docker children holding the lock until they exit,
-//! and a rerun waits for them instead of racing an orphaned
-//! `compose run` or `compose exec` that could still change the trial, for
-//! example a late `keys create` minting a second key whose token is lost.
-//! A killed `docker` child is different: its Compose plugin exits with it
-//! and leaves a `compose run` container running with no client, and a
-//! container holds no lock. So `up`, `stop`, and `down` still wait for
-//! running one-off containers.
+//! Its descriptor is inheritable ([`share_with_children`]), so every
+//! `docker` child holds the lock too. A `trawl` killed by SIGKILL, which
+//! runs no destructor, leaves its docker children holding the lock until
+//! they exit, and a rerun waits for them instead of racing an orphaned
+//! `compose run` or `compose exec`. A killed `compose run` client leaves
+//! its container running, and a container holds no lock. So `up`,
+//! `stop`, and `down` still wait for running one-off containers.
 //!
-//! No child holds the lock forever: every docker call made under it ends
-//! on its own (a pull, `compose up -d --wait` with a wait timeout, a
-//! `compose run --rm` or `compose exec` of a one-shot step, `compose stop`,
-//! listings, and removals), and nothing follows logs or events. The
-//! trial's containers are the Docker daemon's children, never ours, so a
-//! running trial holds no lock.
+//! Every docker call made under the lock ends on its own, and nothing
+//! follows logs or events.
 //!
 //! `status`, `key`, and `-p trial` do not take the lock. They read files
 //! that are only ever replaced by an atomic rename.
@@ -46,7 +36,6 @@ use nix::fcntl::{FcntlArg, FdFlag, fcntl};
 
 use super::TrialError;
 
-/// Held for the life of the value; dropping it releases the lock.
 #[derive(Debug)]
 pub struct TrialLock {
     _file: File,
@@ -66,8 +55,6 @@ impl TrialLock {
         Self::held(file, path)
     }
 
-    /// Take the lock if it is free; `Ok(None)` if another invocation
-    /// holds it.
     pub fn try_acquire(path: &Path) -> Result<Option<Self>, TrialError> {
         let file = open(path)?;
         match file.try_lock() {
@@ -77,19 +64,15 @@ impl TrialLock {
         }
     }
 
-    /// The lock, once `file` holds it, shared with every child spawned
-    /// from now on.
     fn held(file: File, path: &Path) -> Result<Self, TrialError> {
         share_with_children(&file).map_err(|e| TrialError::io("share the lock", path, e))?;
         Ok(Self { _file: file })
     }
 }
 
-/// Clear `FD_CLOEXEC` on the lock's descriptor, so every child spawned
-/// while the lock is held inherits it and keeps the lock until it exits
-/// (see the module documentation). std opens every file close-on-exec,
-/// and neither std nor tokio closes an inheritable descriptor when it
-/// spawns a child, so this is the only step needed.
+/// std opens every file close-on-exec, and neither std nor tokio closes
+/// an inheritable descriptor when it spawns a child, so clearing
+/// `FD_CLOEXEC` is the only step needed.
 fn share_with_children(file: &File) -> io::Result<()> {
     let fd = file.as_raw_fd();
     let flags = FdFlag::from_bits_truncate(fcntl(fd, FcntlArg::F_GETFD)?);
@@ -97,7 +80,6 @@ fn share_with_children(file: &File) -> io::Result<()> {
     Ok(())
 }
 
-/// Open (creating at 0600) the lock file without following a symlink.
 /// The caller has verified the state root.
 fn open(path: &Path) -> Result<File, TrialError> {
     let (file, chmod) = trawl_config::fs::open_with_mode(path, 0o600, |opts| {
@@ -129,8 +111,6 @@ pub(super) mod tests {
     use super::*;
     use crate::trial::paths::TrialPaths;
 
-    /// Set in a re-executed test binary to make [`lock_child_process`]
-    /// act as a lock holder or waiter instead of passing as a no-op.
     const CHILD_ROLE: &str = "TRAWL_TEST_TRIAL_LOCK_ROLE";
     const CHILD_PATH: &str = "TRAWL_TEST_TRIAL_LOCK_PATH";
 
@@ -138,8 +118,6 @@ pub(super) mod tests {
     const WAITING: &str = "trial-lock: waiting";
     const ACQUIRED: &str = "trial-lock: acquired";
 
-    /// Beside the lock file: the pid the `spawn` child's docker stub
-    /// writes, and the file whose creation lets that stub exit.
     const STUB_PID: &str = "docker-stub.pid";
     const STUB_RELEASE: &str = "docker-stub.release";
 
@@ -155,16 +133,6 @@ pub(super) mod tests {
 
     /// The child side of the cross-process test. Under a normal test run
     /// neither variable is set and it passes without doing anything.
-    ///
-    /// - `hold`: take the lock, report `HELD`, and keep it until stdin
-    ///   yields a line (or closes).
-    /// - `wait`: take the lock through [`TrialLock::acquire`], reporting
-    ///   `WAITING` from `on_wait`, then `ACQUIRED`, and exit.
-    /// - `spawn`: take the lock, report `HELD`, then run a stub `docker`
-    ///   through the trial's Docker driver and wait for it, as `up` waits
-    ///   for a `compose run`. The stub writes its pid to [`STUB_PID`] and
-    ///   runs until [`STUB_RELEASE`] exists, or the test's directory is
-    ///   gone.
     ///
     /// Markers go to stderr: libtest writes its own report to stdout.
     #[test]
@@ -223,7 +191,6 @@ pub(super) mod tests {
         }
     }
 
-    /// Re-execute this test binary as a lock child.
     pub(crate) fn spawn_lock_child(role: &str, path: &Path) -> (Child, mpsc::Receiver<String>) {
         let mut child = Command::new(std::env::current_exe().unwrap())
             .args([
@@ -243,8 +210,6 @@ pub(super) mod tests {
         (child, lines)
     }
 
-    /// Stream a child's stderr lines through a channel, so a missing
-    /// marker times out instead of hanging the test.
     fn forward_lines(stderr: ChildStderr) -> mpsc::Receiver<String> {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -258,7 +223,6 @@ pub(super) mod tests {
         rx
     }
 
-    /// Wait for `marker`, failing on any other marker or on silence.
     pub(crate) fn expect_marker(lines: &mpsc::Receiver<String>, marker: &str) {
         loop {
             let line = lines
@@ -279,9 +243,6 @@ pub(super) mod tests {
         assert!(status.success(), "lock child failed: {status}");
     }
 
-    /// Two real processes: while the first holds the lock, the second
-    /// finds it busy, says so, and blocks; it acquires only after the
-    /// first releases.
     #[test]
     fn a_second_process_waits_until_the_first_releases() {
         let (_tmp, paths) = ready_paths();
@@ -333,10 +294,6 @@ pub(super) mod tests {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None).is_ok()
     }
 
-    /// A holder killed with SIGKILL runs no destructor, so its docker
-    /// child is not killed on drop and keeps running. The lock must stay
-    /// held until that child exits: a second process reports that it
-    /// waits, and acquires only after the child is gone.
     #[test]
     fn a_killed_holder_s_docker_child_keeps_the_lock() {
         let (_tmp, paths) = ready_paths();
@@ -376,9 +333,6 @@ pub(super) mod tests {
         exit_ok(waiter);
     }
 
-    /// `flock` belongs to the open file, so two opens in one process
-    /// exclude each other as two processes do.
-    ///
     /// This and the next test take the lock in the test process itself.
     /// nextest runs each test in its own process; under a threaded
     /// `cargo test`, a child another test spawns meanwhile would inherit

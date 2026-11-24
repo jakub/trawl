@@ -25,24 +25,19 @@ use serde::{Deserialize, Serialize};
 use super::TrialError;
 use super::paths::{read_private, write_private};
 
-/// The schema this CLI writes and resumes.
 pub const SCHEMA: u32 = 1;
 
 /// No state file trawl writes comes near this; a larger one is not ours.
 const MAX_STATE_BYTES: u64 = 1024 * 1024;
 
-/// Everything `up` has recorded about the trial.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TrialState {
-    /// [`SCHEMA`]; `up` refuses other values.
     pub schema: u32,
     /// 32 lowercase hex characters from the OS RNG; the value of the
     /// trial id label on every resource.
     pub trial_id: String,
-    /// The Compose project name.
     pub project: String,
-    /// The CLI version that created the trial.
     pub cli_version: String,
     /// RFC 3339.
     pub created_at: String,
@@ -138,9 +133,6 @@ impl std::fmt::Debug for KeyRecord {
     }
 }
 
-/// The sample data's progress. Ingest has no idempotency key, so `Intent`
-/// is written before the one POST and `Complete` only after the counts are
-/// verified; `up` never posts over anything else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Samples {
@@ -175,7 +167,6 @@ pub enum Samples {
 }
 
 impl TrialState {
-    /// Replace `path` with this state, atomically, at 0600.
     pub fn save(&self, path: &Path) -> Result<(), TrialError> {
         let mut bytes = serde_json::to_vec_pretty(self).map_err(|e| TrialError::StateInvalid {
             path: path.to_owned(),
@@ -188,9 +179,6 @@ impl TrialState {
 
 impl TrialState {
     /// Read `path`: `Ok(None)` when there is no state file.
-    ///
-    /// Anything but schema [`SCHEMA`] is refused, and so is any field
-    /// schema 1 does not have.
     pub fn load(path: &Path) -> Result<Option<Self>, TrialError> {
         #[derive(Deserialize)]
         struct SchemaProbe {
@@ -237,9 +225,6 @@ impl DownView {
         write_private(path, &bytes, 0o600)
     }
 
-    /// Read `trial_id` and `engine_id` from `path`, ignoring every other
-    /// field: `Ok(None)` when there is no state file.
-    ///
     /// The id must be usable as a Docker label filter value, so it is
     /// limited to ASCII letters, digits, `-`, and `_`.
     pub fn load(path: &Path) -> Result<Option<Self>, TrialError> {
@@ -292,7 +277,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::trial::paths::TrialPaths;
 
-    /// A complete schema-1 state, with every optional part filled.
     pub(crate) fn fixture(api_port: u16) -> TrialState {
         TrialState {
             schema: SCHEMA,
@@ -334,7 +318,6 @@ pub(crate) mod tests {
                 }),
                 ingest: None,
             },
-            // Formatted as `up` records a verified sample set.
             samples: crate::trial::sample::complete(
                 203,
                 &crate::trial::sample::generate(
@@ -393,8 +376,6 @@ pub(crate) mod tests {
         assert_eq!(json["state"], "complete");
     }
 
-    /// A declined trial is still one `stop` and `down` read, and a state
-    /// written before `declined` existed still resumes.
     #[test]
     fn a_declined_trial_loads_for_every_verb() {
         let (_tmp, path) = state_path();
@@ -448,7 +429,6 @@ pub(crate) mod tests {
         ));
     }
 
-    /// `down` must delete a trial whatever CLI version wrote it.
     #[test]
     fn down_reads_a_future_schema_with_extra_fields() {
         let (_tmp, path) = state_path();
@@ -476,7 +456,6 @@ pub(crate) mod tests {
         assert_eq!(view.engine_id.as_deref(), Some("ENGINE:FUTURE"));
     }
 
-    /// `stop` and `down` see the engine this CLI records.
     #[test]
     fn down_reads_the_recorded_engine() {
         let (_tmp, path) = state_path();
@@ -508,8 +487,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// A parse error reports where, never what: the value could be a
-    /// prefix or a token pasted into the wrong file.
     #[test]
     fn parse_errors_do_not_echo_values() {
         let (_tmp, path) = state_path();

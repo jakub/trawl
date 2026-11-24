@@ -4,19 +4,6 @@
 
 //! Wire types for investigations (ADR-0059).
 //!
-//! An investigation is installation-owned: `investigation_read` with
-//! `query` reads every one, and `investigation_write` writes to any of
-//! them. Its log is append-only and sequenced. Every write advances the
-//! investigation's `seq` by one, and every entry records the `seq` that
-//! created it and the `updated_seq` of its last change (a step gains its
-//! outcome after it was appended). A reader asks for the entries changed
-//! since a `seq` it saw.
-//!
-//! Appends (keep, finding, note) carry no expected sequence. Overwrites
-//! (title, question, status, finding status, retention) carry the `seq`
-//! they observed and fail with 409 `sequence_conflict` and a
-//! [`SequenceConflict`] when it moved.
-//!
 //! Timestamps are RFC 3339 UTC with microseconds, as in
 //! [`crate::results`]. Text bounds are bytes of UTF-8 and are the
 //! `pub const`s below; the server refuses a request over any of them.
@@ -28,44 +15,24 @@ use serde::{Deserialize, Serialize};
 
 use crate::ErrorCode;
 
-// -- bounds ------------------------------------------------------------------
-
-/// Most bytes of an investigation's title.
 pub const TITLE_MAX_BYTES: usize = 200;
-/// Most bytes of an investigation's question.
 pub const QUESTION_MAX_BYTES: usize = 2048;
-/// Most bytes of an investigation's scope text.
 pub const SCOPE_MAX_BYTES: usize = 2048;
-/// Most bytes of a note.
 pub const NOTE_MAX_BYTES: usize = 4096;
-/// Most bytes of a finding's statement.
 pub const FINDING_STATEMENT_MAX_BYTES: usize = 4096;
-/// Most bytes of a finding's remaining question.
 pub const REMAINING_QUESTION_MAX_BYTES: usize = 1024;
-/// Most rows a finding cites as references.
 pub const FINDING_MAX_REFERENCES: usize = 32;
-/// Most rows a finding cites as counterevidence.
 pub const FINDING_MAX_COUNTEREVIDENCE: usize = 32;
-/// Most row numbers one keep records.
 pub const KEEP_MAX_ROWS: usize = 200;
-/// Most bytes of a keep's reason.
 pub const KEEP_REASON_MAX_BYTES: usize = 1024;
-/// Most bytes of the purpose an attached search states for its step.
 pub const PURPOSE_MAX_BYTES: usize = 1024;
 
-// -- identity ----------------------------------------------------------------
-
-/// An investigation id: 32 lowercase hex digits, a random 128-bit value the
-/// MCP server mints for a create, never the model (ADR-0059). The shape is
-/// the captured result id's.
-///
-/// It decodes only in that shape, so an id that reaches a route or a store
-/// is one.
+/// An investigation id: 32 lowercase hex digits, a random 128-bit value.
+/// The shape is the captured result id's.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(try_from = "String", into = "String")]
 pub struct InvestigationId(String);
 
-/// The text is not 32 lowercase hex digits.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvalidInvestigationId;
 
@@ -78,13 +45,8 @@ impl fmt::Display for InvalidInvestigationId {
 impl std::error::Error for InvalidInvestigationId {}
 
 impl InvestigationId {
-    /// The id's length in hex digits.
     pub const LEN: usize = 32;
 
-    /// Parse `text` as an id.
-    ///
-    /// # Errors
-    /// When `text` is not exactly 32 lowercase hex digits.
     pub fn parse(text: &str) -> Result<Self, InvalidInvestigationId> {
         let valid = text.len() == Self::LEN
             && text
@@ -97,7 +59,6 @@ impl InvestigationId {
         }
     }
 
-    /// The id's text.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
@@ -132,12 +93,6 @@ impl From<InvestigationId> for String {
     }
 }
 
-/// Who wrote something: the key's stable prefix and its name when it wrote.
-/// Both are snapshots, so they still read after the key is renamed or
-/// revoked. The prefix is the key's fingerprint, as in
-/// [`WhoAmIResponse::prefix`](crate::WhoAmIResponse::prefix); fleet's
-/// surrogate key id never crosses the wire. Attribution only: it grants
-/// nothing (ADR-0059).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Actor {
     /// The key's stable 8-character prefix. `name` can change, `prefix`
@@ -146,8 +101,6 @@ pub struct Actor {
     /// The key's name at the time of the write.
     pub name: String,
 }
-
-// -- enums -------------------------------------------------------------------
 
 /// An investigation's status. A closed investigation accepts nothing new
 /// until a writer reopens it; work admitted before the close still
@@ -177,7 +130,6 @@ pub enum FindingStatus {
     Unresolved,
 }
 
-/// How a step's work ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StepOutcomeKind {
@@ -199,76 +151,49 @@ pub enum StepOutcomeKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EntryKind {
-    /// Work the server ran for the investigation.
     Step,
-    /// Rows circled in kept evidence, with a reason.
     Keep,
-    /// A statement with a status and cited rows.
     Finding,
-    /// A finding's status, overwritten.
     FindingStatus,
-    /// Free text.
     Note,
-    /// The investigation closed or reopened.
     Status,
-    /// The investigation's title, overwritten.
     Title,
-    /// The investigation's question, overwritten.
     Question,
 }
 
-// -- the investigation -------------------------------------------------------
-
-/// An investigation's own fields.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Investigation {
-    /// The id.
     pub id: InvestigationId,
-    /// A short title.
     pub title: String,
-    /// The question the investigation answers.
     pub question: String,
     /// What the investigation covers, as free text. Empty when none was
     /// given.
     #[serde(default)]
     pub scope: String,
-    /// Open or closed.
     pub status: InvestigationStatus,
     /// The sequence of the latest write.
     pub seq: u64,
-    /// When it was created.
     pub created_at: String,
-    /// When it last changed.
     pub updated_at: String,
     /// When its evidence files stop being kept, unless it changes again.
     pub retain_until: String,
     /// The latest `retain_until` can slide to: 30 days after creation by
     /// default, raised only by `server_manage`.
     pub retain_ceiling: String,
-    /// Who created it.
     pub created_by: Actor,
-    /// Who changed it last.
     pub updated_by: Actor,
 }
 
 /// One row of `GET /api/v1/investigations`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvestigationSummary {
-    /// The id.
     pub id: InvestigationId,
-    /// The title.
     pub title: String,
-    /// Open or closed.
     pub status: InvestigationStatus,
-    /// The sequence of the latest write.
     pub seq: u64,
-    /// When it was created.
     pub created_at: String,
-    /// When it last changed.
     pub updated_at: String,
-    /// Who created it.
     pub created_by: Actor,
-    /// Who changed it last.
     pub updated_by: Actor,
 }
 
@@ -276,20 +201,15 @@ pub struct InvestigationSummary {
 /// first, then the rest, each group most recently changed first.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvestigationList {
-    /// The investigations.
     pub investigations: Vec<InvestigationSummary>,
 }
-
-// -- the log -----------------------------------------------------------------
 
 /// One row of a captured result: the result id and its 0-based row number
 /// (ADR-0057). A citation, never an event identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EvidenceRef {
-    /// The captured result's id.
     pub result_id: String,
-    /// The 0-based row number in that result.
     pub row: u64,
 }
 
@@ -297,16 +217,13 @@ pub struct EvidenceRef {
 /// `[earliest, latest)`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepBounds {
-    /// The inclusive start.
     pub earliest: String,
-    /// The exclusive end.
     pub latest: String,
 }
 
 /// How a step ended, written once when its work ends.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StepOutcome {
-    /// How the work ended.
     pub outcome: StepOutcomeKind,
     /// The error code the work ended with, for an outcome other than
     /// success.
@@ -320,8 +237,8 @@ pub struct StepOutcome {
     pub rows: Option<u64>,
     /// For a success, the rows the execution produced before the capture
     /// cut; equals the kept result's `total_rows`, and exceeds `rows` when
-    /// the capture was cut. Absent on other outcomes and on steps written
-    /// before it was recorded.
+    /// the capture was cut. Absent on other outcomes and on a success
+    /// written before it was recorded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_rows: Option<u64>,
     /// How long the work ran, in milliseconds, when it ran.
@@ -329,7 +246,6 @@ pub struct StepOutcome {
     pub duration_ms: Option<u64>,
 }
 
-/// What a log entry records, tagged by `kind`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EntryPayload {
@@ -356,16 +272,13 @@ pub enum EntryPayload {
     },
     /// Rows circled in kept evidence.
     Keep {
-        /// The kept result.
         result_id: String,
         /// The 0-based row numbers kept.
         rows: Vec<u64>,
-        /// Why.
         reason: String,
     },
     /// A statement with a status and the rows it cites.
     Finding {
-        /// The statement.
         statement: String,
         /// The status the finding was written with. A later
         /// `finding_status` entry overwrites it.
@@ -383,33 +296,19 @@ pub enum EntryPayload {
     FindingStatus {
         /// The `seq` of the finding's own entry, which is its id.
         finding_seq: u64,
-        /// The new status.
         status: FindingStatus,
     },
     /// Free text.
-    Note {
-        /// The text.
-        text: String,
-    },
+    Note { text: String },
     /// The investigation closed or reopened.
-    Status {
-        /// The new status.
-        status: InvestigationStatus,
-    },
+    Status { status: InvestigationStatus },
     /// The investigation's title, overwritten.
-    Title {
-        /// The new title.
-        title: String,
-    },
+    Title { title: String },
     /// The investigation's question, overwritten.
-    Question {
-        /// The new question.
-        question: String,
-    },
+    Question { question: String },
 }
 
 impl EntryPayload {
-    /// The entry's kind.
     #[must_use]
     pub fn kind(&self) -> EntryKind {
         match self {
@@ -425,7 +324,6 @@ impl EntryPayload {
     }
 }
 
-/// One entry of an investigation's log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LogEntry {
     /// The sequence that created the entry; a finding's id.
@@ -438,11 +336,8 @@ pub struct LogEntry {
     pub actor: Actor,
     /// When the entry was created.
     pub at: String,
-    /// What it records.
     pub payload: EntryPayload,
 }
-
-// -- requests ----------------------------------------------------------------
 
 /// Request body for `PUT /api/v1/investigations/{id}`: create if absent.
 /// The same creator sending the same fields gets the existing
@@ -469,17 +364,14 @@ pub enum AppendEntry {
     /// Circle rows of a captured result. A row of the caller's own
     /// temporary result promotes the whole result to kept evidence.
     Keep {
-        /// The result.
         result_id: String,
         /// The 0-based row numbers, at most [`KEEP_MAX_ROWS`].
         rows: Vec<u64>,
         /// Why, at most [`KEEP_REASON_MAX_BYTES`].
         reason: String,
-        /// The latest `seq` the caller has seen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen_seq: Option<u64>,
     },
-    /// Record a finding.
     Finding {
         /// The statement, at most [`FINDING_STATEMENT_MAX_BYTES`].
         statement: String,
@@ -493,22 +385,18 @@ pub enum AppendEntry {
         /// What it leaves open, at most [`REMAINING_QUESTION_MAX_BYTES`].
         #[serde(default, skip_serializing_if = "Option::is_none")]
         remaining_question: Option<String>,
-        /// The latest `seq` the caller has seen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen_seq: Option<u64>,
     },
-    /// Write a note.
     Note {
         /// The text, at most [`NOTE_MAX_BYTES`].
         text: String,
-        /// The latest `seq` the caller has seen.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         seen_seq: Option<u64>,
     },
 }
 
 impl AppendEntry {
-    /// The `seq` the caller has seen, if it sent one.
     #[must_use]
     pub fn seen_seq(&self) -> Option<u64> {
         match self {
@@ -534,13 +422,10 @@ pub struct PatchInvestigation {
     /// `activity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_seq: Option<u64>,
-    /// A new title.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    /// A new question.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub question: Option<String>,
-    /// Close or reopen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<InvestigationStatus>,
 }
@@ -555,7 +440,6 @@ pub struct FindingStatusUpdate {
     /// `activity`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seen_seq: Option<u64>,
-    /// The new status.
     pub status: FindingStatus,
 }
 
@@ -577,7 +461,6 @@ pub struct RetentionExtension {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Attach {
-    /// The investigation.
     pub id: InvestigationId,
     /// The latest `seq` the caller has seen, for the response's
     /// `activity`.
@@ -588,14 +471,11 @@ pub struct Attach {
     pub purpose: Option<String>,
 }
 
-// -- responses ---------------------------------------------------------------
-
 /// Response body for `GET /api/v1/investigations/{id}?since=<seq>`: the
 /// investigation and the entries changed after `since`, in `updated_seq`
 /// order.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InvestigationRead {
-    /// The investigation.
     pub investigation: Investigation,
     /// The entries, bounded.
     pub entries: Vec<LogEntry>,
@@ -621,7 +501,6 @@ pub struct Activity {
 /// Response body for an append or a finding-status overwrite.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AppendResponse {
-    /// The entry written.
     pub entry: LogEntry,
     /// The other actors' entries since the request's `seen_seq`. Absent
     /// when the request sent none.
@@ -635,7 +514,6 @@ pub struct PatchResponse {
     /// The investigation as the write's own transaction left it: its
     /// `seq` is the entry's.
     pub investigation: Investigation,
-    /// The entry written.
     pub entry: LogEntry,
     /// The other actors' entries since the request's `seen_seq`. Absent
     /// when the request sent none.
@@ -714,7 +592,6 @@ mod tests {
                 "{bad:?}"
             );
         }
-        // Multi-byte text of 32 bytes is refused by the digit check.
         assert!(InvestigationId::parse("ąąąąąąąąąąąąąąąą").is_err());
         let id: InvestigationId = serde_json::from_value(json!(ID)).unwrap();
         assert_eq!(serde_json::to_value(&id).unwrap(), json!(ID));
@@ -745,7 +622,6 @@ mod tests {
         );
     }
 
-    /// The step payloads with their wire spelling.
     fn step_cases() -> Vec<(EntryPayload, serde_json::Value)> {
         vec![
             (
@@ -799,7 +675,6 @@ mod tests {
         ]
     }
 
-    /// Every payload kind with its wire spelling.
     fn entry_cases() -> Vec<(EntryPayload, serde_json::Value)> {
         let reference = EvidenceRef {
             result_id: "fedcba9876543210fedcba9876543210".into(),

@@ -3,22 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The file operations of a daily rollup and its recovery, behind one
-//! handle (#357).
+//! handle.
 //!
-//! The rollup and its recovery make every open, footer check, sync, hash,
-//! rename, unlink and retirement through a [`RollupIo`], and each call names
-//! the [`Phase`] of the publish or recovery it belongs to. The caller passes
-//! the handle down and moves it into each blocking task. Nothing is kept in
-//! a thread-local or a static.
-//!
-//! [`RollupIo::REAL`] runs the real calls. Outside tests it has no fields,
-//! so each wrapper compiles down to the call it wraps. Under `cfg(test)` or
-//! the `test-support` feature, `RollupIo::recording` attaches a
-//! `Recorder`. Each call appends one `Entry` when it starts and fills in
+//! A recording handle appends one `Entry` when a call starts and fills in
 //! its result when it returns, so a call made inside another one (the day
 //! fsync inside the marker publish) is listed after it, in the order the
-//! calls started. The recorder can also fault one call, chosen by phase and
-//! by how many earlier calls of that phase this handle made.
+//! calls started.
 //!
 //! The entries record the results the system calls returned. They say
 //! nothing about what reached the disk: a process that is killed keeps its
@@ -38,17 +28,13 @@ pub enum Phase {
     TmpOpen,
     /// Parse the tmp's footer.
     TmpFooter,
-    /// `sync_all` the tmp.
     TmpSync,
-    /// Hash the tmp.
     TmpHash,
     /// Open a merged hourly input to hash it.
     InputOpen,
-    /// Hash a merged hourly input.
     InputHash,
     /// Open the prior daily file that the merge read.
     PriorOpen,
-    /// Hash the prior daily file.
     PriorHash,
     /// fsync the day directory and its ancestors before the marker.
     ChainSync,
@@ -68,7 +54,6 @@ pub enum Phase {
     Retire,
     /// fsync one hour directory after its input is retired.
     HourSync,
-    /// Unlink the marker.
     MarkerUnlink,
     /// fsync the day directory after the marker's unlink.
     UnlinkDaySync,
@@ -89,24 +74,18 @@ pub enum Op {
     Open,
     /// Parse a Parquet footer on an open file.
     Footer,
-    /// `sync_all` an open file.
     SyncFile,
     /// Hash an open file from its first byte.
     Hash,
-    /// fsync a directory.
     SyncDir,
-    /// Publish a marker durably.
     PublishMarker,
     /// Rename a file. The entry's path is the source.
     Rename,
-    /// Unlink a file.
     RemoveFile,
     /// Retire a merged input through the caller's retirement.
     Retire,
 }
 
-/// The I/O handle of one rollup or recovery. See the
-/// [module documentation](self).
 #[derive(Debug, Clone, Default)]
 pub struct RollupIo {
     #[cfg(any(test, feature = "test-support"))]
@@ -118,13 +97,11 @@ pub struct RollupIo {
 const _: () = assert!(std::mem::size_of::<RollupIo>() == 0);
 
 impl RollupIo {
-    /// Run the real calls and record nothing.
     pub const REAL: Self = Self {
         #[cfg(any(test, feature = "test-support"))]
         recorder: None,
     };
 
-    /// Run every call through `recorder`.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn recording(recorder: std::sync::Arc<Recorder>) -> Self {
@@ -176,20 +153,16 @@ impl RollupIo {
         })
     }
 
-    /// `sync_all` `file`, opened from `path`.
     pub fn sync_file(&self, phase: Phase, path: &Path, file: &File) -> io::Result<()> {
         self.call(Op::SyncFile, phase, path, || file.sync_all())
     }
 
-    /// The identity of `file`, opened from `path`, hashed from its first
-    /// byte ([`publication_marker::identity_of_file`]).
     pub fn hash(&self, phase: Phase, path: &Path, file: &mut File) -> io::Result<OutputIdentity> {
         self.call(Op::Hash, phase, path, || {
             publication_marker::identity_of_file(file)
         })
     }
 
-    /// fsync the directory `dir` ([`crate::epoch::fsync_dir`]).
     pub fn sync_dir(&self, phase: Phase, dir: &Path) -> io::Result<()> {
         self.call(Op::SyncDir, phase, dir, || crate::epoch::fsync_dir(dir))
     }
@@ -212,10 +185,7 @@ impl RollupIo {
     }
 
     /// What is at `path`, for recovery's [`classify`](super::rollup_marker::classify): the
-    /// file `open` opens, hashed. The open and the hash are each a
-    /// [`Phase::RecoveryObserve`] call. A `NotFound` open is
-    /// [`Observation::Absent`]; any other failure is
-    /// [`Observation::Unreadable`].
+    /// file `open` opens, hashed.
     pub fn observe(
         &self,
         path: &Path,
@@ -236,8 +206,6 @@ impl RollupIo {
         self.call(Op::Rename, phase, from, || std::fs::rename(from, to))
     }
 
-    /// Unlink `path`. A missing file is the `NotFound` error the call
-    /// returned, for the caller to judge.
     pub fn remove_file(&self, phase: Phase, path: &Path) -> io::Result<()> {
         self.call(Op::RemoveFile, phase, path, || std::fs::remove_file(path))
     }
@@ -272,12 +240,9 @@ mod recorder {
 
     use super::{Op, Phase, RollupIo};
 
-    /// What one call returned.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Outcome {
-        /// The real call succeeded.
         Ok,
-        /// The real call failed with this kind.
         Err(io::ErrorKind),
         /// The recorder failed the call with this kind, and the real call
         /// never ran.
@@ -328,17 +293,14 @@ mod recorder {
         state: Mutex<State>,
     }
 
-    /// The text of every injected error.
     pub const INJECTED: &str = "injected rollup I/O fault";
 
     impl Recorder {
-        /// A recorder with no entries and no faults.
         #[must_use]
         pub fn new() -> Arc<Self> {
             Arc::default()
         }
 
-        /// A [`RollupIo`] that runs every call through this recorder.
         #[must_use]
         pub fn io(self: &Arc<Self>) -> RollupIo {
             RollupIo::recording(Arc::clone(self))
@@ -367,13 +329,11 @@ mod recorder {
                 .insert((phase, occurrence), Fault::Before(Box::new(hook)));
         }
 
-        /// Every call so far, in the order they started.
         #[must_use]
         pub fn entries(&self) -> Vec<Entry> {
             self.state.lock().entries.clone()
         }
 
-        /// The phases of [`Self::entries`], in order.
         #[must_use]
         pub fn phases(&self) -> Vec<Phase> {
             self.state.lock().entries.iter().map(|e| e.phase).collect()

@@ -7,10 +7,6 @@
 //! Distinct from the search-page `Mode` (Snapshot/Live) — that one
 //! lives under `state::query` and only governs the search workspace's
 //! result rendering. `AppMode` governs which page mounts.
-//!
-//! The enum + `mode_from_path` are pure and build on every target so
-//! `section`'s native tests can name modes; `from_url` (the reactive
-//! `Memo`) is wasm32-only.
 
 // `ALL` and `mode_from_path` exist for `section`'s native tests and for
 // `from_url`; neither target reaches every item, so the module carries
@@ -43,8 +39,6 @@ fn mode_from_path(path: &str) -> AppMode {
     }
 }
 
-/// `Memo<AppMode>` derived from the URL pathname. Reactive — uses the
-/// router's `use_location().pathname` which fires on every navigation.
 #[cfg(target_arch = "wasm32")]
 #[must_use]
 pub fn from_url() -> Memo<AppMode> {

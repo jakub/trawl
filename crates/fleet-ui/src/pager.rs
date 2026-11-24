@@ -4,24 +4,11 @@
 
 //! `<Pager/>` — table footer with summary + optional prev/next
 //! controls.
-//!
-//! The one table-footer look in the fleet, `.results-footer`
-//! (ADR-0003). Three shapes:
-//!
-//! - **summary-only** — pass just `summary` (nets' "N nets" count row);
-//!   no pagination semantics are invented for unpaginated tables.
-//! - **prev/next** — pass `on_prev`/`on_next` (+ `can_prev`/`can_next`)
-//!   to render the compact pager buttons.
-//! - **custom trailing slot** — `children` render after the summary,
-//!   e.g. a cursor-based `LoadMore` button.
 
 use leptos::prelude::*;
 
 use crate::button::{Btn, Size, Variant};
 
-/// Table footer. `summary` is the left-hand count/range text
-/// (`"1–50 of 213"`, `"7 nets"`); the pager controls render only when
-/// the corresponding callbacks are provided.
 #[component]
 pub fn Pager(
     #[prop(into)] summary: Signal<String>,

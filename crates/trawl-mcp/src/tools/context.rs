@@ -3,20 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `context`: the rows around one captured row (ADR-0058).
-//!
-//! Reads trawld's capabilities once, first, then sends
-//! `POST /api/v1/results/context` with the focus row, the scope and the
-//! group sizes, and answers with the first page of the new result and its
-//! block: the scope trawld used, the focus row, the earlier, same-time and
-//! later groups as ranges of captured rows, and the sentence that this is
-//! a new read whose equal timestamps establish no order. A focus row
-//! without `_time` or a key the scope names is trawld's `focus_incomplete`
-//! refusal, never a wider read.
-//!
-//! With `investigation`, the read attaches to that investigation as
-//! `search` attaches (ADR-0059, [`super::attach`]): trawld records it as a
-//! step, keeps the new result as evidence, and answers with what other
-//! keys changed since the session's `seen_seq`.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{
@@ -31,7 +17,6 @@ use crate::render::Budget;
 use crate::reply::ContextScope;
 use crate::session::Seen;
 
-/// How `context` names itself when it attaches.
 const CALLER: Caller = Caller {
     tool: CONTEXT,
     input: CONTEXT,
@@ -39,8 +24,6 @@ const CALLER: Caller = Caller {
     answer: "context answer",
 };
 
-/// Run `context` against `backend`, with `seen` the session's bookkeeping
-/// an attached read reads and advances.
 pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: ContextInput) -> CallToolResult {
     let attachment =
         match attach::attachment(CALLER, input.investigation.as_ref(), input.purpose.as_ref()) {

@@ -23,12 +23,6 @@ export function corpus(seed, count, run) {
   });
 }
 
-// An `integer` result cell, read as the exact integer it spells. The result
-// wire carries integers as canonical decimal strings under their column's
-// type (ADR-0035, amended 2026-10-22): no sign on zero, no leading zero,
-// within the signed or the unsigned 64-bit range. A JSON number there is a
-// wire fault, and `BigInt` keeps every digit a `Number` would round past
-// 2^53.
 const INTEGER = /^(0|-?[1-9][0-9]*)$/;
 const INTEGER_MIN = -(2n ** 63n);
 const INTEGER_MAX = 2n ** 64n - 1n;
@@ -42,7 +36,6 @@ export function integerCell(column, value) {
   return integer;
 }
 
-// The rows of one response, whether it is a whole result or one browser page.
 export function verifyRows(response, events) {
   const columns = response.columns.map(c => c.name);
   const seq = columns.indexOf('experiment_seq');
@@ -59,8 +52,6 @@ export function percentile(values, fraction) {
   return sorted[Math.max(0, Math.ceil(sorted.length * fraction) - 1)] ?? null;
 }
 
-// A whole-result read: the server measured `total` before cutting the window,
-// so a response that carries fewer rows than it measured was cut.
 export function verifyWholeResult(response, events) {
   assert.equal(response.pagination.total, response.rows.length, 'query result was cut before the response window');
   verifyRows(response, events);

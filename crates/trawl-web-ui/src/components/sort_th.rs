@@ -2,18 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Sort controls shared by native management tables and the service
-//! drawer's field list. The native wrapper adds a scoped header and
-//! `aria-sort`; the field list keeps its div container. The button's
-//! accessible name includes the current sort direction in both cases.
-
 use leptos::prelude::*;
 
 use crate::sort_label::{sort_arrow, sort_button_name};
 
-/// One sortable header cell. Not a `#[component]` — the flex sizing
-/// `style` is per-column and threading it through props buys nothing.
-/// `default_desc` is the direction a freshly-selected key starts in.
 pub fn sort_th<K>(
     sort: RwSignal<(K, bool)>,
     key: K,
@@ -24,8 +16,6 @@ pub fn sort_th<K>(
 where
     K: Copy + PartialEq + Send + Sync + 'static,
 {
-    // `None` while another column holds the sort, else this column's
-    // descending flag.
     let direction = move || {
         let (k, desc) = sort.get();
         (k == key).then_some(desc)
@@ -56,7 +46,6 @@ where
     }
 }
 
-/// Native management table header. Sort policy stays with the caller.
 pub fn table_sort_th<K>(
     sort: RwSignal<(K, bool)>,
     key: K,

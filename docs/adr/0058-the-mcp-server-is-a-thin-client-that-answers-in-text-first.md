@@ -1,6 +1,6 @@
 # The MCP server is a thin client that answers in text first
 
-status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A2 and B of the arc #214 → A1 → A2 → B, C1 → C2)
+status: accepted (2026-10-22), prep record for the MCP 1.0 slices (A2 and B of the arc #214 → A1 → A2 → B, C1 → C2); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Trawl's own agentic features power features and are not a chatbot (ADR-0035's analyses keep a closed read-only tool set). The investigation of 2026 is a Claude instance speaking MCP and progressing in real time from the answers it gets. That needs a server that is good at being asked: it orients the model in one call, answers a search with a summary before rows, keeps a frozen copy the model can come back to (ADR-0057), correlates one literal across services, compares two windows honestly, and never pretends to be more than a client holding a key. Two facts shaped the design more than the proposal expected. There is no application layer in trawl-server: `handlers::query` owns permission, validation, permit, deadline, publication gate, scratch and shaping in one function, and bearer auth, the trawl grant check, per-key rate and the ADR-0054 count are middleware, so a second door inside the process would skip them. And the clients are not what the spec revision suggests: Claude Code negotiates MCP 2026-07-28 with fallback to the initialize handshake, spills any text result over 50,000 characters to a file, does not document rendering `structuredContent`, documents no consumer for per-resource `subscriptions/listen` updates, and claude.ai connectors connect from Anthropic's cloud, so a tailnet endpoint is unreachable from them regardless of OAuth.
 
@@ -76,3 +76,34 @@ Rejected:
 - **Shorten the columns line and keep the rows whole.** A row array whose cells have no printed column cannot be read by position.
 - **A stored-order prefix as the first step.** In a wide `sightings` result the first columns are mostly null, so the data would sit in the omitted ones and cost one `read action=cell` call per cell.
 - **A larger hard cap.** Width has no bound, and the 50,000-character spill is the client's.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**The `trawl mcp` process.**
+
+- **`trawl mcp` contacts no server before it serves.** An unreachable trawld or a rejected key reaches the model as the error text of the tool call that met it. The exit status is 0 when the client closes the session, 1 when the stdio transport fails, even after the session started, and 2 for every refusal before the server starts.
+- **`TrawlServer` does not use rmcp's tool router macros.** They sort tools by name and turn a typed result into a JSON dump. The decision wants a fixed `tools/list` order and a text block that stands alone.
+
+**Schemas and the mirror.**
+
+- **The root and name rules hold for output schemas too, and "flat" has one meaning for inputs.** Every root, input and output, is an object with no root `anyOf` or `oneOf`, and every property name at every depth stays within `[A-Za-z0-9_.-]`. In an input, each root property is a scalar, an array of scalars, or an array of objects whose properties are all scalars. A tool with variants picks one with a single enum field: `mode`, `action` or `source`. An input enum is an inlined string enum whose variants carry no doc comments, because a documented variant makes schemars emit a `oneOf` of constants instead of one `enum` keyword. Claude Code drops a tool whose schema breaks these rules. `tests/schemas.rs` checks the root and the property names of every schema, and the flat shape of every input. It does not check enums, and an output enum such as `FormatRefusalKind` has documented variants.
+- **The `structuredContent` mirror carries the escape text the text block prints.** `rows::mirror` replaces each unsafe display character in every string and object key, control characters included, with the escape that `json_text` prints for it: `\n` for a line feed, `\u202e` for a right-to-left override. A client may show the model the mirror in place of the text block, or decode the mirror and render its strings, so no rendering of the mirror can reorder or hide the text around a string. The cost is that a mirror string that held such a character does not decode to the stored text. A client that needs those bytes reads them through trawld's HTTP API.
+- **A proposed call whose arguments hold an unsafe display character is left out of the mirror's `next_actions`.** Its arguments are the next call's input, so escaping them would change the call. The text block still proposes the call, and its JSON escapes decode to the original arguments.
+
+**Fitting.**
+
+- **In the refusal at the hard cap, the `read action=cell` call comes right after the fixed first sentence.** `refusal::MAX_ERROR_BYTES` cuts error text at 8 KiB. The cell call is the route that always works, so it sits where that cut cannot reach it.
+
+**`GET /api/v1/capabilities`.**
+
+- **The route checks no permission beyond the trawl grant, as `whoami` does.** Every key that may call trawld may learn the bounds it is held to. The report includes the same health snapshot as `/health`, which checks the data directory and can refresh the cached auth and storage database pings. Retention reach is not in it: `orient` takes retention reach from the dashboard, which stays behind `server_manage`.
+- **An unset `link_origin` and an unlimited `rate_rpm` are written as `null`, never left out.** A client then reads "not configured", not "an older server that lacks the field".
+
+**Correlation reads.**
+
+- **A `context` focus row must hold `_time` and every key its scope names.** This holds for the default scope and an explicit one alike. A missing or non-text key is 400 `focus_incomplete` naming the field, and the read is never widened to make up for it. The window is `[F − seconds, F + seconds + 1 µs)`, so the focus instant is inside it.
+- **`context` does not copy the focus row into its answer.** The facts name it by result id and row, with the time, env and host the read took from it. The same-time group holds at most 20 of the rows the new read found at `F`, and the capture's limits can cut it further. So the focus event's own record may be absent, and it is not marked when present. This is a new read, and equal timestamps establish no order.
+- **Retention reach lists at most 1024 selected envs because of the walk's cost.** Ingest bounds an env's name to 32 bytes, but not the number of envs. Each env is one directory listing, about 10 µs once the capture's own source walk has warmed it: 10,000 envs measured about 95 ms in a debug build. So 1024 envs add about 10 ms to a capture with a 15-second default deadline. A cold listing can cost a disk seek.
+- **Correction.** The amendment "the correlation reads as built" says that the builder walks the whole token tree and refuses a time clause at any depth as `correlation_invalid` naming the keyword. `filter_search` in `trawl_core::correlate` checks only the clauses the parser hoisted, because a clause parses only at the top level (ADR-0061). A clause at the top level is `correlation_invalid` naming the keyword. A clause under `NOT` or in parentheses fails to parse, and the refusal is `correlation_invalid` with the parser's message, "a time clause cannot sit inside parentheses or under NOT". A filter with any pipe stage is also `correlation_invalid`: a `compare` filter is search tokens only.

@@ -3,14 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<AuthShell/>` — authenticated layout wrapping all non-login routes.
-//!
-//! A thin app-specific wrapper over [`fleet_ui::Shell`]: keeps the
-//! `/me` fetch, its Unauthorized answer sent to sign-in carrying the
-//! requested URL through the shared handler, and the
-//! `ShellStatus` + `me` context provision; maps trawl's `AppMode` /
-//! `section` state onto fleet-ui's `SidebarGroup` / `RailItem` props.
-//! The toast bus and `<Toasts/>` host are owned by `fleet_ui::Shell`
-//! (pages reach the bus via `expect_context::<ToastBus>()`).
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -26,9 +18,6 @@ use crate::state::filter_rail::FilterRailChoice;
 use crate::state::section;
 use crate::state::stats_stream::{StatsLifecycle, start_stats_stream};
 
-/// Shared status signals that the shell owns and the `StatusBar` reads.
-/// Search (or any page that wants to drive the status bar) writes to
-/// these via `use_context::<ShellStatus>()`.
 #[derive(Clone, Copy)]
 pub struct ShellStatus {
     pub kind: RwSignal<StatusKind>,
@@ -87,21 +76,15 @@ pub fn AuthShell() -> impl IntoView {
 
     let shell_status = ShellStatus {
         kind: RwSignal::new(StatusKind::Connected),
-        // Pages that never run a search keep the shell's own default:
-        // the snapshot source with nothing counted yet.
         count: RwSignal::new(FooterCount::last(None)),
         lagged: RwSignal::new(None),
     };
     provide_context(shell_status);
     provide_context(me);
     // The wide filter rail's hand choice lives here, above the Search
-    // route, so it survives route changes and drops on sign-out: `/login`
-    // is outside this shell (ADR-0044).
+    // route, so it survives route changes and drops on sign-out (ADR-0044).
     provide_context(FilterRailChoice::new());
 
-    // The Health page and footer share this report. Only server_manage
-    // sessions issue the bootstrap GET or open the stream. The footer
-    // receives live snapshots only, so reconnecting numbers disappear.
     // Dropping the handle closes the stream and invalidates its callbacks.
     let dashboard = RwSignal::new(crate::dashboard_state::DashboardState::<
         trawl_api::DashboardSnapshot,
@@ -134,9 +117,6 @@ pub fn AuthShell() -> impl IntoView {
         }
     });
 
-    // A permission-gated entry appears only once `/me` says the session
-    // holds its grant, and a group left empty is not rendered. The
-    // command palette derives from these groups, so it follows.
     let sidebar_groups = Signal::derive(move || {
         let permissions = me.get().map(|m| m.permissions).unwrap_or_default();
         section::groups()
@@ -235,7 +215,6 @@ pub fn AuthShell() -> impl IntoView {
     }
 }
 
-/// Generic redirect component. Navigates to `path` on mount.
 #[component]
 #[allow(clippy::needless_pass_by_value)] // Leptos component props: easier to pass owned
 pub fn RedirectTo(#[prop(into)] path: String) -> impl IntoView {
@@ -248,7 +227,6 @@ pub fn RedirectTo(#[prop(into)] path: String) -> impl IntoView {
     view! { <p>"Redirecting…"</p> }
 }
 
-/// 404 page — rendered by the router fallback.
 #[component]
 pub fn NotFound() -> impl IntoView {
     view! {

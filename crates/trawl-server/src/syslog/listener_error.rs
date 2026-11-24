@@ -2,26 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The error path the TCP and UDP syslog listeners share (ADR-0054,
-//! 2026-11-06 amendment).
-//!
-//! A failed `accept()` or `recv_from` ends nothing. The listener logs it
-//! under a throttle, waits out [`ACCEPT_ERROR_BACKOFF`] and asks its socket
-//! again. Shutdown cuts the wait short: an already-set flag, a flag set
-//! during the wait and a dropped sender all return at once, with no further
-//! accept or receive.
-//!
-//! The throttle is per listener, over time. A failure logs a line at once
-//! only when the listener has logged no line in the last 30 s; otherwise it
-//! is counted as unlogged, and the next line carries that count. The first
-//! success after a failure episode logs one recovery line, but only when
-//! the episode had a logged line; an episode with none closes silently and
-//! its count carries into the next line. A flood that alternates errors
-//! with successes therefore logs about two lines per 30 s, not two per
-//! backoff.
-//!
-//! Every line uses [`PREAUTH_TRANSPORT_TARGET`]: a sender that can reach
-//! the port can provoke them, so they stay out of the corpus.
+//! The error path the TCP and UDP syslog listeners share (ADR-0054).
 
 use std::io;
 use std::ops::ControlFlow;
@@ -32,11 +13,8 @@ use tokio::time::Instant;
 use crate::shutdown::{ACCEPT_ERROR_BACKOFF, ShutdownRx, shutdown_observed};
 use crate::telemetry::PREAUTH_TRANSPORT_TARGET;
 
-/// The shortest gap between two lines one listener logs about its socket
-/// errors.
 const LOG_INTERVAL: Duration = Duration::from_secs(30);
 
-/// Which listener a [`ListenerErrors`] reports for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Listener {
     Tcp,
@@ -66,22 +44,15 @@ impl Listener {
     }
 }
 
-/// One listener's socket-error state: the throttle and the backoff.
 #[derive(Debug)]
 pub(super) struct ListenerErrors {
     listener: Listener,
     /// A clone of the listener's receiver, so the backoff can wait on
     /// shutdown from inside the outer select's handler.
     shutdown_rx: ShutdownRx,
-    /// Failures since the last success.
     episode_failures: u64,
-    /// Whether this episode has logged a line, which is what earns it a
-    /// recovery line.
     episode_logged: bool,
-    /// Failures since the previous line that got no line of their own,
-    /// across episodes.
     unlogged: u64,
-    /// When this listener last logged a line about its socket errors.
     last_line: Option<Instant>,
 }
 
@@ -97,8 +68,6 @@ impl ListenerErrors {
         }
     }
 
-    /// Record a failed accept or receive, then wait out the backoff.
-    ///
     /// `Break` means shutdown arrived (or was already set) and the
     /// listener must return without touching its socket again.
     pub(super) async fn back_off(&mut self, error: &io::Error) -> ControlFlow<()> {
@@ -171,9 +140,6 @@ impl ListenerErrors {
 #[cfg(any(test, feature = "test-support"))]
 pub(super) type Fault = Box<dyn FnOnce() -> io::Error + Send>;
 
-/// The socket a listener reads, and with `test-support` the queue of
-/// faults its next accept or receive calls answer before the socket is
-/// asked, and a count of those calls. Both belong to this one listener.
 pub(super) struct Incoming<S> {
     pub(super) socket: S,
     #[cfg(any(test, feature = "test-support"))]
@@ -193,8 +159,6 @@ impl<S> Incoming<S> {
         }
     }
 
-    /// `socket`, with `faults` answering its first calls, and the count of
-    /// calls the listener makes.
     #[cfg(test)]
     pub(super) fn with_faults(
         socket: S,
@@ -240,7 +204,6 @@ pub(super) mod test_support {
     use super::super::convert::SyslogDoor;
     use super::Fault;
 
-    /// The one door, with the packaged derivation policy and no relays.
     pub(in crate::syslog) fn test_door() -> SyslogDoor {
         SyslogDoor {
             envs: vec!["prod".to_owned()].into(),
@@ -259,17 +222,13 @@ pub(super) mod test_support {
             .collect()
     }
 
-    /// How shutdown reaches the listener in `listener_shutdown_during_backoff`.
     #[derive(Debug, Clone, Copy)]
     pub(in crate::syslog) enum Stop {
         /// The fault sets the flag, so it is already true when the backoff
         /// starts.
         SetAtBackoffEntry,
-        /// The flag is set while the listener waits out its backoff.
         SentDuringBackoff,
-        /// The last sender drops while the listener waits out its backoff.
         DroppedDuringBackoff,
-        /// The last sender drops while the listener waits on its socket.
         DroppedOutsideBackoff,
     }
 
@@ -280,8 +239,6 @@ pub(super) mod test_support {
         Stop::DroppedOutsideBackoff,
     ];
 
-    /// The faults for one [`Stop`] case, given a sender clone the first
-    /// case's fault sets the flag with.
     pub(in crate::syslog) fn stop_faults(
         stop: Stop,
         shutdown_tx: &crate::shutdown::ShutdownTx,
@@ -371,7 +328,6 @@ pub(super) mod test_support {
         assert_eq!(lines, expected);
     }
 
-    /// One captured socket-error line.
     #[derive(Debug, Clone, PartialEq, Eq)]
     pub(in crate::syslog) struct Line {
         pub target: String,
@@ -406,8 +362,6 @@ pub(super) mod test_support {
         fn record_debug(&mut self, _field: &Field, _value: &dyn std::fmt::Debug) {}
     }
 
-    /// A layer that records the listeners' socket-error lines, with the
-    /// target and level from each event's metadata.
     #[derive(Clone, Default)]
     pub(in crate::syslog) struct Capture {
         lines: Arc<Mutex<Vec<Line>>>,
@@ -477,9 +431,6 @@ mod tests {
     const FAILED: &str = "syslog_tcp_accept_failed";
     const RECOVERED: &str = "syslog_tcp_accept_recovered";
 
-    /// One burst: the first failure at once, then a line per 30 s that
-    /// counts the failures in between, then one recovery line. A second
-    /// success logs nothing.
     #[test]
     fn a_burst_logs_first_summaries_and_one_recovery() {
         let capture = Capture::default();
@@ -505,9 +456,6 @@ mod tests {
         );
     }
 
-    /// The window is the listener's, not the episode's: a new episode
-    /// inside 30 s of the last line logs nothing, closes silently, and its
-    /// count rides on the next line.
     #[test]
     fn an_episode_inside_the_window_closes_silently_and_carries_its_count() {
         let capture = Capture::default();
@@ -539,10 +487,6 @@ mod tests {
         );
     }
 
-    /// The flood the throttle exists for: every 100 ms backoff ends in a
-    /// success and the next one starts with a failure. Over 100 s of that
-    /// one listener logs 8 lines, a failure and its recovery about every
-    /// 30 s, where a per-episode reset would log 2 000.
     #[test]
     fn an_alternating_flood_logs_a_bounded_number_of_lines() {
         let capture = Capture::default();
@@ -574,8 +518,6 @@ mod tests {
         );
     }
 
-    /// The backoff is 100 ms on the clock: still waiting just before, done
-    /// at it.
     #[tokio::test(start_paused = true)]
     async fn the_backoff_waits_out_the_shared_constant() {
         let (_tx, rx) = crate::shutdown::shutdown_channel();

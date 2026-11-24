@@ -5,22 +5,8 @@
 //! Publication markers: the record that makes one compaction publish
 //! exactly-once across crashes (ADR-0041, slice 1).
 //!
-//! A publish turns consumed WAL files into one canonical parquet file. The
-//! marker is written durably before the output is renamed into place, and it
-//! is removed only after the consumed WAL files are retired. While it exists,
-//! it claims the files it names: no compaction of its `(env, service)`, no
-//! stale-tmp cleanup of its output, no rollup or retention of its partition.
-//!
-//! Location: `wal_dir/{env}/.publish-{service}.json`, one per
-//! `(env, service)`. The env comes from the directory name and the service
-//! from the file name. The `.json` extension keeps the marker out of the
-//! compactor's `*.ndjson` WAL scan, and the staged writer's temp name
-//! (`..publish-{service}.json.next.<pid>`) is inert for the same reason.
-//!
-//! Recovery decides publication from the canonical file's identity (size and
-//! BLAKE3 digest) and nothing else. A missing temporary output never proves
-//! publication, because recovery itself may have removed it before a crash.
-//! Every recovery branch is idempotent, so an interrupted recovery can rerun.
+//! Location: `wal_dir/{env}/.publish-{service}.json`. The `.json` extension
+//! keeps the marker out of the compactor's `*.ndjson` WAL scan.
 //!
 //! Recovery deletes files named by an on-disk record, so [`read_marker`]
 //! confines every component before any path is built: paths are only ever
@@ -39,7 +25,6 @@ use super::no_follow;
 use crate::env_dirs::{date_name, hour_dir, hour_name, hourly_file, parse_date, parse_hour};
 use crate::error::CauseKind;
 
-/// Marker file name prefix inside `wal_dir/{env}`.
 const MARKER_PREFIX: &str = ".publish-";
 /// Marker file name suffix. Anything but `.ndjson`, which the WAL scan claims.
 const MARKER_SUFFIX: &str = ".json";
@@ -55,13 +40,6 @@ const MAX_WAL_ENTRY_BYTES: usize = 255;
 /// Largest marker [`read_marker`] reads, about 1 MiB. The WAL writer calls
 /// [`read_marker`] on every write, so the bound keeps a planted marker from
 /// making each write load a file of any size.
-///
-/// [`ValidatedMarker::encode`] writes compact JSON, and validation bounds
-/// every part of it. The keys and punctuation, the 13-byte partition, a
-/// `u64` size of at most 20 digits and the 64-digit digest take 142 bytes;
-/// 1 KiB covers them. Each WAL entry takes its name, two quotes and a comma.
-/// So every marker compaction can write fits, and one at the configured
-/// default holds about 500 names of 30 to 160 bytes, a few dozen KiB.
 pub const MAX_MARKER_BYTES: u64 =
     (1024 + MAX_MARKER_WAL_ENTRIES * (MAX_WAL_ENTRY_BYTES + 3)) as u64;
 
@@ -75,13 +53,11 @@ pub struct PublicationMarker {
     /// Bare file names of the consumed WAL files in `wal_dir/{env}`. Only
     /// surviving inputs; a quarantined `.corrupt` file is never listed.
     pub wal: Vec<String>,
-    /// Size in bytes of the published output.
     pub size: u64,
     /// BLAKE3 digest of the published output, 64 lowercase hex digits.
     pub blake3: String,
 }
 
-/// The size and BLAKE3 digest of an output file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OutputIdentity {
     pub size: u64,
@@ -120,7 +96,6 @@ pub struct ValidatedMarker {
 }
 
 impl ValidatedMarker {
-    /// Validate the parts of a marker about to be written.
     pub fn new(
         env: &str,
         service: &str,
@@ -183,7 +158,6 @@ impl ValidatedMarker {
         self.identity
     }
 
-    /// The bare WAL file names, in marker order.
     pub fn wal_names(&self) -> &[String] {
         &self.wal
     }
@@ -219,7 +193,6 @@ impl ValidatedMarker {
         wal_dir.join(&self.env)
     }
 
-    /// The consumed WAL paths, in marker order.
     pub fn wal_paths(&self, wal_dir: &Path) -> Vec<PathBuf> {
         let env_dir = self.wal_env_dir(wal_dir);
         self.wal.iter().map(|name| env_dir.join(name)).collect()
@@ -243,7 +216,6 @@ impl ValidatedMarker {
             .join(marker_file_name(&self.service))
     }
 
-    /// The marker body as written to disk.
     pub fn encode(&self) -> String {
         let record = PublicationMarker {
             partition: self.partition(),
@@ -359,13 +331,11 @@ impl InvalidReason {
         }
     }
 
-    /// The reason in trawl's own words.
     #[must_use]
     pub fn reason(&self) -> &str {
         &self.reason
     }
 
-    /// serde's wording, when the body did not parse.
     #[must_use]
     pub fn parse_error(&self) -> Option<&str> {
         self.parse_error.as_deref()
@@ -397,10 +367,8 @@ impl fmt::Display for InvalidReason {
     }
 }
 
-/// Why a marker could not be used.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MarkerError {
-    /// No marker exists at the path.
     Missing,
     /// The marker is readable but fails confinement or parsing.
     Invalid(InvalidReason),
@@ -418,7 +386,6 @@ impl fmt::Display for MarkerError {
     }
 }
 
-/// [`MarkerError::Missing`] for `NotFound`, else [`MarkerError::Io`].
 fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
     if error.kind() == io::ErrorKind::NotFound {
         MarkerError::Missing
@@ -430,13 +397,9 @@ fn io_error(path: &Path, operation: &str, error: &io::Error) -> MarkerError {
 /// Read and confine the marker at `path`. The env is the parent directory's
 /// name and the service comes from the file name.
 ///
-/// The marker is opened without following a symlink and without waiting on
-/// a FIFO ([`no_follow::open`]), and its type and size come from `fstat` on
-/// that descriptor, so nothing swapped in at the path after a check is ever
-/// read. Anything but a regular file is invalid. A marker over
-/// [`MAX_MARKER_BYTES`] is invalid: one `fstat` reports is never read, and
-/// one that grows after the `fstat` is read only up to one byte past the
-/// bound. Off Unix no marker is opened, so a present one cannot be read.
+/// A marker over [`MAX_MARKER_BYTES`] is invalid: one `fstat` reports is
+/// never read, and one that grows after the `fstat` is read only up to one
+/// byte past the bound.
 pub fn read_marker(path: &Path) -> Result<ValidatedMarker, MarkerError> {
     read_marker_with(path, no_follow::open)
 }
@@ -520,7 +483,6 @@ pub fn remove_marker_durably(path: &Path) -> Result<(), String> {
         .map_err(|e| format!("failed to fsync directory {}: {e}", dir.display()))
 }
 
-/// Marker files in one env's WAL directory, sorted by name.
 fn list_markers(env_dir: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     let mut markers = Vec::new();
     for entry in std::fs::read_dir(env_dir)? {
@@ -569,7 +531,6 @@ pub struct PublicationClaims {
 }
 
 impl PublicationClaims {
-    /// Whether any marker, or any unknown, exists.
     pub fn any(&self) -> bool {
         self.root_incomplete || !self.services.is_empty() || !self.opaque_envs.is_empty()
     }
@@ -823,7 +784,6 @@ impl RecoveryOutcomeKind {
         }
     }
 
-    /// Count one outcome on `trawl_publication_recovery_total`.
     pub fn record(self) {
         metrics::counter!(crate::metrics::PUBLICATION_RECOVERY_TOTAL, "outcome" => self.label())
             .increment(1);
@@ -1026,8 +986,7 @@ fn inspect(path: &Path) -> Result<Entry, String> {
     }
 }
 
-/// Recover the marker at `marker_path` by the decision table in the module
-/// docs. Every branch validates before its first mutation and is idempotent.
+/// Every branch validates before its first mutation and is idempotent.
 pub fn recover_one(
     marker_path: &Path,
     wal_dir: &Path,
@@ -1229,8 +1188,7 @@ mod tests {
         }
     }
 
-    /// WAL files present, tmp written, marker written: the state right
-    /// after publish step 3.
+    /// WAL files present, tmp written, marker written.
     fn fixture() -> Fixture {
         let tmp = tempfile::tempdir().unwrap();
         let wal = tmp.path().join("wal");
@@ -1259,7 +1217,6 @@ mod tests {
         }
     }
 
-    /// The state right after publish step 4: output renamed into place.
     fn published_fixture() -> Fixture {
         let f = fixture();
         std::fs::rename(f.marker.tmp(&f.data), f.marker.canonical(&f.data)).unwrap();
@@ -1327,8 +1284,6 @@ mod tests {
         }
         assert!(!scan_claims(&f.wal).unwrap().any());
     }
-
-    // ---- codec ----
 
     #[test]
     fn golden_encoding() {
@@ -1406,8 +1361,6 @@ mod tests {
         // Read to the end by the first call, and still the whole file.
         assert_eq!(identity_of_file(&mut file).unwrap(), identity(&bytes));
     }
-
-    // ---- confinement ----
 
     fn read_body(env: &str, service: &str, body: &str) -> Result<ValidatedMarker, MarkerError> {
         let tmp = tempfile::tempdir().unwrap();
@@ -1573,9 +1526,7 @@ mod tests {
         assert_invalid(result, "not a regular file");
     }
 
-    /// A FIFO or a symlink swapped in for a valid marker between a check
-    /// of the path and the open must neither block the read nor be
-    /// followed. A swapper flips the marker path between a valid marker, a
+    /// A swapper flips the marker path between a valid marker, a
     /// FIFO and a symlink to a valid marker while reads run; every read
     /// returns, and none reads through the symlink.
     #[cfg(target_os = "linux")]
@@ -1744,8 +1695,6 @@ mod tests {
         assert_eq!(read_marker(&marker.marker_path(&wal)).unwrap(), marker);
     }
 
-    // ---- durable write and remove ----
-
     #[test]
     fn write_marker_propagates_directory_fsync_failure() {
         let f = fixture();
@@ -1765,8 +1714,6 @@ mod tests {
         assert!(!path.exists());
         remove_marker_durably(&path).unwrap();
     }
-
-    // ---- claims ----
 
     #[test]
     fn claims_of_a_valid_marker() {
@@ -1868,8 +1815,6 @@ mod tests {
         assert!(!claims.blocks_service("lab", SERVICE));
         assert!(!claims.claims_output("lab", date(), 7, SERVICE));
     }
-
-    // ---- recovery decision table ----
 
     #[test]
     fn row_published_canonical_matches_retires_wal_and_removes_marker() {
@@ -2138,8 +2083,6 @@ mod tests {
             RecoveryOutcomeKind::Contradictory
         );
     }
-
-    // ---- AC2: interrupted recovery reruns to the same end state ----
 
     const PUBLISHED_STEPS: [&str; 5] = [
         "recover:published:after_output_fsync",

@@ -3,42 +3,17 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The ingest preview's code path names nothing that stores, counts or
-//! logs (ADR-0049, #200 AC6).
-//!
-//! A preview canonicalizes a sample and keeps none of it. Its handler,
-//! `src/ingest/preview.rs`, and the parse step it shares with real ingest,
-//! `src/ingest/body.rs`, may not reach the WAL writer, the pipeline, the
-//! hot buffer's admission or publication steps, a metric, the repair
-//! service-label set, the `/stats` totals, or a tracing macro: a reject
-//! message quotes sample values, and trawld persists its own tracing
-//! events into the corpus. The preview may not parse the body a second
-//! way either, so `from_str(` and `from_slice(` are refused in its
-//! handler: the shared step is the one parser. And the HTTP producer's
-//! context is built in one place, `body.rs`, so no consumer can
-//! canonicalize against a peer or relay reading of its own.
-//!
-//! This is a tripwire, not the proof. The proof that a preview writes
-//! nothing is the real-server test in `tests/ingest_preview.rs`. This scan
-//! catches the ordinary way the rule would be broken, a side effect copied
-//! in from the ingest handler, at the line that does it.
-//!
-//! The limits of `doctor_touches_nothing.rs` hold: comment lines are
-//! skipped, a needle in a string literal or a trailing comment counts, and
-//! a call reached through another module is not seen. `#[cfg(test)]`
-//! modules are not scanned.
+//! logs (ADR-0049).
 
 use std::path::{Path, PathBuf};
 
-/// What neither the preview handler nor the shared parse step may name.
 const FORBIDDEN: &[&str] = &[
-    // Storage and admission.
     "wal_writer",
     "pipeline",
     "reserve(",
     "publish(",
     "ensure_free_space",
     "publication(",
-    // Counters, metric labels and the `/stats` totals.
     "metrics::counter!",
     "metrics::",
     "repair_service_label",
@@ -54,10 +29,8 @@ const FORBIDDEN: &[&str] = &[
     "event!",
 ];
 
-/// What the preview handler alone may not name: a second parser.
 const SECOND_PARSER: &[&str] = &["from_str(", "from_slice("];
 
-/// The HTTP producer's context, as constructed.
 const HTTP_PRODUCER: &str = "Producer::Http {";
 
 fn src_root() -> PathBuf {
@@ -69,8 +42,6 @@ fn read(path: &Path) -> String {
         .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()))
 }
 
-/// Every `.rs` file under `dir`, recursively, refusing symlinks as
-/// `no_exec_after_seal.rs` does.
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
@@ -106,12 +77,6 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
 
 /// `source` with every inline `#[cfg(test)]` module blanked out, line
 /// numbers kept.
-///
-/// A module starts at a `mod name {` line whose attributes include
-/// `#[cfg(test)]` and ends at the first later line holding only `}` at the
-/// module line's own indentation, which is where rustfmt closes it. A
-/// module that never closes is an error, so production code cannot hide
-/// behind a malformed one.
 fn production_lines(source: &str) -> Result<Vec<&str>, String> {
     let lines: Vec<&str> = source.lines().collect();
     let mut out = Vec::with_capacity(lines.len());
@@ -123,7 +88,6 @@ fn production_lines(source: &str) -> Result<Vec<&str>, String> {
         if line.trim() != "#[cfg(test)]" {
             continue;
         }
-        // Further attributes may sit between the cfg and the module.
         let mut item = at;
         while item < lines.len() && lines[item].trim_start().starts_with("#[") {
             item += 1;
@@ -147,8 +111,6 @@ fn production_lines(source: &str) -> Result<Vec<&str>, String> {
     Ok(out)
 }
 
-/// The 1-based lines that name one of `needles`, with the needle. Comment
-/// lines are skipped.
 fn hits(lines: &[&str], needles: &[&'static str]) -> Vec<(usize, &'static str)> {
     let mut found = Vec::new();
     for (index, line) in lines.iter().enumerate() {
@@ -164,12 +126,6 @@ fn hits(lines: &[&str], needles: &[&'static str]) -> Vec<(usize, &'static str)> 
     found
 }
 
-/// The 1-based lines that construct `Producer::Http { .. }`, as opposed to
-/// matching it.
-///
-/// A struct pattern is told from a struct expression by what follows its
-/// closing brace (`=>`, `if`, `|`, or a `let` pattern's `=`) or by a `..`
-/// rest inside it, which an enum-variant expression cannot hold.
 fn http_producer_constructions(lines: &[&str]) -> Vec<usize> {
     let text = lines.join("\n");
     let mut found = Vec::new();

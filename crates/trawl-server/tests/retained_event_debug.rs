@@ -2,18 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Where a swallowed fault's error text goes (ADR-0040, amended
-//! 2026-11-09): to a DEBUG event with the retained event's `event_type`
-//! and target, and nowhere else.
+//! Where a swallowed fault's error text goes (ADR-0040): to a DEBUG event
+//! with the retained event's `event_type` and target, and nowhere else.
 //!
 //! Its own test binary because `.init()` installs one global subscriber per
 //! process, and this one runs under a filter `retained_event_redaction`
-//! cannot share: the production subscriber from
-//! `telemetry::build_subscriber` under [`telemetry::DEFAULT_LOG_FILTER`]
-//! with `trawl_server` raised to `debug`, with a stdout capture and a
-//! telemetry WAL layer. Raising the one directive, not replacing the
-//! filter, keeps the `trawld`, `storage.backend` and `auth.backend`
-//! targets at the levels they ship at.
+//! cannot share. Raising the `trawl_server` directive to `debug`, not
+//! replacing the filter, keeps the `trawld`, `storage.backend` and
+//! `auth.backend` targets at the levels they ship at.
 
 mod common;
 
@@ -32,8 +28,6 @@ use trawl_server::telemetry::{self, LogSinks, WalHandle, WalLayer};
 
 const ENV: &str = "default";
 
-/// [`telemetry::DEFAULT_LOG_FILTER`] with only the `trawl_server` level
-/// raised to `debug`.
 fn debug_filter() -> String {
     let filter = telemetry::DEFAULT_LOG_FILTER.replace("trawl_server=info", "trawl_server=debug");
     assert_ne!(
@@ -44,9 +38,6 @@ fn debug_filter() -> String {
     filter
 }
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -75,8 +66,6 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber under the raised directives, installed once
-/// for the whole binary.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -109,7 +98,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -148,7 +136,6 @@ fn on_target(line: &str, target: &str) -> bool {
     line.contains(&format!(" {target}: "))
 }
 
-/// Every record the telemetry WAL holds so far, flushed first.
 fn wal_records() -> Vec<Value> {
     static FLUSH: Mutex<()> = Mutex::new(());
     let _flush = FLUSH.lock().unwrap();
@@ -173,7 +160,6 @@ fn read_wal(dir: &Path) -> Vec<Value> {
         .collect()
 }
 
-/// The level a formatted stdout line was logged at.
 fn level(line: &str) -> &'static str {
     ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
         .into_iter()
@@ -181,10 +167,6 @@ fn level(line: &str) -> &'static str {
         .unwrap_or("none")
 }
 
-/// The `history_error` fault of `retained_event_redaction`, under the
-/// raised filter: its trigger's text is on a DEBUG `history_error` line, at
-/// least once, and on no line of any other level or `event_type`. A WAL
-/// record that holds it is that DEBUG event.
 #[tokio::test(flavor = "multi_thread")]
 async fn retained_event_text_is_debug_only() {
     sinks();
@@ -277,7 +259,6 @@ async fn retained_event_text_is_debug_only() {
         assert_eq!(record["key_id"], key_id, "{record}");
     }
 
-    // The retained WARN is still there beside it, without the text.
     let warn: Vec<String> = stdout_lines()
         .into_iter()
         .filter(|line| {
@@ -291,12 +272,6 @@ async fn retained_event_text_is_debug_only() {
     assert_eq!(field(&warn[0], "cause_kind").as_deref(), Some("pg_server"));
 }
 
-/// The `pipeline_wal_write_failed` fault of `retained_event_redaction`
-/// (a WAL root that is a regular file, so the env directory's `create_dir`
-/// fails with `ENOTDIR`), under the raised filter: the operating system's
-/// text is on a DEBUG `pipeline_wal_write_failed` line with the same target
-/// and `batch_service`, the one WARN carries only the closed cause, and
-/// every stdout line or WAL record holding `(os error` is DEBUG.
 #[test]
 fn io_failure_text_is_debug_only() {
     sinks();
@@ -305,7 +280,6 @@ fn io_failure_text_is_debug_only() {
     let root = dir.path().join("wal");
     std::fs::write(&root, b"a regular file where the WAL root should be").unwrap();
     let writer = Arc::new(WalWriter::new(root));
-    // The fault is real: the raw writer's error is the operating system's.
     let raw = match writer.write(ENV, "fault-proof", b"{}\n") {
         Err(trawl_server::ingest::wal::WalWriteError::NotPublished(raw)) => raw,
         other => panic!("not the unpublished filesystem fault: {other:?}"),

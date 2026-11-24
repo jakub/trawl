@@ -6,11 +6,6 @@
 //! (loading / error / ready) async surfaces. Deliberately not a leptos
 //! `Suspense`/`ErrorBoundary` restructure: it wraps the resource
 //! handling a page already has instead of rewriting it.
-//!
-//! Split into two layers, mirroring [`crate::toast`]:
-//! - [`state`] — the pure [`LoadState`] enum, resource mapping, and
-//!   canonical copy strings, natively unit-tested.
-//! - [`component`] — the wasm-only `<Loaded>` wrapper.
 
 pub mod state;
 

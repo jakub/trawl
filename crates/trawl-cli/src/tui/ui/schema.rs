@@ -2,11 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Schema browser detail pane (right side of horizontal split).
-//!
-//! Renders statistics for the selected tree node: a service overview with a
-//! daily-event chart, or a field's type, coverage and value range.
-
 use std::collections::HashSet;
 
 use ratatui::Frame;
@@ -21,7 +16,6 @@ use trawl_core::text_layout::cells;
 use crate::tui::state::SchemaBrowser;
 use crate::tui::theme::Theme;
 
-/// Determine what is selected in the tree and render the appropriate detail.
 pub fn render_detail_pane(
     schema: &SchemaBrowser,
     frame: &mut Frame<'_>,
@@ -54,7 +48,6 @@ enum Selection<'a> {
     ServiceField { service: &'a str, field: &'a str },
 }
 
-/// Walk the flattened tree to find what the cursor points at.
 fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
     let filter = schema.filter.to_lowercase();
     let common_names: HashSet<&str> = schema
@@ -66,7 +59,6 @@ fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
     let mut idx = 0usize;
     let target = schema.selected;
 
-    // Common header + fields.
     if !schema.common_fields.is_empty() {
         let visible_common: Vec<_> = schema
             .common_fields
@@ -88,7 +80,6 @@ fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
         }
     }
 
-    // Services.
     for svc in &schema.services {
         let unique_fields: Vec<_> = svc
             .columns
@@ -127,7 +118,6 @@ fn resolve_selection(schema: &SchemaBrowser) -> Selection<'_> {
     Selection::None
 }
 
-/// Render overview for the common fields header.
 fn render_common_header_detail(
     schema: &SchemaBrowser,
     frame: &mut Frame<'_>,
@@ -167,7 +157,6 @@ fn render_common_header_detail(
     frame.render_widget(p, area);
 }
 
-/// Render service overview with braille chart.
 #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
 fn render_service_detail(
     schema: &SchemaBrowser,
@@ -195,7 +184,6 @@ fn render_service_detail(
     let events_str = format_count(svc.total_events);
     let bytes_str = format_bytes(svc.total_bytes);
 
-    // Compute approximate rate.
     let days = svc.daily_event_counts.len().max(1);
     #[allow(clippy::cast_precision_loss)]
     let daily_rate = svc.total_events as f64 / days as f64;
@@ -239,8 +227,6 @@ fn render_service_detail(
     )));
     lines.push(Line::default());
 
-    // Labels the chart at the bottom of the pane; the field breakdown
-    // renders between the label and the chart.
     if !svc.daily_event_counts.is_empty() {
         lines.push(Line::from(Span::styled(
             "daily events:",
@@ -248,7 +234,6 @@ fn render_service_detail(
         )));
     }
 
-    // Field breakdown.
     lines.push(Line::default());
     lines.push(Line::from(format!(
         "fields: {} total ({unique_count} unique)",
@@ -289,7 +274,6 @@ fn render_service_detail(
         ]));
     }
 
-    // Split area: text above, braille chart below (if data).
     if svc.daily_event_counts.is_empty() {
         let p = Paragraph::new(lines).wrap(Wrap { trim: false });
         frame.render_widget(p, area);
@@ -355,7 +339,6 @@ fn render_service_detail(
     }
 }
 
-/// Render field detail (common or service-scoped).
 fn render_field_detail(
     schema: &SchemaBrowser,
     field_name: &str,
@@ -377,7 +360,6 @@ fn render_field_detail(
         )),
     ];
 
-    // Find the column stats.
     if let Some(svc_name) = service {
         if let Some(svc) = schema.services.iter().find(|s| s.name == svc_name)
             && let Some(col) = svc.columns.iter().find(|c| c.name == field_name)
@@ -411,7 +393,6 @@ fn render_field_detail(
             }
         }
     } else if let Some(cf) = schema.common_fields.iter().find(|f| f.name == field_name) {
-        // Common field — aggregate across services.
         lines.push(Line::from(format!(
             "type:       {}",
             sanitize_display_text(&cf.data_type)
@@ -438,20 +419,13 @@ fn render_field_detail(
     frame.render_widget(p, area);
 }
 
-// -- format helpers ----------------------------------------------------------
-
 /// Trim trailing fractional-zero microseconds from timestamp-like strings.
-///
-/// `"2026-03-01 00:00:00.000000"` → `"2026-03-01 00:00:00"`
-/// `"2026-03-01 12:34:56.123000"` → `"2026-03-01 12:34:56.123"`
-/// Non-timestamp strings pass through unchanged.
 fn trim_timestamp(s: &str) -> &str {
     if let Some(dot_pos) = s.rfind('.') {
         let after_dot = &s[dot_pos + 1..];
         if !after_dot.is_empty() && after_dot.bytes().all(|b| b == b'0') {
             return &s[..dot_pos];
         }
-        // Trim trailing zeros but keep at least one digit after dot.
         let trimmed = s.trim_end_matches('0');
         if trimmed.ends_with('.') {
             return &s[..dot_pos];
@@ -461,11 +435,6 @@ fn trim_timestamp(s: &str) -> &str {
     s
 }
 
-/// Render a range value across one or two lines.
-///
-/// If `min – max` draws in at most 40 cells after the label, render
-/// inline. Otherwise split across two lines with the continuation
-/// indented. What is drawn, and measured, is sanitized.
 fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
     let min_t = trim_timestamp(min_v);
     let max_t = trim_timestamp(max_v);
@@ -487,7 +456,6 @@ fn push_range_lines(lines: &mut Vec<Line<'_>>, min_v: &str, max_v: &str) {
     }
 }
 
-/// Format non-null percentage with "< 0.1%" for near-zero values.
 fn format_non_null_pct(non_null: u64, total: u64) -> String {
     if non_null == 0 {
         return "0%".to_owned();
@@ -501,7 +469,6 @@ fn format_non_null_pct(non_null: u64, total: u64) -> String {
     }
 }
 
-/// Human-readable byte size (KB, MB, GB).
 fn format_bytes(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = 1024 * 1024;
@@ -524,7 +491,6 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Human-readable event count (K, M, B).
 fn format_count(count: u64) -> String {
     if count >= 1_000_000_000 {
         #[allow(clippy::cast_precision_loss)]
@@ -543,10 +509,6 @@ fn format_count(count: u64) -> String {
     }
 }
 
-/// Resample a data series to exactly `target_len` points using linear interpolation.
-///
-/// When data has fewer points than terminal columns, stretches to fill;
-/// when more, compresses. Returns the original data unchanged if lengths match.
 fn resample(data: &[u64], target_len: usize) -> Vec<u64> {
     if data.is_empty() || target_len == 0 {
         return vec![0; target_len];
@@ -559,7 +521,6 @@ fn resample(data: &[u64], target_len: usize) -> Vec<u64> {
     let mut out = Vec::with_capacity(target_len);
 
     for i in 0..target_len {
-        // Map output index to a fractional position in the source.
         #[allow(clippy::cast_precision_loss)]
         let src_pos = if target_len == 1 {
             0.0
@@ -590,7 +551,6 @@ mod tests {
     use super::*;
     use crate::tui::state::compute_common_fields;
 
-    /// A service whose columns are `(name, type, min, max)`.
     fn service(name: &str, bounds: &[(&str, &str, &str, &str)]) -> trawl_api::ServiceSchema {
         trawl_api::ServiceSchema {
             name: name.to_owned(),
@@ -636,9 +596,8 @@ mod tests {
 
     #[test]
     fn schema_time_bounds_merge_and_render() {
-        // `_time` as the server now renders it for compacted (local)
-        // TIMESTAMP columns: fixed-width, no `Z`. The pre-epoch bound
-        // must win the min across services, in either service order.
+        // `_time` as the server renders it for compacted (local)
+        // TIMESTAMP columns: fixed-width, no `Z`.
         let old = service(
             "old",
             &[(
@@ -664,9 +623,6 @@ mod tests {
         assert_eq!(bounds(&[old.clone(), new.clone()], "_time"), want);
         assert_eq!(bounds(&[new.clone(), old.clone()], "_time"), want);
 
-        // Mixed shapes have no common range, whatever the order and
-        // whatever comes after: local beside UTC, and a timestamp beside a
-        // service still holding epoch integers.
         let utc = service(
             "utc",
             &[(
@@ -691,8 +647,6 @@ mod tests {
             assert_eq!(bounds(&order, "_time"), (None, None), "{names:?}");
         }
 
-        // A field no service types as a timestamp keeps the plain text
-        // comparison, numbers and timestamp-looking strings alike.
         let a = service("a", &[("_time", "BIGINT", "200", "404")]);
         let b = service("b", &[("_time", "BIGINT", "1000", "503")]);
         assert_eq!(
@@ -716,8 +670,6 @@ mod tests {
         assert_eq!(bounds(&[looks.clone(), plain.clone()], "note"), want_text);
         assert_eq!(bounds(&[plain, looks], "note"), want_text);
 
-        // Rendered: the fixed-width text reads as a time with trailing
-        // fractional zeros trimmed; a `Z` sample renders as sent.
         let (min, max) = want;
         assert_eq!(
             range_lines(&min.unwrap(), &max.unwrap()),

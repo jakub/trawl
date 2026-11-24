@@ -8,10 +8,8 @@
 //! and no database coupling — it transforms DSL query strings into SQL
 //! strings with parameters. Everything here should be testable in isolation.
 
-/// AST types representing parsed trawl DSL queries.
 pub mod ast;
 
-/// DSL parser — transforms query strings into AST.
 pub mod parser;
 
 /// Advice on a valid query: a local note that never gates (ADR-0068).
@@ -26,10 +24,8 @@ pub(crate) mod calls;
 /// The stop cancellable work reads between its steps (ADR-0063).
 pub mod cancel;
 
-/// SQL emitter — transforms AST into DuckDB-compatible SQL.
 pub mod emitter;
 
-/// DSL query formatter — canonical pretty-printing of parsed queries.
 pub mod format;
 
 /// The canonical form of a parsed query: the one rule for whether two
@@ -66,7 +62,6 @@ pub mod field_refs;
 /// accept, and the walk the evaluator reads it by (ADR-0017).
 pub mod json_path;
 
-/// In-memory event filter compiled from the search stage.
 pub mod filter;
 
 /// The `parse_emit` fuzz wire encoding and its pin-derivation rule,
@@ -107,7 +102,6 @@ pub mod schema;
 /// OTel severity ladder: token tables, bands, syslog inversion.
 pub mod severity;
 
-/// Streaming pipeline compiler and executor.
 pub mod stream;
 
 /// The Unicode case fold the in-memory text containment applies,
@@ -117,8 +111,6 @@ pub mod text;
 /// The one bucket-width resolver every timechart consumer calls (ADR-0038).
 pub mod timechart;
 
-/// Build-time version metadata.
 pub mod version;
 
-/// Saved query display-name validation.
 pub mod saved_name;

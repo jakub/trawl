@@ -5,18 +5,6 @@
 //! Boot hydration (ADR-0041 slice 2): load the WAL that survived a restart
 //! into the hot buffer under its existing batch identities, before any
 //! producer, compaction or the listener starts.
-//!
-//! [`selection`] decides which files load and [`recognizer`] decides
-//! whether a file is exactly what the live writer produced. WAL that
-//! existed at boot and did not become resident is the **overhang**: the
-//! report says whether there is any, and the boot keeps corpus reads
-//! refused until compaction's coverage proof
-//! ([`crate::ingest::coverage_proof`]) clears it. Both list the WAL through
-//! one walk, [`walk_wal`].
-//!
-//! Hydration charges the hot buffer's full caps once
-//! ([`HotBuffer::hydrate`]). It never publishes to the event bus, never
-//! counts as ingested traffic and needs no Postgres.
 
 mod recognizer;
 mod selection;
@@ -30,26 +18,14 @@ use std::time::{Duration, Instant, SystemTime};
 use crate::bus::IngestBatch;
 use crate::hot_buffer::{Charge, HotBuffer, HydrateError, HydratedBatch};
 
-/// What happened to one WAL file at boot: the `outcome` label on
-/// [`crate::metrics::HYDRATION_FILES_TOTAL`]. Every outcome but
-/// `hydrated` leaves overhang.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HydrationOutcome {
-    /// Loaded into the hot buffer.
     Hydrated,
-    /// Did not fit what the caps or the read budget had left.
     Capacity,
-    /// Larger than a full cap: it can never fit.
     Oversized,
-    /// Not exactly what the live writer produces, its name included.
-    /// Compaction's decoder takes it.
     Undecodable,
-    /// Not a regular file, a symlink, or a read that failed.
     Unreadable,
-    /// In a service a pending publication marker blocks.
     Claimed,
-    /// A scope that could not be listed, counted once per scope: the WAL
-    /// root, a root entry, or an env directory.
     Unlisted,
 }
 
@@ -77,7 +53,6 @@ impl HydrationOutcome {
     }
 }
 
-/// A count per [`HydrationOutcome`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct OutcomeCounts([u64; HydrationOutcome::ALL.len()]);
 
@@ -91,7 +66,6 @@ impl OutcomeCounts {
         *slot = slot.saturating_add(count);
     }
 
-    /// Whether any file or scope was left out.
     fn any_left_out(&self) -> bool {
         HydrationOutcome::ALL
             .into_iter()
@@ -99,37 +73,22 @@ impl OutcomeCounts {
     }
 }
 
-/// What one boot hydration did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HydrationReport {
     /// Files per outcome; `unlisted` counts scopes.
     pub counts: OutcomeCounts,
-    /// More WAL files existed than hydration examines
-    /// (`hot_buffer_max_events + 1`).
     pub examine_bound_hit: bool,
-    /// What the hydrated files charged the hot buffer.
     pub charge: Charge,
-    /// Bytes read from WAL files, rejected files included.
     pub bytes_read: u64,
-    /// Some WAL that existed at boot did not become resident: a file was
-    /// not hydrated, a scope was claimed or unlisted, or the examine bound
-    /// was hit. Corpus reads stay refused until compaction proves coverage.
     pub overhang: bool,
 }
 
 /// Load the WAL under `wal_dir` into `hot`, which must be empty and not yet
-/// hydrated, and report what was left out. `now` dates the files: a
-/// hydrated batch's age is `now` minus the time in its file name, zero for
-/// a name in the future.
+/// hydrated, and report what was left out.
 ///
 /// Blocking file I/O: call it from a blocking thread, before any producer
-/// or compaction starts. It calls [`HotBuffer::hydrate`] exactly once, with
-/// an empty plan when nothing fits, so the buffer's one shot is spent
-/// either way. An `Err` is a boot bug (the buffer was already hydrated or
-/// not empty), never a property of the WAL.
-///
-/// Records `trawl_hydration_files_total{outcome}` and logs one INFO
-/// `boot_hydration` event with the counts, never a path.
+/// or compaction starts. An `Err` is a boot bug (the buffer was already
+/// hydrated or not empty), never a property of the WAL.
 pub fn hydrate_at_boot(
     wal_dir: &Path,
     hot: &HotBuffer,
@@ -191,8 +150,6 @@ pub fn hydrate_at_boot(
     Ok(report)
 }
 
-/// How old a WAL file named at `millis` is at `now`: zero for a name in the
-/// future, saturating.
 fn file_age(now: SystemTime, millis: u64) -> Duration {
     now.duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default()
@@ -223,16 +180,12 @@ mod test_support {
     use crate::ingest::pipeline::ServiceBatch;
     use crate::ingest::wal::WalName;
 
-    /// The instant [`stamped`] writes, spelled as ingest spells every
-    /// envelope instant: RFC 3339 UTC at microsecond precision.
     pub(super) fn instant() -> String {
         chrono::DateTime::from_timestamp_micros(1_790_000_000_123_456)
             .unwrap()
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
     }
 
-    /// `event` with the `_time` and `_ingested` that canonicalization puts
-    /// on every event the live writer writes, unless it has them already.
     pub(super) fn stamped(
         mut event: serde_json::Map<String, serde_json::Value>,
     ) -> serde_json::Map<String, serde_json::Value> {
@@ -249,8 +202,6 @@ mod test_support {
         })
     }
 
-    /// Write `count` events through the live writer's line format as
-    /// `wal/{env}/{service}_{millis}_0001.ndjson`, returning its batch id.
     pub(super) fn plant(wal: &Path, env: &str, service: &str, millis: u64, count: u32) -> String {
         let mut batch = ServiceBatch::default();
         for n in 0..count {
@@ -269,7 +220,6 @@ mod test_support {
         format!("{env}/{}", name.file_name().trim_end_matches(".ndjson"))
     }
 
-    /// Unix millis of `time`.
     pub(super) fn millis(time: std::time::SystemTime) -> u64 {
         u64::try_from(
             time.duration_since(std::time::SystemTime::UNIX_EPOCH)
@@ -387,10 +337,6 @@ mod tests {
 
 #[cfg(test)]
 mod age {
-    //! A hydrated batch is as old as its WAL file (ADR-0041): the hot
-    //! buffer's oldest-batch age, which the
-    //! `trawl_hot_buffer_oldest_batch_age_seconds` gauge reports, starts
-    //! from the time in the file name.
 
     use std::time::{Duration, Instant, SystemTime};
 
@@ -420,7 +366,6 @@ mod age {
         let before = Instant::now();
         hydrate_at_boot(tmp.path(), &hot, now).unwrap();
         assert!(hot.is_resident(&id));
-        // Only the time since the install, no back-dating.
         assert!(hot.oldest_batch_age().unwrap() <= before.elapsed());
     }
 
@@ -432,7 +377,6 @@ mod age {
         assert_eq!(file_age(now, 10_001), Duration::ZERO);
         assert_eq!(file_age(now, u64::MAX), Duration::ZERO);
         assert_eq!(file_age(SystemTime::UNIX_EPOCH, 0), Duration::ZERO);
-        // A clock before the epoch dates nothing.
         let before_epoch = SystemTime::UNIX_EPOCH - Duration::from_secs(1);
         assert_eq!(file_age(before_epoch, 0), Duration::ZERO);
     }

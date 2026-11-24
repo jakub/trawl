@@ -3,8 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Key event handlers, split by focus/context.
-//!
-//! Each submodule adds methods to `App` via split `impl` blocks.
 
 mod editor;
 mod mouse;

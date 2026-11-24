@@ -2,46 +2,19 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The Search path of a captured result (ADR-0058, ADR-0027 as amended
-//! 2026-10-22).
-//!
-//! A capture resolves its bounds once, on the server, and records the text
-//! that ran with exact microsecond `earliest=` and `latest=` clauses
-//! spliced in. [`result_search_path`] turns that text and those bounds into
-//! the Search path that reopens the result. `q` carries the executed text
-//! unchanged, so Search's merge of the range can only intersect the exact
-//! bounds and never widen them. `r` carries the whole-second hull of the
-//! bounds: the earliest floored and the latest ceiled to the second, in
-//! the canonical form the codec reads. `page` is 0; `f` and `mode` are
-//! left out.
-//!
-//! The origin and any policy on the whole link's length belong to the
-//! caller; this module builds the path and asks the codec's own reader
-//! whether it would be read back.
+//! The Search path of a captured result (ADR-0058, ADR-0027).
 
 use chrono::{DateTime, DurationRound, SecondsFormat, TimeDelta, Utc};
 
 use crate::query_merge::RangeSpec;
 use crate::search_url::{Mode, Reason, admit_search, build_search_url};
 
-/// Why a captured result has no Search path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResultPathRefusal {
-    /// A bound did not parse as an RFC 3339 instant, or its hull does not
-    /// fit the calendar.
     UnreadableBounds,
-    /// The codec's own reader would refuse the path.
     Refused(Reason),
 }
 
-/// The Search path (`/search?...`) that reopens a captured result: the
-/// executed text in `q`, the whole-second hull of `[earliest, latest)` in
-/// `r`, page zero.
-///
-/// # Errors
-/// [`ResultPathRefusal::UnreadableBounds`] when a bound is not an RFC 3339
-/// instant; [`ResultPathRefusal::Refused`] when the codec's reader would
-/// refuse the path (a query over its size limit).
 pub fn result_search_path(
     executed_query: &str,
     earliest: &str,
@@ -59,8 +32,6 @@ pub fn result_search_path(
     Ok(path)
 }
 
-/// The whole-second hull of `[earliest, latest)`: the earliest floored and
-/// the latest ceiled to the second, in the canonical UTC form `r` carries.
 #[must_use]
 pub fn hull(earliest: &str, latest: &str) -> Option<(String, String)> {
     let second = TimeDelta::seconds(1);

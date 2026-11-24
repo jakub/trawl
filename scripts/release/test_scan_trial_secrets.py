@@ -145,8 +145,6 @@ class Scan(unittest.TestCase):
                 path.unlink()
 
     def test_the_certificate_of_the_key_passes(self):
-        # The certificate carries the key's public half; only the private
-        # key may fail the scan.
         cert = subprocess.run(
             ["openssl", "req", "-x509", "-new", "-key", "/dev/stdin", "-subj", "/CN=trawld", "-days", "1"],
             input=KEY_PEM, capture_output=True, text=True, check=True).stdout

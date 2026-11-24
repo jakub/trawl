@@ -6,21 +6,6 @@
 //! clock: its deadline, found by a read or by the sweep; a quota lowered
 //! across a restart; its file removed or changed out of band; a tombstone
 //! that outlives its lifetime. Every refusal carries its request id.
-//!
-//! The commit of a capture's row is proved here too, through the store's
-//! test-support fault seam (`store::results::fault`). An insert that
-//! answers an error is settled by its fence, the same insert again: one
-//! that committed leaves the fence the taken id, one whose statement never
-//! arrived leaves the fence to insert the row, and one whose transaction is
-//! still open makes the fence wait for it to end. Each keeps the capture
-//! and answers 200. A fence that fails too leaves the commit in doubt
-//! through its grace, which the seam holds open: a row that lands late
-//! keeps its file, a file whose row never comes goes when the grace ends,
-//! and one whose row cannot be read is left to the sweep. A commit still
-//! undecided when trawld shuts down leaves its file to the next boot, which
-//! keeps it once the row has landed.
-//!
-//! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -44,11 +29,10 @@ use trawl_server::results::sweep::{Sweep, sweep};
 use trawl_server::store::results::fault::{CommitEnd, CommitHold, InsertFault};
 use trawl_server::transport::http::{ConnectionTimeouts, ListenerProbe};
 
-/// Where the clock stands when a test captures.
 const CAPTURED_AT: &str = "2024-01-16T10:30:00Z";
 
-/// The tracing events of the whole process. Installed once: the server
-/// logs from every tokio worker and blocking thread.
+/// Installed once: the server logs from every tokio worker and blocking
+/// thread.
 fn telemetry() -> &'static Capture {
     static CAPTURE: OnceLock<Capture> = OnceLock::new();
     CAPTURE.get_or_init(|| {
@@ -68,7 +52,6 @@ async fn boot(capture: CaptureConfig) -> TestServer {
     server
 }
 
-/// The corpus's events, captured as the analyst at the clock's reading.
 async fn events(server: &TestServer) -> CapturedResult {
     let result = captured::captured(server, &server.analyst_token, &events_body())
         .await
@@ -84,7 +67,6 @@ fn events_body() -> serde_json::Value {
     })
 }
 
-/// `answer` is a refusal with `status` and `code`, and names its request.
 fn assert_refused(answer: &captured::Answer, status: StatusCode, code: &str, what: &str) {
     let (got, headers, body) = answer;
     assert_eq!(*got, status, "{what}: {body}");
@@ -99,7 +81,6 @@ fn assert_refused(answer: &captured::Answer, status: StatusCode, code: &str, wha
     );
 }
 
-/// A `result_gone` refusal for `reason`, with its fixed text.
 fn assert_gone(answer: &captured::Answer, reason: GoneReason, what: &str) {
     assert_refused(answer, StatusCode::GONE, "result_gone", what);
     assert_eq!(answer.2["error"]["message"], reason.message(), "{what}");
@@ -119,7 +100,6 @@ fn file_exists(server: &TestServer, id: &str) -> bool {
         .exists()
 }
 
-/// Every row of the results table, of every key and state.
 async fn table_rows(server: &TestServer) -> i64 {
     let pool = common::fixture_pool(&server.app_db_url, 1).await;
     let count = sqlx::query_scalar("SELECT count(*) FROM captured_results")
@@ -130,11 +110,6 @@ async fn table_rows(server: &TestServer) -> i64 {
     count
 }
 
-/// A read at the deadline expires the capture on the spot: 410 with the
-/// expired text, the row marked with its deadline as `gone_at`, the file
-/// gone, and no sweep ran. The tombstone answers 410 until a minute
-/// before its lifetime ends and 404 from a minute after; the sweep then
-/// deletes it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_at_the_deadline_expires_the_capture_and_its_file() {
     let server = boot(CaptureConfig::default()).await;
@@ -215,8 +190,6 @@ async fn a_read_at_the_deadline_expires_the_capture_and_its_file() {
     );
 }
 
-/// A capture nobody reads expires at the sweep: its row is marked, its
-/// file goes, and a read after answers 410.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_sweep_expires_a_capture_nobody_reads() {
     let server = boot(CaptureConfig::default()).await;
@@ -238,9 +211,6 @@ async fn the_sweep_expires_a_capture_nobody_reads() {
     assert_gone(&answer, GoneReason::Expired, "a page after the sweep");
 }
 
-/// A key quota lowered while trawld is down prunes the key's oldest
-/// captures at the next boot: each answers 410 with the pruned text and
-/// its file is gone, while the newer ones still read.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quota_lowered_across_a_restart_prunes_the_oldest_capture() {
     let (mut fixture, server) = Restartable::boot(
@@ -275,8 +245,6 @@ async fn a_quota_lowered_across_a_restart_prunes_the_oldest_capture() {
     assert_eq!(captured::listed(&server, analyst).await, [newest, middle]);
 }
 
-/// A committed capture whose file was removed out of band answers 409
-/// `result_unavailable`, never an empty page, and the read marks its row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_removed_file_answers_unavailable_and_marks_the_row() {
     let server = boot(CaptureConfig::default()).await;
@@ -312,8 +280,6 @@ async fn a_removed_file_answers_unavailable_and_marks_the_row() {
     );
 }
 
-/// A file whose bytes changed answers 500 `result_corrupt`, never its
-/// rows, and the request logs exactly one ADR-0040 `http_failure`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_changed_byte_answers_corrupt_with_one_failure_event() {
     let telemetry = telemetry();
@@ -357,8 +323,6 @@ async fn a_changed_byte_answers_corrupt_with_one_failure_event() {
     );
 }
 
-/// Another key's capture, an unknown id and a malformed one read alike:
-/// 404, each naming its request.
 #[tokio::test(flavor = "multi_thread")]
 async fn ids_the_caller_does_not_own_are_not_found() {
     let server = boot(CaptureConfig::default()).await;
@@ -389,9 +353,6 @@ async fn ids_the_caller_does_not_own_are_not_found() {
     assert_eq!(status, StatusCode::OK, "the owner still reads it");
 }
 
-/// An insert that committed and lost its answer: its fence finds the id
-/// taken, so the capture answers 200 and keeps its file, and its
-/// reservation is settled rather than counted beside the row.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
     let telemetry = telemetry();
@@ -429,10 +390,6 @@ async fn an_insert_that_committed_and_lost_its_answer_keeps_the_capture() {
     assert_one_of_two_taken(&server).await;
 }
 
-/// The capture's fence logged one `results_commit_fenced` event, whose
-/// `fence` is `outcome`: `id_taken` when the first insert's row was there,
-/// `inserted` when the fence inserted it. The insert's error is named by
-/// its class alone, never by its text.
 fn assert_fenced(telemetry: &Capture, id: &str, outcome: &str) {
     let fenced = telemetry.of_type("results_commit_fenced", "result_id", id);
     assert_eq!(fenced.len(), 1, "{fenced:?}");
@@ -444,7 +401,6 @@ fn assert_fenced(telemetry: &Capture, id: &str, outcome: &str) {
     );
 }
 
-/// The capture a 200 answers, and the request it names.
 fn answered(answer: &captured::Answer, what: &str) -> (CaptureResponse, String) {
     let (status, headers, body) = answer;
     assert_eq!(*status, StatusCode::OK, "{what}: {body}");
@@ -468,10 +424,6 @@ async fn assert_one_of_two_taken(server: &TestServer) {
     assert_eq!(table_rows(server).await, 2);
 }
 
-/// An insert that answers an error before its statement reached the
-/// backend: the fence inserts the row, so the capture answers 200 with its
-/// row and its file and books one timing event. The first statement,
-/// arriving after the fence, meets the taken id and commits nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_whose_statement_had_not_arrived_is_committed_by_its_fence() {
     let telemetry = telemetry();
@@ -517,12 +469,6 @@ async fn an_insert_whose_statement_had_not_arrived_is_committed_by_its_fence() {
     assert_one_of_two_taken(&server).await;
 }
 
-/// The first insert's transaction is open: its statement ran and its
-/// commit is on its way. The fence waits on its row's key, so the capture
-/// does not answer, its file stays in flight and no row is visible. When
-/// the transaction ends with COMMIT the fence finds the id taken; with
-/// ROLLBACK it inserts the row itself. Either way the capture answers 200,
-/// keeps its file and holds one row.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fence_waits_for_an_open_commit_that_commits() {
     // Boxed: the fixture's boot and the test's own state outgrow clippy's
@@ -530,8 +476,6 @@ async fn a_fence_waits_for_an_open_commit_that_commits() {
     Box::pin(fence_waits_for_an_open_commit(CommitEnd::Commit)).await;
 }
 
-/// [`a_fence_waits_for_an_open_commit_that_commits`], with the first
-/// insert's transaction rolled back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_fence_waits_for_an_open_commit_that_rolls_back() {
     // Boxed: the fixture's boot and the test's own state outgrow clippy's
@@ -539,8 +483,6 @@ async fn a_fence_waits_for_an_open_commit_that_rolls_back() {
     Box::pin(fence_waits_for_an_open_commit(CommitEnd::Rollback)).await;
 }
 
-/// Wait until a session waits on a lock that backend `pid` holds, in an
-/// insert of a capture's row.
 async fn fence_blocked_by(probe: &sqlx::PgPool, pid: i32) {
     loop {
         let blocked: i64 = sqlx::query_scalar(
@@ -559,9 +501,9 @@ async fn fence_blocked_by(probe: &sqlx::PgPool, pid: i32) {
     }
 }
 
-/// The open-commit test, ended with `end`. Besides the fixture's pools it
-/// holds the first insert's own connection and a one-connection probe pool,
-/// inside the direct-store ceiling.
+/// Besides the fixture's pools this test holds the first insert's own
+/// connection and a one-connection probe pool, inside the direct-store
+/// ceiling.
 async fn fence_waits_for_an_open_commit(end: CommitEnd) {
     let telemetry = telemetry();
     let server = boot(CaptureConfig {
@@ -594,8 +536,6 @@ async fn fence_waits_for_an_open_commit(end: CommitEnd) {
             panic!("the capture answered while its first insert's transaction is open: {answer:?}")
         }
     }
-    // Postgres holds the fence: nothing answers while the transaction is
-    // open, and the file is neither committed nor unlinked.
     assert!(
         tokio::time::timeout(Duration::from_millis(300), &mut capture)
             .await
@@ -653,21 +593,10 @@ async fn fence_waits_for_an_open_commit(end: CommitEnd) {
 /// (`RUNTIME_SHUTDOWN_BUDGET`).
 const RUNTIME_SHUTDOWN_BUDGET: Duration = Duration::from_secs(10);
 
-/// A capture whose commit is undecided when trawld stops: the first
-/// insert's transaction is open with the row in it, and the fence waits on
-/// that row's key. The client goes away, the server is told to stop and
-/// drains, and the runtime that owns the commit task shuts down as
-/// trawld's `main` shuts its own down, which drops the task where it
-/// waits. The open transaction then commits, as a backend still finishing
-/// it does. A restart over the same storage and databases finds the row
-/// and its file: the capture is listed as the owner's and its page reads
-/// 200, and its row is not marked missing.
-///
 /// The server that takes the capture runs on a runtime of its own over the
 /// fixture's state, so its shutdown drops the commit task and the tasks
 /// serving the request. The state, its pools and the held transaction
-/// belong to the test's runtime and outlive it, where trawld's process
-/// ends with its state; the restart then drops the state, as an exit does.
+/// belong to the test's runtime and outlive it.
 #[test]
 #[allow(clippy::too_many_lines)] // one linear narrative across two runtimes
 fn a_capture_whose_commit_is_undecided_at_shutdown_survives_the_restart() {
@@ -685,7 +614,6 @@ fn a_capture_whose_commit_is_undecided_at_shutdown_survives_the_restart() {
     server.results_clock.set(at(CAPTURED_AT));
     let key_id = test.block_on(captured::key_id(&server, &server.analyst_token));
 
-    // trawld's runtime, built as `main` builds it, serving the capture.
     let trawld = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -770,7 +698,6 @@ fn a_capture_whose_commit_is_undecided_at_shutdown_survives_the_restart() {
         "unlinked"
     };
 
-    // The backend finishes the first insert after trawld stopped.
     let _ = end.send(CommitEnd::Commit);
     assert!(
         test.block_on(within("the transaction ends", landed))
@@ -807,14 +734,12 @@ fn a_capture_whose_commit_is_undecided_at_shutdown_survives_the_restart() {
     });
 }
 
-/// `future`, or a failure naming `what` once it has had thirty seconds.
 async fn within<T>(what: &str, future: impl std::future::Future<Output = T>) -> T {
     tokio::time::timeout(Duration::from_secs(30), future)
         .await
         .unwrap_or_else(|_| panic!("timed out waiting for: {what}"))
 }
 
-/// The id of the one published file in the results root.
 fn published(server: &TestServer) -> String {
     let names = captured::root_names(server);
     assert_eq!(names.len(), 1, "one published file: {names:?}");
@@ -831,12 +756,6 @@ fn past_every_floor() -> DateTime<Utc> {
     Utc::now() + TimeDelta::hours(1)
 }
 
-/// An insert that answers an error while its statement is still on its
-/// way to a commit, and a fence that fails: the capture answers 503 with
-/// its commit in doubt. Through the grace the file stays in flight, a sweep
-/// leaves it, and the reservation stays charged. The late commit lands,
-/// and when the grace ends the row is found and keeps its file: a page
-/// reads 200 and the row is not marked missing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     let server = boot(CaptureConfig {
@@ -868,8 +787,6 @@ async fn an_insert_that_commits_after_its_error_keeps_its_file() {
         .expect("the capture holds its grace");
     assert_eq!(table_rows(&server).await, 0, "the insert has not landed");
 
-    // Inside the grace, with the insert still on its way, the sweep finds a
-    // file no row names and leaves it.
     let swept = sweep(results, past_every_floor()).await;
     assert_eq!(swept.orphans, 0, "{swept:?}");
     assert!(
@@ -910,11 +827,6 @@ async fn an_insert_that_commits_after_its_error_keeps_its_file() {
     assert_eq!(captured::listed(&server, analyst).await, [id]);
 }
 
-/// An insert that never commits, and a fence that fails without
-/// committing: the capture answers 503 with its commit in doubt. Through the grace the file
-/// stays and the reservation is charged; when the grace ends the row is
-/// still absent, so the file goes and the reservation lapses, and a sweep
-/// after it finds nothing.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_that_never_commits_loses_its_file_when_the_grace_ends() {
     let server = boot(CaptureConfig {
@@ -968,11 +880,6 @@ async fn an_insert_that_never_commits_loses_its_file_when_the_grace_ends() {
     events(&server).await;
 }
 
-/// An insert whose outcome stays unknown: it and its fence fail, and
-/// reading the row fails when the grace ends. The capture answers 503 and
-/// leaves its file, since a committed row may still name it, and its
-/// reservation lapses. The next sweep finds no row naming the file and removes it,
-/// with no restart.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
     let server = boot(CaptureConfig {
@@ -1013,23 +920,18 @@ async fn an_insert_whose_outcome_stays_unknown_leaves_its_file_to_the_sweep() {
     events(&server).await;
 }
 
-/// The read a race test holds.
 #[derive(Debug, Clone, Copy)]
 enum Read {
     Page,
     Cell,
 }
 
-/// What expires the capture while the read is held.
 #[derive(Debug, Clone, Copy)]
 enum Expiry {
-    /// Another client reads the capture at its deadline.
     AnotherRead,
-    /// The sweep runs at the deadline.
     Sweep,
 }
 
-/// `read` of capture `id` as the analyst.
 async fn read(server: &TestServer, read: Read, id: &str) -> captured::Answer {
     match read {
         Read::Page => captured::page(server, &server.analyst_token, id, "").await,
@@ -1037,7 +939,6 @@ async fn read(server: &TestServer, read: Read, id: &str) -> captured::Answer {
     }
 }
 
-/// Wait, a bounded while, for `cond`.
 async fn until(what: &str, cond: impl Fn() -> bool) {
     tokio::time::timeout(Duration::from_secs(30), async {
         while !cond() {
@@ -1048,11 +949,6 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
-/// A read that passed the row checks a second before the deadline is held
-/// at `seam`; the clock reaches the deadline and `expiry` marks the row
-/// expired and unlinks the file; then the read goes on. It answers what a
-/// read after the expiry answers, 410 `expired`, and leaves the row an
-/// expired tombstone, not one marked `file_missing`.
 async fn a_read_racing_the_expiry(seam: Seam, kind: Read, expiry: Expiry) {
     let what = format!("{kind:?} held at {seam:?}, expired by {expiry:?}");
     let server = boot(CaptureConfig::default()).await;
@@ -1103,8 +999,6 @@ async fn a_read_racing_the_expiry(seam: Seam, kind: Read, expiry: Expiry) {
     assert!(!row.file_missing, "{what}: an expired row is not marked");
 }
 
-/// A page whose capture another read expires while the page waits to
-/// check its file, or to open it, answers 410 `expired`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_racing_another_reads_expiry_answers_expired() {
     for seam in [Seam::Verifying, Seam::Opening] {
@@ -1112,7 +1006,6 @@ async fn a_page_racing_another_reads_expiry_answers_expired() {
     }
 }
 
-/// The same race against the sweep.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_page_racing_the_sweeps_expiry_answers_expired() {
     for seam in [Seam::Verifying, Seam::Opening] {
@@ -1120,7 +1013,6 @@ async fn a_page_racing_the_sweeps_expiry_answers_expired() {
     }
 }
 
-/// A cell read racing another read's expiry answers 410 `expired`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cell_racing_another_reads_expiry_answers_expired() {
     for seam in [Seam::Verifying, Seam::Opening] {
@@ -1128,7 +1020,6 @@ async fn a_cell_racing_another_reads_expiry_answers_expired() {
     }
 }
 
-/// A cell read racing the sweep's expiry answers 410 `expired`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cell_racing_the_sweeps_expiry_answers_expired() {
     for seam in [Seam::Verifying, Seam::Opening] {
@@ -1136,21 +1027,12 @@ async fn a_cell_racing_the_sweeps_expiry_answers_expired() {
     }
 }
 
-/// What happens to a live capture's file, out of band, while a read is
-/// held.
 #[derive(Debug, Clone, Copy)]
 enum Tamper {
-    /// The file is removed.
     Remove,
-    /// The file's bytes are replaced with bytes that are not parquet.
     Replace,
 }
 
-/// The controls for the races above: while the capture is still live, a
-/// file removed out of band during a held read answers 409
-/// `result_unavailable` and marks the row, and a file replaced answers 500
-/// `result_corrupt`, whether the read was held before its digest check or
-/// after it, when only the engine's open can notice.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_file_lost_out_of_band_during_a_read_is_unavailable_or_corrupt() {
     let server = boot(CaptureConfig::default()).await;

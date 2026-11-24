@@ -26,9 +26,6 @@ use trawl_api::{
     StorageMeasurementStatus,
 };
 
-/// Human names for the checks the daemon ships. A key with no entry
-/// renders verbatim: the page does not invent a name for a subsystem it
-/// has not met.
 const CHECK_NAMES: &[(&str, &str)] = &[
     ("auth_db", "Authentication database"),
     ("corpus", "Corpus"),
@@ -38,7 +35,6 @@ const CHECK_NAMES: &[(&str, &str)] = &[
     ("storage_db", "Catalog database"),
 ];
 
-/// The friendly name for a check key, or `None` when there is none.
 fn check_name(key: &str) -> Option<&'static str> {
     CHECK_NAMES
         .iter()
@@ -46,14 +42,6 @@ fn check_name(key: &str) -> Option<&'static str> {
         .map(|(_, name)| *name)
 }
 
-/// The badge for one check result: `ok` is healthy, `ingest_capacity`'s
-/// `refusing` is a warning (ingest is pushed back while queries still
-/// serve, ADR-0043), and so are `corpus`'s `rollup_pending` and
-/// `restart_backlog` (corpus reads are refused until the corpus settles,
-/// which needs no restart, ADR-0041), and so is `duckdb`'s `slow` (the
-/// engine sample ran past its budget but a sample succeeded within the
-/// last minute: the engine is busy, not broken, ADR-0056). Any other value
-/// is a failure shown verbatim.
 fn check_badge(key: &str, result: &str) -> (Tone, String) {
     match (key, result) {
         (_, "ok") => (Tone::Success, "Healthy".to_owned()),
@@ -65,12 +53,6 @@ fn check_badge(key: &str, result: &str) -> (Tone, String) {
     }
 }
 
-/// The checks card's title.
-///
-/// A report that did not arrive is never called healthy: a transport
-/// failure and a permission refusal both reach here as `Err`, and
-/// claiming health on either would be a state the page cannot see
-/// (ADR-0025).
 fn health_title(report: Option<&Result<HealthResponse, String>>) -> &'static str {
     match report {
         None => "Health checks",
@@ -83,10 +65,7 @@ fn health_title(report: Option<&Result<HealthResponse, String>>) -> &'static str
     }
 }
 
-/// The sentence for a report read that failed and did not send the page
-/// to sign-in: a permission refusal has its own, a refusal the server
-/// explained is its message, and a bare status or a lost answer is
-/// generic. A 401 reaches here only when the sign-in handler declined,
+/// A 401 reaches here only when the sign-in handler declined,
 /// and reads as the session-ended sentence.
 fn read_error(error: &api::ApiError) -> String {
     if error.is_unauthorized() {
@@ -106,11 +85,8 @@ fn read_error(error: &api::ApiError) -> String {
     }
 }
 
-/// The sentence for a cancellation that failed. The request is a
-/// DELETE, so a lost answer or a 5xx (which a proxy can return after the
-/// daemon acted) leaves the outcome unknown. A 401 never reached the
-/// daemon: it says the session ended, and this write does not navigate.
-/// Any other enveloped refusal is the server's message.
+/// The request is a DELETE, so a lost answer or a 5xx (which a proxy can
+/// return after the daemon acted) leaves the outcome unknown.
 fn cancel_error(error: &api::ApiError) -> String {
     const UNKNOWN: &str = "Cancellation outcome unknown. Refresh queries before trying again.";
     if error.is_unauthorized() {
@@ -192,9 +168,6 @@ pub fn HealthPage() -> impl IntoView {
                         let version_reported = report.version.is_some();
                         view! {
                             <dl class="health-checks">{checks.into_iter().map(|(key, result)| {
-                                // An unknown key IS the name: naming a
-                                // check the daemon has not shipped would
-                                // be a guess dressed as a fact.
                                 let friendly = check_name(&key);
                                 let (tone, label) = check_badge(&key, &result);
                                 let failed = tone == Tone::Danger;
@@ -258,9 +231,6 @@ pub fn HealthPage() -> impl IntoView {
     }
 }
 
-/// One storage source's reading: a state line, plus totals only when the
-/// server reports a measured sample. The sample age is the server's, unchanged,
-/// including when the stream stops.
 #[derive(Clone, Copy)]
 struct StorageReading {
     state: &'static str,
@@ -288,8 +258,6 @@ fn storage_reading(files: u64, bytes: u64, measurement: StorageMeasurement) -> S
     StorageReading { state, totals }
 }
 
-/// A storage source's state line, then its measured totals as facts. A
-/// state without a measured sample stays one plain line.
 fn storage_reading_view(reading: StorageReading) -> impl IntoView + use<> {
     match reading.totals {
         Some((files, bytes, age)) => view! {
@@ -306,7 +274,7 @@ fn storage_reading_view(reading: StorageReading) -> impl IntoView + use<> {
 }
 
 /// A card sentence with each ISO date in an unbreakable run, so a narrow
-/// screen never wraps a date at its hyphen. The text is unchanged.
+/// screen never wraps a date at its hyphen.
 fn dated_text(line: &str) -> impl IntoView + use<> {
     date_runs(line)
         .into_iter()
@@ -321,10 +289,9 @@ fn dated_text(line: &str) -> impl IntoView + use<> {
         .collect_view()
 }
 
-/// The Disk and retention card (ADR-0042). It states measurements,
-/// evidence and a conditional projection, and never a verdict: no
-/// colour, no badge, no "safe". `parquet` is the snapshot's Parquet
-/// measurement, which says whether an empty environment list was measured.
+/// The Disk and retention card (ADR-0042). `parquet` is the snapshot's
+/// Parquet measurement, which says whether an empty environment list was
+/// measured.
 #[component]
 fn HealthDiskRetention(capacity: Capacity, parquet: StorageMeasurement) -> impl IntoView {
     let Capacity {

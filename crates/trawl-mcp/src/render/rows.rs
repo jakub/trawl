@@ -3,17 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Rows as JSON arrays, and the cells too long to print (ADR-0058).
-//!
-//! Every printed cell is one JSON value: the cell's #214 wire JSON, from
-//! [`trawl_api::value::wire_cell_text`], parsed back into a value. Event
-//! text is therefore always a JSON string inside a JSON array, whatever it
-//! holds: quotes, newlines, control characters or instructions stay data.
-//!
-//! A cell whose wire text is longer than [`ABBREVIATE_OVER_BYTES`] prints
-//! as a JSON string holding the first bytes of that wire text, cut on a
-//! character boundary, followed by a marker naming the omitted bytes and
-//! the `read` call that returns the cell whole. The bytes are of the wire
-//! text because the cell route serves byte ranges of exactly that text.
 
 use std::fmt::Write as _;
 
@@ -28,29 +17,13 @@ use crate::reply::{AbbreviatedCell, Column};
 /// abbreviated.
 pub const ABBREVIATE_OVER_BYTES: usize = 512;
 
-/// A page's printed columns, rows and abbreviated cells, ready for a
-/// [`crate::reply::ResultView`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct EncodedPage {
-    /// The printed columns with their captured positions.
     pub columns: Vec<Column>,
-    /// The rows; every cell is one JSON value.
     pub rows: Vec<Vec<Json>>,
-    /// The cells printed shorter than they are.
     pub abbreviated: Vec<AbbreviatedCell>,
 }
 
-/// Encode a page of a captured result.
-///
-/// `positions` holds each page column's 0-based position in the captured
-/// result (a [`trawl_api::results::ResultPage`]'s `positions`); a column
-/// past its end is placed at its page index. Row `i` of `page` is captured
-/// row `offset + i`.
-///
-/// # Errors
-///
-/// A cell that does not fit its column's type, refused the way the wire
-/// encoder refuses it, with the column named.
 pub fn encode_page(
     page: &QueryResult,
     positions: &[usize],
@@ -85,14 +58,6 @@ pub fn encode_page(
     })
 }
 
-/// Encode one cell of captured row `row`, column position `column`.
-///
-/// The cell's JSON value, and the [`AbbreviatedCell`] entry when its wire
-/// text was longer than [`ABBREVIATE_OVER_BYTES`].
-///
-/// # Errors
-///
-/// A cell that does not fit `ty`, as [`wire_cell_text`] refuses it.
 pub fn encode_cell(
     name: &str,
     ty: &ColumnType,
@@ -120,16 +85,11 @@ pub fn encode_cell(
     ))
 }
 
-/// One printed row: a compact JSON array on one line. [`json_text`]
-/// escapes every line break and control character inside a string, so a
-/// row never spans two lines.
 #[must_use]
 pub fn row_line(row: &[Json]) -> String {
     json_text(row)
 }
 
-/// The columns line: each printed column's position, its name as a JSON
-/// string, and its wire type.
 #[must_use]
 pub fn columns_line(columns: &[Column]) -> String {
     let listed: Vec<String> = columns
@@ -146,22 +106,15 @@ pub fn columns_line(columns: &[Column]) -> String {
     format!("columns (position name type): {}", listed.join(", "))
 }
 
-/// `text` as a JSON string literal, escaped as [`json_text`] escapes.
 pub(crate) fn json_string(text: &str) -> String {
     json_text(text)
 }
 
-/// `value` as compact JSON text with no raw control or format character in
-/// it: every [`is_unsafe_display_char`] is its [`escape_unsafe`] escape.
-///
-/// A JSON encoder escapes the C0 controls itself, with the text
-/// [`escape_unsafe`] writes for them, but leaves raw DEL, the C1 controls
-/// (a terminal reads some as escape sequences), the bidi controls (which
-/// reorder the text around them), the zero-widths, joiners and BOM (which
-/// hide text), the soft hyphen and the Unicode line and paragraph
-/// separators. Outside a string JSON text is ASCII punctuation, so every
-/// such character sits inside a string, where its escape decodes to the
-/// same value.
+/// A JSON encoder escapes the C0 controls itself, but leaves raw DEL, the
+/// C1 controls, the bidi controls, the zero-widths, joiners and BOM, the
+/// soft hyphen and the Unicode line and paragraph separators. Outside a
+/// string JSON text is ASCII punctuation, so every such character sits
+/// inside a string, where its escape decodes to the same value.
 #[must_use]
 pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
     // Values built from JSON values and strings always serialize.
@@ -173,28 +126,12 @@ pub fn json_text<T: Serialize + ?Sized>(value: &T) -> String {
 }
 
 /// `value` as a reply's `structuredContent` mirror: its JSON value with
-/// each [`is_unsafe_display_char`], control characters included, in every
-/// string and object key, replaced by the escape text [`json_text`] prints
-/// for it: `\n` for a line feed, `\u001b` for an escape, `\u202e` for a
-/// right-to-left override. A mirror string without a quote or a backslash
-/// holds exactly what the text block prints between that string's quotes.
+/// each [`is_unsafe_display_char`] in every string and object key replaced
+/// by the escape text [`json_text`] prints for it.
 ///
-/// A client may show the model the serialized mirror in place of the text
-/// block, or decode it and render its strings, so the mirror holds the
-/// very characters the text block prints: no rendering of it carries a
-/// character that reorders, hides or rewrites the text around it, and a
-/// string that held line breaks is one line, as it is in a printed row.
-/// The cost is that a mirror string no longer decodes to the stored text
-/// when it held such a character; a client that needs those bytes reads
-/// them through trawld's HTTP API.
-///
-/// A proposed call's arguments are the next call's input, not text to
-/// show, so the escaping never rewrites them: a reply's `next_actions`
-/// keeps each call whose arguments hold no such character as it is, and
-/// leaves out each one whose arguments do. The text block still proposes
-/// that call, its JSON escapes decoding to the original arguments. An
-/// activity's continuation carries an investigation id the call validated
-/// and a sequence number, which hold no such character.
+/// A proposed call's arguments are the next call's input, so the escaping
+/// never rewrites them: `next_actions` leaves out each call whose arguments
+/// hold such a character.
 pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Json> {
     let mut mirror = serde_json::to_value(value)?;
     if let Some(Json::Array(actions)) = mirror.get_mut("next_actions") {
@@ -204,8 +141,6 @@ pub(crate) fn mirror<T: Serialize + ?Sized>(value: &T) -> serde_json::Result<Jso
     Ok(mirror)
 }
 
-/// Whether a string or object key in `value` holds an
-/// [`is_unsafe_display_char`].
 fn holds_unsafe(value: &Json) -> bool {
     match value {
         Json::String(text) => text.chars().any(is_unsafe_display_char),
@@ -217,7 +152,6 @@ fn holds_unsafe(value: &Json) -> bool {
     }
 }
 
-/// Escape every string and object key in `value` as [`mirror`] does.
 fn escape_strings(value: &mut Json) {
     match value {
         Json::String(text) => {
@@ -242,11 +176,8 @@ fn escape_strings(value: &mut Json) {
     }
 }
 
-/// `text` with each [`is_unsafe_display_char`] as the escape a JSON
-/// encoder writes for a C0 control: the two-character escape JSON has for
-/// a backspace, tab, line feed, form feed or carriage return, else
-/// `\uXXXX` in lowercase hex. Every such character is in the Basic
-/// Multilingual Plane, so `\uXXXX` always has four hex digits.
+/// Every [`is_unsafe_display_char`] is in the Basic Multilingual Plane, so
+/// `\uXXXX` always has four hex digits.
 fn escape_unsafe(text: &str) -> String {
     let mut out = String::with_capacity(text.len() + 16);
     for c in text.chars() {
@@ -265,7 +196,6 @@ fn escape_unsafe(text: &str) -> String {
     out
 }
 
-/// The largest character boundary of `text` at or below `index`.
 pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
     if index >= text.len() {
         return text.len();
@@ -277,7 +207,6 @@ pub(crate) fn floor_char_boundary(text: &str, index: usize) -> usize {
     at
 }
 
-/// A count or index as the `u64` the reply carries.
 pub(crate) fn as_u64(n: usize) -> u64 {
     u64::try_from(n).unwrap_or(u64::MAX)
 }
@@ -286,7 +215,6 @@ pub(crate) fn as_u64(n: usize) -> u64 {
 mod tests {
     use super::*;
 
-    /// Every string in `value`, object keys included.
     fn strings(value: &Json, out: &mut Vec<String>) {
         match value {
             Json::String(text) => out.push(text.clone()),
@@ -312,7 +240,6 @@ mod tests {
 
     #[test]
     fn a_cell_over_the_limit_is_cut_on_a_char_boundary_with_a_marker() {
-        // 511 bytes of `a`, then a three-byte character straddling byte 512.
         let value = Value::String(format!("{}€tail", "a".repeat(510)));
         let wire = wire_cell_text("msg", &ColumnType::String, &value).unwrap();
         let (cell, cut) = encode_cell("msg", &ColumnType::String, &value, 7, 3).unwrap();
@@ -359,7 +286,6 @@ mod tests {
         assert_eq!(mirrored["text"], Json::String(expected.to_owned()));
         assert_eq!(mirrored["list"][0], Json::String(expected.to_owned()));
         assert_eq!(mirrored["keyed"][expected], Json::Bool(true));
-        // Between its quotes the text prints what the mirror holds.
         assert_eq!(json_string(hostile), format!("\"{expected}\""));
         assert_eq!(
             mirrored["text"].to_string(),

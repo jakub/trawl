@@ -3,36 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Severity presentation, keyed off `_severity` alone (ADR-0013 §9).
-//!
-//! Data-in / data-out, and ungated, so the decisions that are easy to get
-//! subtly wrong are table-testable natively rather than only in a
-//! browser: which columns render as severity, and which text a
-//! `_severity` cell shows. The histogram's error counts come from trawld,
-//! which reads `_severity` by the same rule.
-//!
-//! Two rules, both load-bearing:
-//!
-//! - **`_severity` only.** A bare `severity` column is ordinary sender
-//!   data, so coloring one would be trawl assigning meaning to a bare
-//!   name.
-//! - **display, never the wire.** Results display the token (`17` →
-//!   `error`), because that is the vocabulary the query language uses,
-//!   while json/csv/SSE keep the number, so arithmetic consumers are
-//!   untouched. Rendering is presentation, and only presentation.
-//!
-//! The token text comes from `trawl_core::severity::otel_name`, the same
-//! injective table the `SEVERITY` pin's patterns match, so a cell reads
-//! as exactly the value that would filter it.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::value::Value;
 
-/// Which result columns render as severity tokens: `_severity`, plus the
-/// columns the response declared (`sev()` output, ADR-0013 ruling 9).
-///
-/// The membership rule is `trawl_core::severity::renders_as_severity`,
-/// the one every renderer asks; only the index collection is local.
 #[must_use]
 pub fn severity_columns<'a>(
     names: impl IntoIterator<Item = &'a str>,
@@ -46,17 +21,9 @@ pub fn severity_columns<'a>(
         .collect()
 }
 
-/// The `SeverityNumber` a severity cell holds, if it holds one.
-///
 /// The column is BIGINT on the wire; a string is tolerated only because
 /// a hot-buffer row can carry the JSON shape before conformance renders
-/// it. Both shapes read through the one kernel
-/// (`trawl_core::severity::reading_*`, ADR-0013 ruling 9), so a cell
-/// displays exactly the number ingest would have derived and `sev()`
-/// would compute — no surface has its own severity vocabulary. Every
-/// other shape (a float, a bool, an array, an unsigned past `i64::MAX`)
-/// names no rung and has no reading, exactly as the kernel says: every
-/// dialect's ladder ends well inside `i64`.
+/// it.
 #[must_use]
 pub fn severity_number(v: &Value) -> Option<u8> {
     use trawl_core::severity::Dialect;
@@ -119,7 +86,6 @@ fn facet_rung(value: &str) -> Option<i64> {
     value.parse::<i64>().ok().filter(|n| n.to_string() == value)
 }
 
-/// CSS class for a `_severity` value, by `OTel` band.
 #[must_use]
 pub fn severity_class(v: &Value) -> &'static str {
     match severity_number(v).and_then(trawl_core::severity::band_name) {
@@ -135,8 +101,6 @@ pub fn severity_class(v: &Value) -> &'static str {
 mod tests {
     use super::*;
 
-    /// Results display the token, never the number (ADR-0013 §6), and the
-    /// rendering is injective, so `error2` is not shown as `error`.
     #[test]
     fn a_severity_cell_renders_its_otel_short_name() {
         assert_eq!(severity_display(&Value::Integer(17)), "error");
@@ -144,13 +108,10 @@ mod tests {
         assert_eq!(severity_display(&Value::Integer(13)), "warn");
         assert_eq!(severity_display(&Value::Integer(1)), "trace");
         assert_eq!(severity_display(&Value::Integer(24)), "fatal4");
-        // Out of the ladder, or absent: the raw value, never a guess.
         assert_eq!(severity_display(&Value::Integer(99)), "99");
         assert_eq!(severity_display(&Value::Null), "NULL");
     }
 
-    /// A rail value reads as its name when it is a ladder number, and as
-    /// itself otherwise, so the rail never shows two counted values as one.
     #[test]
     fn a_rail_value_names_its_rung_and_keeps_every_other_value() {
         assert_eq!(severity_facet_name("9"), Some("info"));
@@ -168,8 +129,6 @@ mod tests {
         assert_eq!(severity_facet_name(""), None);
     }
 
-    /// The rail inks a value only where the table's pill is colored:
-    /// error and fatal red, warn amber, everything else plain.
     #[test]
     fn a_rail_value_takes_level_ink_only_where_the_table_does() {
         assert_eq!(severity_facet_ink("17"), Some("error"));
@@ -190,8 +149,6 @@ mod tests {
         assert_eq!(severity_facet_ink("017"), None, "shown verbatim, so plain");
     }
 
-    /// The rail reads as a scale, most severe first; a value that is not
-    /// a number keeps its count order after the numbers.
     #[test]
     fn rail_values_order_most_severe_first() {
         let mut values: Vec<(String, u32)> = [
@@ -211,7 +168,6 @@ mod tests {
         assert_eq!(values[2], ("9".to_owned(), 42), "counts travel with values");
     }
 
-    /// Coloring is by band, over the same reading.
     #[test]
     fn a_severity_cell_colors_by_band() {
         assert_eq!(severity_class(&Value::Integer(17)), "lvl lvl-error");
@@ -224,10 +180,6 @@ mod tests {
         assert_eq!(severity_class(&Value::Null), "lvl");
     }
 
-    /// A hot-buffer row can still carry the JSON shape before conformance
-    /// renders it, so a string reads through the same ladder: one kernel,
-    /// so a numeric string and a padded token read here exactly as they
-    /// read at ingest and under `sev()`.
     #[test]
     fn a_string_severity_reads_through_the_same_ladder() {
         assert_eq!(severity_number(&Value::String("error".into())), Some(17));
@@ -235,7 +187,6 @@ mod tests {
         assert_eq!(severity_number(&Value::String("err".into())), Some(17));
         assert_eq!(severity_number(&Value::String("17".into())), Some(17));
         assert_eq!(severity_number(&Value::String(" error ".into())), Some(17));
-        // No reading is no reading: the cell renders its raw value.
         assert_eq!(severity_number(&Value::String("gold".into())), None);
         assert_eq!(severity_number(&Value::String("1.5".into())), None);
         assert_eq!(severity_number(&Value::String("25".into())), None);
@@ -243,8 +194,6 @@ mod tests {
         assert_eq!(severity_display(&Value::String("17".into())), "error");
     }
 
-    /// The integer shape is what the wire actually carries, and its
-    /// ladder guard is the kernel's own.
     #[test]
     fn an_integer_severity_reads_the_ladder_and_nothing_else() {
         for n in 1..=24i64 {
@@ -258,15 +207,11 @@ mod tests {
         assert_eq!(severity_number(&Value::Integer(25)), None);
         assert_eq!(severity_number(&Value::Integer(-1)), None);
         assert_eq!(severity_number(&Value::Integer(i64::MAX)), None);
-        // A shape that names no rung.
         assert_eq!(severity_number(&Value::Float(17.0)), None);
         assert_eq!(severity_number(&Value::Boolean(true)), None);
         assert_eq!(severity_number(&Value::Null), None);
     }
 
-    /// Cell rendering reads `_severity` and whatever the response
-    /// declared — a `sev()` output renders its token like any other
-    /// severity column, and an undeclared bare name renders as data.
     #[test]
     fn declared_severity_columns_join_the_name_keyed_one() {
         let cols = ["_time", "severity", "_severity", "s"];

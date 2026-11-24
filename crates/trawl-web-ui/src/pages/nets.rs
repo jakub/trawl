@@ -3,10 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<NetsPage/>` — saved query ("net") management for the Jobs mode.
-//!
-//! URL params:
-//! - `net=<id>` — opens the detail drawer for that net
-//! - `ntab=query|runs` — active drawer tab (default: query)
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -29,17 +25,12 @@ use fleet_ui::{
     ToastLink, Tone,
 };
 
-/// Whether a net survives the list filter: its name or its query text.
-/// Named once because the sheet footer counts exactly what the table
-/// renders.
 fn matches_filter(net: &SavedQueryResponse, needle: &str) -> bool {
     needle.is_empty()
         || net.name.to_lowercase().contains(needle)
         || net.query.to_lowercase().contains(needle)
 }
 
-/// Sort key for the nets table. Name starts ascending; the two
-/// timestamp keys start descending (most recent first).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetSort {
     Name,
@@ -58,8 +49,6 @@ pub fn NetsPage() -> impl IntoView {
     let table_viewport = NodeRef::<leptos::html::Div>::new();
     let bus = expect_context::<ToastBus>();
     let me = expect_context::<RwSignal<Option<api::MeResponse>>>();
-    // Run now needs `query` beside `saved_query`; a session without it is
-    // offered none, on any row.
     let offered = move |n: &SavedQueryResponse| {
         me.with(|m| run_now_offered(n, m.as_ref().map(|m| m.permissions.as_slice())))
     };
@@ -86,9 +75,6 @@ pub fn NetsPage() -> impl IntoView {
             async move { api::list_saved().await }
         });
 
-    // Past this width the net panel docks in the second column instead
-    // of sliding over a scrim (ADR-0032). The column exists whenever the
-    // URL names a net, so a missing or still-loading one reports there.
     let wide = use_media_query("(min-width: 1100px)");
     let panel_open = Signal::derive(move || net_selected.get().is_some());
 
@@ -166,16 +152,13 @@ pub fn NetsPage() -> impl IntoView {
         }
     };
 
-    // Run now fires the saved schedule's next window early; the server
-    // resolves that window at claim time and the toast repeats it.
     let on_run_now = move |id: i64, name: String, in_flight: RwSignal<bool>| {
         in_flight.set(true);
         spawn_local(async move {
             let outcome = api::trigger_run(id).await;
-            // The row may have unmounted (deleted, filtered away), or the
-            // whole page with it (navigated away), while the request was
-            // out; the toast still reports it, and the page's own signals
-            // are only touched if they still exist.
+            // The row may have unmounted, or the whole page with it, while the
+            // request was out; the page's own signals are only touched if they
+            // still exist.
             let _ = in_flight.try_set(false);
             match outcome {
                 Ok(run) => {
@@ -217,8 +200,6 @@ pub fn NetsPage() -> impl IntoView {
         });
     };
 
-    // The sheet footer counts what the table shows, off the same
-    // predicate the rows are filtered by.
     let visible_nets = Signal::derive(move || {
         let Some(Ok(resp)) = nets.get() else {
             return Vec::new();
@@ -277,18 +258,11 @@ pub fn NetsPage() -> impl IntoView {
                                 // Read current values when invoking an action, not the mount-time net.
                                 let run = on_run_in_search.clone();
                                 let run_in_flight = RwSignal::new(false);
-                                // The drawer is a place with a URL, so the row's one
-                                // control is a link built by the same producer
-                                // `push_net` uses; `prop:replace` is that call's
-                                // `replace: true`.
+                                // `prop:replace` is `push_net`'s `replace: true`.
                                 let href = format!("/jobs/nets?net={id}&ntab=query");
                                 view! {
                                     <tr class="tbl-row" class:active=move || net_selected.get() == Some(id)>
                                         <td class="mono"><a class="row-stretch" href=href prop:replace=true>{move || net.get().name}</a></td>
-                                        // The cadence in words, with the enabled/paused
-                                        // judgement beside it as a Badge rather than a
-                                        // glyph the row has to explain, and the next fire
-                                        // those two qualify on the line beneath.
                                         <td>
                                             <span class="cadence">{move || cadence_sentence(net.get().schedule.as_ref())}</span>
                                             {move || net.get().schedule.map(|s| {
@@ -298,7 +272,6 @@ pub fn NetsPage() -> impl IntoView {
                                             {move || {
                                                 let schedule = net.get().schedule?;
                                                 let run = schedule.last_run?;
-                                                // A spent budget fires no more runs, so it has no next fire.
                                                 (schedule.enabled && !schedule.exhausted).then(|| {
                                                     #[allow(clippy::cast_possible_truncation)]
                                                     let started_ms = js_sys::Date::parse(&run.started_at) as i64;
@@ -311,8 +284,6 @@ pub fn NetsPage() -> impl IntoView {
                                         </td>
                                         <td>{move || {
                                             let Some(schedule) = net.get().schedule else { return view! { <span style="color:var(--ink-3)">"—"</span> }.into_any(); };
-                                            // A spent budget fires no more runs, so it
-                                            // replaces the pending wording.
                                             let spent = run_budget_label(&schedule);
                                             let spent_view = spent.map(|label| view! { <div class="run-spent mono" style="font-size:10px; color:var(--ink-3)">{label}</div> });
                                             let Some(run) = schedule.last_run else {
@@ -353,9 +324,6 @@ pub fn NetsPage() -> impl IntoView {
                                                         on:click=move |ev| {
                                                             ev.stop_propagation();
                                                             let current = net.get_untracked();
-                                                            // Recheck the saved state and the session on
-                                                            // activation: a schedule removed or spent since
-                                                            // render has nothing left to fire.
                                                             if offered(&current) && !run_now_spent(&current) && !run_in_flight.get_untracked() {
                                                                 on_run_now(id, current.name, run_in_flight);
                                                             }
@@ -384,8 +352,6 @@ pub fn NetsPage() -> impl IntoView {
                             "No nets yet — save a query from the search page to get started"
                         } else { "No nets match that filter" }}</div>
                     })}
-                    // Summary-only Pager: this table is unpaginated, so no
-                    // prev/next controls.
                     <Pager summary=Signal::derive(move || {
                         let count = visible_nets.get().len();
                         format!("{count} net{}", if count == 1 { "" } else { "s" })
@@ -417,9 +383,6 @@ pub fn NetsPage() -> impl IntoView {
             }/>
             </div>
 
-            // Delete confirmation modal — open/close plumbing via the
-            // natively-tested fleet_ui::ConfirmState; the ConfirmModal
-            // composition stays app-side (ADR-0002).
             <Show when=move || confirm_delete.get().is_open()>
                 {move || {
                     let Some((_, del_name)) = confirm_delete.get().pending().cloned() else {
@@ -432,8 +395,6 @@ pub fn NetsPage() -> impl IntoView {
                             message=msg
                             confirm_label="Delete"
                             on_confirm=Callback::new(move |()| {
-                                // take() closes the dialog and yields the
-                                // payload exactly once.
                                 if let Some((id, name)) =
                                     confirm_delete.try_update(fleet_ui::ConfirmState::take).flatten()
                                 {

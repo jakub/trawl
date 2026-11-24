@@ -3,12 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The server's `X-Request-Id` on every error that saw a response
-//! (ADR-0057, AC11), and `Retry-After` on a server error.
-//!
-//! Each test serves one connection from a rustls listener on `127.0.0.1`
-//! whose self-signed certificate the client pins as its CA, as
-//! `upload_cut_off.rs` does. The listener writes one canned response, or
-//! hangs up with a reset.
+//! (ADR-0057), and `Retry-After` on a server error.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -24,28 +19,18 @@ use trawl_client::{CaptureRequest, ClientError, ErrorCode, HttpClient, NetworkKi
 
 const TOKEN: &str = "flt_requestidtesttoken";
 
-/// A ULID, the shape trawld's request ids take.
 const REQUEST_ID: &str = "01JBQ7ZK3M8X2V5N9R4T6W0YCD";
 
-/// A result id the client accepts.
 const RESULT_ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(30);
 
-/// What the listener does once it has read a request head.
 enum Answer {
-    /// Hang up with a reset and no response.
     Reset,
-    /// Write this response and close cleanly.
     Respond(Vec<u8>),
-    /// Write these bytes, then hold the connection open and silent until
-    /// the client gives up.
     Stall(Vec<u8>),
 }
 
-/// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
-/// pin, and the server identity.
 fn self_signed() -> (
     Vec<u8>,
     Vec<CertificateDer<'static>>,
@@ -60,14 +45,10 @@ fn self_signed() -> (
     )
 }
 
-/// Serve one connection with `answer`. Returns a client that trusts the
-/// listener's certificate as its pinned CA, and the serving task.
 async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
     serve_one_within(answer, None).await
 }
 
-/// [`serve_one`], with `timeout` bounding each of the client's requests in
-/// place of its long default when given.
 async fn serve_one_within(
     answer: Answer,
     timeout: Option<Duration>,
@@ -130,8 +111,6 @@ async fn serve_one_within(
     (client, served)
 }
 
-/// Read up to the end of the request head. Returns the head and how many
-/// body bytes arrived with it.
 async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, usize) {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -146,7 +125,6 @@ async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, usize) {
     }
 }
 
-/// The request's declared body length; zero without one.
 fn content_length(head: &str) -> usize {
     head.lines()
         .filter_map(|line| line.split_once(':'))
@@ -156,8 +134,6 @@ fn content_length(head: &str) -> usize {
         })
 }
 
-/// A whole HTTP/1.1 response: `status` (`"400 Bad Request"`), the extra
-/// `headers`, and `body` with its length.
 fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     use std::fmt::Write as _;
     let mut head = format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\n");
@@ -175,7 +151,6 @@ fn response(status: &str, headers: &[(&str, &str)], body: &[u8]) -> Vec<u8> {
     out
 }
 
-/// The error envelope trawld would send for `code`.
 fn envelope(code: ErrorCode, message: &str) -> Vec<u8> {
     serde_json::to_vec(&ErrorResponse {
         error: ErrorEnvelope::simple(code, message),
@@ -183,7 +158,6 @@ fn envelope(code: ErrorCode, message: &str) -> Vec<u8> {
     .expect("envelope encodes")
 }
 
-/// Run `call` against the listener, both bounded by [`EXCHANGE`].
 async fn exchange<T>(
     call: impl std::future::Future<Output = Result<T, ClientError>>,
     served: JoinHandle<()>,
@@ -203,8 +177,6 @@ fn capture_request() -> CaptureRequest {
     }
 }
 
-/// A 400 refusal names the request it refused, and the rendered error
-/// quotes it.
 #[tokio::test]
 async fn a_400_carries_the_request_id() {
     let body = envelope(
@@ -238,7 +210,6 @@ async fn a_400_carries_the_request_id() {
     );
 }
 
-/// A 500 carries its id the same way.
 #[tokio::test]
 async fn a_500_carries_the_request_id() {
     let body = envelope(ErrorCode::ResultCorrupt, "the result's file does not match");
@@ -260,8 +231,6 @@ async fn a_500_carries_the_request_id() {
     assert!(error.to_string().contains(REQUEST_ID), "{error}");
 }
 
-/// A server error without the header names no id, and its text is the
-/// one it always was.
 #[tokio::test]
 async fn a_server_error_without_the_header_names_no_id() {
     let body = envelope(ErrorCode::BadRequest, "bad window");
@@ -274,7 +243,6 @@ async fn a_server_error_without_the_header_names_no_id() {
     assert_eq!(error.to_string(), "server error (HTTP 400): bad window");
 }
 
-/// A 429 carries the numeric `Retry-After` beside the id.
 #[tokio::test]
 async fn a_429_carries_retry_after() {
     let body = envelope(ErrorCode::CaptureBusy, "a capture of this key is running");
@@ -301,8 +269,6 @@ async fn a_429_carries_retry_after() {
     assert_eq!(error.request_id(), Some(REQUEST_ID));
 }
 
-/// The HTTP-date form of `Retry-After`, and anything else that is not
-/// digits alone, reads as no wait at all.
 #[tokio::test]
 async fn a_retry_after_that_is_not_seconds_is_none() {
     for value in [
@@ -332,8 +298,6 @@ async fn a_retry_after_that_is_not_seconds_is_none() {
     }
 }
 
-/// A 200 whose body is not JSON is a parse failure that names the
-/// response's id, on the uncapped path and the capped one.
 #[tokio::test]
 async fn a_200_that_does_not_parse_carries_the_request_id() {
     let canned = response(
@@ -361,8 +325,7 @@ async fn a_200_that_does_not_parse_carries_the_request_id() {
     );
 }
 
-/// A 200 body past the endpoint's cap is too large, and still names the
-/// response's id. whoami's cap is 64 KiB.
+/// whoami's cap is 64 KiB.
 #[tokio::test]
 async fn a_200_past_the_cap_carries_the_request_id() {
     let body = vec![b' '; 128 * 1024];
@@ -378,8 +341,6 @@ async fn a_200_past_the_cap_carries_the_request_id() {
     assert_eq!(error.request_id(), Some(REQUEST_ID));
 }
 
-/// A reset before any response is a network error, and there is no id to
-/// name.
 #[tokio::test]
 async fn a_reset_names_no_request_id() {
     let (client, served) = serve_one(Answer::Reset).await;
@@ -392,9 +353,6 @@ async fn a_reset_names_no_request_id() {
     assert_eq!(error.request_id(), None);
 }
 
-/// Headers that carry the id and declare `100` body bytes, then `10` of
-/// them. Written whole by a listener that then closes, or held open by one
-/// that stalls.
 fn cut_short_response() -> Vec<u8> {
     let mut head = format!(
         "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\nx-request-id: {REQUEST_ID}\r\n\
@@ -405,9 +363,6 @@ fn cut_short_response() -> Vec<u8> {
     head
 }
 
-/// A 200 whose body closes before its declared length is a body-read
-/// network error, and still names the response's id, on the capped path
-/// (`whoami`) and the uncapped one (`list_results`, a parse failure).
 #[tokio::test]
 async fn a_body_cut_short_after_the_headers_carries_the_request_id() {
     let (client, served) = serve_one(Answer::Respond(cut_short_response())).await;
@@ -428,9 +383,6 @@ async fn a_body_cut_short_after_the_headers_carries_the_request_id() {
     assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
 }
 
-/// A body that stalls past the client's deadline after the headers is a
-/// body timeout, and still names the response's id, on the capped path
-/// (`whoami`) and the uncapped one (`list_results`).
 #[tokio::test]
 async fn a_body_timeout_after_the_headers_carries_the_request_id() {
     for capped in [true, false] {
@@ -460,8 +412,6 @@ async fn a_body_timeout_after_the_headers_carries_the_request_id() {
     }
 }
 
-/// Open `/stream` and read it until it fails. A stream that ends cleanly
-/// is a test failure, so the caller always has an error to inspect.
 async fn stream_error(client: &HttpClient) -> Result<(), ClientError> {
     use futures::StreamExt as _;
     let mut events = client.stream_events("_service=nginx").await?;
@@ -471,7 +421,6 @@ async fn stream_error(client: &HttpClient) -> Result<(), ClientError> {
     panic!("the stream ended without an error");
 }
 
-/// A `/stream` 200 carrying the id, whose body is `body`.
 fn stream_response(body: &[u8]) -> Vec<u8> {
     response(
         "200 OK",
@@ -483,8 +432,6 @@ fn stream_response(body: &[u8]) -> Vec<u8> {
     )
 }
 
-/// A stream frame that does not decode ends the stream with a parse
-/// error, and that error names the response's id.
 #[tokio::test]
 async fn a_malformed_stream_frame_carries_the_request_id() {
     for body in [
@@ -501,8 +448,6 @@ async fn a_malformed_stream_frame_carries_the_request_id() {
     }
 }
 
-/// A `/stream` body that closes before its declared length is a body-read
-/// network error, and names the response's id.
 #[tokio::test]
 async fn a_stream_cut_short_after_the_headers_carries_the_request_id() {
     let (client, served) = serve_one(Answer::Respond(cut_short_response())).await;
@@ -517,8 +462,6 @@ async fn a_stream_cut_short_after_the_headers_carries_the_request_id() {
     assert_eq!(error.request_id(), Some(REQUEST_ID), "{error:?}");
 }
 
-/// A `/stream` body that stalls past the client's deadline after the
-/// headers is a body timeout, and names the response's id.
 #[tokio::test]
 async fn a_stream_timeout_after_the_headers_carries_the_request_id() {
     let (client, served) = serve_one_within(

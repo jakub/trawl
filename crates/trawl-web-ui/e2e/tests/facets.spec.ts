@@ -2,24 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// The facet rail's controls (issue #161, ADR-0029).
-//
-// Include and exclude were spans inside a block the stylesheet hid with
-// `display: none` until the row was hovered, which is the one way of
-// hiding something that also takes it out of the tab order. They are
-// buttons now, the action area is hidden with `opacity` instead, and the
-// row reveals it on `:focus-within` as well as on hover. So the first
-// two tests below only mean something because they arrive by Tab.
-//
-// The action area is also absolutely positioned at the row's right edge
-// with an opaque background, which is what keeps a long value from
-// reading through the two glyphs. The last test is that geometry, since
-// nothing else in the suite would notice it going.
-//
-// The rail's own <summary> is a keyboard control too (issue #231,
-// ADR-0044): Enter and Space open and close the wide rail, a rail that
-// closes under the reader's focus hands it to the summary, and a closed
-// rail is that one tab stop between the skip links and the console.
+// The facet rail's controls (ADR-0029).
 
 import fs from 'node:fs';
 import { test, expect, resetScenario, CORPUS } from '../fixtures';
@@ -27,10 +10,6 @@ import { expectRail, holdNextQuery, watchToggles } from '../filter-rail';
 import { SEL, COPY, nameFrom } from '../selectors';
 import { expectFocusRing } from '../a11y';
 
-// Issue 238's page: one-off `_time`, `_ingested` and sender `timestamp`
-// columns, the raw event, a repeating `level` and a distinct `host`.
-// Pinned in tests/e2e_wire_fixture_contract.rs and served to these specs
-// alone, so the corpus every other spec counts stays as it is.
 const presentation = JSON.parse(
   fs.readFileSync('harness/wire/query-field-presentation.json', 'utf8'),
 );
@@ -49,7 +28,6 @@ type Pg = import('@playwright/test').Page;
 const FIELD = CORPUS.columns[1];
 const VALUE = CORPUS.hosts[0];
 
-/** The `host` group, found by its header's own accessible name. */
 function hostGroup(page: Pg): Loc {
   return page.locator(SEL.facetGroup).filter({
     has: page.getByRole('button', {
@@ -91,8 +69,6 @@ test('include is reachable by Tab and adds one filter', async ({ page, request }
 
   await page.keyboard.press('Enter');
 
-  // One press, one filter. The chip is the count, and the URL carries
-  // the filter it names.
   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
   await expect(page).toHaveURL(/[?&]f=/);
   await expect(hostGroup(page).locator(SEL.facetValue).first()).toHaveClass(/selected/);
@@ -108,7 +84,6 @@ test('exclude on Space adds one filter', async ({ page, request }) => {
   });
   await expect(exclude).toHaveJSProperty('tagName', 'BUTTON');
 
-  // Two stops past the header: include, then exclude.
   await group.locator(SEL.facetGroupHeader).focus();
   await page.keyboard.press('Tab');
   await page.keyboard.press('Tab');
@@ -117,23 +92,18 @@ test('exclude on Space adds one filter', async ({ page, request }) => {
   await page.keyboard.press(' ');
 
   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
-  // Excluded rather than included: the two buttons sit next to each
-  // other and a count alone could not tell them apart.
   await expect(hostGroup(page).locator(SEL.facetValue).first()).toHaveClass(/excluded/);
 });
 
 test('group header toggles aria-expanded', async ({ page, request }) => {
   await openCorpusSearch(page, request);
 
-  // The first group, which is the facet rail's first focusable after
-  // its own filter box. That is `host`: the corpus's first column,
+  // That is `host`: the corpus's first column,
   // `_time`, is an event instant and never earns a group.
   const group = page.locator(SEL.facetGroup).first();
   const header = group.locator(SEL.facetGroupHeader);
   await expect(header).toHaveJSProperty('tagName', 'BUTTON');
   await expect(header).toHaveAttribute('type', 'button');
-  // The count is a span inside the button, so the name has to say the
-  // two in words or it reads as `host6`.
   await expect(header).toHaveAccessibleName(
     nameFrom(COPY.facetGroupName, FIELD, String(CORPUS.hosts.length)),
   );
@@ -164,7 +134,6 @@ test('show more reveals the hidden values', async ({ page, request }) => {
     nameFrom(COPY.facetMoreName, String(CORPUS.hostsHidden), CORPUS.hostsHidden === 1 ? 'value' : 'values', FIELD),
   );
 
-  // It follows the last value's controls in the tab order.
   await group.locator(SEL.facetOp).last().focus();
   await page.keyboard.press('Tab');
   await expectFocusRing(more);
@@ -175,13 +144,10 @@ test('show more reveals the hidden values', async ({ page, request }) => {
   await expect(group.locator(SEL.facetValueName).last()).toHaveText(
     CORPUS.hosts[CORPUS.hosts.length - 1],
   );
-  // Nothing left to reveal, so the control goes rather than sitting
-  // there doing nothing.
   await expect(more).toHaveCount(0);
 });
 
-// The rail lists up to 10 values per field (`FACET_TOP_N`). A second
-// scope line says so, but only while some field holds more than that.
+// The rail lists up to 10 values per field (`FACET_TOP_N`).
 const LIST_CAP_LINE = 'Lists show up to 10 values per field';
 
 test('the scope names the list cap only while a field holds more values than it lists', async ({ page, request }) => {
@@ -190,8 +156,6 @@ test('the scope names the list cap only while a field holds more values than it 
   await expect(page.locator('.facets-scope').first()).toBeVisible();
   await expect(page.getByText(LIST_CAP_LINE, { exact: true })).toHaveCount(0);
 
-  // Twelve rows with twelve hosts: the heading counts 12, the group
-  // lists 10 once expanded, and the line appears once, in the scope.
   const hostAt = presentation.columns.findIndex((c: { name: string }) => c.name === 'host');
   const rows = Array.from({ length: 12 }, (_, i) => {
     const row = [...presentation.rows[i % presentation.rows.length]];
@@ -216,8 +180,7 @@ test('long value keeps clear of the actions', async ({ page, request }) => {
 
   const group = hostGroup(page);
   const row = group.locator(SEL.facetValue).first();
-  // A value far longer than the row is wide. Written into the DOM
-  // rather than the fixture: the geometry is what is under test, and a
+  // Written into the DOM rather than the fixture: a
   // 200-character hostname in the corpus would change every other
   // spec's rows.
   await row.locator(SEL.facetValueName).evaluate((el) => {
@@ -234,8 +197,6 @@ test('long value keeps clear of the actions', async ({ page, request }) => {
   // can catch either one part way.
   const act = row.locator(SEL.facetActions);
   await expect(act).toHaveCSS('opacity', '1');
-  // The area is out of flow over the row, so it carries its own opaque
-  // floor. Transparent would let the value read through the glyphs.
   await expect(act).not.toHaveCSS('background-color', 'rgba(0, 0, 0, 0)');
 
   const gap = () =>
@@ -254,9 +215,6 @@ test('long value keeps clear of the actions', async ({ page, request }) => {
 test('clear all removes every filter', async ({ page, request }) => {
   await openCorpusSearch(page, request);
 
-  // The two filters are made through the include control the tests
-  // above prove, not by hand-writing the URL's base64 payload: a seed
-  // written by hand would pass this test with the control broken.
   const addInclude = async (value: string) => {
     await hostGroup(page)
       .getByRole('button', { name: nameFrom(COPY.facetIncludeName, FIELD, value) })
@@ -283,15 +241,10 @@ test('clear all removes every filter', async ({ page, request }) => {
   await expectFocusRing(clear);
 
   await page.keyboard.press('Enter');
-  // Both chips, and the link they were carried in.
   await expect(page.locator(SEL.filterChip)).toHaveCount(0);
   await expect(page).not.toHaveURL(/[?&]f=/);
-  // Nothing left to clear, so the control goes with the filters rather
-  // than sitting there doing nothing.
   await expect(clear).toHaveCount(0);
 
-  // Space on a fresh seed. A button answers to both keys; the div this
-  // replaced answered to neither.
   await addInclude(CORPUS.hosts[0]);
   await expect(page.locator(SEL.filterChip)).toHaveCount(1);
   await page.locator(SEL.facetFilterInput).focus();
@@ -310,16 +263,10 @@ test('Enter and Space on the rail summary open and close the rail', async ({ pag
   const summary = page.locator(SEL.filterRailSummary);
   await summary.focus();
 
-  // Each key, each way. One toggle per press: the press cancels the
-  // native toggle and records the choice, so a key the browser turns
-  // into a click must not move the rail twice.
-  //
   // Each press waits for its own toggle before the next key. The browser
   // fires `toggle` from a queued task, and a second change made before
   // that task runs folds both into one event, so two quick presses can
-  // count as one. The settled re-read after the loop catches a press that
-  // toggled twice. Residual exposure: each poll's expect timeout (5 s,
-  // playwright.config.ts) bounds how late a toggle may arrive.
+  // count as one.
   let pressed = 0;
   for (const key of ['Enter', ' ']) {
     for (const open of [false, true]) {
@@ -350,12 +297,9 @@ test('an aggregation that closes the rail moves focus from a group header to the
   await page.goBack();
   await expect(page.locator(SEL.exactTable).locator('tbody tr')).toHaveCount(AGG_GROUPS);
   await expectRail(page, false);
-  // The header went with the groups; the rail's one control is left.
   await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
 });
 
-// Clear all outlives the groups while a filter is set, so here it is the
-// closed rail's inert content, not an unmount, that takes focus away.
 test('an aggregation that closes the rail moves focus from Clear all to the summary', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(`${AGG_URL}&f=${FILTER}`);
@@ -374,12 +318,8 @@ test('an aggregation that closes the rail moves focus from Clear all to the summ
   await expect(page.locator(SEL.filterRailSummary)).toBeFocused();
 });
 
-// Focus the query drops to `body` stays the rail's until the reader goes
-// elsewhere, and a press elsewhere counts even where it focuses nothing.
-// The top bar's page title is such a place: it takes no focus and sits
-// outside `<main>`, so the press leaves `body` active, exactly as the
-// unmount did. A press in the results focuses the results region or
-// `<main>`, and a rail that closes then leaves that focus alone anyway.
+// The top bar's page title takes no focus and sits
+// outside `<main>`, so the press leaves `body` active.
 test('an aggregation that closes the rail leaves focus alone after a press outside the rail', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.goto(AGG_URL);
@@ -407,9 +347,6 @@ test('an aggregation that closes the rail leaves focus alone after a press outsi
   expect(await bodyActive()).toBe(true);
 });
 
-// A closed rail's own controls are out of the tab order, whatever it
-// holds: on an idle page it holds nothing, and on an aggregation carrying
-// a filter it holds a Clear all.
 for (const [name, url] of [
   ['idle', '/search'],
   ['an aggregation carrying a filter', `${AGG_URL}&f=${FILTER}`],
@@ -420,8 +357,6 @@ for (const [name, url] of [
     await page.goto(url);
     await expect(page.locator(SEL.cmContent)).toBeVisible();
     await expectRail(page, false);
-    // By keyboard from the top of the page, as a reader arrives: the
-    // shell's skip link into the main content, then the page's two.
     await page.keyboard.press('Tab');
     await expect(page.getByRole('link', { name: 'Skip to main content', exact: true })).toBeFocused();
     await page.keyboard.press('Enter');
@@ -432,13 +367,11 @@ for (const [name, url] of [
     await expect(page.getByRole('link', { name: 'Skip to results', exact: true })).toBeFocused();
     await page.keyboard.press('Tab');
     await expectFocusRing(page.locator(SEL.filterRailSummary));
-    // The console's first control is the query editor.
     await page.keyboard.press('Tab');
     await expect(page.locator(SEL.cmContent)).toBeFocused();
   });
 }
 
-/** The fields the rail has a group for, read from each header's name. */
 async function railFields(page: Pg): Promise<string[]> {
   const names = await page
     .locator(`${SEL.facetGroup} ${SEL.facetGroupHeader}`)
@@ -450,8 +383,6 @@ test('the rail counts dimensions, not instants, the raw event or one-off times',
   await page.route('**/api/v1/query', (route) => route.fulfill({ json: presentation }));
   await page.goto(PRESENTATION_URL);
 
-  // A repeating field earns its group, and so does a distinct one that
-  // is not a time: five hosts on five rows are still hosts.
   await expect(
     page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'level', '3') }),
   ).toBeVisible();
@@ -471,10 +402,8 @@ test('filters on a field the rail no longer counts stay visible and removable', 
   const first = presentation.rows[0][ts] as string;
   const second = presentation.rows[1][ts] as string;
 
-  // Both filters come from the detail views' own controls, never from a
-  // hand-written URL (see "clear all" above): the include from the
-  // inline expansion, the exclude from the inspector, which is the only
-  // view that offers one.
+  // Both filters come from the detail views' own controls, never a
+  // hand-written URL; only the inspector offers an exclude.
   await page.locator(SEL.resultsExpandControl).nth(0).click();
   await page
     .locator(SEL.resultsDetailCell)
@@ -492,8 +421,6 @@ test('filters on a field the rail no longer counts stay visible and removable', 
     .getByRole('button', { name: `Exclude timestamp = ${second}`, exact: true })
     .click();
 
-  // Two chips, one of each kind, while the rail still has no group for
-  // the field they filter.
   const chips = page.locator(SEL.filterChip);
   await expect(chips).toHaveCount(2);
   await expect(chips.filter({ hasText: `timestamp = ${first}` })).not.toHaveClass(/excl/);
@@ -503,7 +430,6 @@ test('filters on a field the rail no longer counts stay visible and removable', 
   ).toBeVisible();
   expect(await railFields(page)).not.toContain('timestamp');
 
-  // Each one comes off on its own.
   await page.getByRole('button', { name: `Remove filter timestamp = ${second}`, exact: true }).click();
   await expect(chips).toHaveCount(1);
   await expect(chips).toContainText(`timestamp = ${first}`);

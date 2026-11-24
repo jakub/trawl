@@ -2,9 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The command line, malformed input, and the proof that the doctor binds
-//! nothing and writes nothing (#271 AC1 and the leak AC, D3, D13, D15).
-
 use std::ffi::OsString;
 use std::path::Path;
 
@@ -16,11 +13,8 @@ use crate::support::{
     write_config, write_key,
 };
 
-/// A doctor run's environment.
 type Env = Vec<(&'static str, OsString)>;
 
-/// Every row after `proxy.identity` is `not_sampled`, `blocked`: the
-/// components by `proxy.config`, health by the trust it waits on.
 fn assert_blocked_by_config(report: &trawl_api::doctor::Report, label: &str) {
     let ids: Vec<&str> = report.checks().iter().map(|c| c.id.as_str()).collect();
     assert_eq!(ids, CHECK_IDS, "{label}");
@@ -43,11 +37,6 @@ fn assert_blocked_by_config(report: &trawl_api::doctor::Report, label: &str) {
     }
 }
 
-/// The doctor checks only a file named by `--config` on its command line
-/// (ADR-0047, D13): the path through `TRAWL_CONFIG` alone, or the default
-/// path even when a file is there, is a usage error, exit 2, that quotes
-/// neither path and writes nothing. The same file named by `--config` is
-/// checked, so it is the flag, not the file, that the doctor refused.
 #[test]
 fn web_doctor_requires_config_flag() {
     let root = tempfile::tempdir().unwrap();
@@ -58,7 +47,6 @@ fn web_doctor_requires_config_flag() {
     std::fs::create_dir(&private).unwrap();
     let fixture = WebDoctorConfig::in_dir(&private);
     let config = write_config(&private, &fixture);
-    // The default path, `~/.trawl/trawld.toml`, holds a configuration too.
     let default_dir = root.path().join(".trawl");
     std::fs::create_dir(&default_dir).unwrap();
     write_config(&default_dir, &WebDoctorConfig::in_dir(&default_dir));
@@ -73,13 +61,11 @@ fn web_doctor_requires_config_flag() {
     };
     let trawl_config = [("TRAWL_CONFIG", config.clone().into_os_string())];
     let cases: Vec<(Vec<OsString>, Env)> = vec![
-        // The path only through TRAWL_CONFIG, which the doctor never reads.
         (vec!["--doctor".into()], with_env(&trawl_config)),
         (
             vec!["--doctor".into(), "--format".into(), "json".into()],
             with_env(&trawl_config),
         ),
-        // No path: the default, which exists here, is not read either.
         (vec!["--doctor".into()], with_env(&[])),
         // A spelling of the flag clap refuses.
         (
@@ -102,7 +88,6 @@ fn web_doctor_requires_config_flag() {
     }
     assert_unchanged(&before, &fs_snapshot(root.path()), "a refused doctor run");
 
-    // Named on the command line, the same file is checked.
     let (_, checked) = doctor(&config, &with_env(&trawl_config), &planted_owned);
     assert_eq!(
         verdict(&checked, "proxy.config"),
@@ -115,10 +100,6 @@ fn web_doctor_requires_config_flag() {
     );
 }
 
-/// The listen port held by a live listener does not stop the doctor: it
-/// never binds (D15), so it still produces a report, connects nothing to
-/// that listener, and leaves the configuration, key and CA directories and
-/// HOME exactly as they were.
 #[test]
 fn web_doctor_never_binds() {
     let home = tempfile::tempdir().unwrap();
@@ -157,15 +138,13 @@ fn web_doctor_never_binds() {
     }
 }
 
-/// A well-formed name reaches the resolver, so a check that only parses
-/// the address would call it complete. RFC 6761 reserves names under
-/// `.invalid.`: no lookup of one returns an address. The name is absolute
-/// (trailing dot) so no search domain is appended to it. How fast the lookup
-/// gives up depends on the host's resolver (systemd-resolved takes longer
-/// than the doctor's deadline), so the row is either a failed lookup or a
-/// timed-out one, and never complete. Each output format runs on its own,
-/// since a cold lookup and a cached one may land on different sides of the
-/// deadline.
+/// RFC 6761 reserves names under `.invalid.`: no lookup of one returns an
+/// address. The name is absolute (trailing dot) so no search domain is
+/// appended to it. How fast the lookup gives up depends on the host's
+/// resolver (systemd-resolved takes longer than the doctor's deadline), so
+/// the row is either a failed lookup or a timed-out one. Each output format
+/// runs on its own, since a cold lookup and a cached one may land on
+/// different sides of the deadline.
 #[test]
 fn web_doctor_listen_name_lookup_is_never_complete() {
     let home = tempfile::tempdir().unwrap();
@@ -218,13 +197,6 @@ fn web_doctor_listen_name_lookup_is_never_complete() {
     }
 }
 
-/// `proxy.config` owns "the listen address resolves" (D3): startup hands
-/// the selected address to its listener, which resolves it as
-/// `ToSocketAddrs` does, so an address that does not resolve fails the
-/// check, exit 1, from the file or from `TRAWL_WEB_BIND_ADDR`, naming its
-/// source and echoing neither the value nor a resolver's message. A
-/// literal address, bracketed IPv6 and a name such as `localhost` resolve
-/// and stay complete. The doctor still binds none of them.
 #[test]
 fn web_doctor_listen_address_must_resolve() {
     let home = tempfile::tempdir().unwrap();
@@ -331,18 +303,12 @@ fn web_doctor_listen_address_must_resolve() {
     }
 }
 
-/// Write `bytes` as `dir/trawld.toml` and return its path.
 fn write_document(dir: &Path, bytes: &[u8]) -> std::path::PathBuf {
     let path = dir.join("trawld.toml");
     std::fs::write(&path, bytes).unwrap();
     path
 }
 
-/// Malformed input costs `proxy.config` its row, exit 1, never a leak, and
-/// blocks every component (D3): configurations that do not parse, each
-/// carrying `private-secret` where a parser's message would quote it, bytes that
-/// are not UTF-8, and a path that is a FIFO, a directory, or nothing. A
-/// FIFO is refused at once, not waited on.
 #[test]
 fn web_doctor_malformed_config_leaks_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -396,7 +362,6 @@ fn web_doctor_malformed_config_leaks_nothing() {
         assert_blocked_by_config(&report, label);
     }
 
-    // Paths that are not a regular file, or nothing at all.
     let fifo = dir.path().join("fifo.toml");
     nix::unistd::mkfifo(&fifo, nix::sys::stat::Mode::S_IRWXU).expect("mkfifo");
     let not_regular = "the configuration is not a regular file";
@@ -429,9 +394,6 @@ fn web_doctor_malformed_config_leaks_nothing() {
     }
 }
 
-/// Usage errors print a fixed message and exit 2, quoting no argument (D13):
-/// an unknown flag, a stray value, flags missing their values, a format
-/// clap refuses, and a repeated `--config`, each spelled with `private-secret`.
 #[test]
 fn web_doctor_usage_errors_quote_no_argument() {
     let dir = tempfile::tempdir().unwrap();
@@ -473,8 +435,7 @@ fn web_doctor_usage_errors_quote_no_argument() {
 }
 
 /// clap's help shows an env-bound argument's current value, as
-/// `[env: NAME=value]`. The doctor's help names `TRAWL_CONFIG` and shows no
-/// value.
+/// `[env: NAME=value]`.
 #[test]
 fn web_doctor_help_shows_no_environment_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -492,9 +453,6 @@ fn web_doctor_help_shows_no_environment_value() {
     }
 }
 
-/// Run as root, `proxy.identity` is `not_sampled`, `ran_as_root`, so a
-/// root run never exits 0, even when every other check could pass (D12).
-/// The report shows uid 0.
 #[test]
 fn web_doctor_root_identity_is_not_sampled() {
     let Some(userns) = Userns::for_test("web_doctor_root_identity_is_not_sampled") else {
@@ -537,8 +495,7 @@ fn web_doctor_root_identity_is_not_sampled() {
 /// to comes from the password database, which can be a network service
 /// that stalls. The doctor expands the path on its blocking pool under a
 /// 5 s deadline, and the identity row's lookup has 2 s, so the run returns
-/// within 15 s whatever the lookup does, with `proxy.config` reporting on
-/// the path it found: here, one that does not exist.
+/// within 15 s whatever the lookup does.
 #[test]
 fn web_doctor_tilde_config_without_home_returns() {
     let missing = format!(
@@ -570,9 +527,6 @@ fn web_doctor_tilde_config_without_home_returns() {
     assert!(run.stderr.is_empty(), "{}", run.stderr);
 }
 
-/// `~` in the key and CA paths expands where each file is read, as at
-/// startup: the key file and the pinned CA under HOME are found through
-/// `~`, and each row shows the path as the configuration writes it.
 #[test]
 fn web_doctor_expands_tilde_where_each_file_is_read() {
     let home = tempfile::tempdir().unwrap();
@@ -609,11 +563,6 @@ fn web_doctor_expands_tilde_where_each_file_is_read() {
     );
 }
 
-/// With HOME unset, expanding `~` in the key and CA paths asks the password
-/// database, inside each file's bounded read. The run returns whatever the
-/// lookup does: each row reports what its read found at the expanded path,
-/// or at the path as written when no home was found, or that the read ran
-/// out of time.
 #[test]
 fn web_doctor_tilde_paths_without_home_return() {
     let dir = tempfile::tempdir().unwrap();

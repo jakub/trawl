@@ -3,18 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawld --doctor` tests of the certificate and listener checks.
-//!
-//! The listener is a real trawld wherever trawld can show the state under
-//! test: `common`'s [`TestServer`](crate::common::TestServer), a second
-//! trawld listener over its state serving an operator certificate, or the
-//! fixture behind a TCP relay that replaces the certificate file while the
-//! doctor's probe is in flight. States trawld never produces (a health
-//! value it does not send, a status it does not answer, a certificate it
-//! cannot sign for) come from a TLS listener in this test that serves with
-//! trawld's own `rustls` config ([`trawl_server::tls::serving_config`]).
-//!
-//! Every run is checked with [`assert_no_values`] for the certificates'
-//! subjects, names and SHA-256 fingerprints, and the listener addresses.
 
 use std::ffi::OsString;
 use std::fmt::Write as _;
@@ -39,18 +27,15 @@ const MATERIAL: &str = "server.tls.material";
 const IDENTITY: &str = "server.listener.identity";
 const HEALTH: &str = "server.listener.health";
 
-/// A self-signed pair, and what of it the report must never show.
 struct Pair {
     cert_pem: String,
     key_pem: String,
     der: CertificateDer<'static>,
     key_der: PrivateKeyDer<'static>,
-    /// The subject's common name, the SANs, and the SHA-256 fingerprint.
     planted: Vec<String>,
 }
 
 impl Pair {
-    /// A fresh pair whose subject is `subject` and whose SANs are `names`.
     fn new(subject: &str, names: &[&str]) -> Self {
         let key = rcgen::KeyPair::generate().unwrap();
         let mut params = rcgen::CertificateParams::new(
@@ -74,7 +59,6 @@ impl Pair {
         }
     }
 
-    /// The shared fixture pair every [`common::TestServer`] serves.
     fn fixture() -> Self {
         let (cert, key) = common::ensure_test_cert();
         let cert_pem = std::fs::read_to_string(cert).unwrap();
@@ -96,7 +80,6 @@ impl Pair {
         }
     }
 
-    /// Write the pair as `dir/<name>.crt` and `dir/<name>.key`.
     fn write(&self, dir: &Path, name: &str) -> (PathBuf, PathBuf) {
         let cert = dir.join(format!("{name}.crt"));
         let key = dir.join(format!("{name}.key"));
@@ -105,14 +88,12 @@ impl Pair {
         (cert, key)
     }
 
-    /// trawld's own listener config for this pair.
     fn serving(&self) -> rustls::ServerConfig {
         trawl_server::tls::serving_config(vec![self.der.clone()], self.key_der.clone_key())
             .expect("trawld serves the pair")
     }
 }
 
-/// The SHA-256 fingerprint of `der`, as lowercase hex.
 fn fingerprint(der: &[u8]) -> String {
     let rustls::SupportedCipherSuite::Tls13(suite) =
         rustls::crypto::ring::cipher_suite::TLS13_AES_128_GCM_SHA256
@@ -131,7 +112,6 @@ fn fingerprint(der: &[u8]) -> String {
         })
 }
 
-/// The strings the report must not show of a listener at `addr`.
 fn address_values(addr: SocketAddr) -> Vec<String> {
     let port = addr.port();
     vec![
@@ -141,8 +121,6 @@ fn address_values(addr: SocketAddr) -> Vec<String> {
     ]
 }
 
-/// Run the doctor over `config` in both formats with `env`, check both
-/// outputs for every planted value, and return the JSON report.
 async fn doctor(config: &Path, env: Vec<(&'static str, OsString)>, planted: &[String]) -> Report {
     let config = config.to_owned();
     let planted: Vec<String> = planted
@@ -180,7 +158,6 @@ async fn doctor(config: &Path, env: Vec<(&'static str, OsString)>, planted: &[St
     .expect("the doctor run")
 }
 
-/// The row `id`.
 fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
     report
         .checks()
@@ -189,13 +166,11 @@ fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
         .unwrap_or_else(|| panic!("no {id} row in {report:#?}"))
 }
 
-/// `id`'s outcome and reason.
 fn outcome<'a>(report: &'a Report, id: &str) -> (Outcome, Option<&'a str>) {
     let check = row(report, id);
     (check.outcome, check.reason.as_deref())
 }
 
-/// The `server.listener.health.<key>` rows, as (key, outcome, reason).
 fn keyed(report: &Report) -> Vec<(&str, Outcome, Option<&str>)> {
     report
         .checks()
@@ -207,8 +182,6 @@ fn keyed(report: &Report) -> Vec<(&str, Outcome, Option<&str>)> {
         .collect()
 }
 
-/// A doctor configuration in `dir` whose listener is `http_addr`, serving
-/// the pair at `tls`.
 fn config_for(dir: &Path, http_addr: String, tls: (PathBuf, PathBuf)) -> PathBuf {
     let mut config = DoctorConfig::in_dir(dir);
     config.http_addr = http_addr;
@@ -216,7 +189,6 @@ fn config_for(dir: &Path, http_addr: String, tls: (PathBuf, PathBuf)) -> PathBuf
     write_doctor_config(dir, &config)
 }
 
-/// The fixture's listener address.
 fn fixture_addr(server: &common::TestServer) -> SocketAddr {
     server
         .url
@@ -226,14 +198,11 @@ fn fixture_addr(server: &common::TestServer) -> SocketAddr {
         .expect("a socket address")
 }
 
-/// A TLS listener on loopback that answers every request with `response`,
-/// with `config` as its `rustls` server config.
 fn tls_listener(config: rustls::ServerConfig, response: Vec<u8>) -> SocketAddr {
     let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     tls_listener_on(socket, config, response)
 }
 
-/// [`tls_listener`] on `socket`, which the caller bound.
 fn tls_listener_on(
     socket: std::net::TcpListener,
     config: rustls::ServerConfig,
@@ -267,7 +236,6 @@ fn tls_listener_on(
     addr
 }
 
-/// An HTTP/1.1 response with `status` and a JSON `body`.
 fn http(status: u16, body: &[u8]) -> Vec<u8> {
     let mut response = format!(
         "HTTP/1.1 {status} X\r\ncontent-type: application/json\r\ncontent-length: {}\r\n\
@@ -279,10 +247,6 @@ fn http(status: u16, body: &[u8]) -> Vec<u8> {
     response
 }
 
-/// An operator certificate that names only a DNS host passes while the
-/// probe dials loopback: the listener is a real trawld listener over the
-/// fixture's state, serving that certificate, and the configured address
-/// is the wildcard, from the file and then from `TRAWL_HTTP_ADDR`.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_leaf_pin_dns_cert() {
     let server = common::setup().await;
@@ -339,7 +303,6 @@ async fn doctor_listener_leaf_pin_dns_cert() {
             "{identity:?}"
         );
         assert_eq!(outcome(&report, HEALTH), (Outcome::Complete, None));
-        // The real trawld answers for every subsystem, all well.
         let rows = keyed(&report);
         for key in [
             "auth_db",
@@ -358,8 +321,6 @@ async fn doctor_listener_leaf_pin_dns_cert() {
     serve.abort();
 }
 
-/// A real trawld listener over `server`'s state on `socket`, serving the
-/// operator pair `tls`.
 fn serve_trawld(
     server: &common::TestServer,
     socket: std::net::TcpListener,
@@ -392,8 +353,6 @@ fn serve_trawld(
     })
 }
 
-/// A v4 and a v6 loopback listener on one port, or `None` when this host
-/// has no IPv6 loopback.
 fn dual_loopback() -> Option<(std::net::TcpListener, std::net::TcpListener)> {
     for _ in 0..64 {
         let v4 = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -417,8 +376,6 @@ fn dual_loopback() -> Option<(std::net::TcpListener, std::net::TcpListener)> {
 /// with IPv6 turned off.
 const EAFNOSUPPORT: i32 = 97;
 
-/// The strings the report must not show of the loopback pair on `port`
-/// and the name that resolves to it.
 fn dual_values(port: u16) -> Vec<String> {
     vec![
         format!("localhost:{port}"),
@@ -429,14 +386,6 @@ fn dual_values(port: u16) -> Vec<String> {
     ]
 }
 
-/// A listener address that names a host is dialed at every address the
-/// name resolves to, in order, within one deadline. `localhost` resolves
-/// to `::1` and `127.0.0.1`; trawld listens on one of them and a foreign
-/// TLS listener, serving another certificate, on the other, both ways
-/// round: whichever the resolver returns first, trawld's certificate is
-/// proven and its health read. Foreign listeners on both leave unknown
-/// which address trawld binds (`ambiguous_address`); nothing on either is
-/// `not_listening`. No address is shown.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_probes_every_resolved_address() {
     let Some((v4, v6)) = dual_loopback() else {
@@ -533,8 +482,7 @@ async fn doctor_listener_probes_every_resolved_address() {
     );
 }
 
-/// The listener serving another certificate than the file fails the
-/// identity check. A file replaced between the doctor's two reads is
+/// A file replaced between the doctor's two reads is
 /// `material_changed`, and that is deterministic: the relay in front of the
 /// fixture replaces the file when the probe's connection arrives, before it
 /// dials trawld, so the replacement always lands after the first read and
@@ -546,7 +494,6 @@ async fn doctor_listener_stale_cert_fails() {
     let fixture_pair = Pair::fixture();
     let dir = tempfile::tempdir().unwrap();
 
-    // The file names another certificate than the one trawld serves.
     let stale = Pair::new("stale-private-subject", &["localhost"]);
     let mut planted = stale.planted.clone();
     planted.extend(fixture_pair.planted.clone());
@@ -572,9 +519,6 @@ async fn doctor_listener_stale_cert_fails() {
     );
     assert_eq!(report.verdict().exit_code(), 1);
 
-    // A relay in front of trawld. While armed, each connection it accepts
-    // first swaps the configured pair between the served one and
-    // `replacement`, then passes the connection on.
     let (cert, key) = fixture_pair.write(dir.path(), "served");
     let replacement = Pair::new("replacement-private-subject", &["localhost"]);
     planted.extend(replacement.planted.clone());
@@ -614,7 +558,6 @@ async fn doctor_listener_stale_cert_fails() {
     }
     let config = config_for(dir.path(), relay_addr.to_string(), (cert.clone(), key));
 
-    // Unarmed, the relay changes nothing: trawld's certificate is proven.
     let report = doctor(&config, planted_env(dir.path()), &planted).await;
     assert_eq!(outcome(&report, IDENTITY), (Outcome::Complete, None));
     assert_eq!(outcome(&report, HEALTH), (Outcome::Complete, None));
@@ -644,9 +587,6 @@ async fn doctor_listener_stale_cert_fails() {
     );
 }
 
-/// A listener that presents the certificate on disk but cannot sign with
-/// its key is refused, over TLS 1.2 and TLS 1.3: the pinned leaf alone
-/// proves nothing without the handshake signature.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_refuses_the_leaf_without_its_key() {
     let dir = tempfile::tempdir().unwrap();
@@ -693,7 +633,6 @@ async fn doctor_listener_refuses_the_leaf_without_its_key() {
     }
 }
 
-/// Serves one certificate and key, whatever the hello asks.
 #[derive(Debug)]
 struct Presents(Arc<rustls::sign::CertifiedKey>);
 
@@ -706,18 +645,13 @@ impl rustls::server::ResolvesServerCert for Presents {
     }
 }
 
-/// The per-key rows a health answer should give, as (key, outcome, reason).
 type Keyed = &'static [(&'static str, Outcome, Option<&'static str>)];
 
-/// The reason of a value no doctor knows.
 const UNKNOWN: Option<&str> = Some("reported a value this doctor does not know");
 
-/// The health check's own row for an `unavailable` answer, whatever its
-/// checks report.
 const UNAVAILABLE: (Outcome, Option<&str>) =
     (Outcome::Failed, Some("trawld reports itself unavailable"));
 
-/// A health answer from a listener in this test, and the rows it gives.
 struct HealthCase {
     response: Vec<u8>,
     health: (Outcome, Option<&'static str>),
@@ -734,15 +668,12 @@ const DEGRADED: &[u8] = br#"{"status":"degraded","version":"0.0.0","checks":{
     "Bad-Key-Private":"ok","private_secret":"ok",
     "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8":"ok"}}"#;
 
-/// The names in [`DEGRADED`] that trawld does not report; none may appear.
 const UNKNOWN_NAMES: [&str; 3] = [
     "Bad-Key-Private",
     "private_secret",
     "5e884898da28047151d0e56f8dc6292773603d0d6aabbdd62a11ef721d1542d8",
 ];
 
-/// The answers trawld never sends, or sends only in states a fixture does
-/// not reach, and what the doctor must make of each.
 fn health_cases() -> Vec<HealthCase> {
     let case = |response, health, keyed| HealthCase {
         response,
@@ -843,8 +774,6 @@ fn health_cases() -> Vec<HealthCase> {
     ]
 }
 
-/// Run the doctor against `server`, which serves the fixture pair, and
-/// return its report.
 async fn doctor_against(server: &common::TestServer, dir: &Path) -> Report {
     let fixture_pair = Pair::fixture();
     let upstream = fixture_addr(server);
@@ -870,14 +799,6 @@ async fn trawld_with_a_pending_rollup(dir: &Path) -> common::TestServer {
     common::setup_observing_boot(dir, data, None, &mut |_| {}).await
 }
 
-/// Each reported health value maps as specified. A real trawld whose
-/// engine sample reads `error` answers 503, `unavailable`, which fails the health
-/// check itself, and keeps its body: `duckdb` fails, the rest still report.
-/// An `unavailable` answer fails the check even when no reported check
-/// does. A real trawld with an unresolved rollup reports
-/// `corpus` `rollup_pending`, which is `not_sampled`/`recovering`. Values
-/// and answers trawld does not send come from a listener in this test that
-/// serves with trawld's own TLS config.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_health_rows() {
     let dir = tempfile::tempdir().unwrap();
@@ -896,7 +817,6 @@ async fn doctor_listener_health_rows() {
         assert_eq!(keyed(&report), case.keyed);
     }
 
-    // No unknown value is shown, whatever its shape.
     let addr = tls_listener(pair.serving(), http(200, DEGRADED));
     let config = config_for(dir.path(), addr.to_string(), tls.clone());
     let report = doctor(&config, planted_env(dir.path()), &pair.planted).await;
@@ -911,7 +831,6 @@ async fn doctor_listener_health_rows() {
     assert_eq!(detail("data_path"), "the value is not shown");
     assert_eq!(detail("corpus"), "reported rollup_pending");
 
-    // A real trawld whose engine sample reads `error` answers 503.
     let server = common::setup().await;
     let held = server.state.engine_sample.hold();
     server
@@ -939,7 +858,6 @@ async fn doctor_listener_health_rows() {
         "{rows:?}"
     );
 
-    // A real trawld whose rollup recovery failed reports it pending.
     let boot_dir = tempfile::tempdir().unwrap();
     let server = trawld_with_a_pending_rollup(boot_dir.path()).await;
     let report = doctor_against(&server, dir.path()).await;
@@ -956,12 +874,7 @@ async fn doctor_listener_health_rows() {
 }
 
 /// trawld's request-limit refusal, under the regular or the probe
-/// message, is a capacity refusal and not a foreign answer: the health
-/// row is `not_sampled`/`request_limit_reached` with the shared text and
-/// a retry with backoff, the doctor invents no per-check rows, and no row
-/// says another service listens. The same code under a 200, and an
-/// unrelated 503 envelope, still fail as answers that are not trawld's
-/// (ADR-0054).
+/// message, is a capacity refusal and not a foreign answer (ADR-0054).
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_request_limit_refusal_is_not_sampled() {
     let dir = tempfile::tempdir().unwrap();
@@ -1003,8 +916,6 @@ async fn doctor_listener_request_limit_refusal_is_not_sampled() {
         }
     }
 
-    // Controls: the code under a status trawld does not pair it with, and
-    // an unrelated envelope or body under a 503, are still not trawld's.
     for response in [
         http(200, regular),
         http(503, br#"{"error":{"code":"internal_error","message":"x"}}"#),
@@ -1029,9 +940,6 @@ async fn doctor_listener_request_limit_refusal_is_not_sampled() {
     }
 }
 
-/// An unknown health value is never shown, even one shaped like an
-/// identifier, which may still be a secret: its row fails with a fixed
-/// reason and says the value is not shown.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_never_shows_an_unknown_health_value() {
     let dir = tempfile::tempdir().unwrap();
@@ -1062,11 +970,6 @@ async fn doctor_listener_never_shows_an_unknown_health_value() {
     }
 }
 
-/// A health answer that breaks off is not classified: whatever part of it
-/// arrived proves nothing, so the row is `not_sampled`/`interrupted` with
-/// no per-key rows, even when the part that arrived holds a whole health
-/// body. What arrived whole is still judged: a status trawld never sends
-/// fails with the body cut short, and bytes that are not HTTP fail.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_interrupted_health_is_not_sampled() {
     let dir = tempfile::tempdir().unwrap();
@@ -1136,15 +1039,10 @@ async fn doctor_listener_interrupted_health_is_not_sampled() {
     }
 }
 
-/// What a listener in [`doctor_listener_cut_off_handshake_is_not_sampled`]
-/// does once the client's first bytes arrive.
 #[derive(Debug, Clone, Copy)]
 enum Peer {
-    /// Close the connection, sending nothing.
     Close,
-    /// Reset the connection, sending nothing.
     Reset,
-    /// Send these bytes, which are not TLS, and close.
     Answer(&'static [u8]),
 }
 
@@ -1180,10 +1078,6 @@ async fn cut_off_listener(peer: Peer) -> SocketAddr {
     addr
 }
 
-/// A TLS handshake the listener cuts off, by a close or a reset after the
-/// client's hello with no byte in answer, proves nothing about the
-/// listener: `not_sampled`/`interrupted`. A listener that answers the
-/// hello with bytes that are not TLS still fails.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_cut_off_handshake_is_not_sampled() {
     let dir = tempfile::tempdir().unwrap();
@@ -1222,9 +1116,6 @@ async fn doctor_listener_cut_off_handshake_is_not_sampled() {
     }
 }
 
-/// With auto TLS and no generated pair yet, the doctor only opens a TCP
-/// connection: nothing there is `not_listening`; something there is
-/// `no_material`, and receives not one byte. Nothing is generated.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_listener_without_material_only_connects() {
     let dir = tempfile::tempdir().unwrap();
@@ -1269,11 +1160,6 @@ async fn doctor_listener_without_material_only_connects() {
     }
 }
 
-/// A directory at `tls/key.pem`, where an older trawld kept its key, fails
-/// `server.tls.material`: boot removes that entry before it reads its pair
-/// and stops when it cannot. The doctor only looks, so the directory is
-/// still there afterwards. A regular file there is one boot removes, so the
-/// check goes on to the pair.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_fails_a_directory_at_the_old_key_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -1305,10 +1191,6 @@ async fn doctor_fails_a_directory_at_the_old_key_path() {
     assert!(old.is_file(), "the doctor removed nothing");
 }
 
-/// With auto TLS and no generated pair yet, a state directory the running
-/// user cannot write fails `server.tls.material`: the start that generates
-/// the pair cannot create `tls/` or `tls-key/` in it. A user who writes a
-/// directory its mode forbids sees `will_initialize`. Nothing is created.
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_fails_a_pair_the_start_cannot_create() {

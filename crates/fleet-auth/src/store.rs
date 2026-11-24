@@ -4,16 +4,8 @@
 
 //! Postgres-backed API key store with data-defined roles (ADR-0006).
 //!
-//! [`KeyStore`] is the runtime entry point: construct with [`from_pool`], call
-//! [`verify_key`] on the request path, call the admin operations (key
-//! lifecycle, role CRUD, role assignment) from whatever CLI / API surface
-//! owns the lifecycle.
-//!
 //! Construction does NOT run migrations — apply them via [`crate::migrate`]
 //! from the operational tool that owns deploys (e.g. `fleet-admin migrate`).
-//!
-//! [`from_pool`]: KeyStore::from_pool
-//! [`verify_key`]: KeyStore::verify_key
 
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
@@ -30,29 +22,16 @@ use crate::types::{ApiKeyInfo, CreatedKey, PrincipalKind, Role, RolePermission, 
 use crate::validation::{validate_app_namespace, validate_permission, validate_role_name};
 
 /// How many argon2id checks may run at once in this process (ADR-0054).
-///
-/// Every hash and every verification counts, the dummy check on a prefix
-/// miss included. At the production parameters each check holds 128 MiB, so
-/// the limit bounds argon2 memory at 512 MiB however many callers hang up.
 const ARGON2_CHECK_LIMIT: usize = 4;
 
-/// The process-wide permits behind [`ARGON2_CHECK_LIMIT`]. Every
-/// [`KeyStore`] in the process shares them.
 static ARGON2_CHECKS: LazyLock<Arc<Semaphore>> =
     LazyLock::new(|| Arc::new(Semaphore::new(ARGON2_CHECK_LIMIT)));
 
-/// Run argon2id hashing on the tokio blocking pool.
-///
-/// Production argon2id with 128 MiB / 3 iterations takes ~200 ms and would
-/// stall a tokio worker thread for that long — invalid-token spray could
-/// starve the runtime. `spawn_blocking` moves the CPU work to a dedicated
-/// pool sized for blocking I/O.
 async fn hash_token_async(plaintext: &str) -> Result<String, AuthError> {
     let plaintext = plaintext.to_owned();
     on_blocking_pool(move || token::hash_token(&plaintext)).await
 }
 
-/// Run argon2id verification on the tokio blocking pool. See `hash_token_async`.
 async fn verify_token_async(plaintext: &str, hash: &str) -> Result<bool, AuthError> {
     let plaintext = plaintext.to_owned();
     let hash = hash.to_owned();
@@ -68,13 +47,6 @@ async fn verify_dummy_async(plaintext: &str) -> Result<bool, AuthError> {
     on_blocking_pool(move || token::verify_token(&plaintext, &token::DUMMY_HASH)).await
 }
 
-/// Run one argon2id step on the blocking pool, under [`ARGON2_CHECK_LIMIT`].
-///
-/// The permit is taken before the task is spawned and moves into it. A
-/// caller dropped while it waits for a permit starts no work. A caller
-/// dropped after that cannot release the permit early: it is released when
-/// the step returns.
-///
 /// A worker that did not return answers fixed text. `JoinError`'s
 /// `Display` quotes a panic payload, and the middleware logs this error on
 /// the bearer request path, so the join error is never formatted.
@@ -102,25 +74,15 @@ where
     })?
 }
 
-/// Whether a connection coming back to [`KeyStore::connect`]'s pool is
-/// outside any transaction, so the pool may give it out again.
-///
 /// A transaction sqlx begins counts only once Postgres has answered its
 /// `BEGIN`. A request dropped while that answer is on its way leaves the
 /// session inside a transaction no one ends, and the pool's own return
-/// check accepts it: the next caller's writes would report success before
-/// any commit, and its locks would stay held. So the pool closes a session
-/// still inside a transaction, which ends it in Postgres, and logs it once.
-/// Key verification runs its transaction on a task no request owns
-/// ([`KeyStore::verify_key`]), so a caller who hangs up during
-/// verification leaves no such session. The admin operations' transactions
-/// run in their request, and this check is the backstop for every path.
+/// check accepts it. So the pool closes a session still inside a
+/// transaction.
 ///
-/// One simple-protocol query, so it starts the transaction it runs in
-/// unless one is open already: the start of its transaction is the start
-/// of the statement only in autocommit. A failed transaction refuses the
-/// query with `in_failed_sql_transaction`, and is inside one too. Any
-/// other failure closes the connection as broken.
+/// The probe's two timestamps are equal only in autocommit. A failed
+/// transaction refuses it with `in_failed_sql_transaction`, and is inside
+/// one too.
 async fn released_outside_transaction(
     conn: &mut sqlx::postgres::PgConnection,
 ) -> Result<bool, sqlx::Error> {
@@ -142,34 +104,18 @@ async fn released_outside_transaction(
     Ok(outside)
 }
 
-/// Postgres + argon2id-cache backed API key store.
-///
-/// Cheap to `Clone` — the inner `PgPool` is already `Arc`-shared, the
-/// cache is `Arc`-shared via `VerificationCache`, and so are the
-/// verification permits. Suitable for axum `FromRef` extraction.
 #[derive(Clone, Debug)]
 pub struct KeyStore {
     pool: PgPool,
     cache: VerificationCache,
-    /// One permit per connection of `pool`, for the transactions
-    /// [`Self::verify_key`] runs on tasks of their own.
     verifying: Arc<Semaphore>,
 }
 
 impl KeyStore {
-    /// Construct from an existing pool. Infallible, no I/O, no migrations.
-    ///
-    /// Callers own pool lifecycle and connectivity validation (use
-    /// [`Self::ping`] to confirm the database is reachable). Migrations are
-    /// applied via [`crate::migrate`] from an operational tool, never here.
     pub fn from_pool(pool: PgPool) -> Self {
         Self::with_cache(pool, VerificationCache::new())
     }
 
-    /// Construct from an existing pool and the given verification cache.
-    /// Crate-private: the store's tests pass a small cache to reach
-    /// eviction, and the product only ever constructs through
-    /// [`Self::from_pool`].
     pub(crate) fn with_cache(pool: PgPool, cache: VerificationCache) -> Self {
         let connections = pool.options().get_max_connections() as usize;
         Self {
@@ -179,22 +125,7 @@ impl KeyStore {
         }
     }
 
-    /// Connect to Postgres from a database URL and construct a store.
-    ///
-    /// Establishes the pool eagerly (the first connection is opened before
-    /// this returns), so daemon consumers fail fast at startup when the
-    /// auth backend is unreachable instead of on the first request.
-    ///
-    /// Does NOT run migrations — apply them via [`crate::migrate`] from the
-    /// operational tool that owns deploys (e.g. `fleet-admin migrate`).
-    ///
-    /// # Errors
-    /// Returns [`AuthError::Database`] when the URL is malformed or the
-    /// database is unreachable, or [`AuthError::Schema`] when read-only
-    /// history validation finds an unsupported or incomplete schema.
     pub async fn connect(database_url: &str) -> Result<Self, AuthError> {
-        /// Upper bound on pooled connections. Sized for a single daemon's
-        /// request path plus background pollers — not a tunable yet.
         const MAX_CONNECTIONS: u32 = 8;
 
         // KeyStore::connect is the named production pool owner for the
@@ -209,37 +140,19 @@ impl KeyStore {
         Ok(Self::from_pool(pool))
     }
 
-    /// Borrow the underlying pool (e.g. for higher-level layers that need to
-    /// run their own queries against the same connection budget).
     pub fn pool(&self) -> &PgPool {
         &self.pool
     }
 
-    /// Snapshot the argon2id result cache state (entry count etc.).
     pub fn cache_stats(&self) -> VerificationCacheStats {
         self.cache.stats()
     }
 
-    /// Lightweight health check: runs `SELECT 1` against the pool.
     pub async fn ping(&self) -> Result<(), AuthError> {
         sqlx::query("SELECT 1").execute(&self.pool).await?;
         Ok(())
     }
 
-    // -- key lifecycle --------------------------------------------------------
-
-    /// Create a new API key holding the named roles.
-    ///
-    /// Returns the metadata plus the plaintext token, which must be shown to
-    /// the user immediately because it cannot be recovered later. Retries
-    /// on prefix collision (UNIQUE constraint), though collisions are
-    /// astronomically unlikely with a 48-bit prefix space.
-    ///
-    /// `role_names` may be empty (the key authenticates but authorizes
-    /// nothing until roles are assigned). Every named role must pre-exist —
-    /// unknown names error with [`AuthError::RoleNotFound`] rather than
-    /// silently minting a capability-less key. Duplicate names in the batch
-    /// error with [`AuthError::RoleAlreadyAssigned`].
     pub async fn create_key(
         &self,
         name: &str,
@@ -247,16 +160,12 @@ impl KeyStore {
         role_names: &[String],
         expires_in: Option<Duration>,
     ) -> Result<CreatedKey, AuthError> {
-        /// Retry attempts for prefix collision (UNIQUE violation).
         const MAX_RETRIES: usize = 3;
 
         for role in role_names {
             validate_role_name(role)?;
         }
 
-        // Reject duplicate role names explicitly so the error names the
-        // duplicate instead of relying on the key_roles PK inside the
-        // transaction.
         let mut seen = std::collections::HashSet::new();
         for role in role_names {
             if !seen.insert(role) {
@@ -267,8 +176,6 @@ impl KeyStore {
             }
         }
 
-        // Resolve every role name up front — RoleNotFound must name the
-        // missing role before any row is written.
         let mut role_ids = Vec::with_capacity(role_names.len());
         for role in role_names {
             role_ids.push(self.get_role_id(role).await?);
@@ -313,7 +220,6 @@ impl KeyStore {
             let row = match insert_result {
                 Ok(row) => row,
                 Err(sqlx::Error::Database(e)) if e.code().as_deref() == Some("23505") => {
-                    // Prefix collision — drop transaction, retry with a new token.
                     drop(tx);
                     continue;
                 }
@@ -414,8 +320,7 @@ impl KeyStore {
 
         let Some(row) = row_opt else {
             // SECURITY: equalize timing with the hit path so prefix existence
-            // doesn't leak via response time. spawn_blocking so the argon2id
-            // work doesn't block a tokio worker thread.
+            // doesn't leak via response time.
             let _ = verify_dummy_async(plaintext).await;
             return Err(AuthError::InvalidKey("authentication failed".into()));
         };
@@ -436,8 +341,6 @@ impl KeyStore {
         // insertion order (see the cache module docs).
         let ran_kdf = !self.cache.contains(&cache_key);
         if ran_kdf {
-            // Cache miss — pay the argon2id cost on the blocking pool so
-            // the tokio worker thread stays available for other tasks.
             let hash_valid = verify_token_async(plaintext, &stored_hash).await?;
             if !hash_valid {
                 return Err(AuthError::InvalidKey("authentication failed".into()));
@@ -458,9 +361,7 @@ impl KeyStore {
 
         // Insert only after this request ran the KDF and then passed every
         // database check, the hash predicate included, so the entry is for
-        // a hash a row still holds — never pollute the cache with (prefix,
-        // hash, fingerprint) triples that lost a race, and never re-insert
-        // on a hit.
+        // a hash a row still holds.
         if ran_kdf {
             self.cache.insert(cache_key);
         }
@@ -468,15 +369,6 @@ impl KeyStore {
         Ok(VerifiedKey::from_roles(id, db_prefix, name, kind, roles))
     }
 
-    /// Record a use of key `id`, verified against `stored_hash`, and
-    /// resolve its roles: the transaction of [`Self::verify_key`], run on a
-    /// task of its own under one of the store's permits.
-    ///
-    /// The permit is taken before the task is spawned and moves into it,
-    /// so a caller dropped while it waits for a permit starts no work, and
-    /// the permit is released only once the transaction has ended. A task
-    /// that did not return (a panic, a runtime shutting down) answers as a
-    /// backend failure with fixed text; the join error is never formatted.
     async fn record_use(&self, id: i64, stored_hash: String) -> Result<Vec<Role>, AuthError> {
         // Nothing closes the semaphore, so the error arm is unreachable.
         let permit = Arc::clone(&self.verifying)
@@ -492,7 +384,6 @@ impl KeyStore {
         .map_err(|_| AuthError::Database(sqlx::Error::WorkerCrashed))?
     }
 
-    /// The transaction of [`Self::record_use`].
     async fn use_and_roles(
         pool: &PgPool,
         id: i64,
@@ -527,23 +418,11 @@ impl KeyStore {
             return Err(AuthError::InvalidKey("authentication failed".into()));
         }
 
-        // Resolve key → roles → permissions fresh from the DB, in one
-        // snapshot inside the row-lock transaction — never cached.
         let roles = Self::load_key_roles(&mut *tx, id).await?;
         tx.commit().await?;
         Ok(roles)
     }
 
-    /// Look up a key by database id and return it only if it is *live*:
-    /// active (not revoked) AND unexpired. Roles + permissions are resolved
-    /// fresh from the database on every call — never cached.
-    ///
-    /// This is the substrate hook for consumers that gate background work on
-    /// key liveness (e.g. trawl's scheduler skipping runs whose owning key
-    /// was revoked, expired, or stripped of its app capability — ADR-0004).
-    /// Returns `Ok(None)` for unknown ids, revoked keys, and expired keys;
-    /// callers cannot distinguish those cases (they all mean "don't run").
-    ///
     /// Unlike [`verify_key`], this does NOT update `last_used` — liveness
     /// polling is not a use of the credential.
     ///
@@ -577,12 +456,8 @@ impl KeyStore {
         )))
     }
 
-    /// Load a key's roles with their permission bundles in one snapshot.
-    ///
-    /// A single `key_roles JOIN roles LEFT JOIN role_permissions` statement
-    /// so the resolution is one consistent read (one statement, one
-    /// snapshot under READ COMMITTED). Runs against either the pool or an
-    /// open transaction (`verify_key` passes its row-lock transaction).
+    /// A single statement so the resolution is one consistent read (one
+    /// statement, one snapshot under READ COMMITTED).
     async fn load_key_roles<'e, E>(executor: E, key_id: i64) -> Result<Vec<Role>, AuthError>
     where
         E: sqlx::PgExecutor<'e>,
@@ -602,7 +477,6 @@ impl KeyStore {
         rows_to_roles(rows)
     }
 
-    /// Load just the sorted role names for a key (admin list/detail views).
     async fn load_key_role_names(&self, key_id: i64) -> Result<Vec<String>, AuthError> {
         let rows = sqlx::query(
             "SELECT r.name
@@ -619,7 +493,6 @@ impl KeyStore {
             .collect()
     }
 
-    /// List all keys. Never exposes hashes.
     pub async fn list_keys(&self, active_only: bool) -> Result<Vec<ApiKeyInfo>, AuthError> {
         let sql = if active_only {
             "SELECT id, prefix, name, kind, active, created_at, expires_at, last_used, revoked_at
@@ -638,8 +511,6 @@ impl KeyStore {
             .map(row_to_api_key_info_no_roles)
             .collect::<Result<Vec<_>, _>>()?;
 
-        // Eager-load role names. N+1 is fine for admin list views at fleet
-        // scale; a JOIN + group_concat is messier and we don't need streaming.
         for key in &mut keys {
             key.roles = self.load_key_role_names(key.id).await?;
         }
@@ -647,7 +518,6 @@ impl KeyStore {
         Ok(keys)
     }
 
-    /// Look up a key's full metadata by prefix.
     pub async fn get_key_by_prefix(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
         let row_opt = sqlx::query(
             "SELECT id, prefix, name, kind, active, created_at, expires_at, last_used, revoked_at
@@ -669,10 +539,6 @@ impl KeyStore {
         Ok(info)
     }
 
-    /// Revoke a key by prefix.
-    ///
-    /// Errors with [`AuthError::KeyRevoked`] if the key exists but is already
-    /// revoked, and [`AuthError::KeyNotFound`] if the prefix isn't known.
     pub async fn revoke_key(&self, prefix: &str) -> Result<ApiKeyInfo, AuthError> {
         let updated = sqlx::query(
             "UPDATE api_keys
@@ -692,9 +558,6 @@ impl KeyStore {
         self.get_key_by_prefix(prefix).await
     }
 
-    /// Change the kind (human/service) of a non-revoked key.
-    ///
-    /// Refuses to retype revoked keys — retyping a dead key is likely a typo.
     pub async fn retype_key(
         &self,
         prefix: &str,
@@ -716,16 +579,8 @@ impl KeyStore {
         self.get_key_by_prefix(prefix).await
     }
 
-    // -- role assignment ------------------------------------------------------
-
-    /// Assign a role to an existing key.
-    ///
     /// Locks the key row first, so an in-flight `verify_key` on the same key
-    /// serializes against this mutation. Errors with
-    /// [`AuthError::KeyRevoked`] when the locked key is inactive,
-    /// [`AuthError::RoleAlreadyAssigned`] on a duplicate so assignment is
-    /// never a silent no-op, and [`AuthError::RoleNotFound`] for unknown
-    /// role names.
+    /// serializes against this mutation.
     pub async fn assign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
         validate_role_name(role_name)?;
         let mut tx = self.pool.begin().await?;
@@ -759,13 +614,6 @@ impl KeyStore {
         }
     }
 
-    /// Remove a role from a key.
-    ///
-    /// Locks the key row first (same serialization contract as
-    /// [`Self::assign_role`]). Errors with [`AuthError::KeyRevoked`] when the
-    /// locked key is inactive, [`AuthError::RoleNotAssigned`] when the key
-    /// doesn't hold the role — silently succeeding would mask typos — and
-    /// [`AuthError::RoleNotFound`] for unknown role names.
     pub async fn unassign_role(&self, prefix: &str, role_name: &str) -> Result<(), AuthError> {
         validate_role_name(role_name)?;
         let mut tx = self.pool.begin().await?;
@@ -797,15 +645,6 @@ impl KeyStore {
         Ok(())
     }
 
-    // -- role CRUD ------------------------------------------------------------
-
-    /// Create a new role with an optional rate ceiling and initial
-    /// permission bundle.
-    ///
-    /// Errors with [`AuthError::RoleExists`] on a name collision. Every
-    /// `(app, permission)` pair is shape-validated; vocabulary membership is
-    /// NOT enforced here (the registry is warn-only — callers like
-    /// fleet-admin surface the warning).
     pub async fn create_role(
         &self,
         name: &str,
@@ -862,7 +701,6 @@ impl KeyStore {
         self.get_role(name).await
     }
 
-    /// Look up a role (with its permission bundle) by name.
     pub async fn get_role(&self, name: &str) -> Result<Role, AuthError> {
         let rows = sqlx::query(
             "SELECT r.id AS role_id, r.name, r.rate_rpm, rp.app, rp.permission
@@ -881,7 +719,6 @@ impl KeyStore {
         })
     }
 
-    /// List every role (with permission bundles), ordered by name.
     pub async fn list_roles(&self) -> Result<Vec<Role>, AuthError> {
         let rows = sqlx::query(
             "SELECT r.id AS role_id, r.name, r.rate_rpm, rp.app, rp.permission
@@ -894,7 +731,6 @@ impl KeyStore {
         rows_to_roles(rows)
     }
 
-    /// Count keys currently holding a role (by name).
     pub async fn count_role_assignments(&self, name: &str) -> Result<i64, AuthError> {
         let role_id = self.get_role_id(name).await?;
         let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM key_roles WHERE role_id = $1")
@@ -904,14 +740,6 @@ impl KeyStore {
         Ok(count)
     }
 
-    /// Set (or clear with `None`) a role's `rate_rpm` ceiling, returning the
-    /// updated role.
-    ///
-    /// This is the non-destructive way to re-tier class-of-service: the
-    /// role's permission bundle and every `key_roles` assignment are left
-    /// untouched, so no key loses capability while the ceiling changes.
-    /// Clearing falls the role's keys back to the route-class config
-    /// defaults. Errors with [`AuthError::RoleNotFound`] for an unknown name.
     pub async fn set_role_rate_rpm(
         &self,
         name: &str,
@@ -940,12 +768,6 @@ impl KeyStore {
         self.get_role(name).await
     }
 
-    /// Delete a role.
-    ///
-    /// Refuses with [`AuthError::RoleInUse`] (carrying the affected-key
-    /// count) while any key still holds the role, unless `force` — forcing
-    /// unassigns the role from every key first, which strips capability
-    /// from those keys immediately.
     pub async fn delete_role(&self, name: &str, force: bool) -> Result<(), AuthError> {
         validate_role_name(name)?;
         let mut tx = self.pool.begin().await?;
@@ -987,8 +809,6 @@ impl KeyStore {
         Ok(())
     }
 
-    /// Add `(app, permission)` pairs to an existing role. Duplicates are
-    /// no-ops (idempotent).
     pub async fn add_role_permissions(
         &self,
         name: &str,
@@ -1028,9 +848,6 @@ impl KeyStore {
         self.get_role(name).await
     }
 
-    /// Remove `(app, permission)` pairs from an existing role. Returns the
-    /// number of rows actually removed — callers can warn when a named pair
-    /// wasn't on the role.
     pub async fn remove_role_permissions(
         &self,
         name: &str,
@@ -1061,9 +878,6 @@ impl KeyStore {
         Ok(removed)
     }
 
-    /// Whether `(app, permission)` is registered in the `app_permissions`
-    /// vocabulary. The registry is warn-only: an unknown pair is legal to
-    /// persist, but tooling should surface the gap (typo protection).
     pub async fn is_known_permission(
         &self,
         app: &str,
@@ -1079,12 +893,6 @@ impl KeyStore {
         Ok(known)
     }
 
-    // -- internals ------------------------------------------------------------
-
-    /// Classify a "zero rows affected" UPDATE on `api_keys` by prefix —
-    /// distinguishes a not-found prefix from one that exists but is already
-    /// revoked. Used by `revoke_key` and `retype_key`, both of which guard
-    /// their UPDATE on `active = TRUE` / `revoked_at IS NULL`.
     async fn classify_prefix_miss(&self, prefix: &str) -> Result<AuthError, AuthError> {
         let exists: bool =
             sqlx::query("SELECT EXISTS(SELECT 1 FROM api_keys WHERE prefix = $1) AS exists")
@@ -1104,12 +912,10 @@ impl KeyStore {
         })
     }
 
-    /// Resolve a role name to its row id against the pool.
     async fn get_role_id(&self, name: &str) -> Result<i64, AuthError> {
         Self::get_role_id_in(&self.pool, name).await
     }
 
-    /// Resolve a role name to its row id against any executor.
     async fn get_role_id_in<'e, E>(executor: E, name: &str) -> Result<i64, AuthError>
     where
         E: sqlx::PgExecutor<'e>,
@@ -1126,7 +932,6 @@ impl KeyStore {
         Ok(row.try_get("id")?)
     }
 
-    /// Lock the key row and refuse inactive keys for a role mutation.
     async fn lock_active_key_id_by_prefix(
         &self,
         tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
@@ -1157,8 +962,7 @@ impl KeyStore {
 }
 
 /// Fold `roles LEFT JOIN role_permissions` rows (ordered by role name) into
-/// [`Role`] values. A role with no permissions yields NULL app/permission
-/// from the LEFT JOIN and an empty bundle here.
+/// [`Role`] values.
 fn rows_to_roles(rows: Vec<PgRow>) -> Result<Vec<Role>, AuthError> {
     let mut roles: Vec<Role> = Vec::new();
     for row in rows {
@@ -1188,9 +992,6 @@ fn rows_to_roles(rows: Vec<PgRow>) -> Result<Vec<Role>, AuthError> {
     Ok(roles)
 }
 
-/// Map a row from `api_keys` to [`ApiKeyInfo`] without roles.
-///
-/// Callers populate `roles` separately.
 fn row_to_api_key_info_no_roles(row: &PgRow) -> Result<ApiKeyInfo, AuthError> {
     let kind_str: String = row.try_get("kind")?;
     let kind: PrincipalKind = kind_str.parse()?;
@@ -1233,7 +1034,6 @@ mod tests {
     pub(super) static ARGON2_LIMIT_TESTS: tokio::sync::Mutex<()> =
         tokio::sync::Mutex::const_new(());
 
-    /// A check parked on the blocking pool while it holds an argon2 permit.
     pub(super) struct Parked {
         release: mpsc::Sender<()>,
         caller: JoinHandle<Result<(), AuthError>>,
@@ -1322,9 +1122,6 @@ mod tests {
         out
     }
 
-    /// Four checks fill the limit and a fifth waits until one ends. Key
-    /// hashing, key verification and the dummy check of a prefix miss each
-    /// queue behind the same four permits.
     #[tokio::test]
     async fn argon2_checks_share_a_limit_of_four() {
         let _serial = ARGON2_LIMIT_TESTS.lock().await;
@@ -1343,8 +1140,6 @@ mod tests {
         }
         assert_eq!(available_permits(), 0, "four parked checks hold the limit");
 
-        // Each kind of check, run alone against a full limit, waits for a
-        // parked check to end and then runs on the permit it freed.
         let hashed =
             waits_for_a_freed_permit(&mut parked, pin!(hash_token_async("another key"))).await;
         assert!(token::verify_token("another key", &hashed).expect("a PHC string"));
@@ -1366,15 +1161,11 @@ mod tests {
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
     }
 
-    /// The permit moves into the blocking step. A caller dropped after its
-    /// step started leaves the permit held until the step returns, and a
-    /// caller dropped while it waits for a permit starts no work at all.
     #[tokio::test]
     async fn argon2_permit_outlives_a_cancelled_caller() {
         let _serial = ARGON2_LIMIT_TESTS.lock().await;
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
 
-        // A caller whose step has started is cancelled and joined.
         let (entered, mut entered_rx) = unbounded_channel();
         let (release, released) = mpsc::channel();
         let caller = tokio::spawn(on_blocking_pool(park(entered, released)));
@@ -1386,8 +1177,6 @@ mod tests {
             .expect_err("the caller was cancelled");
         assert!(cancelled.is_cancelled());
 
-        // The orphaned step still holds its permit, so three more checks
-        // fill the limit.
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT - 1);
         let mut parked = Vec::new();
         for _ in 1..ARGON2_CHECK_LIMIT {
@@ -1408,8 +1197,6 @@ mod tests {
             Err(tokio::sync::mpsc::error::TryRecvError::Disconnected)
         ));
 
-        // A fifth check waits until the orphaned step returns, then runs on
-        // the permit that step released.
         let mut fifth = pin!(hash_token_async("fifth"));
         assert!(poll_once(fifth.as_mut()).await.is_pending());
         release.send(()).expect("the orphaned step is waiting");
@@ -1424,9 +1211,6 @@ mod tests {
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
     }
 
-    /// A panicking worker answers `AuthError::Hash` with fixed text. The
-    /// payload never enters the string: `JoinError`'s `Display` quotes it,
-    /// and the middleware logs this error on the bearer request path.
     #[tokio::test]
     async fn a_panicking_worker_never_carries_its_payload() {
         // It takes an argon2 permit, so it must not disturb the counts the
@@ -1460,8 +1244,6 @@ mod pg_tests {
     use crate::error::AuthError;
     use crate::types::PrincipalKind;
 
-    /// A key whose check is cached runs no argon2, so it verifies while
-    /// parked checks hold all four permits.
     #[sqlx::test]
     async fn a_cached_key_never_waits_for_an_argon2_permit(pool: PgPool) {
         let _serial = ARGON2_LIMIT_TESTS.lock().await;
@@ -1494,9 +1276,6 @@ mod pg_tests {
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
     }
 
-    /// A cache hit runs no KDF, so it inserts nothing. The entry a hit
-    /// finds is the one the KDF run inserted, and a hit neither re-queues
-    /// nor renews it.
     #[sqlx::test]
     async fn a_cache_hit_inserts_nothing(pool: PgPool) {
         let _serial = ARGON2_LIMIT_TESTS.lock().await;
@@ -1524,10 +1303,6 @@ mod pg_tests {
         assert_eq!(store.cache_stats().entries, 1);
     }
 
-    /// An evicted key pays argon2id again: with every permit parked, its
-    /// check cannot finish until one is freed. A wrong token for an evicted
-    /// prefix, or for a cached one, is refused by a KDF run and inserts
-    /// nothing. Eviction changes cost, never the answer.
     #[sqlx::test]
     async fn eviction_forces_a_kdf_run_and_never_authenticates_a_wrong_token(pool: PgPool) {
         let _serial = ARGON2_LIMIT_TESTS.lock().await;
@@ -1583,8 +1358,6 @@ mod pg_tests {
         }
         assert_eq!(available_permits(), ARGON2_CHECK_LIMIT);
 
-        // `second` is the evicted key now. A wrong token with its prefix
-        // reaches argon2id and is refused there.
         let tampered_second = format!(
             "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
             &second.plaintext_token[..12]
@@ -1593,8 +1366,6 @@ mod pg_tests {
             store.verify_key(&tampered_second).await,
             Err(AuthError::InvalidKey(_))
         ));
-        // And a wrong token with the cached prefix misses the cache, because
-        // the entry is bound to the plaintext fingerprint, and is refused too.
         let tampered_first = format!(
             "{}AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA0",
             &first.plaintext_token[..12]

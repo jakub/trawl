@@ -141,7 +141,6 @@ fn names(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| (*s).to_owned()).collect()
 }
 
-/// Seed the standard converted-shape roles used across these tests.
 async fn seed_roles(store: &KeyStore) {
     store
         .create_role(
@@ -172,10 +171,6 @@ async fn seed_roles(store: &KeyStore) {
         .await
         .expect("seed coastwatch-siem_consumer");
 }
-
-// ---------------------------------------------------------------------------
-// lifecycle tests
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn create_and_verify_roundtrip(pool: sqlx::PgPool) {
@@ -239,7 +234,6 @@ async fn multi_role_key_resolves_the_union(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn cross_app_role_grants_in_both_namespaces(pool: sqlx::PgPool) {
-    // One role spanning two apps grants in both from a single key_roles row.
     let store = KeyStore::from_pool(pool);
     store
         .create_role(
@@ -330,10 +324,6 @@ async fn create_key_with_expiry_in_future(pool: sqlx::PgPool) {
     assert_eq!(verified.name, "expiring");
 }
 
-// ---------------------------------------------------------------------------
-// role CRUD
-// ---------------------------------------------------------------------------
-
 #[sqlx::test]
 async fn create_role_roundtrip_with_rate_rpm(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -402,8 +392,6 @@ async fn get_role_unknown_is_role_not_found(pool: sqlx::PgPool) {
 
 #[sqlx::test]
 async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::PgPool) {
-    // Permissions resolve fresh on every verify_key, never cached, so a role
-    // mutation is visible to the very next call.
     let store = KeyStore::from_pool(pool);
     store
         .create_role("mutable", None, &[rp("trawl", "query")])
@@ -437,7 +425,6 @@ async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::Pg
     let final_state = store.verify_key(&created.plaintext_token).await.unwrap();
     assert!(!final_state.has_app_permission("trawl", "export"));
 
-    // Removing a pair that isn't on the role reports zero rows.
     let removed = store
         .remove_role_permissions("mutable", &[rp("trawl", "export")])
         .await
@@ -447,8 +434,6 @@ async fn add_and_remove_role_permissions_reflected_on_next_verify(pool: sqlx::Pg
 
 #[sqlx::test]
 async fn set_role_rate_rpm_updates_in_place_without_touching_assignments(pool: sqlx::PgPool) {
-    // Re-tiering class-of-service must not cost an authz outage: the key keeps
-    // the role, and its permissions, across the change.
     let store = KeyStore::from_pool(pool);
     store
         .create_role("tier", Some(120), &[rp("trawl", "query")])
@@ -507,7 +492,6 @@ async fn delete_role_refuses_while_assigned_unless_forced(pool: sqlx::PgPool) {
     );
     assert_eq!(store.count_role_assignments("clingy").await.unwrap(), 1);
 
-    // Forced delete unassigns and removes; the key loses the capability.
     store.delete_role("clingy", true).await.unwrap();
     let err = store.get_role("clingy").await.unwrap_err();
     assert!(matches!(err, AuthError::RoleNotFound { .. }));
@@ -548,10 +532,6 @@ async fn is_known_permission_reads_the_registry(pool: sqlx::PgPool) {
         "coastwatch seeds its own vocabulary in its companion arc"
     );
 }
-
-// ---------------------------------------------------------------------------
-// verify_key security
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn verify_nonexistent_prefix_runs_dummy_and_fails(pool: sqlx::PgPool) {
@@ -647,7 +627,6 @@ async fn revoke_blocks_verify_even_with_cache_entry(pool: sqlx::PgPool) {
         )
         .await
         .unwrap();
-    // Populate cache.
     store.verify_key(&created.plaintext_token).await.unwrap();
 
     store.revoke_key(&created.info.prefix).await.unwrap();
@@ -662,9 +641,6 @@ async fn expired_key_fails_verify(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
     seed_roles(&store).await;
 
-    // Can't backdate expires_at directly — the api_keys_expiry_after_create
-    // CHECK constraint refuses any expires_at <= created_at. Instead, create
-    // with a near-zero TTL and sleep past it before verifying.
     let created = store
         .create_key(
             "doomed",
@@ -728,8 +704,6 @@ async fn concurrent_verifies_all_succeed(pool: sqlx::PgPool) {
     }
 }
 
-/// An in-flight `verify_key` holds the `api_keys` row lock, so a concurrent
-/// role unassignment on the same key has to wait for it.
 #[sqlx::test]
 async fn unassign_role_waits_for_key_row_lock(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -746,9 +720,6 @@ async fn unassign_role_waits_for_key_row_lock(pool: sqlx::PgPool) {
         .unwrap();
 
     // `verify_key` holds this same row lock while it resolves roles.
-    // Holding it manually gives the regression test a deterministic
-    // interleaving instead of hoping the scheduler lands inside a
-    // microsecond race window.
     let mut tx = store.pool().begin().await.unwrap();
     sqlx::query("SELECT id FROM api_keys WHERE id = $1 FOR UPDATE")
         .bind(created.info.id)
@@ -867,10 +838,6 @@ async fn concurrent_duplicate_role_assignment_has_one_winner(pool: sqlx::PgPool)
         ["trawl-admin"]
     );
 }
-
-// ---------------------------------------------------------------------------
-// admin operations
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn revoke_nonexistent_prefix_errors(pool: sqlx::PgPool) {
@@ -1286,10 +1253,6 @@ async fn ping_succeeds(pool: sqlx::PgPool) {
     store.ping().await.expect("ping");
 }
 
-// ---------------------------------------------------------------------------
-// live-key lookup (ADR-0004: scheduler gating)
-// ---------------------------------------------------------------------------
-
 #[sqlx::test]
 async fn live_key_by_id_active(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -1378,7 +1341,6 @@ async fn live_key_by_id_reflects_role_changes(pool: sqlx::PgPool) {
         .await
         .unwrap();
 
-    // Strip the role out-of-band — the live lookup must observe it.
     store
         .unassign_role(&created.info.prefix, "trawl-admin")
         .await
@@ -1390,7 +1352,6 @@ async fn live_key_by_id_reflects_role_changes(pool: sqlx::PgPool) {
         .expect("still active");
     assert!(!live.has_any_permission("trawl"), "roles must be fresh");
 
-    // Re-assign a different role — fresh again.
     store
         .assign_role(&created.info.prefix, "trawl-analyst")
         .await
@@ -1404,12 +1365,6 @@ async fn live_key_by_id_reflects_role_changes(pool: sqlx::PgPool) {
     assert!(!live.has_app_permission("trawl", "server_manage"));
 }
 
-// ---------------------------------------------------------------------------
-// connect() — URL-based construction for daemon consumers (ADR-0004)
-// ---------------------------------------------------------------------------
-
-/// `KeyStore::connect` validates both reachability and the migrated schema.
-/// Its URL names the owned per-test database, never the `SQLx` admin database.
 #[sqlx::test]
 async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
     use sqlx::ConnectOptions as _;
@@ -1420,13 +1375,7 @@ async fn connect_and_ping_via_url(pool: sqlx::PgPool) {
 }
 
 /// A raw `pool.begin()` dropped while Postgres' answer to its `BEGIN` is
-/// on the way leaves its session inside a transaction sqlx never counted,
-/// as when an admin operation's caller hangs up at that moment. The
-/// keystore pool closes that session when it comes back instead of
-/// reusing it: the lock the transaction took is gone with it, the pool's
-/// next statement runs outside any transaction, and one warning names the
-/// event. The answer is held back by a proxy until the `BEGIN` has been
-/// dropped.
+/// on the way leaves its session inside a transaction sqlx never counted.
 #[sqlx::test]
 async fn a_keystore_connection_returned_inside_a_transaction_is_closed(pool: sqlx::PgPool) {
     use sqlx::ConnectOptions as _;
@@ -1507,7 +1456,6 @@ async fn a_keystore_connection_returned_inside_a_transaction_is_closed(pool: sql
     assert_eq!(warned, 1, "one warning names the closed session");
 }
 
-/// The `last_used` of key `id`.
 async fn last_used(pool: &sqlx::PgPool, id: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     sqlx::query_scalar("SELECT last_used FROM api_keys WHERE id = $1")
         .bind(id)
@@ -1516,14 +1464,8 @@ async fn last_used(pool: &sqlx::PgPool, id: i64) -> Option<chrono::DateTime<chro
         .unwrap()
 }
 
-/// A verification whose request is dropped while its transaction waits
-/// for Postgres, as when a client resets its connection then, still runs
-/// its transaction to the end: the transaction commits, its row lock goes
-/// with the commit, and its session comes back to the pool outside any
-/// transaction, so the pool's return check closes nothing and warns
-/// nothing. The answer to the transaction's `BEGIN` is held back by a
-/// proxy until the request has been dropped. The verification hits the
-/// cache, the path that pays no argon2id and so is cheapest to repeat.
+/// The verification hits the cache, the path that pays no argon2id and so is
+/// cheapest to repeat.
 #[sqlx::test]
 async fn a_verification_dropped_in_its_transaction_finishes_it_and_keeps_its_session(
     pool: sqlx::PgPool,
@@ -1617,18 +1559,10 @@ async fn a_verification_dropped_in_its_transaction_finishes_it_and_keeps_its_ses
     );
 }
 
-/// Dropped verifications leave no more transactions running behind them
-/// than the store's pool has connections: a request takes its permit
-/// before its transaction's task starts, and one dropped while it waits
-/// for a permit starts nothing.
-///
-/// Four cache-hit verifications through a one-connection pool read their
-/// key's row in turn while the test holds the connection (the pool serves
-/// waiters first come, first served), so all four are past the read when
-/// the first one's transaction starts and waits on the key's row lock,
-/// which another session holds. All four requests are then dropped and
-/// the lock released. A trigger counts the `last_used` updates: exactly
-/// one transaction ran.
+/// Four cache-hit verifications queue for a one-connection pool the test
+/// holds. The pool serves waiters first come, first served, so all four
+/// have read the key's row when the first transaction blocks on its row
+/// lock. All four are dropped and the lock released: exactly one ran.
 #[sqlx::test]
 async fn dropped_verifications_leave_no_more_transactions_than_the_pool_has_connections(
     pool: sqlx::PgPool,
@@ -1681,7 +1615,6 @@ async fn dropped_verifications_leave_no_more_transactions_than_the_pool_has_conn
             tokio::spawn(async move { store.verify_key(&token).await.map(drop) })
         })
         .collect();
-    // Each request now waits for the connection, in the order spawned.
     tokio::time::sleep(Duration::from_millis(100)).await;
     drop(gate);
     let waiting = tokio::time::timeout(Duration::from_secs(10), async {
@@ -1733,7 +1666,6 @@ async fn dropped_verifications_leave_no_more_transactions_than_the_pool_has_conn
 
 #[tokio::test]
 async fn connect_malformed_url_errors() {
-    // Malformed URL fails at parse time — no network round-trip, no timeout.
     let err = KeyStore::connect("not-a-postgres-url")
         .await
         .expect_err("must fail");
@@ -1744,26 +1676,15 @@ async fn connect_malformed_url_errors() {
 async fn connect_unreachable_endpoint_errors() {
     // The endpoint must be unreachable in a way sqlx does NOT retry.
     // `PoolInner::connect` treats ECONNREFUSED as "the database is still
-    // starting" and backs off until the acquire deadline, which
-    // `KeyStore::connect` leaves at sqlx's default 30 seconds. So a dropped
-    // port would make this test either slow or, worse, a pass by timeout:
-    // the previous shape wrote `if let Ok(Ok(_)) = timeout(3s, ...)`, under
-    // which Err(Elapsed) — a hang, the regression this test exists to catch
-    // — sailed through as success.
-    //
-    // A listener we OWN for the whole test, accepting and immediately
-    // closing, gives the postgres startup handshake an EOF instead. That is
-    // not a retryable connect error, so the pool gives up at once, and
-    // nothing can take the port from under us mid-test.
+    // starting" and backs off until the acquire deadline, so a dropped port
+    // would make this test slow or a pass by timeout. A listener we OWN,
+    // accepting and immediately closing, gives the postgres startup
+    // handshake an EOF instead, which is not a retryable connect error.
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
     let port = listener.local_addr().expect("local_addr").port();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_in_thread = std::sync::Arc::clone(&stop);
     let closing = std::thread::spawn(move || {
-        // One accept per connect attempt; the stream drops at the end of
-        // each iteration, which closes it. The listener lives in this
-        // thread, so the loop ends when the test sets `stop` and makes
-        // one final connection to unblock `accept`.
         while let Ok((stream, _)) = listener.accept() {
             let _ = stream.shutdown(std::net::Shutdown::Both);
             if stop_in_thread.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1808,7 +1729,6 @@ async fn connect_unreachable_endpoint_errors() {
 /// a loaded runner, not a budget the healthy path spends.
 const BOUNDED_CONNECT: Duration = Duration::from_secs(2);
 
-// One sync sanity test to confirm imports compile without DB.
 #[test]
 fn validation_reexported_works() {
     assert!(validate_app_namespace("trawl").is_ok());
@@ -1816,12 +1736,6 @@ fn validation_reexported_works() {
     let t = token::generate_token();
     assert!(t.plaintext.starts_with("flt_"));
 }
-
-// ---------------------------------------------------------------------------
-// A warm cache never outranks the database (#304). The cache only records
-// that argon2id accepted a plaintext; activity, expiry, roles and the
-// stored hash are read from Postgres on every verify.
-// ---------------------------------------------------------------------------
 
 #[sqlx::test]
 async fn warm_cache_then_expiry_refuses_the_next_verify(pool: sqlx::PgPool) {
@@ -1837,7 +1751,6 @@ async fn warm_cache_then_expiry_refuses_the_next_verify(pool: sqlx::PgPool) {
         )
         .await
         .unwrap();
-    // Warm the cache while the key is live.
     store
         .verify_key(&created.plaintext_token)
         .await
@@ -1946,19 +1859,12 @@ async fn warm_cache_then_hash_rotation_refuses_the_old_token(pool: sqlx::PgPool)
         1,
         "a refused KDF run inserts nothing"
     );
-    // The untouched key is unaffected.
     store
         .verify_key(&donor.plaintext_token)
         .await
         .expect("the donor still verifies");
 }
 
-/// Start a verification of `token` while another transaction holds the
-/// key's row, so the verification's `last_used` UPDATE waits on the lock
-/// after its SELECT read the old hash and after argon2id, if it ran,
-/// accepted the old plaintext. Rotate the hash to `donor_id`'s in the
-/// holding transaction, commit, and return what the verification decided
-/// once the lock let it continue.
 async fn verify_while_the_hash_rotates(
     store: &KeyStore,
     token: &str,
@@ -2018,10 +1924,6 @@ async fn verify_while_the_hash_rotates(
         .expect("the verification task ran to its end")
 }
 
-/// A rotation that commits after a verification read the old hash and
-/// argon2id accepted the old plaintext, but before its `last_used` UPDATE
-/// ran, refuses that verification: the UPDATE requires the hash it was
-/// verified against, so the old token never authenticates a rotated key.
 #[sqlx::test]
 async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_miss(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -2068,8 +1970,6 @@ async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_miss(pool: sq
         .expect("the donor still verifies");
 }
 
-/// The same race on a cache hit: the warm entry skips argon2id, and the
-/// UPDATE still refuses once the hash it was looked up under is gone.
 #[sqlx::test]
 async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_hit(pool: sqlx::PgPool) {
     let store = KeyStore::from_pool(pool);
@@ -2122,8 +2022,6 @@ async fn concurrent_hash_rotation_refuses_the_old_token_on_a_cache_hit(pool: sql
 
 #[sqlx::test]
 async fn revocation_through_a_second_store_refuses_the_first_stores_warm_key(pool: sqlx::PgPool) {
-    // Two processes sharing one database each hold their own cache. A
-    // revocation through either refuses the key everywhere on its next use.
     let first = KeyStore::from_pool(pool.clone());
     let second = KeyStore::from_pool(pool);
     seed_roles(&first).await;

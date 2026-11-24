@@ -32,34 +32,23 @@ use common::Server;
 use common::mcp::loader_path;
 use common::tui::{DEADLINE, Home, READER_PERMISSIONS, Tui, describe, line_with, pinned};
 
-/// The service every case ingests under, and the query that finds it.
 const SERVICE: &str = "zone_probe";
 const QUERY: &str = "service=zone_probe | table _time, message";
 
-/// The client zones the cases run under.
 const KOLKATA: &str = "Asia/Kolkata";
 const BERLIN: &str = "Europe/Berlin";
 
-/// The one event of the cross-client case, and how each surface spells it.
 const EVENT_AT: &str = "2026-11-01T06:00:00Z";
 const EVENT_UTC_WIRE: &str = "2026-11-01T06:00:00.000000Z";
 const EVENT_KOLKATA_WIRE: &str = "2026-11-01T11:30:00.000000+05:30";
 const EVENT_KOLKATA_HUMAN: &str = "2026-11-01 11:30:00 +05:30";
 
-/// The child the cross-client case re-runs under `TZ=UTC`.
 const UTC_CHILD: &str = "daemon_at_utc_child";
 
-// ---------------------------------------------------------------------------
-// Clients
-// ---------------------------------------------------------------------------
-
-/// Mint the clients' key on `server`.
 async fn reader(server: &Server) -> String {
     server.mint("zone-reader", &READER_PERMISSIONS).await
 }
 
-/// `[server]` for a client that reaches trawld through `proxy` as
-/// `token`, in plain HTTP.
 fn proxied(proxy: &Proxy, token: &str) -> String {
     format!(
         "url = {:?}\ntoken = {token:?}\ninsecure = true\n",
@@ -71,12 +60,10 @@ fn event(at: &str, message: &str) -> Value {
     json!({ "_time": at, "service": SERVICE, "message": message })
 }
 
-/// The parquet files a compaction wrote, as embedded `--data` reads them.
 fn data_glob(server: &Server) -> String {
     format!("{}/**/*.parquet", server.data.display())
 }
 
-/// Each NDJSON row's `_time` read as an instant, beside its `message`.
 fn rows(ndjson: &str) -> Vec<(DateTime<Utc>, String)> {
     let mut rows: Vec<_> = ndjson
         .lines()
@@ -95,25 +82,16 @@ fn rows(ndjson: &str) -> Vec<(DateTime<Utc>, String)> {
     rows
 }
 
-/// The one row of an NDJSON answer, by field.
 fn only_row(ndjson: &str) -> Value {
     let lines: Vec<&str> = ndjson.lines().filter(|l| !l.trim().is_empty()).collect();
     assert_eq!(lines.len(), 1, "one row expected:\n{ndjson}");
     serde_json::from_str(lines[0]).expect("a JSON row")
 }
 
-// ---------------------------------------------------------------------------
-// A recording proxy
-// ---------------------------------------------------------------------------
-
-/// A plain-HTTP front for a trawld that records every byte each way. It
-/// copies bytes, so the SSE stream of a live tail passes through as it
-/// arrives. The clients send no `Accept-Encoding`, so both logs are text.
+/// The clients send no `Accept-Encoding`, so `sent` and `received` are text.
 struct Proxy {
     url: String,
-    /// What the clients sent: request lines, headers and bodies.
     sent: Arc<Mutex<Vec<u8>>>,
-    /// What trawld answered.
     received: Arc<Mutex<Vec<u8>>>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -194,7 +172,6 @@ impl Drop for Proxy {
     }
 }
 
-/// Copy `from` into `to`, recording each chunk, until either side ends.
 async fn relay(
     mut from: impl AsyncRead + Unpin,
     mut to: impl AsyncWrite + Unpin,
@@ -210,11 +187,6 @@ async fn relay(
     let _ = to.shutdown().await;
 }
 
-// ---------------------------------------------------------------------------
-// A listener that counts connections
-// ---------------------------------------------------------------------------
-
-/// A TCP port that accepts and drops every connection, counting them.
 struct Counting {
     port: u16,
     accepted: Arc<AtomicUsize>,
@@ -254,7 +226,6 @@ impl Counting {
         }
     }
 
-    /// Stop accepting; returns how many connections arrived.
     fn finish(mut self) -> usize {
         self.stop.store(true, Ordering::SeqCst);
         self.thread
@@ -266,15 +237,8 @@ impl Counting {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
-
-/// The daemon's zone is not the reader's: with trawld at `TZ=UTC` and every
-/// client at `TZ=Asia/Kolkata` under `ui.timezone = "local"`, the daemon
-/// query, the embedded query, the TUI's batch and its live tail all print
-/// the event at `+05:30`. The fixture boots trawld in-process, so the case
-/// re-runs itself as a child whose whole process is at `TZ=UTC`.
+/// The fixture boots trawld in-process, so the case re-runs itself as a
+/// child whose whole process is at `TZ=UTC`.
 #[test]
 fn client_local_zone_is_independent_of_daemon_zone() {
     let mut command = std::process::Command::new(std::env::current_exe().expect("this binary"));
@@ -295,8 +259,6 @@ fn client_local_zone_is_independent_of_daemon_zone() {
     );
 }
 
-/// The body of [`client_local_zone_is_independent_of_daemon_zone`], in a
-/// process at `TZ=UTC`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "run by client_local_zone_is_independent_of_daemon_zone under TZ=UTC"]
 async fn daemon_at_utc_child() {
@@ -335,8 +297,6 @@ async fn daemon_at_utc_child() {
         embedded.contains(EVENT_KOLKATA_HUMAN),
         "embedded trawl query:\n{embedded}"
     );
-    // The embedded executor answers in UTC: with no conversion asked, the
-    // client in Kolkata prints the UTC wire text.
     let embedded_utc = home
         .query_ok(KOLKATA, &utc, &[QUERY, "--data", &glob, "--format", "json"])
         .await;
@@ -352,10 +312,9 @@ async fn daemon_at_utc_child() {
     let row = line_with(&batch, "batch event").expect("a batch row");
     assert!(row.contains(EVENT_KOLKATA_HUMAN), "TUI batch:\n{batch}");
 
-    // Live: events arrive after the stream opens, at the same instant.
-    // The tail flushes a snapshot every ten events, and the stream may
-    // not be subscribed yet when a round lands, so rounds repeat until the
-    // tab holds one.
+    // The tail flushes a snapshot every ten events, and the stream may not
+    // be subscribed yet when a round lands, so rounds repeat until the tab
+    // holds one.
     tui.send(json!({ "cmd": "key", "key": "f9" })).await;
     let status = tui.send(json!({ "cmd": "status" })).await;
     assert_eq!(status["live_mode"], true, "F9 started no tail: {status}");
@@ -385,7 +344,6 @@ async fn daemon_at_utc_child() {
     assert!(row.contains(EVENT_KOLKATA_HUMAN), "TUI live:\n{live}");
     tui.quit().await;
 
-    // The wire: no request named a zone, and trawld answered in UTC.
     let sent = proxy.sent();
     assert!(
         sent.contains("POST /api/v1/query") && sent.contains("GET /api/v1/stream"),
@@ -408,8 +366,6 @@ async fn daemon_at_utc_child() {
     server.stop().await;
 }
 
-/// Two instants that read 02:30 on Berlin's fall-back night keep their own
-/// offsets, in the CLI table and on the TUI screen.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn local_display_preserves_dst_identity() {
     const SUMMER: &str = "2026-10-25 02:30:00 +02:00";
@@ -447,8 +403,6 @@ async fn local_display_preserves_dst_identity() {
     server.stop().await;
 }
 
-/// A zone the grammar refuses stops every client before it sends anything
-/// or prints a result: no fallback to UTC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_display_zone_never_falls_back() {
     const ZONE: &str = "Mars/Olympus";
@@ -536,9 +490,6 @@ async fn invalid_display_zone_never_falls_back() {
     assert_eq!(listener.finish(), 0, "a client connected to the server");
 }
 
-/// The zone is configuration, read before the connection: with no
-/// credential anywhere, the TUI's refusal names the invalid zone, as
-/// `trawl query`'s does, and leaves no `tui.log`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn invalid_display_zone_precedes_the_credential_refusal() {
     const ZONE: &str = "Mars/Olympus";
@@ -567,8 +518,6 @@ async fn invalid_display_zone_precedes_the_credential_refusal() {
     );
 }
 
-/// json and csv carry the wire spelling in the display zone; Parquet,
-/// which never reads the zone, and the HTTP export stay UTC.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn cli_timestamp_output_formats() {
     let server = Server::start(true).await;
@@ -605,7 +554,6 @@ async fn cli_timestamp_output_formats() {
         let mut args = with("parquet");
         args.extend(["-o", out_arg]);
         home.query_ok(KOLKATA, &refused, &args).await;
-        // Read back with no conversion asked: the stored instant, in UTC.
         let back = home
             .query_ok(
                 KOLKATA,
@@ -694,11 +642,6 @@ async fn display_zone_does_not_change_evaluation() {
     server.stop().await;
 }
 
-/// Embedded `--data` answers a kv-tail filter on `_time` with the rows the
-/// same query keeps without `extract kv`, in csv and in json.
-///
-/// The SQL step returns `_time` as a TIMESTAMP, so the tail compares it as
-/// an instant against the RFC 3339 bound, as the all-SQL lane does.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn embedded_kv_tail_matches_the_sql_lane() {
     const TAIL: &str = "service=zone_probe | extract kv \
@@ -748,7 +691,6 @@ async fn embedded_kv_tail_matches_the_sql_lane() {
         "embedded json with the tail:\n{tail}"
     );
 
-    // csv: the same header, and the same data lines in any order.
     let lines = |csv: &str| {
         let mut lines = csv.lines().filter(|line| !line.trim().is_empty());
         let header = lines.next().map(str::to_owned);

@@ -4,75 +4,6 @@
 
 //! The `sightings` read (ADR-0058): where one literal appears, counted
 //! exactly over every match, with the most recent matches captured.
-//!
-//! The statement is trawl-core's [`correlate::sightings_query`]: the
-//! literal as one quoted text search over `message` and `_raw`, then
-//! `eventstats` writing each (`service`, `env`) group's match count, first
-//! and last `_time` onto every match. It has no head and no sort of its
-//! own. The capture imposes the event shape ([`Shape::Events`]), so the
-//! lane orders the matches newest first and cuts them like any search of
-//! events, while [`bounds::classify`](super::bounds::classify) would call
-//! the `eventstats` stage whole. The window functions see every match
-//! before the cut does.
-//!
-//! # Two populations
-//!
-//! The selection reads the groups from the UNCUT rows, before the cut:
-//! `matches_total` is every match in the bounds, and each group's count,
-//! first and last seen are exact over all of them, a group whose matches
-//! are all older than the cut included. It reorders and drops nothing.
-//! After the cut it attributes the literal to fields over the KEPT rows,
-//! under the text search's own containment rule
-//! ([`correlate::contains_ci`]). Both denominators are named in the facts:
-//! field counts are over `captured`, group counts over `matches_total`.
-//!
-//! The eligible columns are every column except `_raw` and the three
-//! `sighting_*` columns, compared under the DSL's field fold; `fields`
-//! naming one of those is refused. Attribution runs over the request's
-//! `fields` among them, or, without them, over all of them. `fields`
-//! restricts the per-field list only: the search, its matches, the groups
-//! and `raw_only_rows` are the same with or without it. A cell is
-//! attributed when its displayed text holds the literal: text is itself,
-//! an integer its decimal digits, a boolean `true` or `false`, a float
-//! Rust's shortest round-trip `Display` (`12.5`, `0.1`, `3` for 3.0,
-//! `100000000000000000000` for 1e20, never an exponent), and a timestamp
-//! the text the engine already wrote. A null or a list holds nothing.
-//! The list keeps the [`ATTRIBUTION_MAX_FIELDS`] fields holding it in the
-//! most kept matches, ties by name, and counts the rest as
-//! `fields_omitted`; at most [`MAX_FIELDS`] `fields` never reach the cut.
-//! `raw_only_rows` counts the kept matches in which no eligible column
-//! holds it, whatever `fields` says: matched through `_raw` alone. The
-//! facts carry the validated `fields` as `attribution_fields`, so a later
-//! page states the same restriction.
-//!
-//! The `sighting_*` columns overwrite user fields of the same names
-//! before the matches are captured; those names are the statement's.
-//!
-//! # Bounds on the answer
-//!
-//! A read over more matches than `max_result_rows` is refused by the
-//! engine's row cap, `result_too_large`, before anything is captured. Its
-//! message names the row limit but not the fix, which is to narrow the
-//! window or the literal. The facts document is stored beside the file and
-//! sent with every answer about the capture, so the groups are capped too:
-//! more than [`CORRELATION_MAX_GROUPS`] distinct (`env`, `service`) groups
-//! is refused with `result_too_large`. Each group is at most a 32-byte env,
-//! a 128-byte service and two timestamps. The field list is at most
-//! [`ATTRIBUTION_MAX_FIELDS`] names whatever the catalog holds, `fields` at
-//! most [`MAX_FIELDS`] and the follow-ups at most two queries; at the caps
-//! the worst-case facts document is about 1.6 MB. The capture bounds the
-//! encoded document whatever its names ([`service::CORRELATION_MAX_BYTES`])
-//! and counts it in the capture's bytes.
-//!
-//! Every refusal of the request itself (the literal's caps and NUL, the
-//! `fields` cap, lengths and names, the window) comes before
-//! [`service::run`], so it takes nothing, and none quotes more than
-//! [`ERROR_EXCERPT_BYTES`] of what the caller sent. The authority comes
-//! first of all ([`service::authorize`]): for a read attached to an
-//! investigation (ADR-0059) the write authority and the purpose's bound
-//! as well as `query`. An attached read is kept as a search capture is
-//! ([`service`]'s module docs, "An attached capture"), so a refusal of
-//! its request records no step.
 
 use std::collections::BTreeMap;
 
@@ -100,14 +31,12 @@ use crate::state::AppState;
 pub const MAX_FIELDS: usize = 16;
 
 /// The most attributed fields the facts list; the rest are counted in
-/// `fields_omitted` (module docs, "Bounds on the answer").
+/// `fields_omitted`.
 pub const ATTRIBUTION_MAX_FIELDS: usize = 256;
 
-/// The window a `sightings` read covers when the request names none.
 const DEFAULT_WINDOW: &str = "24h";
 
-/// Count where a literal appears (module docs).
-///
+/// Count where a literal appears.
 /// # Errors
 /// 403 without the `query` permission, or attached without write
 /// authority on investigations; 400 for the attachment's purpose, the
@@ -156,7 +85,6 @@ pub async fn sightings(
         .map(CorrelationResponse::from)
 }
 
-/// The literal's caps, each named with the value sent.
 fn check_literal(literal: &str) -> Result<(), ServerError> {
     if literal.is_empty() {
         return Err(ServerError::BadRequest(
@@ -177,21 +105,12 @@ fn check_literal(literal: &str) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// The columns attribution never counts, under any case: `_raw`, which
-/// the search reads and raw-only stands for, and the statement's own
-/// `sighting_*` aggregates.
 const RESERVED: [&str; 4] = [RAW, SIGHTING_COUNT, SIGHTING_FIRST, SIGHTING_LAST];
 
-/// Whether `name` folds to a [`RESERVED`] column.
 fn is_reserved(name: &str) -> bool {
     RESERVED.contains(&catalog_key(name).as_str())
 }
 
-/// The `fields` cap and names: at most [`MAX_FIELDS`], each at most
-/// [`MAX_FIELD_NAME_BYTES`] and a name the DSL can write, none
-/// [`RESERVED`], none twice under the field fold. Kept in request order.
-/// A name over the length limit is refused by its length alone; the
-/// others quote at most [`ERROR_EXCERPT_BYTES`] of it.
 fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
     if fields.len() > MAX_FIELDS {
         return Err(ServerError::BadRequest(format!(
@@ -229,23 +148,17 @@ fn check_fields(fields: Vec<String>) -> Result<Vec<String>, ServerError> {
     Ok(fields)
 }
 
-/// The sightings read's selection (module docs, "Two populations").
 struct Sightings {
     literal: String,
-    /// The validated `fields`; empty attributes to every column.
     fields: Vec<String>,
-    /// Every match, counted before the cut.
     matches_total: u64,
-    /// The groups, read before the cut, ranked.
     groups: Vec<SightingGroup>,
 }
 
-/// The position of the first column named `name`.
 fn position(result: &QueryResult, name: &str) -> Option<usize> {
     result.columns.iter().position(|column| column.name == name)
 }
 
-/// A group key cell: its text, or none for a null or a non-text cell.
 fn text(row: &[Value], at: Option<usize>) -> Option<String> {
     match at.map(|at| &row[at]) {
         Some(Value::String(text)) => Some(text.clone()),
@@ -253,7 +166,6 @@ fn text(row: &[Value], at: Option<usize>) -> Option<String> {
     }
 }
 
-/// A count the statement wrote.
 fn count(row: &[Value], at: usize) -> Result<u64, ServerError> {
     match &row[at] {
         Value::Integer(n) => u64::try_from(*n).map_err(|_| counted_wrong()),
@@ -272,9 +184,6 @@ fn null_last(value: Option<&String>) -> (bool, Option<&String>) {
     (value.is_none(), value)
 }
 
-/// The cell's text the literal is looked for in: a non-null scalar's
-/// displayed text ([`Value`]'s `Display`), none for a null or a list
-/// (module docs).
 fn haystack(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
     match value {
         Value::String(text) => Some(std::borrow::Cow::Borrowed(text)),
@@ -286,7 +195,6 @@ fn haystack(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
 }
 
 impl Selection for Sightings {
-    /// Count every match and read each (`env`, `service`) group once.
     fn before_cut(&mut self, result: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
         self.matches_total = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
         if result.rows.is_empty() {
@@ -339,7 +247,6 @@ impl Selection for Sightings {
         Ok(())
     }
 
-    /// Attribute the literal to fields over the kept matches.
     fn after_cut(
         &mut self,
         kept: &QueryResult,
@@ -548,8 +455,6 @@ mod tests {
         assert_eq!(restricted.attribution_fields, vec!["Service".to_owned()]);
     }
 
-    /// A reserved name that got past `check_fields` still attributes
-    /// nothing: the exclusion comes before the membership test.
     #[test]
     fn reserved_columns_are_never_attributed_even_when_named() {
         let rows = [("ip=10.0.4.17", "prod", "api", "login", 1, "10.0.4.17", "t")];
@@ -566,7 +471,6 @@ mod tests {
         }
     }
 
-    /// A non-null scalar's haystack is its displayed text.
     #[test]
     fn every_scalar_is_looked_for_in_its_displayed_text() {
         let found = |value: Value| haystack(&value).map(std::borrow::Cow::into_owned);

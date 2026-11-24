@@ -3,17 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! One admission contract, both validation doors (ADR-0024).
-//!
-//! The SQL lane refuses through `emitter::validate_pipeline`, which every
-//! emit entrypoint funnels into; the streaming lane refuses through
-//! `stream::compile_stream_plan`. They must carry the SAME sentence for
-//! the same DSL text, modulo the emitter's own `unsupported operation: `
-//! prefix — otherwise a query that a live tail rejects for its expansion
-//! would be explained one way in the browser and another in the CLI.
-//!
-//! The check runs BEFORE each lane's own semantic refusals, so an
-//! over-budget pipeline gets the expansion sentence even where the stage
-//! is unstreamable, or where a later stage is a projection collision.
 
 use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::complexity::{MAX_LATERAL_EXPANSION, MAX_PIPELINE_STAGES, MAX_STAGE_FIELDS};
@@ -22,8 +11,6 @@ use trawl_core::parser;
 use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
-/// A FIXED anchor: nothing may self-serve an evaluation context
-/// (`tests/now_anchor_contract.rs`).
 fn anchor() -> EvalContext {
     EvalContext::at(
         chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
@@ -32,8 +19,6 @@ fn anchor() -> EvalContext {
     )
 }
 
-/// A populated catalog snapshot: one pin of every canonical type, over the
-/// names the fixtures below use.
 fn populated_pins() -> FieldTypes {
     let mut pins = FieldTypes::new();
     pins.insert("status", CanonicalType::Varchar);
@@ -53,7 +38,6 @@ fn pipeline(dsl: &str) -> Vec<Spanned<PipeStage>> {
     parser::parse(dsl).expect("dsl parses").pipeline
 }
 
-/// The refusal the SQL lane carries, with the emitter's prefix stripped.
 fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
     let query = parser::parse(dsl).expect("dsl parses");
     let empty = FieldTypes::new();
@@ -71,9 +55,6 @@ fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
         .unwrap_or_else(|| panic!("{dsl}: the emitter's own prefix is missing from {text:?}"))
         .to_string();
 
-    // Every emit entrypoint funnels into `validate_pipeline`, so all four
-    // refuse identically, under an empty pin map and a populated one
-    // alike — the check is corpus-independent by construction.
     for other in [
         trawl_core::emitter::emit(&query, "src", anchor()),
         trawl_core::emitter::emit_with_pins(
@@ -120,13 +101,11 @@ fn sql_sentence(dsl: &str, pins: &FieldTypes) -> String {
     stripped
 }
 
-/// The refusal the streaming lane carries.
 fn stream_sentence(dsl: &str, pins: &FieldTypes) -> String {
     let stages = pipeline(dsl);
     let text = trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(pins), None)
         .expect_err("the stream lane must refuse")
         .to_string();
-    // Pin-blindness must not change the answer either.
     let blind = trawl_core::stream::compile_stream_plan(&stages, &PinScope::unpinned(), None)
         .expect_err("the stream lane must refuse pin-blind too")
         .to_string();
@@ -134,21 +113,15 @@ fn stream_sentence(dsl: &str, pins: &FieldTypes) -> String {
     text
 }
 
-/// A same-stage chain over `n` references — over budget at 513.
 fn over_budget_let(n: usize) -> String {
     let args = vec!["x"; n].join(", ");
     format!("* | let x = abs(y), z = coalesce({args})")
 }
 
-/// The matrix: every fixture must be refused by BOTH doors with one
-/// sentence.
 fn matrix() -> Vec<String> {
     vec![
-        // let, and its `eval` spelling.
         over_budget_let(513),
         over_budget_let(513).replace("| let", "| eval"),
-        // A stage that is unstreamable on its own: the expansion sentence
-        // still wins, because the budget is checked first.
         format!(
             "* | stats abs(y) as k, coalesce({}) as z",
             vec!["k"; 513].join(", ")
@@ -161,9 +134,6 @@ fn matrix() -> Vec<String> {
             "* | eventstats abs(y) as k, coalesce({}) as z",
             vec!["k"; 513].join(", ")
         ),
-        // The tail AFTER `extract kv` is part of the same pipeline: the
-        // executor peels those stages off to run in Rust, and both doors
-        // still have to see them.
         format!(
             "* | extract kv | {}",
             over_budget_let(513).replace("* | ", "")
@@ -172,27 +142,20 @@ fn matrix() -> Vec<String> {
             "* | head 5 | extract kv | sort dur | {}",
             over_budget_let(513).replace("* | ", "")
         ),
-        // The stage cap.
         format!("*{}", " | head 1".repeat(MAX_PIPELINE_STAGES + 1)),
-        // `from saved` counts, before source resolution removes it.
         format!(
             "| from saved daily{}",
             " | head 1".repeat(MAX_PIPELINE_STAGES)
         ),
-        // A pipeline that ALSO has a projection collision: the expansion
-        // refusal comes first, in both lanes.
         format!(
             "* | let x = abs(y), z = coalesce({}) | stats count() by count",
             vec!["x"; 513].join(", ")
         ),
-        // One field over the field-list limit. The stream door refuses
-        // every `sort` as unstreamable, but the limit is checked first.
         format!("* | sort {}", wide_field_list()),
         format!("* | extract kv | dedup {}", wide_field_list()),
     ]
 }
 
-/// [`MAX_STAGE_FIELDS`] + 1 distinct field names.
 fn wide_field_list() -> String {
     (0..=MAX_STAGE_FIELDS)
         .map(|i| format!("f{i}"))
@@ -216,8 +179,6 @@ fn both_doors_refuse_with_one_sentence() {
     }
 }
 
-/// The same pipelines one reference short of the budget are admitted by
-/// both doors — the refusal is the budget, never the shape.
 #[test]
 fn the_same_pipelines_are_admitted_one_reference_short() {
     let pins = populated_pins();
@@ -232,8 +193,6 @@ fn the_same_pipelines_are_admitted_one_reference_short() {
     .expect("512 references are admitted by the SQL lane");
 
     let stages = pipeline(&over_budget_let(512));
-    // The stream lane's own refusal for this pipeline is about the STAGE,
-    // never the budget: `let` streams, so this one compiles outright.
     trawl_core::stream::compile_stream_plan(&stages, &PinScope::root(&pins), None)
         .expect("512 references are admitted by the stream lane");
 
@@ -251,9 +210,6 @@ fn the_same_pipelines_are_admitted_one_reference_short() {
         .expect("128 stages are admitted");
 }
 
-/// Admission is not a promise that every admitted stage runs in every
-/// lane: an under-budget `pivot` is still refused by the stream compiler,
-/// with its own unsupported-stage sentence.
 #[test]
 fn admission_does_not_make_a_stage_streamable() {
     let dsl = "* | pivot count() on status by host";
@@ -270,10 +226,6 @@ fn admission_does_not_make_a_stage_streamable() {
     );
 }
 
-/// The refusal is corpus-independent: the same DSL text answers the same
-/// way under an empty catalog and a populated one, at every door. A check
-/// that read pins would make a saved query admitted when it was written
-/// and refused after a repin.
 #[test]
 fn the_verdict_never_depends_on_the_catalog() {
     let empty = FieldTypes::new();
@@ -289,16 +241,9 @@ fn the_verdict_never_depends_on_the_catalog() {
         assert_eq!(a, b, "{dsl}");
     }
 
-    // And the admitted side: a pinned severity chain that fits stays
-    // fitting whatever the catalog says.
-    //
-    // It is a BARE alias of one reading, not a reading inside a severity
-    // set: since the simple-`CASE` repricing, `sev()` alone weighs ~414
-    // nodes, so `t = s` spends most of the 512 budget on its own and
-    // anything multiplying it (a twelve-run set, a token-text pattern) is
-    // refused. That refusal is the point of the repricing, and this case
-    // exists to prove the CATALOG never moves the line — not to prove
-    // where the line is.
+    // A BARE alias of one reading, not a reading inside a severity set: `sev()`
+    // alone spends most of the 512 budget, so anything multiplying it is refused.
+    // This case proves the CATALOG never moves the line, not where the line is.
     let dsl = "* | let s = sev(level), t = s";
     for scope in [PinScope::unpinned(), PinScope::root(&pins)] {
         trawl_core::stream::compile_stream_plan(&pipeline(dsl), &scope, None)

@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! App-agnostic auth types shared across fleet apps.
-
 use std::collections::BTreeMap;
 use std::str::FromStr;
 
@@ -12,23 +10,14 @@ use zeroize::Zeroizing;
 
 use crate::error::AuthError;
 
-/// Identity discriminator orthogonal to role assignments.
-///
-/// Distinguishes interactive principals (humans logging into a UI) from
-/// non-interactive ones (services calling an API). No effect on authorization
-/// by itself — apps may use it for richer audit context or to gate features
-/// (e.g. require human consent for destructive ops).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrincipalKind {
-    /// Interactive principal — a person using the UI or CLI.
     Human,
-    /// Non-interactive principal — a service or automation account.
     Service,
 }
 
 impl PrincipalKind {
-    /// Wire / database representation.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
@@ -55,78 +44,41 @@ impl FromStr for PrincipalKind {
     }
 }
 
-/// One `(app, permission)` entry in a role's permission bundle.
-///
-/// `app` is an opaque app namespace (e.g. `"trawl"`, `"coastwatch"`); the
-/// permission string is interpreted by the owning app's compile-time
-/// `Permission` enum — roles are data, permissions are code (ADR-0006).
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct RolePermission {
-    /// App namespace this permission belongs to.
     pub app: String,
-    /// App-defined permission string (e.g. `"query"`, `"stories_read"`).
     pub permission: String,
 }
 
-/// A data-defined role: a named, cross-app bundle of permission strings
-/// (ADR-0006). Keys hold any number of roles; effective permissions are the
-/// union across them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Role {
-    /// Database row id.
     pub id: i64,
-    /// Unique role name (lowercase alnum + underscore + hyphen).
     pub name: String,
-    /// Optional per-role rate ceiling (requests/minute). A key's effective
-    /// RPM is the max across its roles; when set it replaces the route
-    /// class's config default rather than being max'd or summed with it.
     pub rate_rpm: Option<u32>,
-    /// The `(app, permission)` bundle this role grants.
     pub permissions: Vec<RolePermission>,
 }
 
-/// Metadata about an API key, as stored in the database.
-///
-/// Never contains the hash or the plaintext token.
 #[derive(Debug, Clone, Serialize)]
 pub struct ApiKeyInfo {
-    /// Database row id.
     pub id: i64,
-    /// First 8 chars of the random token body (after the `flt_` prefix). Used
-    /// for identification in admin tooling and audit logs.
     pub prefix: String,
-    /// Human-readable label.
     pub name: String,
-    /// Whether the underlying principal is interactive or not.
     pub kind: PrincipalKind,
-    /// Names of every role held by this key, sorted.
     pub roles: Vec<String>,
-    /// Whether the key is active (`!revoked`).
     pub active: bool,
-    /// Creation timestamp.
     #[cfg(feature = "keystore")]
     pub created_at: chrono::DateTime<chrono::Utc>,
-    /// Optional expiration timestamp.
     #[cfg(feature = "keystore")]
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Optional last-used timestamp.
     #[cfg(feature = "keystore")]
     pub last_used: Option<chrono::DateTime<chrono::Utc>>,
-    /// Optional revocation timestamp.
     #[cfg(feature = "keystore")]
     pub revoked_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-/// The result of creating a new API key.
-///
-/// The plaintext token is returned once here and never persisted, so it must
-/// be shown to the user immediately. Wrapped in [`Zeroizing`] so it is
-/// cleared from memory on drop.
 #[derive(Clone)]
 pub struct CreatedKey {
-    /// Key metadata.
     pub info: ApiKeyInfo,
-    /// The full plaintext token.
     pub plaintext_token: Zeroizing<String>,
 }
 
@@ -139,27 +91,17 @@ impl std::fmt::Debug for CreatedKey {
     }
 }
 
-/// A verified API key identity — the result of successful authentication.
-///
-/// Carries role names (display/audit) plus the resolved per-app permission
-/// unions (gates). The union fields are private: [`VerifiedKey::from_roles`]
-/// is the single place union semantics exist, so a hand-rolled construction
-/// can never disagree with the substrate's resolution rules.
+/// The union fields are private: [`VerifiedKey::from_roles`] is the single
+/// place union semantics exist, so a hand-rolled construction can never
+/// disagree with the substrate's resolution rules.
 #[derive(Clone)]
 pub struct VerifiedKey {
-    /// Database row id.
     pub id: i64,
-    /// The key prefix for identification.
     pub prefix: String,
-    /// Human-readable name (as a UI convenience).
     pub name: String,
-    /// Whether the principal is interactive or not.
     pub kind: PrincipalKind,
-    /// Sorted role names.
     roles: Vec<String>,
-    /// Per-app permission union: app → sorted, deduped permission strings.
     permissions: BTreeMap<String, Vec<String>>,
-    /// Max `rate_rpm` across the key's roles, if any role sets one.
     rate_rpm: Option<u32>,
 }
 
@@ -184,11 +126,6 @@ impl std::fmt::Debug for VerifiedKey {
 }
 
 impl VerifiedKey {
-    /// Build a verified identity from the key row plus its resolved roles.
-    ///
-    /// The only constructor, so union semantics live here and nowhere else:
-    /// role names are sorted, per-app permissions are the deduped union
-    /// across roles, and `rate_rpm` is the max across roles that set it.
     pub fn from_roles(
         id: i64,
         prefix: impl Into<String>,
@@ -225,39 +162,28 @@ impl VerifiedKey {
         }
     }
 
-    /// Sorted names of every role this key holds.
     pub fn roles(&self) -> &[String] {
         &self.roles
     }
 
-    /// The resolved permission union for one app namespace (sorted, deduped).
-    /// Empty slice when the key has no permissions in that app.
     pub fn permissions_for(&self, app: &str) -> &[String] {
         self.permissions.get(app).map_or(&[], Vec::as_slice)
     }
 
-    /// Whether the resolved union grants `permission` in `app`.
     pub fn has_app_permission(&self, app: &str, permission: &str) -> bool {
         self.permissions
             .get(app)
             .is_some_and(|perms| perms.iter().any(|p| p == permission))
     }
 
-    /// Whether the key holds at least one permission in `app` — the
-    /// substrate-level "may enter this app at all" question
-    /// (`require_session`'s namespace gate).
     pub fn has_any_permission(&self, app: &str) -> bool {
         self.permissions.get(app).is_some_and(|p| !p.is_empty())
     }
 
-    /// Max `rate_rpm` across the key's roles, `None` when no role sets one.
     pub fn rate_rpm(&self) -> Option<u32> {
         self.rate_rpm
     }
 
-    /// Render this key's role names as `"role-a,role-b"` (sorted) for log
-    /// fields and display. Returns `"none"` when the key holds no roles so
-    /// log filters can match an explicit string instead of an absent field.
     pub fn roles_display(&self) -> String {
         if self.roles.is_empty() {
             "none".to_owned()
@@ -307,7 +233,6 @@ mod tests {
 
     #[test]
     fn from_roles_unions_overlapping_permissions() {
-        // Two overlapping roles resolve the deduped union.
         let key = key_with(vec![
             role(
                 "tier1",
@@ -327,7 +252,6 @@ mod tests {
 
     #[test]
     fn from_roles_cross_app_role_grants_in_both_namespaces() {
-        // One role spanning two apps grants in both from a single link.
         let key = key_with(vec![role(
             "bridge",
             None,
@@ -342,7 +266,6 @@ mod tests {
 
     #[test]
     fn from_roles_rate_rpm_is_max_across_roles() {
-        // Max across roles; None when every role leaves it unset.
         assert_eq!(key_with(vec![]).rate_rpm(), None);
         assert_eq!(
             key_with(vec![role("a", None, &[]), role("b", None, &[])]).rate_rpm(),

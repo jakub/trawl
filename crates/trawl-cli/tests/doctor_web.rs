@@ -5,23 +5,8 @@
 //! `trawl doctor --web-url`, observed on the real binary against a real
 //! `trawl-web` router (ADR-0047).
 //!
-//! Each test binds `127.0.0.1:0` first, so the origin the doctor probes is
-//! known before `trawl-web`'s `public_origins` is written, then serves
-//! `trawl_web::routes::build` over plain loopback HTTP. The router's
-//! upstream is an address nothing listens on: the probes never reach
-//! trawld, and a test that needed it would fail rather than pass.
-//!
-//! A recording layer in front of every router notes each request's method,
-//! path, `Origin`, whether it carried `Authorization` or `Cookie`, the
-//! `api_key` its body held, and the raw text of its headers and body. The
-//! doctor runs with a key selected (`--token-file` naming a canary), so a
-//! probe has a key it could leak. Every test asserts that no request
-//! carried a credential or the canary, and that each one is in
-//! [`trawl_cli::doctor::REQUESTS`].
-//!
-//! The API target is a closed port in every test, so the `api.*` rows fail
-//! and the verdict is `fail` throughout; the web rows are checked by id.
-//! They do not depend on the API.
+//! The router's upstream is an address nothing listens on: the probes never
+//! reach trawld, and a test that needed it would fail rather than pass.
 
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -40,7 +25,6 @@ use trawl_config::WebConfig;
 use trawl_web::config::ResolvedConfig;
 use trawl_web::state::AppState;
 
-/// One request a web origin received.
 #[derive(Debug, Clone)]
 struct Seen {
     method: String,
@@ -48,18 +32,14 @@ struct Seen {
     origin: Option<String>,
     authorization: bool,
     cookie: bool,
-    /// The body's `api_key`, when the body is JSON that has one.
     api_key: Option<String>,
-    /// Every header name and value and the body, as text.
     raw: String,
 }
 
-/// The key the doctor is given. It must reach no web origin.
 const CANARY: &str = "flt_canary00_doctorwebmustneversendthis";
 
 type Log = Arc<Mutex<Vec<Seen>>>;
 
-/// Record the request, then pass it on unchanged.
 async fn record(State(log): State<Log>, request: Request, next: Next) -> Response {
     let (parts, body) = request.into_parts();
     let bytes = axum::body::to_bytes(body, 64 * 1024)
@@ -110,7 +90,6 @@ const ACCEPTED: &str = r#"{"error":{"code":"bad_request","message":"bad request"
 const REJECTED: &str =
     r#"{"error":{"code":"forbidden","message":"cross-origin request rejected"}}"#;
 
-/// A router on an owned loopback listener, recording every request.
 struct Origin {
     url: String,
     log: Log,
@@ -148,7 +127,6 @@ impl Origin {
         }
     }
 
-    /// A real `trawl-web` whose `public_origins` is `origins(url)`.
     fn trawl_web(origins: impl FnOnce(&str) -> Vec<String>) -> Self {
         let upstream = closed_port();
         let origin = Self::serve(|url| {
@@ -167,7 +145,6 @@ impl Origin {
         }
     }
 
-    /// Something that is not `trawl-web`, answering its two paths.
     fn stub(healthz: (u16, &str), login: (u16, &str)) -> Self {
         let answer = |(status, body): (u16, &str)| {
             let body = body.to_owned();
@@ -187,8 +164,6 @@ impl Origin {
         self.log.lock().unwrap().clone()
     }
 
-    /// The requests, as `METHOD path`, after checking that none of them
-    /// carried a credential and that each is one the doctor declares.
     fn keyless_requests(&self, case: &str) -> Vec<String> {
         let requests = self.requests();
         for seen in &requests {
@@ -237,16 +212,12 @@ impl ClosedPort {
     }
 }
 
-/// A port with nothing listening on it, held for as long as the guard lives.
 fn closed_port() -> ClosedPort {
     let socket = tokio::net::TcpSocket::new_v4().expect("socket");
     socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
     ClosedPort(socket)
 }
 
-/// Run `trawl doctor --url <closed> --token-file <canary> --web-url <web>
-/// --format json` with no inherited `TRAWL_*` variables and a temp `HOME`
-/// holding the [`CANARY`] key file.
 fn doctor(web: &str) -> (Output, serde_json::Value) {
     let home = tempfile::tempdir().expect("tempdir");
     let key = home.path().join("key");
@@ -287,7 +258,6 @@ fn doctor(web: &str) -> (Output, serde_json::Value) {
     (output, report)
 }
 
-/// `(outcome, reason, blocked_by)` of the check `id`.
 fn outcome(report: &serde_json::Value, id: &str) -> (String, Option<String>, Option<String>) {
     let check = report["checks"]
         .as_array()
@@ -313,8 +283,6 @@ fn notes(report: &serde_json::Value) -> Vec<String> {
 
 const PROBES: [&str; 2] = ["GET /healthz", "POST /api/auth/login"];
 
-/// The web rows follow the API rows, and the API's failure does not block
-/// them.
 fn assert_api_failed_independently(report: &serde_json::Value, case: &str) {
     let ids: Vec<&str> = report["checks"]
         .as_array()
@@ -344,8 +312,6 @@ fn assert_api_failed_independently(report: &serde_json::Value, case: &str) {
     assert_eq!(outcome(report, "api.transport").0, "failed", "{case}");
 }
 
-/// `trawl-web` lists the origin: both web checks complete, and the report
-/// says that this does not prove the proxy reaches trawld.
 #[test]
 fn doctor_web_origin_accepted() {
     let web = Origin::trawl_web(|url| vec!["https://trawl.example.com".to_owned(), url.to_owned()]);
@@ -365,7 +331,6 @@ fn doctor_web_origin_accepted() {
             .any(|note| note == ORIGIN_ACCEPTED_NOTE),
         "{report}"
     );
-    // Only the closed API port fails the run.
     let failed: Vec<&str> = report["checks"]
         .as_array()
         .unwrap()
@@ -378,8 +343,6 @@ fn doctor_web_origin_accepted() {
     assert_eq!(web.keyless_requests("accepted"), PROBES);
 }
 
-/// `trawl-web` does not list the origin: `web.origin` fails and names the
-/// setting to change.
 #[test]
 fn doctor_web_origin_rejected() {
     let web = Origin::trawl_web(|_| vec!["https://trawl.example.com".to_owned()]);
@@ -408,8 +371,6 @@ fn doctor_web_origin_rejected() {
     assert_eq!(web.keyless_requests("rejected"), PROBES);
 }
 
-/// Login answers that are not trawl-web's: the legacy bodies, envelopes
-/// that miss by one field, key or status, and plain text.
 const FOREIGN_LOGINS: &[(&str, (u16, &str))] = &[
     ("400 legacy body", (400, r#"{"error":"bad request"}"#)),
     (
@@ -480,9 +441,6 @@ const FOREIGN_LOGINS: &[(&str, (u16, &str))] = &[
     ("401 with the accepted envelope", (401, ACCEPTED)),
 ];
 
-/// Something that answers the right statuses with other bodies is not
-/// taken for `trawl-web`; one whose health answer is not `ok` is not
-/// probed further.
 #[test]
 fn doctor_web_foreign_endpoint() {
     for &(case, login) in FOREIGN_LOGINS {
@@ -530,10 +488,6 @@ fn doctor_web_foreign_endpoint() {
     assert_eq!(web.keyless_requests("foreign health"), ["GET /healthz"]);
 }
 
-/// A probe body past the cap is too large, never judged by its prefix. A
-/// foreign endpoint whose body opens with trawl-web's exact answer, pads
-/// it with JSON whitespace to the cap, and then goes on, is not taken for
-/// `trawl-web`, for either answer `web.origin` recognizes.
 #[test]
 fn doctor_web_truncated_body_is_too_large() {
     for (case, status, signature) in [
@@ -565,11 +519,8 @@ fn doctor_web_truncated_body_is_too_large() {
     }
 }
 
-/// A plain loopback origin that answers `GET /healthz` with `200 ok`
-/// unless `cut_healthz`, and cuts every other answer short: headers that
-/// declare 100 bytes of body, 10 of them, then a closed connection. It
-/// records each request it read as [`record`] does, headers and body
-/// included, so [`Origin::keyless_requests`] applies to it.
+/// The origin records each request it read as [`record`] does, headers and
+/// body included, so [`Origin::keyless_requests`] applies to it.
 fn cut_short_origin(cut_healthz: bool) -> Origin {
     use std::io::{Read as _, Write as _};
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -656,11 +607,6 @@ fn cut_short_origin(cut_healthz: bool) -> Origin {
     }
 }
 
-/// A web answer the origin cuts short after its headers is an observed
-/// failure, not a failed connection and not a timeout: the check that
-/// read it fails with `response body broken`. A broken `/healthz` fails
-/// `web.transport` and blocks `web.origin`; a broken login answer after a
-/// good `/healthz` fails `web.origin` alone.
 #[test]
 fn doctor_web_body_cut_short_is_broken() {
     let web = cut_short_origin(true);
@@ -704,8 +650,6 @@ fn doctor_web_body_cut_short_is_broken() {
     assert_eq!(web.keyless_requests("login cut short"), PROBES);
 }
 
-/// `GET /healthz` answering 429 samples nothing: `web.transport` is
-/// `not_sampled` with `rate_limited`, and `web.origin` is not sent.
 #[test]
 fn doctor_web_health_rate_limited() {
     let web = Origin::stub((429, "slow down"), (400, ACCEPTED));

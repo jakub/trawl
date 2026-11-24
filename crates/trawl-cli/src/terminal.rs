@@ -2,15 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Sender and server text on its way to the operator's terminal
-//! (ADR-0039, amendment of 2026-11-09).
-//!
-//! Field names and event values are chosen by whoever can ingest, so a sink
-//! that can reach a terminal must show them through
-//! [`trawl_core::sanitize`]. A prose line sanitizes each value it
-//! interpolates at its own site. A table draws each header and cell through
-//! [`table_cell`]. `json` and `csv` change only on a [`Destination::Terminal`]:
-//! in a pipe or a file they carry every value exactly.
+//! Sender and server text on its way to the operator's terminal (ADR-0039).
 
 use std::io::{self, IsTerminal, Write};
 
@@ -18,21 +10,14 @@ use serde::Serialize;
 use serde_json::ser::{CharEscape, CompactFormatter, Formatter, PrettyFormatter};
 use trawl_core::sanitize::{is_unsafe_display_char, sanitize_display_text};
 
-/// Where a renderer's output goes, as far as sender text is concerned.
-///
-/// A command decides it once, from its stdout, and hands it to the
-/// renderers; a renderer never asks for itself. An `-o` file is always
-/// [`Data`](Self::Data), whatever stdout is.
+/// An `-o` file is always [`Data`](Self::Data), whatever stdout is.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Destination {
-    /// An operator reads it.
     Terminal,
-    /// A pipe or a file: `json` and `csv` carry every value exactly.
     Data,
 }
 
 impl Destination {
-    /// What this process's stdout is.
     pub fn stdout() -> Self {
         if io::stdout().is_terminal() {
             Self::Terminal
@@ -42,12 +27,6 @@ impl Destination {
     }
 }
 
-/// `value` as one line of JSON, its record-ending newline included.
-///
-/// For [`Destination::Data`] the line is `serde_json::to_writer`'s bytes.
-/// For a terminal, every unsafe character in a key or a string, at any
-/// depth, is a `\uXXXX` escape instead, so the line decodes to the same
-/// value and none of those characters reaches the terminal raw.
 pub(crate) fn write_json_line<T: Serialize + ?Sized>(
     out: &mut impl Write,
     value: &T,
@@ -64,9 +43,6 @@ pub(crate) fn write_json_line<T: Serialize + ?Sized>(
     writeln!(out)
 }
 
-/// `value` as pretty JSON: `serde_json::to_string_pretty`'s text for
-/// [`Destination::Data`], and for a terminal the same layout with every
-/// unsafe character in a key or a string escaped as in [`write_json_line`].
 pub(crate) fn json_pretty<T: Serialize + ?Sized>(
     value: &T,
     destination: Destination,
@@ -84,17 +60,8 @@ pub(crate) fn json_pretty<T: Serialize + ?Sized>(
     }
 }
 
-/// A `serde_json` formatter that writes each unsafe character of string
-/// content, keys included, as a `\uXXXX` escape, one per UTF-16 unit in
-/// lowercase hex. That covers the controls `serde_json` would spell `\n`,
-/// `\t`, `\r`, `\b` and `\f`.
-///
-/// Everything else is the wrapped formatter's: the quote, reverse solidus
-/// and solidus escapes, numbers and literals, and the whole layout, so a
-/// pretty formatter keeps its structural newlines and indentation.
 struct TerminalFormatter<F>(F);
 
-/// Write `c` as JSON `\uXXXX` escapes.
 fn write_unicode_escape<W: ?Sized + Write>(writer: &mut W, c: char) -> io::Result<()> {
     let mut units = [0; 2];
     for unit in c.encode_utf16(&mut units) {
@@ -103,8 +70,6 @@ fn write_unicode_escape<W: ?Sized + Write>(writer: &mut W, c: char) -> io::Resul
     Ok(())
 }
 
-/// Forward each named `Formatter` method, with its extra arguments, to the
-/// wrapped formatter.
 macro_rules! forward {
     ($($method:ident($($arg:ident: $ty:ty),*);)*) => {
         $(
@@ -199,13 +164,6 @@ impl<F: Formatter> Formatter for TerminalFormatter<F> {
     }
 }
 
-/// A table header or cell as the table draws it, after value presentation.
-///
-/// A line break, `\n` or `\r\n`, stays a line inside the cell: comfy-table
-/// splits a cell on `\n` and draws its borders on every line, so a break
-/// cannot leave the cell. Every other unsafe character on a line becomes
-/// U+FFFD, a tab and a lone `\r` included. Tables are a human format, so
-/// this holds wherever the table goes, an `-o` file included.
 pub(crate) fn table_cell(text: &str) -> String {
     text.replace("\r\n", "\n")
         .split('\n')

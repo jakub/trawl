@@ -2,19 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Wasm-only `localStorage` + `<html data-*>` glue around the pure
-//! parsers in [`super::prefs`].
-//!
 //! The CSS in `styles/fleet-ui.css` reads `[data-theme]` and
 //! `[data-rowstyle]` selectors. Writing them on
 //! `<html>` (not `<body>`) matches the design spec and keeps the
 //! cascade authoritative for `:root` token overrides. Prefs that no
 //! global selector reads get no attribute: the sidebar collapse state
 //! is a class on `nav.rail`, so it is persisted here and applied there.
-//!
-//! [`install`] takes a `storage_key` so each consuming app uses its own
-//! localStorage namespace — `"trawl.ui"` for trawl-web, `"coastwatch.ui"`
-//! for coastwatch-web, and so on.
 
 use leptos::prelude::*;
 use wasm_bindgen::{JsCast, JsValue, closure::Closure};
@@ -23,20 +16,6 @@ use super::prefs::{
     Details, ParseOutcome, RowStyle, Rows, Sidebar, Stored, Theme, ThemePreference, parse_stored,
 };
 
-/// Reactive UI preferences, a read-only resolved theme, and owner-scoped
-/// effects that project appearance and persist preference changes.
-///
-/// Construction is sealed: [`install`] is the only way to get a
-/// `UiPrefs`. [`UiPrefs::theme`] is binary and read-only; select an appearance
-/// through [`UiPrefs::select_theme`] and read that choice through
-/// [`UiPrefs::theme_preference`]. Reading preferences are exposed via
-/// [`UiPrefs::rowstyle`], [`UiPrefs::sidebar`], [`UiPrefs::details`]
-/// and [`UiPrefs::rows`] — each returns the underlying [`RwSignal`] so
-/// consumers can read with `.get()`, write with `.set()`, and feed into
-/// derived signals or effects.
-///
-/// Stash the returned value with `provide_context` from a top-level
-/// component so descendants can pick it up via `use_context`.
 #[derive(Debug, Clone, Copy)]
 pub struct UiPrefs {
     theme: Signal<Theme>,
@@ -48,15 +27,11 @@ pub struct UiPrefs {
 }
 
 impl UiPrefs {
-    /// The resolved Light or Dark appearance for CSS, charts, and backdrops.
-    /// System follows the current OS appearance; fixed preferences ignore it.
-    /// Change the preference with [`Self::select_theme`].
     #[must_use]
     pub fn theme(self) -> Signal<Theme> {
         self.theme
     }
 
-    /// The selected preference, independent of System's resolved appearance.
     #[must_use]
     pub fn theme_preference(self) -> Signal<ThemePreference> {
         self.theme_preference.into()
@@ -93,21 +68,9 @@ impl UiPrefs {
     }
 }
 
-/// Initialize preference signals from `localStorage` + install the
-/// effects that keep `<html>` attributes and persisted preferences in sync.
-/// Reads storage and current media state afresh, independently of the early
-/// bootstrap. Owns one dark-scheme listener until the current owner is disposed.
-/// Initialization and OS changes do not write storage. Missing or invalid
-/// stored themes select System; valid legacy Light/Dark values stay fixed.
-///
-/// `storage_key` is the localStorage key under which a JSON snapshot
-/// is persisted — pass `"trawl.ui"`, `"coastwatch.ui"`, etc.
-///
+/// Initialization and OS changes do not write storage.
 /// Call once at app boot from inside the `<App/>` body so the effects and
-/// listener belong to that reactive owner. For first styled appearance,
-/// also load `js/theme-bootstrap.js` before styles and Wasm with this same
-/// key in `data-storage-key`. Runtime installation alone makes no first-paint
-/// guarantee. Both paths leave `color-scheme` to CSS.
+/// listener belong to that reactive owner.
 #[must_use]
 pub fn install(storage_key: &'static str) -> UiPrefs {
     let stored = load(storage_key);
@@ -128,14 +91,12 @@ pub fn install(storage_key: &'static str) -> UiPrefs {
     };
 
     // Apply the fresh installation sample immediately, including a changed OS
-    // appearance since the bootstrap ran. CSS continues to own color-scheme.
+    // appearance since the bootstrap ran.
     apply_to_dom(theme.get_untracked(), stored.rowstyle);
     Effect::new(move |_| apply_to_dom(prefs.theme.get(), prefs.rowstyle.get()));
 
-    // This tracks observed session preferences, not successful persistence.
     // Starting at the loaded snapshot preserves malformed raw storage. A failed
-    // write is not retried on reselect or an OS change; only another preference
-    // change attempts a new write.
+    // write is not retried on reselect or an OS change.
     let last_observed = StoredValue::new(stored);
 
     Effect::new(move |_| {
@@ -223,9 +184,6 @@ fn write_stored(storage_key: &str, s: Stored) {
         "rows":     s.rows.as_attr(),
     });
     if let Err(err) = storage.set_item(storage_key, &payload.to_string()) {
-        // QuotaExceededError (Safari private browsing, full storage) is the
-        // realistic case. Warn so "my settings stopped sticking" surfaces in
-        // devtools instead of going to ground.
         warn(&format!(
             "fleet-ui: failed to persist prefs to localStorage `{storage_key}`: \
              {err:?}. preferences are still applied this session but won't survive reload."

@@ -3,36 +3,21 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Minimal Shell composition demo — proves the public API can be
-//! wired by an app that isn't trawl, including the [`ToastBus`] context
-//! contract: a child inside `Shell` (see [`ToastProbe`]) reaches the
-//! Shell-owned bus via `expect_context` and fires both a success and an
-//! error toast.
+//! wired by an app that isn't trawl.
 //!
 //! This is a `src/bin` target (not an `examples/` file) so `cargo check
 //! -p fleet-ui --target wasm32-unknown-unknown` — the CI wasm gate —
 //! covers it by default (a plain `cargo check` builds bins but skips
-//! examples). Compile it standalone with:
-//!
-//! ```sh
-//! cargo build -p fleet-ui --bin shell_demo --target wasm32-unknown-unknown
-//! ```
+//! examples).
 //!
 //! For a live rendered preview the crate ships `index.html` +
 //! `Trunk.toml` next to `Cargo.toml`, so `cd crates/fleet-ui && trunk
-//! serve` renders it with the real fleet-ui CSS. No backend or auth
-//! required: a success and an error toast fire on mount, and buttons
-//! re-fire on demand.
+//! serve` renders it with the real fleet-ui CSS.
 
 #[cfg(not(target_arch = "wasm32"))]
-fn main() {
-    // The demo composes wasm-only fleet-ui components. Native build
-    // is a no-op so `cargo clippy --workspace --all-targets` (which
-    // doesn't cross-compile) stays green.
-}
+fn main() {}
 
 #[cfg(target_arch = "wasm32")]
-// TopBar and Sidebar are exported via fleet-ui but mounted internally by
-// Shell — referencing them here would duplicate the chrome.
 use fleet_ui::{
     Btn, ConfirmWithReasonModal, Drawer, ErrorBanner, Icon, Login, Modal, RailItem, Shell,
     SidebarGroup, Size, TabItem, Tabs, Theme, ToastBus, UserInfo, Variant, install,
@@ -44,17 +29,6 @@ use leptos_router::components::{Route, Router, Routes};
 #[cfg(target_arch = "wasm32")]
 use leptos_router::path;
 
-/// The shader backdrop, behind fleet-ui's default-off `atmosphere`
-/// feature — `index.html` turns it on via `data-cargo-features`, so
-/// the trunk-served workbench paints it. The xtask design-cards pages
-/// are static HTML with no WebGL context, so the workbench is the only
-/// fleet-ui venue that shows the backdrop.
-///
-/// The feature-off arm is not dead weight: it is the shape every
-/// non-mounting consumer compiles, and it is what `cargo check -p
-/// fleet-ui --target wasm32-unknown-unknown` (default features) keeps
-/// building. Without the feature the vendored bundle is never linked,
-/// so wasm-bindgen emits no snippet into the dist (ADR-0012).
 #[cfg(all(target_arch = "wasm32", feature = "atmosphere"))]
 fn backdrop(theme: impl Into<Signal<Theme>>) -> impl IntoView {
     use fleet_ui::Atmosphere;
@@ -99,11 +73,6 @@ fn sidebar_groups() -> Vec<SidebarGroup> {
     ]
 }
 
-/// Stands in for a page/modal rendered inside `Shell`: it reaches the
-/// Shell-owned [`ToastBus`] via `expect_context` (never constructing its
-/// own bus or `<Toasts/>` host) and fires both a success and an error
-/// toast, verifiable with `trunk serve` alone. One of each fires on
-/// mount so a fresh load is self-evident; the buttons re-fire on demand.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn ToastProbe() -> impl IntoView {
@@ -138,10 +107,6 @@ fn ToastProbe() -> impl IntoView {
     }
 }
 
-/// Mounts the Drawer + Tabs from a non-trawl consumer: a standalone
-/// workspace-style strip with a count chip, and a drawer composing the
-/// drawer-style strip, title/actions slots, and body panes switched by
-/// the active tab.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DrawerProbe() -> impl IntoView {
@@ -193,9 +158,6 @@ fn DrawerProbe() -> impl IntoView {
     }
 }
 
-/// Mounts the modal family from a non-trawl consumer: the `Modal`
-/// shell with icon/footer/Cmd-Ctrl+Enter, and `ConfirmWithReasonModal`.
-/// Also exercises the `Btn` size axis.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn ModalProbe() -> impl IntoView {
@@ -265,12 +227,10 @@ fn DemoApp() -> impl IntoView {
     // once leptos's executor is live (which `mount_to_body` sets up
     // before it renders this component). Calling it from `main` — before
     // mount — panics with "spawn_local before a global executor was
-    // initialized". This mirrors trawl-web-ui's `App`, which likewise
-    // calls `fleet_ui::install` in its body.
+    // initialized".
     let prefs = install("fleet-ui-demo:prefs");
-    // …and, like trawl-web-ui's App, the prefs must be provided as
-    // context: TopBar's theme choices reach them via
-    // `use_context::<UiPrefs>()`; missing context hides the choices and warns.
+    // TopBar's theme choices read the prefs via `use_context::<UiPrefs>()`;
+    // missing context hides the choices and warns.
     provide_context(prefs);
 
     let groups = Signal::derive(sidebar_groups);
@@ -304,27 +264,17 @@ fn DemoApp() -> impl IntoView {
                         sidebar_active=sidebar_active
                         user=user
                         on_logout=Callback::new(|()| {})
-                        // footer is #[prop(optional)]: a footer-less app simply
-                        // omits it. The demo passes one to exercise the slot
-                        // (and the `auto` grid row sizing).
                         footer=Box::new(|| view! {
                             <div class="statusbar">"demo footer"</div>
                         }.into_any())
-                        // Bottom sidebar slot, used by trawl's Help link.
                         sidebar_bottom=ViewFn::from(|| view! {
                             <a class="it" title="Pinned — demo" href="/">
                                 <span class="lb">"Pinned"</span>
                             </a>
                         })
                     >
-                        // Child rendered inside Shell — reaches the
-                        // Shell-owned ToastBus via expect_context and fires
-                        // success + error toasts.
                         <ToastProbe/>
                         <RangeProbe/>
-                        // Hidden export sentinel — proves Icon is in scope
-                        // without re-mounting TopBar/Sidebar (which Shell
-                        // already renders internally).
                         <span hidden=true>{format!("{:?}", Icon::Question)}</span>
                     </Shell>
                 }/>
@@ -367,8 +317,6 @@ fn main() {
     mount_to_body(DemoHost);
 }
 
-/// Workbench lifecycle controls dispose the sole preference installation with
-/// its child owner. They never mount a second installation beside the first.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn DemoHost() -> impl IntoView {
@@ -386,7 +334,6 @@ fn DemoHost() -> impl IntoView {
     }
 }
 
-/// A second app's presets and refusal policy, with no live mode.
 #[cfg(target_arch = "wasm32")]
 #[component]
 fn RangeProbe() -> impl IntoView {

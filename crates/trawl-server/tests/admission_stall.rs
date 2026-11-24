@@ -19,13 +19,6 @@
 //! batch proposes a pin the in-process cache does not already hold, so
 //! every event written after the block carries a field no earlier batch
 //! had.
-//!
-//! `self_telemetry_is_admitted_where_a_trawld_named_request_is_refused`
-//! drives a real `WalLayer` flush against the same fixture shape.
-//!
-//! `overhang_stall_stays_bounded` boots over WAL planted above the caps, so
-//! the corpus is overhang (ADR-0041 slice 2), and stalls compaction the same
-//! way while refused reads feed self-telemetry.
 
 mod common;
 
@@ -60,14 +53,10 @@ fn knobs(compaction_interval_secs: u64) -> HotBufferKnobs {
     }
 }
 
-// -- requests -----------------------------------------------------------------
-
 fn client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
 
-/// `count` ndjson events for `service` with ids `{prefix}-{n}`, each
-/// carrying `extra` as additional fields.
 fn events(
     service: &str,
     prefix: &str,
@@ -104,7 +93,6 @@ async fn post(server: &TestServer, body: Vec<u8>) -> reqwest::Response {
         .unwrap()
 }
 
-/// POST and require a 200 that accepted all `expected` events.
 async fn acknowledge(server: &TestServer, body: Vec<u8>, expected: usize) {
     let response = post(server, body).await;
     assert_eq!(response.status(), 200, "{:?}", response.text().await);
@@ -113,7 +101,6 @@ async fn acknowledge(server: &TestServer, body: Vec<u8>, expected: usize) {
     assert_eq!(answer.rejected, 0, "{answer:?}");
 }
 
-/// A refusal's status and error code.
 async fn refusal(response: reqwest::Response) -> (u16, String) {
     let status = response.status().as_u16();
     let body: serde_json::Value = response.json().await.unwrap();
@@ -126,8 +113,6 @@ async fn refusal(response: reqwest::Response) -> (u16, String) {
     )
 }
 
-/// Run `dsl` over HTTP, require a 200, and return every row as a map from
-/// column name to value.
 async fn search(server: &TestServer, dsl: &str) -> Vec<BTreeMap<String, trawl_api::value::Value>> {
     let response = client()
         .post(format!("{}/api/v1/query", server.url))
@@ -164,7 +149,6 @@ fn text(row: &BTreeMap<String, trawl_api::value::Value>, column: &str) -> Option
     }
 }
 
-/// Every `id` a search for `service` returns, with its multiplicity.
 async fn id_counts(server: &TestServer, service: &str) -> BTreeMap<String, usize> {
     let mut counts = BTreeMap::new();
     for row in search(server, &format!("service={service} last=1h")).await {
@@ -174,7 +158,6 @@ async fn id_counts(server: &TestServer, service: &str) -> BTreeMap<String, usize
     counts
 }
 
-/// Assert that a search returns exactly `acked`, each id once.
 async fn assert_exactly_once(server: &TestServer, service: &str, acked: &[String]) {
     let counts = id_counts(server, service).await;
     let repeated: Vec<_> = counts.iter().filter(|(_, n)| **n != 1).collect();
@@ -188,7 +171,6 @@ async fn assert_exactly_once(server: &TestServer, service: &str, acked: &[String
     assert_eq!(found, expected, "every acknowledged event, and only those");
 }
 
-/// GET /api/v1/health: its status code and body.
 async fn health(server: &TestServer) -> (u16, serde_json::Value) {
     let response = client()
         .get(format!("{}/api/v1/health", server.url))
@@ -198,8 +180,6 @@ async fn health(server: &TestServer) -> (u16, serde_json::Value) {
     (response.status().as_u16(), response.json().await.unwrap())
 }
 
-/// The value of one exact series (name and labels) on `/metrics`, `0` when
-/// absent.
 async fn metric(server: &TestServer, series: &str) -> u64 {
     let body = client()
         .get(format!("{}/metrics", server.url))
@@ -225,7 +205,6 @@ fn hot(server: &TestServer) -> &Arc<HotBuffer> {
         .expect("ingest is enabled")
 }
 
-/// Every file under `dir`, recursively, with its size and mtime.
 fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64, std::time::SystemTime)> {
     let mut out = BTreeSet::new();
     let mut stack = vec![dir.to_path_buf()];
@@ -246,7 +225,6 @@ fn listing(dir: &Path) -> BTreeSet<(PathBuf, u64, std::time::SystemTime)> {
     out
 }
 
-/// Poll `condition` every 50 ms until it holds, or panic after `limit`.
 async fn eventually(what: &str, limit: Duration, mut condition: impl FnMut() -> bool) {
     let deadline = tokio::time::Instant::now() + limit;
     while !condition() {
@@ -258,9 +236,6 @@ async fn eventually(what: &str, limit: Duration, mut condition: impl FnMut() -> 
     }
 }
 
-// -- the catalog database -------------------------------------------------------
-
-/// The database name a DSN points at.
 fn database_name(url: &str) -> String {
     url.rsplit('/')
         .next()
@@ -269,8 +244,6 @@ fn database_name(url: &str) -> String {
         .to_owned()
 }
 
-/// Stop the database accepting connections and end every session on it.
-/// Every catalog call then fails at connect.
 async fn block_database(url: &str) {
     set_allow_connections(url, false).await;
     common::terminate_backends(url).await;
@@ -293,12 +266,6 @@ async fn set_allow_connections(url: &str, allow: bool) {
         .expect("ALTER DATABASE ... ALLOW_CONNECTIONS");
 }
 
-// -- AC14 -----------------------------------------------------------------------
-
-/// A drain that stalls behind a dead catalog ends in 503s, never in lost or
-/// doubled events: reads stay exact and `/health` says `degraded` at 200
-/// with `ingest_capacity` `refusing`. Once the catalog is back, the drain
-/// resumes and ingest is admitted again.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
@@ -341,7 +308,6 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
         compaction_stop_rx,
     );
 
-    // 1. Identifiable events, drained while the catalog is up.
     let mut acked = Vec::new();
     let (body, ids) = events(SERVICE, "before", 10, &serde_json::json!({}));
     acknowledge(&server, body, 10).await;
@@ -352,15 +318,14 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
     .await;
     assert_exactly_once(&server, SERVICE, &acked).await;
 
-    // 2. Block the catalog. Nothing written from here on can drain.
     block_database(&catalog_db).await;
     let drained_at_block = buffer.drained_batches();
     let data_at_block = listing(&data_dir);
     let chunk_failures = "trawl_compaction_operation_failures_total{operation=\"chunk\"}";
     let failures_at_block = metric(&server, chunk_failures).await;
 
-    // 3. Fill until HTTP refuses. Every event carries a field no drained
-    //    batch had, so compaction must reach the catalog to pin it.
+    // Every event carries a field no drained batch had, so compaction must
+    // reach the catalog to pin it.
     let stalled = serde_json::json!({"stall_probe": "blocked"});
     let mut round = 0;
     let refused_ids = loop {
@@ -384,7 +349,6 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
         "eight rounds of seven fit under 60"
     );
     assert_eq!(buffer.admission_state(), AdmissionState::Refusing);
-    // What still fits is admitted, up to exactly the HTTP ceiling.
     let (body, ids) = events(SERVICE, "top", 4, &stalled);
     acknowledge(&server, body, 4).await;
     acked.extend(ids);
@@ -417,15 +381,12 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
     let (status, code) = refusal(post(&server, events(SERVICE, "late", 1, &stalled).0).await).await;
     assert_eq!((status, code.as_str()), (503, "hot_buffer_full"));
 
-    // 4. Reads stay exact: parquet and hot rows, each acknowledged event
-    //    once, nothing from a refused request.
     assert_exactly_once(&server, SERVICE, &acked).await;
     let found = id_counts(&server, SERVICE).await;
     for id in &refused_ids {
         assert!(!found.contains_key(id), "refused {id} became searchable");
     }
 
-    // 5. Health: degraded at 200, only because ingest is refusing.
     let (status, body) = health(&server).await;
     assert_eq!(status, 200, "{body}");
     assert_eq!(body["status"], "degraded", "{body}");
@@ -434,8 +395,6 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
         assert_eq!(body["checks"][check], "ok", "{check}: {body}");
     }
 
-    // 6. Unblock the catalog: the drain resumes, admission reopens and
-    //    ingest is admitted again.
     unblock_database(&catalog_db).await;
     eventually(
         "the stalled batches to drain once the catalog is back",
@@ -465,12 +424,6 @@ async fn stalled_drain_refuses_ingest_and_keeps_reads_exact() {
     std::mem::forget(dir);
 }
 
-// -- AC9 ------------------------------------------------------------------------
-
-/// With HTTP at its ceiling, a real self-telemetry flush is admitted into
-/// the reserve while an HTTP request calling itself `service=trawld` is
-/// refused: the entitlement follows the code path, not the event.
-///
 /// The fixture boots no telemetry producer, so the test builds one the way
 /// trawld's `main` does: a `WalLayer` with the server's WAL writer, default
 /// env and hot buffer, fed by a subscriber and flushed by `flush_cycle`,
@@ -487,7 +440,6 @@ async fn self_telemetry_is_admitted_where_a_trawld_named_request_is_refused() {
     let trawld_refused = metric(&server, &refusals("trawld")).await;
     let http_refused = metric(&server, &refusals("http")).await;
 
-    // Fill HTTP to exactly its ceiling.
     let mut acked = 0;
     let mut round = 0;
     while acked < HTTP_CEILING {
@@ -504,12 +456,10 @@ async fn self_telemetry_is_admitted_where_a_trawld_named_request_is_refused() {
     }
     assert_eq!(buffer.charged().events, HTTP_CEILING);
 
-    // An HTTP request naming itself trawld is refused.
     let spoof = serde_json::json!({});
     let (status, code) = refusal(post(&server, events("trawld", "spoof", 1, &spoof).0).await).await;
     assert_eq!((status, code.as_str()), (503, "hot_buffer_full"));
 
-    // A real self-telemetry flush is admitted.
     let defaults = IngestConfig::default();
     let handle = WalHandle::new();
     handle.set(
@@ -544,12 +494,10 @@ async fn self_telemetry_is_admitted_where_a_trawld_named_request_is_refused() {
     );
     assert_eq!(buffer.event_count(), HTTP_CEILING + 1);
 
-    // The reserve admits telemetry only: the spoof is still refused.
     let (status, code) =
         refusal(post(&server, events("trawld", "spoof2", 1, &spoof).0).await).await;
     assert_eq!((status, code.as_str()), (503, "hot_buffer_full"));
 
-    // What a search for trawld finds is the flushed event, never a spoof.
     let rows = search(&server, "service=trawld last=1h").await;
     assert_eq!(rows.len(), 1, "{rows:?}");
     assert_eq!(
@@ -575,9 +523,6 @@ async fn self_telemetry_is_admitted_where_a_trawld_named_request_is_refused() {
     );
 }
 
-// -- AC10 (#265) ------------------------------------------------------------------
-
-/// A search's status and error code.
 async fn search_refusal(server: &TestServer, dsl: &str) -> (u16, String) {
     refusal(
         client()
@@ -591,7 +536,6 @@ async fn search_refusal(server: &TestServer, dsl: &str) -> (u16, String) {
     .await
 }
 
-/// Captured events whose `event_type` is exactly `name`.
 fn captured(
     capture: &common::audit_capture::Capture,
     name: &str,
@@ -619,9 +563,6 @@ fn captured(
 /// boot pass is the one extra. The compaction interval is three telemetry
 /// flushes long, so the loop is woken more often than a normal pass falls
 /// due, and a loop that let those wakes start passes would break the bound.
-/// Every pass logs one `coverage_proof`, which fails with the stuck file not
-/// resident. Once the catalog is back, the next pass drains everything, the
-/// proof settles the corpus, and a search counts every planted event once.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn overhang_stall_stays_bounded() {
@@ -676,7 +617,6 @@ async fn overhang_stall_stays_bounded() {
         "hydration above half the cap: every insert wakes the loop"
     );
 
-    // The catalog on a database of its own, down before the first pass.
     let catalog_db = common::create_app_database().await;
     let catalog_storage =
         trawl_server::store::StorageState::from_pool(common::app_pool(&catalog_db).await)
@@ -754,7 +694,6 @@ async fn overhang_stall_stays_bounded() {
         compaction_stop_rx,
     );
 
-    // Refused searches for the whole window, ten per interval.
     let dsl = format!("service={SERVICE} last=1h");
     let mut refused = 0;
     while loop_started.elapsed() < WINDOW {
@@ -769,8 +708,6 @@ async fn overhang_stall_stays_bounded() {
     let finished = stats.total_runs.load(std::sync::atomic::Ordering::Relaxed);
     let intervals = loop_started.elapsed().as_secs() / INTERVAL.as_secs();
 
-    // What the window offered the loop: refusals, their WARNs, and the
-    // self-telemetry inserts that wake it.
     assert_eq!(
         captured(&capture, "http_failure")
             .iter()
@@ -788,7 +725,6 @@ async fn overhang_stall_stays_bounded() {
         "the loop was woken during the stall"
     );
 
-    // The bound: the boot pass, then at most one pass per interval.
     assert!(
         proofs.len() as u64 <= intervals + 1,
         "{} passes in {intervals} intervals",
@@ -814,7 +750,6 @@ async fn overhang_stall_stays_bounded() {
         "nothing settled during the stall"
     );
 
-    // Catalog back: the next pass drains everything and settles the corpus.
     unblock_database(&catalog_db).await;
     eventually(
         "the corpus to settle once the catalog is back",

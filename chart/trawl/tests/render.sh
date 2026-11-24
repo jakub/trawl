@@ -22,10 +22,6 @@ render() {
   render_only statefulset.yaml "$@"
 }
 
-# The web sidecar's own defaults: enabled, with the one setting that has
-# no default (ADR-0016). Every case below that wants a working sidecar
-# passes these, so a case that omits publicOrigins is omitting it on
-# purpose.
 web_origin="https://trawl.example.com"
 web_enabled=(--set web.enabled=true --set-string "web.publicOrigins[0]=${web_origin}")
 
@@ -90,7 +86,6 @@ assert_claim_template() {
   fi
 }
 
-# The securityContext block of one container in a rendered StatefulSet.
 # Container and volume list entries share the same eight-space indent, so the
 # scan ends at the next entry or at the next six-space key (containers: ->
 # volumes:). Keys inside the securityContext sit two levels deeper, which is
@@ -107,8 +102,7 @@ container_security_context() {
   ' "$manifest"
 }
 
-# Counts the lines of one container's securityContext that match a pattern.
-# The block is captured ONCE and an empty capture is a failure, not a zero: a
+# An empty capture is a failure, not a zero: a
 # renamed container, or a `name:` that stops being the entry's first line,
 # would otherwise make every `expected 0` assertion pass while reading nothing.
 assert_security_context_lines() {
@@ -131,10 +125,6 @@ assert_security_context_lines() {
   fi
 }
 
-# The Secret name and key one container's env var reads, as name/key, or
-# nothing when the container does not set it. Scoped like
-# container_security_context: the container's entry, then its env block, then
-# the variable's entry up to the next one.
 env_secret_ref() {
   local manifest=$1
   local container=$2
@@ -167,8 +157,6 @@ assert_env_secret_ref() {
   fi
 }
 
-# The pod-level securityContext of a rendered StatefulSet: its six-space
-# key, up to the next six-space key.
 assert_pod_seccomp_runtime_default() {
   local manifest=$1
   local block
@@ -206,10 +194,6 @@ render --set persistence.enabled=true --set persistence.storageClass=test-data \
 assert_name_count 2 data "$data_claim"
 assert_claim_template data test-data 7Gi "$data_claim"
 
-# persistence.enabled is required (ADR-0056, amendment 2026-11-06): the data
-# claim template is unconditional, so `false` and a removed key (`null`) are
-# refused before any other check. Every cell of web x crashDump x tls.mode
-# refuses, and every accepted cell wires each `data` mount to the one claim.
 for web_cell in off on; do
   for crash_cell in off on; do
     for tls_cell in auto secret certManager; do
@@ -243,9 +227,6 @@ if grep -Fq 'TRAWL_CRASH_DUMP_' "$disabled" || grep -Eq '^[[:space:]]*(- )?name:
   exit 1
 fi
 
-# The crash-dump volume must not shadow query scratch (ADR-0056): a mount at,
-# under, or above the effective scratch directory is refused, and a neighbour
-# renders. The default scratch is <data.path>.query-scratch.
 scratch_overlap_stderr="$work_dir/scratch-overlap.err"
 scratch_overlap() {
   if render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
@@ -267,9 +248,6 @@ scratch_overlap --set-string config.server.queryScratchDir=/var/lib/trawl/scratc
 render_only configmap.yaml --set persistence.enabled=true --set crashDump.enabled=true \
   --set-string crashDump.mountPath=/var/lib/trawl/data.query-scratch-cores >"$work_dir/scratch-beside.yaml"
 
-# -- ADR-0057: the results root and [capture] ---------------------------
-
-# Defaults leave both to trawld: no results_dir line, no [capture] table.
 results_default="$work_dir/results-default.yaml"
 render_only configmap.yaml >"$results_default"
 if grep -Eq '^[[:space:]]*results_dir' "$results_default" \
@@ -278,12 +256,10 @@ if grep -Eq '^[[:space:]]*results_dir' "$results_default" \
   exit 1
 fi
 
-# A set resultsDir renders cleaned and quoted.
 results_set="$work_dir/results-set.yaml"
 render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/results/ >"$results_set"
 grep -Fxq '    results_dir = "/var/lib/trawl/results"' "$results_set"
 
-# linkOrigin (ADR-0058) is absent by default and renders quoted when set.
 if grep -Eq '^[[:space:]]*link_origin' "$results_default"; then
   echo "the default render carried link_origin" >&2
   exit 1
@@ -292,7 +268,6 @@ link_set="$work_dir/link-origin-set.yaml"
 render_only configmap.yaml --set-string config.server.linkOrigin=https://trawl.example.com >"$link_set"
 grep -Fxq '    link_origin = "https://trawl.example.com"' "$link_set"
 
-# config.capture renders its keys verbatim, strings quoted, and nothing else.
 capture_set="$work_dir/capture-set.yaml"
 render_only configmap.yaml --set config.capture.ttl_secs=3600 \
   --set-string config.capture.per_key_bytes=128MiB >"$capture_set"
@@ -305,7 +280,6 @@ if [[ $capture_lines -ne 2 ]]; then
   exit 1
 fi
 
-# config.investigation (ADR-0059) renders the same way, and not by default.
 if grep -Fxq '    [investigation]' "$results_default"; then
   echo "the default render carried an [investigation] table" >&2
   exit 1
@@ -322,7 +296,6 @@ if [[ $investigation_lines -ne 2 ]]; then
   exit 1
 fi
 
-# The results root must land on the data volume, apart from scratch.
 assert_render_fails "resultsDir off the data mount" \
   "config.server.resultsDir must be an absolute path below /var/lib/trawl" \
   render_only configmap.yaml --set-string config.server.resultsDir=/tmp/results
@@ -349,14 +322,6 @@ assert_render_fails "a crash-dump mount at the results directory" \
 render_only configmap.yaml --set-string config.server.resultsDir=/var/lib/trawl/data.results-aside \
   >"$work_dir/results-beside.yaml"
 
-# -- ADR-0023 ruling 7, amended: the capability is trawld's alone ------
-
-# The added SYS_PTRACE is the whole grant. containerd hands it to the
-# container's init process as permitted and effective, and the image's
-# cap_sys_ptrace+p file capability keeps the bit across trawld's exec of the
-# monitor, so no_new_privs stays on: allowPrivilegeEscalation must render
-# false on trawld too. The sidecars must not come along for the ride, hence a
-# render with the web sidecar on: render_only defaults it off.
 security_enabled="$work_dir/security-enabled.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \
@@ -367,8 +332,6 @@ assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
 assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
   "$security_enabled" trawld
 assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_enabled" trawld
-# The capability does not cost the pod its RuntimeDefault seccomp filter;
-# capture is verified under it (ADR-0023, amended).
 assert_pod_seccomp_runtime_default "$security_enabled"
 for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
@@ -376,9 +339,6 @@ for sidecar in init-auth init-tls-dir trawl-web; do
   assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_enabled" "$sidecar"
 done
 
-# Disabled renders the shared securityContext untouched: an explicit
-# allowPrivilegeEscalation: false and no added capability at all, so an
-# install that never enables crash dumps stays Restricted-compatible.
 security_disabled="$work_dir/security-disabled.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \
@@ -391,8 +351,6 @@ assert_security_context_lines 0 '^ +allowPrivilegeEscalation: true$' \
 assert_security_context_lines 0 '^ +- SYS_PTRACE$' "$security_disabled" trawld
 assert_pod_seccomp_runtime_default "$security_disabled"
 
-# The helper appends to whatever the operator put in securityContext, so a
-# capability they added survives and SYS_PTRACE is not added twice.
 security_operator_caps="$work_dir/security-operator-caps.yaml"
 render "${web_enabled[@]}" \
   --set persistence.enabled=true \
@@ -405,18 +363,10 @@ assert_security_context_lines 1 '^ +- SYS_PTRACE$' "$security_operator_caps" tra
 assert_security_context_lines 1 '^ +allowPrivilegeEscalation: false$' \
   "$security_operator_caps" trawld
 
-# -- ADR-0016: the browser-origin allowlist is stated, never derived -----
-
-# An enabled web sidecar with no origins refuses to render, and says which
-# knob to set. There is no default worth having: an empty list would be a
-# proxy that 403s every browser.
 assert_render_fails "web.enabled with an empty publicOrigins" \
   "web.enabled=true requires web.publicOrigins" \
   render --set web.enabled=true
 
-# An ingress host is not an origin. It carries no scheme, TLS terminates
-# wherever the operator put it, and one install answers to several names,
-# so setting one must NOT satisfy the requirement.
 assert_render_fails "an ingress host without publicOrigins" \
   "web.enabled=true requires web.publicOrigins" \
   render --set web.enabled=true --set ingress.enabled=true \
@@ -424,8 +374,6 @@ assert_render_fails "an ingress host without publicOrigins" \
   --set-string 'ingress.hosts[0].paths[0].path=/' \
   --set-string 'ingress.hosts[0].paths[0].pathType=Prefix'
 
-# Stated origins reach both halves: the generated TOML the proxy reads,
-# and the env var the chart passes to the sidecar.
 origins_config="$work_dir/origins-config.yaml"
 render_only configmap.yaml "${web_enabled[@]}" \
   --set-string 'web.publicOrigins[1]=http://localhost:8090' >"$origins_config"
@@ -440,11 +388,6 @@ render "${web_enabled[@]}" \
 assert_followed_by 'name: FLEET_SESSION_PUBLIC_ORIGINS' \
   "value: \"${web_origin},http://localhost:8090\"" "$origins_sts"
 
-# -- ADR-0004: trawld reads FLEET_DATABASE_URL; fleet-admin reads DATABASE_URL --
-
-# Both names in the trawld container read the one Secret key, so the access
-# guide's fleet-admin commands run in that container. trawl-web gets no DSN.
-# Any key name works, and the variables do not depend on the init container.
 for case in default custom no-init-auth; do
   dsn="$work_dir/dsn-${case}.yaml"
   key=DATABASE_URL
@@ -464,8 +407,6 @@ for case in default custom no-init-auth; do
     assert_env_secret_ref "fleet-db/${key}" "$dsn" init-auth DATABASE_URL
   fi
 done
-
-# -- httpRoute.backend mirrors ingress.backend ------------------------------
 
 # A backendRef port is a number, not a Service port name, so the route must
 # carry the same number service.yaml publishes for the chosen backend.
@@ -491,8 +432,6 @@ assert_route_port 9443 "${web_enabled[@]}" --set httpRoute.backend=trawld --set 
 assert_render_fails "httpRoute.backend=web without the web sidecar" \
   'httpRoute.backend=web requires web.enabled=true' \
   render_only httproute.yaml --set httpRoute.enabled=true
-# An unknown backend fails in the schema, and in the template itself when
-# schema validation is skipped.
 assert_render_fails "an unknown httpRoute.backend" \
   'must be one of' \
   render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
@@ -502,7 +441,7 @@ assert_render_fails "an unknown httpRoute.backend without schema validation" \
   render_only httproute.yaml "${web_enabled[@]}" --set httpRoute.enabled=true \
   --set httpRoute.backend=api --skip-schema-validation
 
-# Syslog zones (ADR-0050). A values file, because --set splits dotted
+# A values file, because --set splits dotted
 # and colon keys. default_timezone must land in [syslog] itself, before
 # any [syslog.*] subtable, so parse the rendered TOML as well as grep it.
 syslog_zones_values="$work_dir/syslog-zones-values.yaml"
@@ -548,7 +487,6 @@ for key, value in expected.items():
         sys.exit(f"expected syslog.{key} = {value!r}, parsed {syslog.get(key)!r}")
 EOF
 
-# Unset zones render nothing, so trawld applies its UTC default.
 syslog_default_config="$work_dir/syslog-default-config.yaml"
 render_only configmap.yaml --set config.syslog.enabled=true >"$syslog_default_config"
 if grep -Eq 'default_timezone|sender_timezones' "$syslog_default_config"; then
@@ -556,8 +494,6 @@ if grep -Eq 'default_timezone|sender_timezones' "$syslog_default_config"; then
   exit 1
 fi
 
-# Sizing (ADR-0056): the trawld and sidecar memory limits, the startup
-# probe's five minutes, and a termination grace derived from the drain.
 sizing="$work_dir/sizing.yaml"
 render "${web_enabled[@]}" >"$sizing"
 if ! grep -Eq '^      terminationGracePeriodSeconds: 60$' "$sizing"; then
@@ -647,8 +583,6 @@ printf 'config:\n  scheduler:\n    maxRunsPerSchedule: 9007199254740992\n' >"$in
 assert_render_fails "maxRunsPerSchedule: 9007199254740992" "config.scheduler.maxRunsPerSchedule" \
   render_only configmap.yaml -f "$inexact_runs"
 
-# Each container port is the port its configured listen address binds, so the
-# Service's named target ports reach a listener whatever the addresses say.
 ports="$work_dir/ports.yaml"
 render "${web_enabled[@]}" --set config.syslog.enabled=true \
   --set-string config.server.httpAddr=0.0.0.0:6000 \

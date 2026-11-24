@@ -3,23 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Every class hook a fleet-ui component emits, paired with the CSS rule
-//! that styles it.
-//!
-//! `css_chrome_parity` proves each chrome rule still lives byte-for-byte
-//! in `fleet-ui.css` and `css_move_invariant` proves its design tokens are
-//! untouched, so a hook that *is* emitted paints as intended. Neither
-//! observes whether the component still emits it: a primitive renamed to
-//! `class="modal-overlay"` leaves the byte-identical `.modal-scrim` rule
-//! green while dropping every pixel it painted, invisible to compile, to
-//! clippy, and to the CSS tests.
-//!
-//! fleet-ui compiles leptos only under `cfg(target_arch = "wasm32")`
-//! (natively it is `serde_json` + `chrono`), so no native test can *render*
+//! that styles it. fleet-ui compiles leptos only under
+//! `cfg(target_arch = "wasm32")`, so no native test can *render*
 //! these components. Instead each primitive's source is read with
-//! `include_str!` and scanned for its hooks, the same trick
-//! `css_chrome_parity` uses on the stylesheet. Rule ships plus hook
-//! emitted is as close to "renders identically" as a native test gets;
-//! the screenshot grid stays the PR-time deliverable for the rest.
+//! `include_str!` and scanned for its hooks.
 
 const MODAL_SHELL: &str = include_str!("../src/modal/shell.rs");
 const CONFIRM_REASON: &str = include_str!("../src/modal/confirm_reason.rs");
@@ -28,10 +15,6 @@ const TABS: &str = include_str!("../src/tabs.rs");
 const ERROR_BANNER: &str = include_str!("../src/error_banner.rs");
 const LOGIN: &str = include_str!("../src/login/component.rs");
 
-// Small widgets. Their tone/class *composition* is pinned by native
-// unit tests in the pure layers (badge::tone, status_dot::tone,
-// segmented::class); these source scans pin the base class hooks the
-// wasm components emit.
 const BADGE: &str = include_str!("../src/badge/component.rs");
 const BADGE_TONE: &str = include_str!("../src/badge/tone.rs");
 const STATUS_DOT_TONE: &str = include_str!("../src/status_dot/tone.rs");
@@ -65,17 +48,9 @@ const FLEET_CSS: &str = include_str!("../styles/fleet-ui.css");
 const TYPE_BUTTON: &str = "type=\"button\"";
 
 /// The source with its comment lines removed, for the negative scans:
-/// a module doc that explains why an affordance was retired names the
-/// affordance, and prose is not markup. Same trick as trawl-core's
-/// `now_anchor_contract`.
-///
-/// Block comments go first, counting nesting the way rustc does, then
-/// any line whose first non-space characters are `//`, which covers
-/// `//`, `///` and `//!` alike. A trailing comment after code on the
+/// prose is not markup. A trailing comment after code on the
 /// same line stays: removing it would need to know where string
-/// literals end, and a literal is where hooks like `title="Close
-/// (Esc)"` legitimately live. `view!` markup is not a string literal,
-/// so nothing here strips quoted text.
+/// literals end.
 fn markup_only(src: &str) -> String {
     let bytes = src.as_bytes();
     let mut kept: Vec<u8> = Vec::with_capacity(bytes.len());
@@ -131,8 +106,6 @@ fn markup_only_hides_prose_and_keeps_markup() {
     );
 }
 
-/// Assert `src` contains `hook` (a class literal or class-idiom substring),
-/// blaming the CSS rule that hook must line up with.
 fn emits(src: &str, hook: &str, styled_by: &str) {
     assert!(
         src.contains(hook),
@@ -146,11 +119,7 @@ fn emits(src: &str, hook: &str, styled_by: &str) {
 
 #[test]
 fn modal_shell_emits_the_hooks_its_css_styles() {
-    // `.modal-scrim > .modal[.modal-sm] > .m-hd(.ic/.t/.x) / .m-body / .m-ft`
-    // — the frame `modal_family_classes_shipped_with_crate` pins in
-    // css_chrome_parity.
     emits(MODAL_SHELL, r#"class="modal-scrim""#, ".modal-scrim");
-    // narrow => `modal modal-sm`, else `modal`; both selectors are styled.
     emits(MODAL_SHELL, r#""modal modal-sm""#, ".modal-sm");
     emits(MODAL_SHELL, r#""modal""#, ".modal");
     emits(MODAL_SHELL, r#"class="m-hd""#, ".modal .m-hd");
@@ -161,23 +130,12 @@ fn modal_shell_emits_the_hooks_its_css_styles() {
 
 #[test]
 fn confirm_reason_emits_field_and_reason_input() {
-    // ConfirmWithReasonModal: `.m-field` wrapper (via Field's class
-    // override) + `.reason-input` textarea, both pinned in the CSS
-    // parity test's `modal_family_classes_shipped_with_crate`.
     emits(CONFIRM_REASON, r#"class="m-field""#, ".modal .m-field");
     emits(CONFIRM_REASON, r#"class="reason-input""#, ".reason-input");
 }
 
 #[test]
 fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
-    // The `sd-*` shell css_chrome_parity's `drawer_shell_classes_shipped_
-    // with_crate` pins: scrim, panel, header (title + actions + close),
-    // body.
-    //
-    // The host's two classes are conditional on `docked` (ADR-0032):
-    // the scrim paints the overlay presentation, `.sd-host` collapses
-    // the host to `display: contents` so the docked panel becomes a
-    // child of the layout that placed it.
     emits(DRAWER, "class:sd-scrim=", ".sd-scrim");
     emits(DRAWER, "class:sd-host=", ".sd-host");
     emits(DRAWER, "class:sd-docked=", ".sd-drawer.sd-docked");
@@ -191,23 +149,12 @@ fn drawer_emits_the_sd_shell_hooks_its_css_styles() {
 
 #[test]
 fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
-    // Workspace family: `.tabs > div.t.active > span.c`. The active
-    // modifier must be `active` (weight-500 `.tabs .t.active`) and the
-    // count chip `.c` — both pinned in the CSS test.
     emits(TABS, r#"class="tabs""#, ".tabs");
     emits(TABS, r#"class="t""#, ".tabs .t");
     emits(TABS, "class:active", ".tabs .t.active");
     emits(TABS, r#"class="c""#, ".tabs .t .c");
-    // The trailing slot's wrapper: `.tabs .tabs-actions` is what keeps
-    // the consumer's actions on one line when the strip wraps.
     emits(TABS, r#"class="tabs-actions""#, ".tabs .tabs-actions");
 
-    // Drawer family: `.sd-tabs > span.tb.on`. The active modifier here is
-    // `on` (weight-600 `.sd-tabs .tb.on`) — a different idiom from the
-    // workspace `active`. `tab_strip_families_stay_distinct` pins the two
-    // weights apart on the CSS side; pin the two active-class idioms apart
-    // on the emission side so a "unify the tab strips" refactor can't
-    // collapse one family onto the other's class and shift its weight.
     emits(TABS, r#"class="sd-tabs""#, ".sd-tabs");
     emits(TABS, r#""tb on""#, ".sd-tabs .tb.on");
     assert!(
@@ -221,12 +168,6 @@ fn tabs_emits_both_strip_families_with_distinct_active_idioms() {
 
 #[test]
 fn tabs_render_a_named_tablist() {
-    // ADR-0028: the tabs are native buttons inside a named tablist,
-    // and only the tabs are inside it — the spacer, the trailing
-    // action slot and the drawer's meta text are siblings of that
-    // node, so a Save link is never announced as a tab. Scanned
-    // against the markup, so prose about a role cannot stand in for
-    // one.
     let tabs = markup_only(TABS);
     assert!(
         tabs.contains(r#"class="tablist""#) && tabs.contains("role=role"),
@@ -244,11 +185,6 @@ fn tabs_render_a_named_tablist() {
         "tabs are <button type=\"button\">: inside a form, a type-less \
          button submits it"
     );
-    // Selection-derived roving tabindex: one predicate over
-    // roving::resolve_selected, no focus state of its own (the
-    // asymmetry roving.rs documents). Going through that helper is
-    // what makes an id matching no tab select the first tab instead of
-    // leaving the strip with no tab stop at all.
     assert!(
         tabs.contains(r#"if selected.get() == Some(i) { "0" } else { "-1" }"#)
             && TABS.contains("resolve_selected"),
@@ -267,10 +203,6 @@ fn tabs_render_a_named_tablist() {
         "no element-sibling walk: the spacer and the trailing slot sit \
          in the same container and would take focus"
     );
-    // Activation is manual: arrows move focus and nothing else. The
-    // walk lives in its own function that is not handed the callback,
-    // so it cannot select — Enter and Space reach on_change through the
-    // native button's click.
     let walk = TABS
         .split_once("fn tab_keydown(")
         .expect("the arrow walk is its own function")
@@ -280,7 +212,6 @@ fn tabs_render_a_named_tablist() {
         "the arrow walk must never run on_change — arrowing across \
          trawl's ?ntab= strip would rewrite the URL under the user"
     );
-    // Both drawer families name their strip.
     assert!(
         DRAWER.contains("tabs_label") && DRAWER.contains("label=tabs_label"),
         "Drawer must require a tabs_label and forward it verbatim — the \
@@ -290,12 +221,8 @@ fn tabs_render_a_named_tablist() {
 
 #[test]
 fn badge_emits_the_bdg_class_and_not_the_rail_chip_class() {
-    // <Badge> composes `bdg {tone}` via the natively-tested badge_class.
     emits(BADGE, "badge_class(tone)", ".bdg");
     emits(BADGE_TONE, r#"format!("bdg {}""#, ".bdg");
-    // The base class must stay `bdg`: a top-level `.badge` rule would
-    // leak display/text-transform into the rail count chip, which owns
-    // `.rail .it .badge` in the same stylesheet.
     assert!(
         !BADGE_TONE.contains(r#""badge {}""#),
         "Badge must not adopt the `badge` base class — it collides with \
@@ -322,9 +249,6 @@ fn sparkline_emits_the_spark_class() {
 fn loaded_emits_the_tri_state_hint_hooks() {
     emits(LOADED, r#"class="load-hint""#, ".load-hint");
     emits(LOADED, r#"class="load-hint error""#, ".load-hint.error");
-    // The Missing arm renders on the neutral hint tone (a missing
-    // resource is not a failure — no `.error` modifier), with the
-    // subtitle hook for the explanatory second line.
     emits(LOADED, "missing_copy(label)", ".load-hint");
     emits(LOADED, r#"class="load-sub""#, ".load-hint .load-sub");
     assert!(
@@ -336,16 +260,10 @@ fn loaded_emits_the_tri_state_hint_hooks() {
 
 #[test]
 fn segmented_emits_one_strip_family_with_a_single_active_treatment() {
-    // <Segmented> composes the container class via the natively-tested
-    // segmented_class (Default/Sm/Xs x full table in segmented::class);
-    // the pure layer owns the `seg`/`seg-sm`/`seg-full` fragment.
     emits(SEGMENTED, "segmented_class(size, full)", ".seg");
     emits(SEGMENTED_CLASS, r#"String::from("seg")"#, ".seg");
     emits(SEGMENTED, r#"class="seg-opt""#, ".seg .seg-opt");
     emits(SEGMENTED, "class:on", ".seg .seg-opt.on");
-    // ADR-0003: one accent-wash active treatment. The size axis must not
-    // grow its own active rule — exactly one `.seg-opt.on` declaration
-    // ships in the stylesheet.
     let active_rules = FLEET_CSS.matches(".seg-opt.on").count();
     assert_eq!(
         active_rules, 1,
@@ -382,9 +300,6 @@ fn kbd_emits_both_chip_treatments() {
 fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
     emits(ACTIONS_MENU, r#"class="actions-wrap""#, ".actions-wrap");
     emits(ACTIONS_MENU, r#"class="btn-icon""#, ".btn-icon");
-    // The panel class is a prop of the shared menu panel now, so the
-    // hook that `.actions-menu` styles is the value ActionsMenu passes;
-    // the item classes it styles are emitted in menu.rs.
     emits(
         ACTIONS_MENU,
         r#"panel_class="actions-menu""#,
@@ -396,9 +311,6 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
         "ActionsMenu must mount the shared menu panel — a second local \
          panel is how the two menus drifted apart before ADR-0028"
     );
-    // The open panel arbitrates Escape through the overlay stack
-    // (topmost-only), like Modal and Drawer. That registration moved
-    // into menu.rs with the panel, so assert it where it lives.
     assert!(
         MENU.contains("use_overlay_layer()") && MENU.contains("is_topmost()"),
         "the shared menu panel must register an overlay layer and gate \
@@ -421,16 +333,11 @@ fn actions_menu_emits_its_hooks_and_registers_with_the_overlay_stack() {
 
 #[test]
 fn the_menu_contract_is_shared_and_walks_by_index() {
-    // Both menus mount one panel, and that panel is the only place the
-    // lifecycle lives: no second set of window listeners anywhere.
     assert!(
         !markup_only(ACTIONS_MENU).contains("use_event_listener"),
         "menu lifecycle (Escape, outside mousedown) belongs to menu.rs \
          alone — a second listener is a second contract"
     );
-    // The walk indexes commands and radio choices in one queried list. The element
-    // sibling walk it replaced hopped whatever came next, so a header
-    // or a separator could take focus.
     assert!(
         markup_only(MENU).contains(r#"[role="menuitem"], [role="menuitemradio"]"#)
             && MENU.contains("next_index"),
@@ -446,7 +353,6 @@ fn the_menu_contract_is_shared_and_walks_by_index() {
         "restore-by-cause and the index arithmetic are the two pure \
          halves this contract is native-tested through"
     );
-    // One tab stop: exactly one item at 0, the rest at -1.
     assert!(
         markup_only(MENU).contains(r#"if focused.get() == index { "0" } else { "-1" }"#),
         "menu items carry a true roving tabindex — every item tabbable \
@@ -498,9 +404,6 @@ fn theme_group_emits_its_labels_and_radio_contract() {
 
 #[test]
 fn topbar_menu_is_native_and_registers_with_the_stack() {
-    // The trigger paints through `.topbar .user` and the panel through
-    // `.user-menu`; the header/name/mail hooks are the identity block
-    // the panel renders outside role="menu".
     emits(TOPBAR, r#"class="user""#, ".topbar .user");
     emits(TOPBAR, r#"class="avatar""#, ".topbar .user .avatar");
     emits(TOPBAR, r#"class="who""#, ".topbar .user .who");
@@ -509,9 +412,6 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
     emits(TOPBAR, r#"class="mail""#, ".user-menu .hdr .mail");
     emits(MENU, r#"class="sep""#, ".user-menu .sep");
 
-    // A native trigger that reports its state, not a div with on:click.
-    // Every tag and attribute below is scanned against the markup: the
-    // module doc names each affordance it explains.
     let markup = markup_only(TOPBAR);
     assert!(
         markup.contains("<button") && markup.contains(r#"type="button""#),
@@ -523,9 +423,6 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
         "the trigger must announce that it opens a menu and whether it \
          is open"
     );
-    // One predicate for the mount and for the reported state. Split
-    // them and a lost identity unmounts the panel while the trigger
-    // still reads aria-expanded="true".
     assert!(
         markup.contains("<Show when=move || panel_open.get()>")
             && markup.contains("aria-expanded=move || panel_open.get().to_string()"),
@@ -551,7 +448,6 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
          second contract"
     );
 
-    // ADR-0025's retired controls stay absent.
     assert!(
         !markup.contains("iconbtn"),
         "the notifications bell is retired — it was never wired"
@@ -577,10 +473,6 @@ fn topbar_menu_is_native_and_registers_with_the_stack() {
 
 #[test]
 fn sidebar_emits_an_unconditional_group_wrapper_and_names_labelled_groups() {
-    // The wrapper is unconditional so `.rail .grp > a[title]` addresses
-    // every destination, labelled group or not; `role`/`aria-label` ride
-    // only the labelled ones, because a nameless role="group" is an axe
-    // defect (ADR-0032).
     let sidebar = markup_only(SIDEBAR);
     for required in [
         r#"class="grp""#,
@@ -608,10 +500,6 @@ fn sidebar_emits_an_unconditional_group_wrapper_and_names_labelled_groups() {
 
 #[test]
 fn shell_mounts_the_nav_overlay_as_a_capture_layer() {
-    // Below 900px navigation is an overlay, not a docked column: same
-    // policy the Drawer uses, so Escape only closes the topmost layer,
-    // the background stays interactive and the palette chord is inert
-    // while it is open.
     let shell = markup_only(SHELL);
     for required in [
         "FocusPolicy::Capture",
@@ -809,10 +697,6 @@ fn command_palette_class_hooks_have_viewport_and_control_styles() {
 
 #[test]
 fn modal_family_traps_focus_and_keeps_aria_modal() {
-    // The modal family renders aria-modal="true" and earns it: the shell
-    // registers FocusPolicy::Trap with the overlay stack (initial focus,
-    // Tab/Shift+Tab cycle, restore-to-opener) and hands the glue its
-    // panel element with a tabindex="-1" fallback.
     assert!(
         MODAL_SHELL.contains(r#"aria-modal="true""#),
         "the modal shell must keep aria-modal=\"true\" — it traps focus, \
@@ -833,10 +717,6 @@ fn modal_family_traps_focus_and_keeps_aria_modal() {
 
 #[test]
 fn drawer_is_an_honest_non_modal_dialog() {
-    // The drawer is non-modal by design (background stays interactive;
-    // modal-over-live-drawer is a supported stack), so it must not claim
-    // aria-modal. It keeps role="dialog" and registers
-    // FocusPolicy::Capture (initial focus + restore, no trap).
     assert!(
         DRAWER.contains(r#"role="dialog""#),
         "the drawer keeps role=\"dialog\""
@@ -863,8 +743,6 @@ fn drawer_is_an_honest_non_modal_dialog() {
         "the drawer panel needs tabindex=\"-1\" so the initial-focus \
          fallback can land on the panel itself"
     );
-    // A05: role="dialog" needs a host element that allows it, and
-    // `<aside>` is a complementary landmark, which does not.
     assert!(
         DRAWER.contains(r#"<div class="sd-drawer""#),
         "the drawer panel must be a <div> host for role=\"dialog\" (A05)"
@@ -878,10 +756,6 @@ fn drawer_is_an_honest_non_modal_dialog() {
 
 #[test]
 fn drawer_names_its_dialog_from_a_required_label() {
-    // The dialog's name is the bare entity name the consumer passes, not
-    // the text of the title slot: consumers put rename buttons, status
-    // badges and Back links there, and each one leaked into the name
-    // ("Rename errors by host", "errors by host success"). ADR-0028.
     let markup = markup_only(DRAWER);
     let signature = markup
         .split_once("pub fn Drawer(")
@@ -919,9 +793,6 @@ fn drawer_names_its_dialog_from_a_required_label() {
 
 #[test]
 fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
-    // Document / Upload / Copy, and the sidebar's Menu / PanelLeft,
-    // belong to the closed enum, each with an icon_body arm in house
-    // style.
     for glyph in ["Document", "Upload", "Copy", "Menu", "PanelLeft"] {
         assert!(
             ICON.contains(&format!("    {glyph},\n"))
@@ -929,8 +800,6 @@ fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
             "Icon::{glyph} must exist as a variant with an icon_body arm"
         );
     }
-    // The lib.rs crate doc must describe its exports by category, never
-    // by count: a hard-coded number rots the next time one lands.
     assert!(
         !LIB.contains("four typed components"),
         "lib.rs crate doc must not hard-code a component count (doc rot)"
@@ -939,10 +808,6 @@ fn icon_ships_the_slice_d_glyphs_and_the_crate_doc_is_honest() {
 
 #[test]
 fn drawer_and_tabs_meta_is_reactive() {
-    // `meta` is a reactive optional (MaybeProp) on both Tabs and the
-    // Drawer that forwards to it — live counts must tick. Static Strings
-    // still convert via `into`, so call sites with snapshot copy compile
-    // unchanged.
     assert!(
         TABS.contains("MaybeProp<String>"),
         "Tabs meta must be a reactive MaybeProp<String>"
@@ -956,9 +821,6 @@ fn drawer_and_tabs_meta_is_reactive() {
 
 #[test]
 fn copy_button_reports_through_the_shared_toast_bus() {
-    // One click-to-copy component, wired to the Shell's ToastBus (never
-    // a second bus), with the canonical "Copied" / "Copy failed" toast
-    // titles.
     assert!(
         COPY_BUTTON.contains("expect_context::<ToastBus>()"),
         "CopyButton must resolve the Shell-owned ToastBus from context"
@@ -977,16 +839,11 @@ fn copy_button_reports_through_the_shared_toast_bus() {
 
 #[test]
 fn a_toast_link_is_a_native_anchor_its_css_styles() {
-    // A toast's optional destination is a real `<a href>`: the router
-    // follows it and the ADR-0007 focus ring reaches it by keyboard.
     emits(TOAST_RUNTIME, "<a class=\"link\" href=", ".toast .link");
 }
 
 #[test]
 fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
-    // The last three pseudo-buttons in the crate (ADR-0028). Each has
-    // to be reachable by Tab and operable by Enter and Space, which no
-    // amount of CSS gives a <span on:click>.
     for (src, what) in [
         (MODAL_SHELL, "the modal close"),
         (TOAST_RUNTIME, "the toast dismiss"),
@@ -999,9 +856,6 @@ fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
              neither the keyboard nor the ADR-0007 focus ring"
         );
     }
-    // Both glyph-only controls take their whole accessible name from an
-    // aria-label: a stroked X and a multiplication sign announce as
-    // nothing useful. The class hooks stay `.x` either way.
     emits(MODAL_SHELL, "class=\"x\"", ".modal .m-hd .x");
     emits(TOAST_RUNTIME, "class=\"x\"", ".toast .x");
     assert!(
@@ -1016,14 +870,11 @@ fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
         "the toast dismiss is named by aria-label, and its × is hidden \
          decoration — read aloud, \"times\" is not a dismissal"
     );
-    // The bare copy trigger keeps the propagation stop it had as a
-    // span: it sits inside clickable rows and header bars.
     assert!(
         COPY_BUTTON.contains("e.stop_propagation();"),
         "bare-mode copy must keep e.stop_propagation() — the click would \
          otherwise also open the row the trigger sits in"
     );
-    // Neither glyph control may go back to a span with a click handler.
     for (src, name) in [
         (MODAL_SHELL, "modal/shell.rs"),
         (TOAST_RUNTIME, "toast/runtime.rs"),
@@ -1040,10 +891,6 @@ fn modal_close_toast_dismiss_and_bare_copy_are_native_buttons() {
 
 #[test]
 fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
-    // Cursor-driven list footer. The three terminal states (button /
-    // end-of-list / empty) are pinned natively in load_more::phase
-    // tests; these pin the class hooks and that the busy label is the
-    // canonical loading copy, not a bespoke string.
     emits(LOAD_MORE, r#"class="load-more""#, ".load-more");
     emits(
         LOAD_MORE,
@@ -1059,9 +906,6 @@ fn load_more_emits_its_hooks_and_the_canonical_busy_label() {
 
 #[test]
 fn when_renders_both_modes_off_the_shared_clock() {
-    // <When> renders relative (time_ago buckets) and absolute
-    // ("%Y-%m-%d %H:%M UTC" — explicit zone marker) modes, always with
-    // the full RFC 3339 form in the title attr.
     emits(WHEN, r#"class="when""#, ".when");
     assert!(
         WHEN.contains("title=") && WHEN.contains("to_rfc3339"),
@@ -1072,8 +916,6 @@ fn when_renders_both_modes_off_the_shared_clock() {
         "absolute mode renders \"%Y-%m-%d %H:%M UTC\" — nothing else in \
          the app signals timezone, the explicit marker is the point"
     );
-    // One shared tick drives every instance: <When> subscribes to
-    // clock::now_ms and must never own a timer of its own.
     assert!(
         WHEN.contains("clock::now_ms") && !WHEN.contains("Interval"),
         "<When> must subscribe to the shared clock tick, never a \
@@ -1091,8 +933,6 @@ fn error_banner_emits_error_class_with_alert_role() {
     // ErrorBanner paints via `.error-banner`, not a bare `.error`: that
     // selector would leak banner padding onto every element using
     // `error` as a state token (`.status-dot.error`, `.load-hint.error`).
-    // Pin both — the class so it paints, the role so the sanctioned a11y
-    // delta isn't silently dropped.
     emits(ERROR_BANNER, r#"class="error-banner""#, ".error-banner");
     assert!(
         ERROR_BANNER.contains(r#"role="alert""#),
@@ -1103,19 +943,12 @@ fn error_banner_emits_error_class_with_alert_role() {
 
 #[test]
 fn login_associates_its_error_with_the_input() {
-    // A04: the login error rides a sibling banner, so `role="alert"`
-    // announces it once and nothing associates it with the field it is
-    // about. The input carries aria-invalid and points
-    // aria-describedby at the banner's id, which ErrorBanner renders
-    // from its `id` prop.
     assert!(
         LOGIN.contains("aria-invalid=") && LOGIN.contains("aria-describedby="),
         "the login input must carry aria-invalid and aria-describedby — \
          without them the alert is announced once and is unreachable \
          from the invalid field (A04)"
     );
-    // One binding feeds the banner's id and the association, so the two
-    // cannot drift apart; the test pins the value and both uses.
     assert!(
         LOGIN.contains(r#""fleet-login-error""#)
             && LOGIN.contains("id=ERROR_ID")
@@ -1128,8 +961,6 @@ fn login_associates_its_error_with_the_input() {
         "ErrorBanner must render its `id` prop — an unrendered id leaves \
          login's aria-describedby pointing at nothing"
     );
-    // A05/landmarks: /login routes outside the app shell, so the card
-    // is the page's only chance at a <main>.
     assert!(
         LOGIN.contains(r#"<main class="login-shell">"#),
         "the login card must sit in a <main> landmark — /login never \
@@ -1143,11 +974,7 @@ fn login_associates_its_error_with_the_input() {
 
 #[test]
 fn atmosphere_emits_its_hook_and_is_hidden_from_the_accessibility_tree() {
-    // The shader backdrop mounts into `.atmosphere`, the fixed
-    // full-viewport layer whose CSS paints the var(--bg) fallback floor
-    // for browsers without WebGL.
     emits(ATMOSPHERE, r#"class="atmosphere""#, ".atmosphere");
-    // Pure decoration: never in the accessibility tree.
     assert!(
         ATMOSPHERE.contains(r#"aria-hidden="true""#),
         "the atmosphere layer is decorative — it must carry \
@@ -1157,8 +984,6 @@ fn atmosphere_emits_its_hook_and_is_hidden_from_the_accessibility_tree() {
 
 #[test]
 fn atmosphere_disposes_its_shader_mount_on_cleanup() {
-    // A leaked ShaderHandle keeps a rAF loop + WebGL context alive for
-    // the life of the page, one per route transition.
     assert!(
         ATMOSPHERE.contains("on_cleanup") && ATMOSPHERE.contains("dispose"),
         "Atmosphere must dispose its ShaderHandle in on_cleanup — \

@@ -2,31 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Authentication endpoints, mounted at `/api/auth/{login,logout,me}`.
-//!
-//! The login flow is:
-//! 1. Browser POSTs `{api_key}` → proxy calls upstream `/whoami` with that
-//!    bearer token to validate and fetch identity metadata.
-//! 2. On 200 (with a trawl grant), proxy encrypts the app-agnostic
-//!    `{token, name, exp}` payload into the shared `fleet_session` AEAD
-//!    cookie (`HttpOnly; SameSite=Lax; Path=/`, `Secure` per config,
-//!    `Domain=` per `shared_domain`).
-//! 3. Browser is redirected client-side by the SPA.
-//!
-//! Roles and permissions stay out of the cookie (ADR-0004): the payload
-//! must be byte-identical across fleet apps for SSO, so `me` re-derives the
-//! trawl permission set from upstream `/whoami` on every request. Under
-//! roles-as-data (ADR-0006) the gate is at least one resolved trawl
-//! permission; role names are display/audit only.
-//!
-//! Login and logout call [`fleet_auth::check_origin`] themselves, before
-//! any upstream call and before a cookie is minted or cleared, because
-//! they are the two cookie endpoints with no session to extract. `me` does
-//! not: it takes the `Session` extractor, which runs the same guard for
-//! it (ADR-0016, `middleware::session_extractor`). The check matters most
-//! on logout, where the shared `fleet_session` cookie means a forged
-//! cross-site request would sign the user out of every fleet app.
-
 use axum::Json;
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -43,35 +18,16 @@ use crate::middleware::body_deadline::BodyDeadlineElapsed;
 use crate::middleware::session_extractor::Session;
 use crate::state::AppState;
 
-/// The most a body under `/api/auth/*` may hold. An API key is about 50
-/// bytes; without this bound an unauthenticated caller could make the
-/// proxy buffer axum's default 2 MiB per login (ADR-0054, amended
-/// 2026-10-17). [`envelope_login_body_limit`] enforces it.
 pub const LOGIN_BODY_LIMIT: usize = 16 * 1024;
 
-/// The name the login limit's 413 carries, where trawld's names a setting.
 pub const LOGIN_BODY_LIMIT_NAME: &str = "the login body limit";
 
-/// Hold a login body to [`LOGIN_BODY_LIMIT`], answering every refusal with
-/// the error envelope.
-///
-/// The body is read here, up to one byte past the limit, and the bytes
-/// are handed on to the `Json` extractor, so the limit holds whatever the
-/// request's framing or content type. A declared `Content-Length` over
-/// the limit is refused before any of it is read. Nothing else can be
-/// trusted to declare the size: hyper gives `Transfer-Encoding: chunked`
-/// precedence over `Content-Length` and removes the latter from the
-/// headers the router sees, and the extractor answers a non-JSON type 415
-/// without reading the body. A body that crosses the limit as it arrives
-/// is refused 413 `request_too_large` naming the limit and its value, the
-/// shape trawld's own 413 has; nothing reaches the extractor, and trawld
-/// is never asked. The memory a login can hold is the limit, and the
-/// proxy's request count bounds how many are at once.
-///
-/// The read is under the router's body deadline
-/// (`middleware::body_deadline`), the outer layer: a body that stalls
-/// fails its read, and the deadline layer answers the request 408
-/// `timeout` whatever this function returns for it.
+/// The body is read here and the bytes are handed on to the `Json`
+/// extractor, so the limit holds whatever the request's framing or content
+/// type. Nothing else enforces it: hyper gives `Transfer-Encoding: chunked`
+/// precedence over `Content-Length` and removes the latter from the headers
+/// the router sees, and the extractor answers a non-JSON type 415 without
+/// reading the body.
 pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response {
     let too_large = || {
         ProxyError::RequestTooLarge {
@@ -115,19 +71,15 @@ pub async fn envelope_login_body_limit(request: Request, next: Next) -> Response
         .await
 }
 
-/// Request body for `POST /api/auth/login`.
 #[derive(Debug, Deserialize)]
 pub struct LoginRequest {
     pub api_key: String,
 }
 
-/// Response body for `POST /api/auth/login`.
 #[derive(Debug, Serialize)]
 pub struct LoginResponse {
     pub name: String,
-    /// Names of every role the key holds (display/audit; cross-app).
     pub roles: Vec<String>,
-    /// Server-resolved trawl permissions (the SPA's gating currency).
     pub permissions: Vec<String>,
 }
 
@@ -136,10 +88,6 @@ pub async fn login(
     headers: HeaderMap,
     Json(req): Json<LoginRequest>,
 ) -> Result<Response, ProxyError> {
-    // These two are the only handlers that ask the guard themselves,
-    // because they are the only cookie endpoints with no session to
-    // extract: login has no cookie yet and logout is throwing one away.
-    // Everywhere else the guard rides the `Session`/`Auth` extractor.
     fleet_auth::check_origin(&headers, state.public_origins(), "login")
         .map_err(|_| ProxyError::OriginMismatch)?;
 
@@ -149,9 +97,6 @@ pub async fn login(
 
     let whoami = fetch_whoami(&state, &req.api_key).await?;
 
-    // Valid key but zero trawl permissions → 403 with no cookie, so the
-    // user never gets a session for an app they can't access. Trawld 403s
-    // permissionless keys before /whoami anyway; this checks again here.
     if whoami.permissions.is_empty() {
         return Err(ProxyError::Upstream(StatusCode::FORBIDDEN));
     }
@@ -160,8 +105,6 @@ pub async fn login(
     let ttl = i64::try_from(state.session_ttl_secs())
         .map_err(|_| ProxyError::Internal("session_ttl_secs out of i64 range".into()))?;
 
-    // App-agnostic payload: {token, name, exp}, no role. Byte-identical
-    // across fleet apps, which is the SSO compatibility contract.
     let payload = SessionPayload {
         token: Zeroizing::new(req.api_key),
         name: whoami.name.clone(),
@@ -188,9 +131,6 @@ pub async fn login(
     Ok((StatusCode::OK, headers, Json(body)).into_response())
 }
 
-/// Local view of the upstream `/whoami` payload — only the fields the proxy
-/// actually uses. `permissions` is trawld's resolved trawl-namespace set
-/// (the gate); `roles` are display-only names.
 #[derive(Debug, Deserialize)]
 struct WhoAmI {
     name: String,
@@ -223,28 +163,14 @@ async fn fetch_whoami(state: &AppState, token: &str) -> Result<WhoAmI, ProxyErro
     }
 }
 
-/// Response body for `GET /api/auth/me`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MeResponse {
     pub name: String,
-    /// Names of every role the key holds (display/audit; cross-app).
     pub roles: Vec<String>,
-    /// Server-resolved trawl permissions (the SPA's gating currency).
     pub permissions: Vec<String>,
     pub exp: i64,
 }
 
-/// Identity plus roles/permissions for the SPA's auth shell.
-///
-/// Roles and permissions are fetched live from upstream `/whoami` on every
-/// call (they never live in the cookie), so a role or permission change
-/// takes effect on the next request rather than at cookie expiry. Upstream
-/// mapping:
-/// - `/whoami` 401 (key revoked/expired fleet-wide) → 401 with a clear
-///   cookie: the session is dead everywhere.
-/// - `/whoami` 200 but zero trawl permissions, or upstream 403 → 403 with
-///   the cookie preserved: the key may still hold capability in sibling
-///   apps.
 pub async fn me(
     State(state): State<AppState>,
     session: Session,
@@ -307,17 +233,10 @@ mod tests {
     use crate::routes;
     use crate::test_support::TlsUpstream;
 
-    /// The browser origin the standalone fixtures answer on.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
 
-    /// The browser origin the SSO fixtures answer on. Its sibling
-    /// `https://sibling.fleet.test` shares the parent-domain cookie and is
-    /// deliberately NOT in the list: sharing a cookie is not an origin
-    /// allowlist.
     const SSO_ORIGIN: &str = "https://trawl.fleet.test";
 
-    /// Standalone-mode state reaching the upstream `upstream` names:
-    /// a [`TlsUpstream::web_config`], or [`unreached_upstream`].
     fn test_state(upstream: WebConfig) -> AppState {
         let web = WebConfig {
             allow_insecure_cookies: true,
@@ -328,9 +247,6 @@ mod tests {
         AppState::from_config(cfg).unwrap()
     }
 
-    /// An upstream for a test whose handler answers before any upstream
-    /// call. Nothing listens at the name, so a request that did go out
-    /// would fail rather than reach something.
     fn unreached_upstream() -> WebConfig {
         WebConfig {
             upstream_url: Some("https://unused.invalid".to_owned()),
@@ -338,8 +254,6 @@ mod tests {
         }
     }
 
-    /// Upstream `/whoami` body for a key with trawl capability. The
-    /// `permissions` list is what the proxy gates on; `roles` is display.
     fn whoami_body(name: &str, role: &str, permissions: &[&str]) -> serde_json::Value {
         json!({
             "prefix": "abcd1234",
@@ -390,9 +304,7 @@ mod tests {
         assert!(set_cookie.contains("HttpOnly"));
         assert!(set_cookie.contains("SameSite=Lax"), "got: {set_cookie}");
         assert!(set_cookie.contains("Path=/"));
-        // allow_insecure_cookies=true in test => no `Secure`
         assert!(!set_cookie.contains("Secure"));
-        // no shared_domain configured => no Domain attribute
         assert!(
             !set_cookie.to_lowercase().contains("domain="),
             "got: {set_cookie}"
@@ -425,7 +337,6 @@ mod tests {
 
     #[tokio::test]
     async fn login_rejects_empty_api_key() {
-        // No upstream needed — handler must fail input validation first.
         let state = test_state(unreached_upstream());
         let app = routes::build(state);
 
@@ -442,9 +353,6 @@ mod tests {
 
     #[tokio::test]
     async fn login_no_trawl_grant_is_403_without_cookie() {
-        // Valid key, but every grant is for a sibling app. The proxy must
-        // NOT mint a session (403, no Set-Cookie) — and must NOT clear
-        // anything either: the key works elsewhere in the fleet.
         let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
@@ -515,9 +423,6 @@ mod tests {
         assert!(set_cookie.contains("Secure"));
     }
 
-    // -- cookie contract ---------------------------------------------------
-
-    /// State with `shared_domain` set — SSO mode.
     fn sso_state(upstream: WebConfig) -> AppState {
         let web = WebConfig {
             allow_insecure_cookies: true,
@@ -559,8 +464,7 @@ mod tests {
             .unwrap()
             .to_str()
             .unwrap();
-        // Full attribute contract in SSO mode. The `cookie` crate
-        // normalises the leading dot away per RFC 6265.
+        // The `cookie` crate normalises the leading dot away per RFC 6265.
         assert!(
             set_cookie.starts_with("fleet_session="),
             "got: {set_cookie}"
@@ -575,8 +479,6 @@ mod tests {
         assert!(set_cookie.contains("Max-Age=3600"), "got: {set_cookie}");
     }
 
-    /// Split a Set-Cookie header into its attribute set (everything after
-    /// the `name=value` pair), normalised for order-insensitive comparison.
     fn attribute_set(set_cookie: &str) -> std::collections::BTreeSet<String> {
         set_cookie
             .split(';')
@@ -588,9 +490,6 @@ mod tests {
 
     #[tokio::test]
     async fn clear_cookie_attributes_match_issuance() {
-        // Browsers reject clear directives whose Domain/Path/SameSite
-        // don't match the issued cookie — the clear must carry the exact
-        // attribute set login used (minus lifetime).
         let upstream = TlsUpstream::start().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
@@ -643,13 +542,8 @@ mod tests {
         );
     }
 
-    // -- cross-app cookie compat -------------------------------------------
-
     #[tokio::test]
     async fn login_cookie_is_fleet_auth_compatible_with_role_less_payload() {
-        // A cookie minted by trawl-web must decrypt via fleet_auth with a
-        // payload whose JSON shape is exactly {token, name, exp} — the
-        // byte-identical cross-app contract (no versioning exists).
         let dir = tempfile::tempdir().unwrap();
         let key_path = dir.path().join("web.key");
         let key_bytes = [0x42u8; fleet_auth::KEY_LEN];
@@ -697,8 +591,6 @@ mod tests {
             .unwrap()
             .1;
 
-        // Decrypt with an independently constructed fleet-auth key, which
-        // is what a sibling app holding the shared key does.
         let sibling_key = fleet_auth::SessionKey::from_bytes(key_bytes);
         let payload = fleet_auth::decrypt(&sibling_key, value).unwrap();
         assert_eq!(payload.name, "alice");
@@ -714,8 +606,6 @@ mod tests {
             "payload must be exactly {{token, name, exp}} — no role"
         );
     }
-
-    // -- origin validation -------------------------------------------------
 
     #[tokio::test]
     async fn login_rejects_cross_origin() {
@@ -757,11 +647,6 @@ mod tests {
 
     #[tokio::test]
     async fn logout_rejects_sso_sibling_origin_without_clearing() {
-        // A compromised sibling under the shared domain, or attacker-hosted
-        // content on one, can auto-submit a plain HTML form POST to trawl's
-        // logout endpoint. Its sibling Origin is not trusted just because it
-        // lives under the same parent-domain cookie: 403 with no Set-Cookie,
-        // so fleet_session is not cleared fleet-wide.
         let app = routes::build(sso_state(unreached_upstream()));
 
         let req = Request::builder()
@@ -783,10 +668,6 @@ mod tests {
 
     #[tokio::test]
     async fn logout_allows_the_configured_origin_with_no_host_header_at_all() {
-        // A request with an absolute URI and no `Host` header: since
-        // ADR-0016 neither is read, and the configured allowlist decides,
-        // so a request carrying only a matching `Origin` is accepted and
-        // clears the cookie.
         let app = routes::build(test_state(unreached_upstream()));
 
         let req = Request::builder()
@@ -806,10 +687,6 @@ mod tests {
 
     #[tokio::test]
     async fn logout_rejects_a_foreign_origin_whatever_the_uri_authority_says() {
-        // The request URI names the deployment's own authority and the
-        // `Origin` does not. The allowlist is the only input, so this is a
-        // refusal: the authority in the URI is the attacker's to choose
-        // as much as any header is.
         let app = routes::build(test_state(unreached_upstream()));
 
         let req = Request::builder()
@@ -836,8 +713,6 @@ mod tests {
             .mount(upstream.mock())
             .await;
 
-        // The configured origin, standalone mode → allowed. The `host`
-        // header rides along to show it changes nothing.
         let app = routes::build(test_state(upstream.web_config()));
         let req = Request::builder()
             .method("POST")
@@ -850,9 +725,6 @@ mod tests {
         let response = app.oneshot(req).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
 
-        // A sibling app under the same shared domain is a different origin
-        // and must be rejected (403, no cookie): sharing a parent-domain
-        // cookie is not an origin allowlist. See `origin_allowed`.
         let app = routes::build(sso_state(upstream.web_config()));
         let req = Request::builder()
             .method("POST")
@@ -867,8 +739,6 @@ mod tests {
         assert!(!response.headers().contains_key(header::SET_COOKIE));
     }
 
-    /// Returns just the `name=value` pair from a Set-Cookie header, ready
-    /// to send back as a Cookie request header.
     fn cookie_pair(set_cookie: &str) -> String {
         set_cookie.split(';').next().unwrap().trim().to_string()
     }
@@ -931,9 +801,6 @@ mod tests {
 
     #[tokio::test]
     async fn me_reflects_upstream_permission_change_between_calls() {
-        // Roles and permissions live upstream, not in the cookie. Mutating
-        // the mock /whoami between two calls on one cookie must be
-        // reflected, which proves a live fetch rather than cookie residue.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         let me_req = || {
@@ -953,7 +820,6 @@ mod tests {
         assert_eq!(body.roles, ["trawl-analyst"]);
         assert!(!body.permissions.contains(&"server_manage".to_owned()));
 
-        // Promote the principal upstream — same cookie, new role + perms.
         upstream.mock().reset().await;
         Mock::given(method("GET"))
             .and(path("/api/v1/whoami"))
@@ -984,8 +850,6 @@ mod tests {
 
     #[tokio::test]
     async fn me_upstream_401_clears_cookie() {
-        // Key revoked fleet-wide after login: /me must 401 AND tell the
-        // browser to drop the dead cookie.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         upstream.mock().reset().await;
@@ -1019,8 +883,6 @@ mod tests {
 
     #[tokio::test]
     async fn me_upstream_403_preserves_cookie() {
-        // Trawl grant revoked but key still valid (works in sibling apps):
-        // /me must 403 WITHOUT touching the shared cookie.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         upstream.mock().reset().await;
@@ -1046,7 +908,6 @@ mod tests {
 
     #[tokio::test]
     async fn me_grant_removed_upstream_is_403_preserving_cookie() {
-        // Same as above but via the whoami-200-without-trawl-grant branch.
         let (app, upstream, cookie) = login_and_get_cookie().await;
 
         upstream.mock().reset().await;

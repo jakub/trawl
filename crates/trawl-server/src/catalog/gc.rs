@@ -3,46 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Pin garbage collection: reclaiming catalog slots no live field holds.
-//!
-//! A pin is spent permanently on the ingest path and the cap
-//! ([`crate::store::MAX_PINNED_FIELDS`]) is install-wide, so a typo'd
-//! field name or a decommissioned sender keeps a slot forever. This module
-//! holds the pure half of the reclaim: how long "dead" is, and whether one
-//! pin qualifies on the observation axis.
-//!
-//! Two independent proofs make a pin collectable. The observation axis is
-//! the field catalog's own `field_services` history, which says nothing has
-//! written the field recently. The metadata axis is the standing corpus
-//! itself, where no parquet footer under a live env declares the column. A
-//! candidate on the first axis is a candidate to be disproved by a footer,
-//! never a decision to delete.
-//!
-//! # Threat model
-//!
-//! The negative proof ("no footer declares this column") is sound against
-//! the data root trawld owns, and that is the whole model. Under ADR-0009
-//! trawld is the single writer of `data/`: compaction publishes files, the
-//! repin engine and retention move or delete them, and nothing else is
-//! supposed to write there at all. Against that root the walk cannot be
-//! fooled, because everything it might read was put there by this process.
-//!
-//! An actor with write access INSIDE a live env directory is outside the
-//! model, deliberately. Such an actor does not need to race the walk: they
-//! plant a one-column parquet and every pin they name is proved alive
-//! forever, or they delete files and prove pins dead. The check-to-open
-//! window (lstat a path, then open it, with a replacement possible in
-//! between) grants nothing that write access does not already grant, so
-//! closing it — handle-relative opens, `O_NOFOLLOW` on every step — would
-//! buy real complexity against an attacker who has already won. The lstat
-//! checks that do exist are correctness, not a security boundary: they
-//! catch a stray symlink, a FIFO left by tooling, a directory named
-//! `x.parquet`, and they fail the run closed instead of hanging an open or
-//! following a link out of the corpus.
-//!
-//! The first half of the file is pure: no clock, no pool, no filesystem.
-//! [`PinGc`] is the engine over it, and it samples one `decided_at` for the
-//! whole run and hands the derived cutoff down, so the report, the SQL
-//! comparisons and the audit events all agree on when "now" was.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -57,60 +17,27 @@ use crate::error::ServerError;
 use crate::repin::RepinCoordinator;
 use crate::store::{CatalogStore, GcPinRow, PurgedPin, RepinJobStatus, RepinStore};
 
-/// How long a field must go unobserved before gc will consider it dead,
-/// when the request names no window of its own.
-///
-/// A month covers the shapes that legitimately go quiet without being
-/// gone: a monthly batch job, a service parked for a sprint, a host out
-/// for a long repair. Shorter windows start collecting fields that were
-/// only sleeping, and re-pinning is cheap but the conflict evidence and
-/// per-service history that die with the pin are not.
 pub const DEFAULT_DEAD_WINDOW: Duration = Duration::from_hours(24 * 30);
 
-/// The window one gc run applies, and the numbers behind it.
-///
-/// The formula lives here and only here. The CLI and the SPA render
-/// `requested`/`floor`/`effective` as the server reported them; if a
-/// client recomputed the floor it would eventually disagree with the run
-/// that actually happened, and an operator would be reading a window no
-/// deletion ever used.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DeadWindow {
-    /// The requested window in seconds, after the server default applied.
     pub requested_secs: u64,
     /// The retention floor in seconds, when a finite retention horizon
     /// exists. `None` when the global `max_age_days` or any
     /// `[retention.env.*]` entry is 0: no finite age then bounds what the
     /// corpus still holds, so nothing floors the request and it applies as
     /// given (the standing-parquet footer axis is what still guards a pin).
-    /// Reported whenever it exists, whether or not it bound the answer.
     pub floor_secs: Option<u64>,
-    /// The window applied: the larger of the request and the floor.
     pub effective_secs: u64,
 }
 
 impl DeadWindow {
-    /// The effective window as a [`Duration`].
     #[must_use]
     pub fn effective(&self) -> Duration {
         Duration::from_secs(self.effective_secs)
     }
 }
 
-/// Decide the window one gc run applies.
-///
-/// `older_than` is the operator's request, `None` meaning
-/// [`DEFAULT_DEAD_WINDOW`]. `floor_secs` is the retention floor from
-/// [`crate::retention::maximum_enabled_age_secs`] — the longest age any
-/// env still keeps data for: `None` when some env keeps its data forever,
-/// which imposes no floor at all.
-///
-/// The rule is one `max`. A window shorter than the corpus trawl still
-/// keeps would call a field dead while its data sits on disk under a live
-/// env, so retention raises the request; nothing ever lowers it. A
-/// requested `0` is honoured literally, because the footer scan is the
-/// proof that makes that safe, and an operator cleaning up after a bad shipper should
-/// not have to wait out a window for a field the corpus has never carried.
 #[must_use]
 pub fn effective_dead_window(older_than: Option<Duration>, floor_secs: Option<u64>) -> DeadWindow {
     let requested_secs = older_than.unwrap_or(DEFAULT_DEAD_WINDOW).as_secs();
@@ -122,47 +49,13 @@ pub fn effective_dead_window(older_than: Option<Duration>, floor_secs: Option<u6
     }
 }
 
-/// One pin's verdict on the observation axis.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Candidacy {
-    /// Unobserved through the whole window: a candidate, pending the
-    /// footer scan.
     Candidate,
-    /// A field whose type is trawl's to declare, not an operator's to
-    /// reclaim ([`is_contract_typed`]).
     ContractTyped,
-    /// Observed at or after the cutoff, so something still writes it.
     ObservedInWindow,
 }
 
-/// Judge one pin on the observation axis.
-///
-/// `last_seen` is the newest `field_services` observation, `cutoff` the
-/// run's `decided_at` minus the effective window.
-///
-/// Three rules, in this order:
-///
-/// 1. [`is_contract_typed`] wins over everything. The ten envelope slots
-///    are trawl's own contract; an envelope field nobody has sent lately
-///    is still the field the partition path, the peer fill and the
-///    severity ladder are built on, and its seeded pin must survive a
-///    corpus that never carried it.
-/// 2. `last_seen >= cutoff` is alive. At-the-instant counts as observed:
-///    the boundary belongs to the retained side, matching the `last_seen`
-///    window the schema routes apply.
-/// 3. Everything else, including a pin never observed at all, is a
-///    candidate.
-///
-/// Rule 3 is a deliberate divergence from `/api/v1/schema`'s listing rule,
-/// where a never-observed pin is always shown rather than windowed out
-/// (a pin with no observation has no `last_seen` to compare, and hiding it
-/// would make the seeded envelope invisible). The listing errs toward
-/// showing; gc errs toward reclaiming, because a pin with no observation
-/// and no carrier file is exactly the accidental slot this exists to
-/// free: a `curl` typo pinned once, never written, never seen again. The
-/// envelope stays safe through rule 1, not through the never-observed
-/// case, and the metadata axis still has to agree before anything is
-/// deleted.
 #[must_use]
 pub fn candidacy(
     field: &str,
@@ -178,49 +71,20 @@ pub fn candidacy(
     }
 }
 
-/// How long any READ-ONLY postgres operation performed under the corpus
-/// gate may take before the run gives up on it.
-///
-/// The gate is held across every one of them, and while it is held no
-/// compaction batch can publish, so a postgres that has stopped answering
-/// must not translate into an ingest stall of unbounded length. One budget
-/// per operation rather than one for the whole gated section: each is a
-/// single round trip, and a per-call bound is the one an operator can read
-/// off the refusal.
-///
 /// Read-only only. Cancelling a read costs the answer and nothing else;
 /// cancelling the purge would abandon a transaction whose commit may still
 /// land, which is why that one is bounded inside postgres instead
 /// ([`crate::store::CatalogStore::delete_pins`]).
 const IN_GATE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How many offending paths a fail-closed refusal names. The rest are a
-/// count: an operator needs a place to start, not a directory listing.
 const MAX_REPORTED_PATHS: usize = 3;
 
-/// Who asked for a run, for the audit record.
-///
-/// Name and key prefix only. The prefix is the stable, non-secret head of
-/// the API key id that already identifies an actor elsewhere in trawl's
-/// audit events, so two runs by the same key are recognisably the same
-/// hand without the record carrying a credential.
-///
-/// Deliberately its own type rather than a borrow of the request's auth
-/// context: the run outlives the request (see [`PinGc::run`]), so it needs
-/// owned strings.
 #[derive(Debug, Clone, Default)]
 pub struct GcActor {
-    /// The key's human-facing name, when it has one.
     pub name: Option<String>,
-    /// Stable non-secret prefix of the key id.
     pub key_prefix: Option<String>,
 }
 
-/// The pin garbage collector — one per ingest-enabled daemon.
-///
-/// A query-only node owns nothing under the data root and so cannot prove
-/// the metadata axis; it holds no engine at all
-/// ([`crate::state::AppState::gc`] is `None` there).
 #[derive(Debug, Clone)]
 pub struct PinGc {
     store: CatalogStore,
@@ -228,18 +92,7 @@ pub struct PinGc {
     cache: Arc<FieldCatalog>,
     coordinator: Arc<RepinCoordinator>,
     data_dir: PathBuf,
-    /// The retention floor in seconds
-    /// ([`crate::retention::maximum_enabled_age_secs`]), resolved once at
-    /// construction because retention config is fixed for the process.
     retention_floor_secs: Option<u64>,
-    /// Admission: one run at a time, per engine.
-    ///
-    /// Try-lock, never await. A queued second run would hold nothing while
-    /// it waited and then take the corpus gate for another full footer
-    /// scan, so two operators hammering the route would stall compaction
-    /// for as long as they kept it up. It is also a run whose candidate set
-    /// was read before the first run deleted anything, which has no useful
-    /// answer to give. The honest reply is 409 now.
     admission: Arc<tokio::sync::Mutex<()>>,
     /// Test-only observation and hold points, held on the engine rather
     /// than in a static so one test's armed hold cannot leak into another
@@ -248,19 +101,11 @@ pub struct PinGc {
     hooks: Arc<TestHooks>,
 }
 
-/// Test-only synchronisation points inside [`PinGc::run`].
-///
-/// Two orderings a gc test needs and cannot get from a sleep. Whether a run
-/// currently holds admission, so a second caller's 409 is asserted against a
-/// fact rather than a guess; and a hold right after the candidate read, so a
-/// concurrent catalog write provably lands between that read and the purge.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug)]
 struct TestHooks {
     admitted: std::sync::atomic::AtomicBool,
-    /// `true` while a test wants the run parked after its candidate read.
     post_candidate_hold: tokio::sync::watch::Sender<bool>,
-    /// `true` while a run is actually parked there.
     post_candidate_parked: std::sync::atomic::AtomicBool,
 }
 
@@ -290,22 +135,12 @@ impl Drop for AdmissionSignal {
     }
 }
 
-/// What the footer scan proved, and what it cost.
 #[derive(Debug)]
 struct Walk {
-    /// Candidates still undisproved: no scanned footer named them.
     dead: BTreeSet<String>,
-    /// Parquet footers actually read.
     files_scanned: u64,
 }
 
-/// Paths the walk could not make sense of, for one fail-closed message.
-///
-/// The message is a free-text 409, so it reaches the wire and every record
-/// of the failure (ADR-0040, amendment of 2026-11-08). It names each path
-/// relative to the data root and each I/O failure by its
-/// [`std::io::ErrorKind`]; the absolute path and the error text go to a
-/// DEBUG event only.
 #[derive(Debug)]
 pub(crate) struct Problems {
     root: PathBuf,
@@ -322,7 +157,6 @@ impl Problems {
         }
     }
 
-    /// Record `path` with a reason trawl wrote.
     pub(crate) fn note(&mut self, path: &Path, why: &str) {
         self.count += 1;
         if self.shown.len() < MAX_REPORTED_PATHS {
@@ -331,8 +165,6 @@ impl Problems {
         }
     }
 
-    /// Record `path` as failing with `e`: the kind in the message, the text
-    /// at DEBUG.
     pub(crate) fn note_io(&mut self, path: &Path, what: &str, e: &std::io::Error) {
         tracing::debug!(
             event_type = "catalog_gc_unreadable_path",
@@ -343,7 +175,6 @@ impl Problems {
         self.note(path, &format!("{what}: {}", e.kind()));
     }
 
-    /// Record a parquet whose column names could not be read.
     pub(crate) fn note_parquet(
         &mut self,
         path: &Path,
@@ -358,7 +189,6 @@ impl Problems {
         self.note(path, &parquet_problem(e));
     }
 
-    /// The refusal message, or `None` when the walk was clean.
     pub(crate) fn refusal(&self) -> Option<String> {
         (self.count > 0).then(|| {
             format!(
@@ -372,9 +202,6 @@ impl Problems {
     }
 }
 
-/// `path` named relative to the data root, env component included
-/// (`prod/junk.parquet`). The root itself is "the data root". A path the
-/// root does not prefix is named by that fact, never by its absolute form.
 pub(crate) fn root_relative(root: &Path, path: &Path) -> String {
     match path.strip_prefix(root) {
         Ok(rel) if rel.as_os_str().is_empty() => "the data root".to_owned(),
@@ -383,9 +210,6 @@ pub(crate) fn root_relative(root: &Path, path: &Path) -> String {
     }
 }
 
-/// Why a parquet's column names could not be read, from the variant alone.
-/// Every variant's text carries the absolute path, and the footer's carries
-/// parser text, so none of it is used.
 pub(crate) fn parquet_problem(e: &trawl_engine::parquet_stats::ParquetStatsError) -> String {
     use trawl_engine::parquet_stats::ParquetStatsError;
     match e {
@@ -399,7 +223,6 @@ pub(crate) fn parquet_problem(e: &trawl_engine::parquet_stats::ParquetStatsError
     }
 }
 
-/// The refusal when the repin evidence check itself fails.
 pub(crate) fn unreadable_evidence_refusal(kind: std::io::ErrorKind) -> String {
     format!(
         "pin gc cannot tell whether a repin owns the data root (checking \
@@ -408,7 +231,6 @@ pub(crate) fn unreadable_evidence_refusal(kind: std::io::ErrorKind) -> String {
     )
 }
 
-/// The refusal when the data root cannot be listed at all.
 pub(crate) fn data_root_unreadable_refusal(kind: std::io::ErrorKind) -> String {
     format!(
         "pin gc cannot read the data root ({kind}), so it cannot prove any \
@@ -418,8 +240,6 @@ pub(crate) fn data_root_unreadable_refusal(kind: std::io::ErrorKind) -> String {
 }
 
 impl PinGc {
-    /// Build the engine. `retention_floor_secs` comes from
-    /// [`crate::retention::maximum_enabled_age_secs`].
     #[must_use]
     pub fn new(
         store: CatalogStore,
@@ -442,8 +262,6 @@ impl PinGc {
         }
     }
 
-    /// Test-only: whether a run holds admission right now. A second run's
-    /// 409 is only meaningful once this is true.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn admission_held(&self) -> bool {
@@ -452,15 +270,11 @@ impl PinGc {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Test-only: park the next run between its candidate read and the
-    /// corpus gate, until [`Self::release_post_candidate_hold`].
     #[cfg(any(test, feature = "test-support"))]
     pub fn arm_post_candidate_hold(&self) {
         self.hooks.post_candidate_hold.send_replace(true);
     }
 
-    /// Test-only: whether a run is parked in that hold right now — the
-    /// rising edge a test waits for before it writes to the catalog.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn parked_after_candidate_read(&self) -> bool {
@@ -469,13 +283,11 @@ impl PinGc {
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// Test-only: let the parked run continue.
     #[cfg(any(test, feature = "test-support"))]
     pub fn release_post_candidate_hold(&self) {
         self.hooks.post_candidate_hold.send_replace(false);
     }
 
-    /// The run's side of the hold: a no-op unless a test armed it.
     #[cfg(any(test, feature = "test-support"))]
     async fn hold_after_candidate_read(&self) {
         let mut rx = self.hooks.post_candidate_hold.subscribe();
@@ -491,21 +303,12 @@ impl PinGc {
             .store(false, std::sync::atomic::Ordering::SeqCst);
     }
 
-    /// Run one collection, dry or real.
-    ///
     /// The whole run happens in a spawned task the caller merely awaits.
     /// axum drops a handler future the moment the client disconnects, and
     /// this run has a window — between the postgres commit and the cache
     /// eviction — where being dropped would leave the pin gone from the
     /// store and present in the cache. Owned by its own task, the sequence
     /// always finishes; a caller that walked away only loses the response.
-    ///
-    /// # Errors
-    /// [`ServerError::Conflict`] when another run is already in progress,
-    /// when a repin owns the data root, when the corpus cannot be proved
-    /// (unreadable path, foreign parquet), or when a gated store call times
-    /// out; [`ServerError::Store`] for a postgres failure;
-    /// [`ServerError::Panicked`] if the run or its scan task panics.
     pub async fn run(
         self: &Arc<Self>,
         older_than: Option<Duration>,
@@ -520,16 +323,12 @@ impl PinGc {
         }
     }
 
-    /// The engine sequence, on its own task.
     async fn run_owned(
         self: Arc<Self>,
         older_than: Option<Duration>,
         dry_run: bool,
         actor: GcActor,
     ) -> Result<trawl_api::GcPinsResponse, ServerError> {
-        // 0. Admission: this engine runs one collection at a time, and a
-        //    second caller is told so immediately rather than queued behind
-        //    a gate-holding scan.
         let Ok(_admitted) = self.admission.try_lock() else {
             return Err(ServerError::Conflict(
                 "a pin gc run is already in progress; wait for it to finish \
@@ -545,16 +344,13 @@ impl PinGc {
             AdmissionSignal(Arc::clone(&self.hooks))
         };
 
-        // 1. Entry checks, before any work: a repin rearranging the corpus
-        //    makes every footer proof provisional.
         self.refuse_if_repin_owns_the_corpus().await?;
 
-        // 2. One clock for the whole run.
+        // One clock for the whole run.
         let decided_at = Utc::now();
         let window = effective_dead_window(older_than, self.retention_floor_secs);
         let cutoff = cutoff_for(decided_at, window.effective_secs);
 
-        // 3. The observation axis.
         let rows: Vec<GcPinRow> = self
             .store
             .pins_unobserved_since(cutoff)
@@ -563,8 +359,6 @@ impl PinGc {
             .filter(|row| candidacy(&row.field, row.last_seen, cutoff) == Candidacy::Candidate)
             .collect();
         if rows.is_empty() {
-            // Nothing to disprove: no gate, no walk. Compaction keeps
-            // running through a gc that has nothing to do.
             let response = Report {
                 window: &window,
                 decided_at,
@@ -579,8 +373,6 @@ impl PinGc {
             return Ok(response);
         }
 
-        // 4. The metadata axis, under the corpus write gate: no compaction
-        //    batch may publish a file between the scan and the delete.
         #[cfg(any(test, feature = "test-support"))]
         self.hold_after_candidate_read().await;
         let gate = self.coordinator.cutover_guard().await;
@@ -595,8 +387,6 @@ impl PinGc {
             deleted,
         } = outcome?;
 
-        // The metric counts rows postgres actually deleted, so it is
-        // incremented after the commit and never on a dry run.
         if deleted > 0 {
             metrics::counter!(crate::metrics::CATALOG_PINS_GC_TOTAL).increment(deleted);
         }
@@ -619,9 +409,6 @@ impl PinGc {
         Ok(response)
     }
 
-    /// Everything that happens under the corpus gate: the re-check, the
-    /// walk, and (for a real run) the purge and the cache eviction.
-    ///
     /// One function so the gate's scope is one `await` in the caller and
     /// the eviction provably precedes the release.
     async fn prove_and_purge(
@@ -653,11 +440,6 @@ impl PinGc {
             .map_err(ServerError::Conflict)?;
 
         if dry_run || walk.dead.is_empty() {
-            // A dry run mutates nothing at all: no delete, no eviction, no
-            // generation bump. That is the whole safety story for a command
-            // whose real form is irreversible. A real run with an empty set
-            // takes the same exit for the simpler reason that there is
-            // nothing to delete.
             let pins = rows
                 .iter()
                 .filter(|row| walk.dead.contains(&row.field))
@@ -691,10 +473,6 @@ impl PinGc {
             // and over-evict every candidate.
             Err(crate::store::StoreError::PurgeCommitUnknown) => {
                 self.cache.evict_many(fields.iter().map(String::as_str));
-                // The same over-correction the eviction makes: postgres may
-                // have deleted the rows, so every cached derivation of the
-                // pin set has to be rebuilt whether or not this map held
-                // them.
                 self.cache.touch_generation();
                 return Err(ServerError::ServiceUnavailable(format!(
                     "pin gc's purge could not confirm its commit, so whether {} pin(s) \
@@ -717,9 +495,6 @@ impl PinGc {
                 // gate.
                 self.reconcile_cache(&fields).await;
                 return Err(match e {
-                    // The purge transaction's own running-row check is the
-                    // authority on the claim race, and it refuses inside
-                    // the transaction, so nothing was deleted.
                     crate::store::StoreError::RepinAlreadyRunning => ServerError::Conflict(
                         "a repin job claimed the catalog while pin gc was proving its \
                          candidates dead, so the purge refused and deleted nothing; \
@@ -762,9 +537,6 @@ impl PinGc {
         })
     }
 
-    /// Settle the pin cache against postgres after a purge that failed
-    /// BEFORE its commit, while the corpus gate is still held.
-    ///
     /// Every error this serves comes from the purge's pre-commit phase — a
     /// failed statement, a refused claim, the client-side prepare bound —
     /// and none of them can have committed anything. That is what makes
@@ -779,20 +551,6 @@ impl PinGc {
     /// conforms new batches to it. So the failure of the reconcile READ is
     /// resolved by over-evicting every candidate, never by leaving the
     /// cache alone.
-    ///
-    /// The read is bounded by [`IN_GATE_TIMEOUT`] like the other gated
-    /// reads: cancelling it is safe, and the timeout arm evicts everything
-    /// anyway.
-    ///
-    /// One error never gets here at all.
-    /// [`crate::store::StoreError::PurgeCommitUnknown`] means the commit
-    /// was reached and its outcome is unknown — detached and still running,
-    /// or failed by a backend that may have made it durable first — and a
-    /// read racing that can answer with the state on either side of it.
-    /// Reading "still pinned" a microsecond early would leave the cache
-    /// holding pins postgres has deleted, which is the corruption this
-    /// whole asymmetry exists to prevent, so that arm skips the read and
-    /// over-evicts unconditionally.
     async fn reconcile_cache(&self, fields: &[String]) {
         match self
             .in_gate(
@@ -829,12 +587,6 @@ impl PinGc {
         }
     }
 
-    /// Refuse while a repin owns the data root: marker, shadow or aside
-    /// root present.
-    ///
-    /// Unreadable evidence is evidence. `in_flight_evidence` is fallible
-    /// exactly so that an I/O error cannot read as "go ahead", and gc is
-    /// one of the two callers that must not proceed on a maybe.
     fn refuse_if_repin_owns_the_root(&self) -> Result<(), ServerError> {
         match crate::repin::in_flight_evidence(&self.data_dir) {
             Ok(None) => Ok(()),
@@ -854,10 +606,6 @@ impl PinGc {
         }
     }
 
-    /// The postgres half of the same question, over a job row already read.
-    ///
-    /// Split from the read so the gated caller can put the read behind
-    /// [`Self::in_gate`] without a second copy of the verdict.
     fn refuse_if_repin_job_running(
         job: Option<&crate::store::RepinJob>,
     ) -> Result<(), ServerError> {
@@ -872,21 +620,11 @@ impl PinGc {
         }
     }
 
-    /// Both halves, off the gate: the entry check.
     async fn refuse_if_repin_owns_the_corpus(&self) -> Result<(), ServerError> {
         self.refuse_if_repin_owns_the_root()?;
         Self::refuse_if_repin_job_running(self.repin_store.latest().await?.as_ref())
     }
 
-    /// Run one postgres operation under the corpus gate, bounded by
-    /// [`IN_GATE_TIMEOUT`].
-    ///
-    /// Every gated store call goes through here, not just the purge. The
-    /// gate excludes whole compaction batches, so a postgres that stops
-    /// answering during the re-check stalls ingest exactly as one that
-    /// stops answering during the delete would. A timeout is UNKNOWN, never
-    /// a pass: `what` names the operation and the remedy is always the same
-    /// one, a dry run that reports the catalog's real state.
     async fn in_gate<T>(
         &self,
         what: &str,
@@ -905,27 +643,17 @@ impl PinGc {
     }
 }
 
-/// Everything the wire report is built from.
-///
-/// A struct rather than seven positional arguments, because six of them
-/// are numbers and two of those are windows in seconds.
 struct Report<'a> {
     window: &'a DeadWindow,
     decided_at: DateTime<Utc>,
     dry_run: bool,
-    /// How many candidates the observation axis produced.
     pins_examined: usize,
-    /// The pins the run reports: what the purge transaction returned on a
-    /// real run, what the footer scan left undisproved on a dry one.
     pins: &'a [PurgedPin],
     files_scanned: u64,
-    /// Rows postgres reported deleted; 0 on a dry run.
     deleted: u64,
 }
 
 impl Report<'_> {
-    /// One shape for a dry run and a real one — `dry_run` and `deleted`
-    /// are what tell them apart.
     fn build(self) -> trawl_api::GcPinsResponse {
         // Both producers are field-sorted already (`pins_unobserved_since`
         // orders by field, the purge sorts its RETURNING set), so the
@@ -954,8 +682,6 @@ impl Report<'_> {
     }
 }
 
-/// One candidate as the pre-gate snapshot described it, for the dry run.
-///
 /// A dry run deletes nothing, so there is no transaction to read the
 /// current row from and nothing to audit; `pinned_from` is the one field
 /// the candidate query does not carry and no report renders it.
@@ -970,7 +696,6 @@ fn projected(row: &GcPinRow) -> PurgedPin {
     }
 }
 
-/// The run summary: one event per run, dry or real.
 fn log_complete(r: &trawl_api::GcPinsResponse, actor: &GcActor, gate_held_ms: u64) {
     tracing::info!(
         event_type = "catalog_pin_gc_complete",
@@ -989,8 +714,6 @@ fn log_complete(r: &trawl_api::GcPinsResponse, actor: &GcActor, gate_held_ms: u6
     );
 }
 
-/// The purge's outcome, so the caller can release the gate before it
-/// touches metrics or logs.
 #[derive(Debug)]
 struct Purged {
     pins: Vec<PurgedPin>,
@@ -998,14 +721,6 @@ struct Purged {
     deleted: u64,
 }
 
-/// One audit record per pin actually deleted (execution only).
-///
-/// The catalog row is gone after this, so everything the record needs is
-/// in it: what the pin was, who set it, when it was taken, when it was last
-/// observed, and the window that judged it. Every one of those comes from
-/// the purge transaction, not from the candidate snapshot the run started
-/// with, so a repin that finished in between cannot make the record name a
-/// type the row no longer had.
 fn log_deleted(pin: &PurgedPin, r: &trawl_api::GcPinsResponse, actor: &GcActor) {
     tracing::info!(
         event_type = "catalog_pin_gc",
@@ -1026,8 +741,6 @@ fn log_deleted(pin: &PurgedPin, r: &trawl_api::GcPinsResponse, actor: &GcActor) 
     );
 }
 
-/// `decided_at` minus the window, clamped at the unix epoch.
-///
 /// `max_age_days` is an unvalidated operator number, in the global and in
 /// every `[retention.env.*]` override, so an "effectively never" retention
 /// floor lands here as a window no subtraction can hold.
@@ -1055,33 +768,6 @@ fn iso8601(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// Walk the standing corpus and remove from `dead` every field some
-/// parquet footer declares.
-///
-/// Blocking (one `read_dir` per directory, one footer read per file), so
-/// callers run it on the blocking pool.
-///
-/// The scan domain is every `*.parquet` under each valid live `data/{env}/`
-/// tree: hourly files, daily rollups, and anything else that happens to sit
-/// there, because presence in the query glob is exactly what makes a file's
-/// footer evidence. `data/scheduled/` and `wal/` are excluded by the env
-/// name rule ([`trawl_config::RESERVED_ENV_NAMES`]); the repin staging
-/// siblings live outside the data root and their existence has already been
-/// refused by the time this runs.
-///
-/// It fails the whole run closed. A symlink under an env dir, a `.parquet`
-/// that is not a regular file, a `.parquet` whose footer will not parse, a nested foreign schema, a directory that
-/// cannot be listed, a file that vanished mid-walk: each is a file whose
-/// columns are unknown, and an unknown file cannot be part of a proof that
-/// nothing carries a field. Returning "no carrier found" from a corpus that
-/// was only partly read is exactly the wrong answer, since the outcome is a
-/// deletion. Non-parquet artefacts (`.corrupt` quarantines, `.tmp`
-/// leftovers, marker files) are skipped, not refused: they are outside the
-/// query glob and carry no columns.
-///
-/// # Errors
-/// The refusal message, naming the count and up to
-/// [`MAX_REPORTED_PATHS`] paths.
 fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, String> {
     let mut files_scanned = 0u64;
     let mut problems = Problems::new(data_dir);
@@ -1135,9 +821,6 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
                             dead.remove(&catalog_key(&name));
                         }
                         if dead.is_empty() {
-                            // Every candidate is carried: nothing left to
-                            // disprove, so the rest of the corpus cannot
-                            // change the answer.
                             return Ok(Walk {
                                 dead,
                                 files_scanned,
@@ -1159,8 +842,6 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
     )
 }
 
-/// The env directories to walk, strictly.
-///
 /// Same env rule as the query planner and the compactor
 /// ([`trawl_config::is_valid_env_name`] plus the reserved names), with one
 /// addition: a symlink WEARING a valid env name is refused rather than
@@ -1174,10 +855,7 @@ fn prove_carriers(data_dir: &Path, mut dead: BTreeSet<String>) -> Result<Walk, S
 /// zero files disproves nothing, so every candidate would be "dead" and the
 /// run would delete the whole catalog. An unmounted volume, a typo'd
 /// `[data] path`, a root moved aside by hand: each is a reason to
-/// refuse, and none is a reason to reclaim. A genuine cold start has an
-/// empty data root (trawld creates it at boot), which walks to zero files
-/// and is still refused only if a candidate exists — which, on a corpus
-/// nothing has ever written, it does not.
+/// refuse, and none is a reason to reclaim.
 fn env_dirs_strict(data_dir: &Path, problems: &mut Problems) -> Result<Vec<PathBuf>, String> {
     let entries = match std::fs::read_dir(data_dir) {
         Ok(entries) => entries,
@@ -1234,43 +912,33 @@ mod tests {
 
     #[test]
     fn dead_window_truth_table() {
-        // No request, no retention: the packaged default.
         let w = effective_dead_window(None, None);
         assert_eq!(w.requested_secs, 30 * DAY);
         assert_eq!(w.floor_secs, None);
         assert_eq!(w.effective_secs, 30 * DAY);
         assert_eq!(w.effective(), DEFAULT_DEAD_WINDOW);
 
-        // 7 days requested under 90 days of retention: the floor wins.
         let w = effective_dead_window(Some(Duration::from_secs(7 * DAY)), Some(90 * DAY));
         assert_eq!(w.requested_secs, 7 * DAY);
         assert_eq!(w.floor_secs, Some(90 * DAY));
         assert_eq!(w.effective_secs, 90 * DAY);
 
-        // A request longer than the floor stands, and the floor is still
-        // reported so the operator can see it did not bind.
         let w = effective_dead_window(Some(Duration::from_secs(120 * DAY)), Some(90 * DAY));
         assert_eq!(w.effective_secs, 120 * DAY);
         assert_eq!(w.floor_secs, Some(90 * DAY));
 
-        // Retention disabled: the request is the answer, default included.
         let w = effective_dead_window(Some(Duration::from_secs(DAY)), None);
         assert_eq!(w.effective_secs, DAY);
         assert_eq!(effective_dead_window(None, None).effective_secs, 30 * DAY);
 
-        // Zero is a window, not a missing value.
         let w = effective_dead_window(Some(Duration::ZERO), None);
         assert_eq!(w.requested_secs, 0);
         assert_eq!(w.effective_secs, 0);
 
-        // ...and it is still floored when retention names one.
         let w = effective_dead_window(Some(Duration::ZERO), Some(90 * DAY));
         assert_eq!(w.effective_secs, 90 * DAY);
     }
 
-    /// The envelope is trawl's contract, so no window and no absence of
-    /// observations can reclaim its seeded pins. `ENVELOPE_TYPES` growing
-    /// a slot must not need this test edited.
     #[test]
     fn every_envelope_seed_survives_gc() {
         let cutoff = at(4_000_000_000);
@@ -1313,7 +981,6 @@ mod tests {
         );
     }
 
-    /// The body of `prove_and_purge`, for the two source-shape tests below.
     fn gated_section() -> &'static str {
         let src = include_str!("gc.rs");
         let start = src
@@ -1324,18 +991,6 @@ mod tests {
         &body[..end]
     }
 
-    /// Every READ made with the corpus gate held rides [`IN_GATE_TIMEOUT`],
-    /// and the purge deliberately does not.
-    ///
-    /// Source-shape, and deliberately so: no fixture can make a live
-    /// postgres stop answering in the middle of a gated transaction, so
-    /// what is worth asserting is that a gated statement cannot be ADDED
-    /// without a decision about its bound. The gate excludes whole
-    /// compaction batches, and an unbounded read there is an ingest stall of
-    /// unbounded length — while a purge cancelled from OUT here is worse
-    /// than a slow one, because the commit it abandons may still land. The
-    /// purge is bounded, just not by this caller: it splits its own phases
-    /// and applies a cancelling bound to the one where cancelling is safe.
     #[test]
     fn every_gated_store_read_rides_the_timeout_and_the_purge_does_not() {
         let body = gated_section();
@@ -1371,15 +1026,6 @@ mod tests {
         }
     }
 
-    /// A purge that failed with an unknown outcome reconciles the pin cache
-    /// against postgres BEFORE the caller drops the corpus gate.
-    ///
-    /// Source-shape too: injecting a store failure into a live purge means
-    /// killing postgres mid-transaction, which no fixture here can do. What
-    /// the shape guards is the ordering — reconcile, then return — because
-    /// a `return Err` added above the reconcile would let a cache holding
-    /// pins postgres deleted go on serving comparisons and conforming
-    /// batches under them.
     #[test]
     fn a_failed_purge_reconciles_the_cache_before_it_returns() {
         let arm = ordinary_failure_arm();
@@ -1394,8 +1040,6 @@ mod tests {
         );
     }
 
-    /// The purge's two failure arms, split off the one `match`.
-    ///
     /// Returns (unknown-commit arm, every-other-error arm). The unknown arm
     /// is written first in the source, so the ordinary one is what follows
     /// `Err(e) => {`.
@@ -1419,15 +1063,6 @@ mod tests {
         purge_failure_arms().1
     }
 
-    /// The generation follows what the STORE deleted, never what the map
-    /// happened to hold.
-    ///
-    /// Source-shape: the wiring is what can rot. "How many entries did the
-    /// map lose" is the wrong question after an earlier run over-evicted —
-    /// the map is empty, the store still has rows to delete, and a cached
-    /// `/api/v1/schema` listing would outlive the deletion by a TTL. Both
-    /// purge outcomes that may have changed postgres stamp the generation
-    /// off the STORE's answer.
     #[test]
     fn the_generation_follows_the_store_not_the_map() {
         let body = gated_section();
@@ -1448,18 +1083,6 @@ mod tests {
         );
     }
 
-    /// A purge whose commit outcome is unknown must NOT re-read postgres.
-    ///
-    /// The commit was detached rather than cancelled, or it failed in a way
-    /// that does not prove a rollback, so a reconcile read races it either
-    /// way: "still pinned" answered a microsecond early would leave the
-    /// cache serving pins postgres has deleted. The safe move is the
-    /// over-evicting one, so this arm evicts every candidate and asks the
-    /// store nothing.
-    ///
-    /// Source-shape, like its sibling above: no fixture can stall a live
-    /// postgres commit past its bound, so what is guarded is that the arm
-    /// keeps its shape.
     #[test]
     fn an_unknown_commit_over_evicts_and_never_reads_the_store() {
         let (unknown, _) = purge_failure_arms();
@@ -1477,14 +1100,6 @@ mod tests {
         );
     }
 
-    /// A window nothing can subtract lands on the unix epoch, not on
-    /// chrono's minimum.
-    ///
-    /// The cutoff is bound straight into a `timestamptz` comparison, and
-    /// postgres refuses year -262143, so the old saturating floor turned an
-    /// absurd-but-valid `--older-than` into a 503 at bind time. The epoch
-    /// answers the same question (nothing was observed before 1970) and
-    /// binds.
     #[test]
     fn an_unsubtractable_window_clamps_to_the_epoch() {
         let decided_at = at(1_800_000_000);
@@ -1495,8 +1110,6 @@ mod tests {
                 "window {window} must clamp to the epoch"
             );
         }
-        // A window that merely reaches back past 1970 clamps too, and an
-        // ordinary one is untouched.
         assert_eq!(
             cutoff_for(decided_at, 1_800_000_001),
             DateTime::UNIX_EPOCH,
@@ -1505,16 +1118,11 @@ mod tests {
         assert_eq!(cutoff_for(decided_at, 86_400), at(1_799_913_600));
     }
 
-    /// The divergence from the schema listing, asserted so a later "make
-    /// gc match /schema" cleanup has to argue with a test.
     #[test]
     fn a_never_observed_pin_is_a_candidate() {
         assert_eq!(candidacy("typoed_feild", None, at(0)), Candidacy::Candidate);
     }
 
-    /// Pin gc's refusals are free-text 409s, so their text reaches the wire
-    /// and every record. Given injected I/O text and a data root at an
-    /// absolute path, they carry neither, and they still name the remedy.
     #[test]
     fn refusals_do_not_carry_io_text_or_the_absolute_root() {
         const MARKER: &str = "zz_io_marker_/srv/secret";
@@ -1530,14 +1138,12 @@ mod tests {
             assert!(!msg.contains(&tmp_abs), "{what} carries a host path: {msg}");
         };
 
-        // The unreadable-evidence refusal (`refuse_if_repin_owns_the_root`).
         let injected = std::io::Error::other(MARKER);
         let msg = unreadable_evidence_refusal(injected.kind());
         clean("evidence refusal", &msg);
         assert!(msg.contains("other error"), "names the kind: {msg}");
         assert!(msg.contains("refuses rather than delete"), "{msg}");
 
-        // The walk refusal, with injected text on every kind of note.
         let mut problems = Problems::new(&root);
         problems.note_io(&root.join("prod"), "unreadable directory", &injected);
         problems.note_io(&root, "unreadable data-root entry", &injected);
@@ -1562,8 +1168,6 @@ mod tests {
             "{msg}"
         );
 
-        // A real ParquetStatsError: its Display names the absolute path and
-        // the parser's text; the note names the file relative to the root.
         let junk = root.join("prod").join("junk.parquet");
         std::fs::write(&junk, b"PAR1 and then some lies").unwrap();
         let e = trawl_engine::parquet_stats::read_column_names(&junk)
@@ -1586,7 +1190,6 @@ mod tests {
             "{msg}"
         );
 
-        // The data root that cannot be listed: the real read_dir failure.
         let vanished = tmp.path().join("not-mounted");
         let msg = env_dirs_strict(&vanished, &mut Problems::new(&vanished))
             .expect_err("a missing data root refuses");

@@ -3,15 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Canonical timestamp presentation for fleet apps.
-//!
-//! The relative-time functions take `now_ms` as a parameter instead of
-//! reading a clock, so everything here is pure and native-tested,
-//! matching the [`theme::prefs`](crate::theme::prefs) template.
-//!
-//! The wasm half: [`clock`] owns the single shared 30-second tick
-//! every relative label subscribes to (never per-instance timers),
-//! and [`when::When`] renders a timestamp in relative or absolute
-//! mode with the full RFC 3339 form in its `title` attribute.
 
 #[cfg(target_arch = "wasm32")]
 pub mod clock;
@@ -21,16 +12,6 @@ pub mod when;
 use chrono::{DateTime, Datelike, TimeZone, Utc};
 
 /// Format an ISO8601 UTC timestamp relative to `now_ms` (ms since epoch).
-///
-/// Buckets:
-/// - `< 60s`   → `"just now"`
-/// - `< 1h`    → `"Nm ago"`
-/// - `< 24h`   → `"Nh ago"`
-/// - `< 7d`    → `"Nd ago"`
-/// - `>= 7d`   → `"Mon D"` (e.g. `"Apr 11"`)
-///
-/// Returns the raw input unchanged if it can't be parsed as RFC3339 —
-/// better to show something imperfect than a panicky `"?"`.
 #[must_use]
 pub fn time_ago(iso: &str, now_ms: i64) -> String {
     let Ok(parsed) = DateTime::parse_from_rfc3339(iso) else {
@@ -39,7 +20,6 @@ pub fn time_ago(iso: &str, now_ms: i64) -> String {
     let then_ms = parsed.timestamp_millis();
     let delta = now_ms.saturating_sub(then_ms);
 
-    // Future timestamps (clock skew / bad data) — treat as "just now".
     if delta < 60_000 {
         return "just now".to_string();
     }
@@ -59,8 +39,6 @@ pub fn time_ago(iso: &str, now_ms: i64) -> String {
         return format!("{days}d ago");
     }
 
-    // Calendar fallback: "Apr 11". Use the parsed timestamp's own UTC
-    // calendar — good enough for a list label.
     let d: DateTime<Utc> = Utc
         .timestamp_millis_opt(then_ms)
         .single()
@@ -68,7 +46,6 @@ pub fn time_ago(iso: &str, now_ms: i64) -> String {
     format!("{} {}", month_abbrev(d.month()), d.day())
 }
 
-/// Compact duration: `"482ms"` below one second, `"1.005s"` from one second up.
 #[must_use]
 pub fn format_duration(ms: u64) -> String {
     if ms < 1000 {
@@ -79,9 +56,6 @@ pub fn format_duration(ms: u64) -> String {
     format!("{s}.{frac:03}s")
 }
 
-/// Parse a timestamp string into `DateTime<Utc>`.
-///
-/// Tries RFC 3339 first, then `DuckDB`'s space-separated format.
 /// `DuckDB` timestamps carry no timezone; we assume UTC.
 #[must_use]
 pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -93,10 +67,6 @@ pub fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Format a countdown to a future timestamp.
-///
-/// Returns `"in <1m"` / `"in Nm"` / `"in Nh"` / `"in Nd"`, or `"overdue"`
-/// once the target is in the past.
 #[must_use]
 pub fn time_until(target_ms: i64, now_ms: i64) -> String {
     let remaining = target_ms - now_ms;
@@ -141,7 +111,6 @@ fn month_abbrev(m: u32) -> &'static str {
 mod tests {
     use super::*;
 
-    /// Reference moment: 2026-04-18T12:00:00Z.
     fn now() -> i64 {
         DateTime::parse_from_rfc3339("2026-04-18T12:00:00Z")
             .unwrap()
@@ -178,7 +147,6 @@ mod tests {
 
     #[test]
     fn calendar_fallback_beyond_week() {
-        // 10 days back → "Apr 8".
         assert_eq!(time_ago("2026-04-08T12:00:00Z", now()), "Apr 8");
     }
 
@@ -242,15 +210,12 @@ mod tests {
 
     #[test]
     fn format_duration_contract() {
-        // sub-second values print integer milliseconds
         assert_eq!(format_duration(0), "0ms");
         assert_eq!(format_duration(9), "9ms");
         assert_eq!(format_duration(10), "10ms");
         assert_eq!(format_duration(482), "482ms");
-        // boundary: 999ms is the last millisecond value, 1000ms the first seconds value
         assert_eq!(format_duration(999), "999ms");
         assert_eq!(format_duration(1000), "1.000s");
-        // frac zero-pad above the seconds place
         assert_eq!(format_duration(1005), "1.005s");
         assert_eq!(format_duration(1240), "1.240s");
     }

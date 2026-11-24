@@ -8,16 +8,7 @@
 //! every window test drives `poll_and_execute` with explicit instants
 //! instead of waiting for them. Coverage is a claim about hours, so a
 //! wall-clock test could only prove the parts that fit inside a few
-//! seconds — which is none of the interesting ones. One test spawns the
-//! real loop instead, over the shared server fixture, to prove its start
-//! leaves a fresh manual claim alone.
-//!
-//! The fixture is one service (`fx`) whose events sit on and around the
-//! window boundaries: the instant T0 itself, one microsecond either side
-//! of it, and the same again at T0+2h. Half-open windows `[start, end)`
-//! are what those events test — a boundary event has to land in exactly
-//! one of two consecutive runs, and a microsecond on the wrong side of a
-//! bound is a lost or duplicated log line in production.
+//! seconds — which is none of the interesting ones.
 
 mod common;
 
@@ -41,28 +32,18 @@ use trawl_server::store::{
     ScheduleStore, StorageState,
 };
 
-/// The saved DSL every windowed schedule here runs.
 const DSL: &str = "service=fx | table _time";
 
-/// The service and env the fixture parquet is written under.
 const SERVICE: &str = "fx";
 const ENV: &str = "lab";
 const DATE: &str = "2026-03-14";
 
-/// A query timeout no test should ever reach.
 const TIMEOUT_SECS: u64 = 30;
 
-// ---------------------------------------------------------------------------
-// instants
-// ---------------------------------------------------------------------------
-
-/// The instant every window in this file is measured from: 03:00 UTC, an
-/// hour into the fixture's day so that `T0 - 1h` is still inside it.
 fn t0() -> DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 3, 14, 3, 0, 0).unwrap()
 }
 
-/// `T0 + offset`.
 fn at(offset: Duration) -> DateTime<Utc> {
     t0() + offset
 }
@@ -79,8 +60,6 @@ fn micros(n: i64) -> Duration {
     Duration::microseconds(n)
 }
 
-/// Every `_time` the fixture carries, as offsets from T0.
-///
 /// The three outside the tiled range (`-2h`, `+2h`, `+3h`) are there to be
 /// EXCLUDED: a window that swallowed a neighbour would still look right
 /// against a fixture that only held events it was supposed to match.
@@ -102,9 +81,6 @@ fn fixture_offsets() -> Vec<Duration> {
     ]
 }
 
-/// The fixture instants inside `[start, end)`, sorted — what a run over
-/// that window must return, computed from the fixture rather than
-/// hand-listed per test.
 fn expected_rows(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<DateTime<Utc>> {
     let mut times: Vec<DateTime<Utc>> = fixture_offsets()
         .into_iter()
@@ -115,19 +91,11 @@ fn expected_rows(start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<DateTime<Utc>>
     times
 }
 
-// ---------------------------------------------------------------------------
-// fixture parquet
-// ---------------------------------------------------------------------------
-
-/// Write the fixture corpus under the ADR-0009 layout,
-/// `data/{env}/{date}/{HH}/{service}.parquet`.
-///
 /// One file per partition hour, which is what the query planner globs: a
 /// flat root is only reachable through a whole-root `**` the planner
 /// deliberately never emits.
 fn write_fixture(data_dir: &Path) {
     let conn = duckdb::Connection::open_in_memory().expect("open duckdb");
-    // The session zone every conform and every bound cast reads under.
     conn.execute_batch("SET TimeZone='UTC'").expect("set zone");
     conn.execute_batch(
         "CREATE TABLE logs (
@@ -176,13 +144,6 @@ fn write_fixture(data_dir: &Path) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// harness
-// ---------------------------------------------------------------------------
-
-/// Everything one scheduler test drives: both databases, a live key, a
-/// `DuckDB` pool over a private data root, and the scheduler config the tick
-/// reads `max_catchup_intervals` from.
 struct Harness {
     _dir: tempfile::TempDir,
     data_dir: PathBuf,
@@ -191,8 +152,6 @@ struct Harness {
     key_id: i64,
     saved: SavedQueryStore,
     schedules: ScheduleStore,
-    /// A second pool onto the same app-state database, for the one test
-    /// that has to write a saved query the write-time gate refuses.
     app_pool: PgPool,
     config: SchedulerConfig,
     _fleet_pool: PgPool,
@@ -258,7 +217,6 @@ async fn harness_with(permits: usize) -> Harness {
 }
 
 impl Harness {
-    /// Create a saved query and its schedule, returning the saved-query id.
     async fn schedule(
         &self,
         name: &str,
@@ -287,8 +245,6 @@ impl Harness {
         saved.id
     }
 
-    /// Create a query-mode saved query over [`DSL`] whose hourly schedule
-    /// has its fire cursor at `fire`, returning the saved-query id.
     async fn schedule_at(&self, name: &str, fire: DateTime<Utc>) -> i64 {
         let saved = self
             .saved
@@ -317,8 +273,6 @@ impl Harness {
         .await
     }
 
-    /// What a claim moves or spends: the fire cursor, the watermark and
-    /// the run budget spent so far.
     async fn claim_state(
         &self,
         saved_query_id: i64,
@@ -336,8 +290,6 @@ impl Harness {
         )
     }
 
-    /// One scheduler tick at `now`, awaiting the executions it spawned.
-    ///
     /// The daemon drops these handles; a test that did the same would race
     /// its own assertions against a run still writing its parquet.
     async fn tick(&self, now: DateTime<Utc>) {
@@ -355,7 +307,6 @@ impl Harness {
         }
     }
 
-    /// Every run of a saved query, oldest first.
     async fn runs(&self, saved_query_id: i64) -> Vec<ReportRun> {
         let mut runs = self
             .schedules
@@ -366,7 +317,6 @@ impl Harness {
         runs
     }
 
-    /// The schedule's cursor and watermark.
     async fn cursor(&self, saved_query_id: i64) -> (DateTime<Utc>, Option<DateTime<Utc>>) {
         let schedule = self
             .schedules
@@ -377,8 +327,6 @@ impl Harness {
         (schedule.next_fire_at, schedule.covered_through)
     }
 
-    /// The `_time` values a run actually stored, read back out of its own
-    /// parquet through the engine that wrote it.
     fn run_rows(&self, run: &ReportRun) -> Vec<DateTime<Utc>> {
         let relative = run
             .result_path
@@ -395,8 +343,6 @@ impl Harness {
     }
 }
 
-/// Read a result cell back as the instant it renders: the result wire's
-/// RFC 3339 with its offset.
 fn cell_time(cell: &Value) -> DateTime<Utc> {
     let Value::String(text) = cell else {
         panic!("expected a rendered timestamp, got {cell:?}");
@@ -406,7 +352,6 @@ fn cell_time(cell: &Value) -> DateTime<Utc> {
         .with_timezone(&Utc)
 }
 
-/// The DSL a windowed run of [`DSL`] must have executed and stored.
 fn resolved(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     format!(
         "earliest=\"{}\" latest=\"{}\" {DSL}",
@@ -415,19 +360,10 @@ fn resolved(start: DateTime<Utc>, end: DateTime<Utc>) -> String {
     )
 }
 
-/// The window a run recorded, as the tuple the assertions compare.
 fn window_of(run: &ReportRun) -> (Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<bool>) {
     (run.window_start, run.window_end, run.window_truncated)
 }
 
-// ---------------------------------------------------------------------------
-// tests
-// ---------------------------------------------------------------------------
-
-/// Consecutive `since_last` runs tile: one run's end is the next one's
-/// start, the bounds sit on the planned fires rather than on the tick that
-/// noticed them, and the event at exactly T0 lands in exactly one run
-/// (ADR-0018 rulings 6, 10, 14).
 #[tokio::test]
 async fn since_last_fires_tile_and_a_boundary_event_lands_once() {
     let h = harness().await;
@@ -435,8 +371,6 @@ async fn since_last_fires_tile_and_a_boundary_event_lands_once() {
         .schedule("tiling", DSL, Some(ScheduleWindow::SinceLast), 3600, 0)
         .await;
 
-    // Deliberately late, and by a different amount each time: the fire is
-    // planned from the cursor, so lateness must not reach the bounds.
     h.tick(at(Duration::seconds(3))).await;
     h.tick(at(hours(1) + Duration::seconds(7))).await;
     h.tick(at(hours(2) + Duration::seconds(9))).await;
@@ -495,9 +429,6 @@ async fn since_last_fires_tile_and_a_boundary_event_lands_once() {
     );
 }
 
-/// A failed run leaves the watermark where it was, so the next success
-/// covers its own interval AND the failed one's (ruling 9). Editing the
-/// saved DSL in between does not reset the watermark (ruling 14).
 #[tokio::test]
 async fn a_failed_run_holds_the_watermark_and_the_next_success_covers_both_intervals() {
     let h = harness().await;
@@ -561,14 +492,6 @@ async fn a_failed_run_holds_the_watermark_and_the_next_success_covers_both_inter
     assert_eq!(h.cursor(sq).await, (at(hours(3)), Some(at(hours(2)))));
 }
 
-/// A FIRST run that fails must not cost its interval either.
-///
-/// The watermark is seeded at creation with the origin the schedule owes
-/// coverage from, so a failed first run leaves that origin standing and the
-/// next success covers both intervals. Without the seed the watermark would
-/// still be unset here, the planner would fall back to ruling 14, and run 2
-/// would cover only `[T0, T0+1h)`: the first hour dropped, `truncated`
-/// false, nothing anywhere admitting the loss.
 #[tokio::test]
 async fn first_failed_since_last_run_is_healed_by_next_success() {
     let h = harness().await;
@@ -626,9 +549,6 @@ async fn first_failed_since_last_run_is_healed_by_next_success() {
     assert_eq!(h.cursor(sq).await, (at(hours(2)), Some(at(hours(1)))));
 }
 
-/// A gap wider than `max_catchup_intervals` clamps forward and says so, on
-/// the run row and on the counter, rather than handing one run a day and a
-/// half of corpus or wedging the schedule (ruling 9).
 #[tokio::test]
 async fn a_thirty_interval_gap_coalesces_into_one_clamped_run() {
     // Installed before the tick that increments it: a counter recorded with
@@ -670,13 +590,6 @@ async fn a_thirty_interval_gap_coalesces_into_one_clamped_run() {
     );
 }
 
-/// Ruling 13: a window that held no events is still a run. It records its
-/// bounds, it carries its (empty) result as a typed empty parquet file, and
-/// it is the run `latest_successful_run` returns.
-///
-/// The older run's file is still on disk, which is exactly the trap: before
-/// this, `run=latest` filtered on `result_path IS NOT NULL` and answered
-/// from that older file, reporting a superseded window as the current one.
 #[tokio::test]
 async fn a_zero_row_run_records_its_window_and_is_the_latest_success() {
     let h = harness().await;
@@ -690,7 +603,6 @@ async fn a_zero_row_run_records_its_window_and_is_the_latest_success() {
         )
         .await;
 
-    // [T0-5m, T0) holds the event one microsecond before T0.
     h.tick(t0()).await;
     // [T0+55m, T0+1h) holds nothing: the fixture's neighbours are at +30m
     // and at +1h, and +1h is the exclusive end.
@@ -738,9 +650,6 @@ async fn a_zero_row_run_records_its_window_and_is_the_latest_success() {
     );
 }
 
-/// A fixed trailing window is re-measured from every planned fire and keeps
-/// no watermark, so it never heals a gap: missed fires are simply missed,
-/// and `lag` delays coverage rather than widening it (ruling 6).
 #[tokio::test]
 async fn fixed_windows_trail_each_planned_fire_and_never_catch_up() {
     let h = harness().await;
@@ -789,21 +698,11 @@ async fn fixed_windows_trail_each_planned_fire_and_never_catch_up() {
     );
 }
 
-/// A scheduled attempt that cannot get a permit fails THAT run and
-/// nothing else (ADR-0024).
-///
-/// The pool is held exclusively, so the attempt spends its whole budget
-/// queueing and never starts work. That is a capacity refusal, not an
-/// execution timeout: the run row carries the fixed capacity sentence,
-/// and the schedule stays enabled on its ordinary cadence, because a
-/// server that is busy for a minute is not an operator's mistake to
-/// repair.
 #[tokio::test]
 async fn a_scheduled_run_refused_for_capacity_fails_only_that_attempt() {
     let h = harness().await;
     let sq = h.schedule("busy", DSL, None, 3600, 0).await;
 
-    // Every permit in one hand: no lane can acquire one until it drops.
     let held = h
         .pool
         .exclusive(StdDuration::from_secs(5))
@@ -842,8 +741,6 @@ async fn a_scheduled_run_refused_for_capacity_fails_only_that_attempt() {
     assert_eq!(runs[0].row_count, None);
     assert_eq!(runs[0].result_path, None);
 
-    // Later scheduling is untouched: same enabled schedule, next fire on
-    // the ordinary cadence, and the following tick succeeds.
     let schedule = h
         .schedules
         .get_schedule_for_saved_query(sq, h.key_id)
@@ -863,9 +760,6 @@ async fn a_scheduled_run_refused_for_capacity_fails_only_that_attempt() {
     );
 }
 
-/// `report_runs.query` is reproducible by paste (ruling 11): re-parsing it
-/// yields the run's own bounds, and re-executing it standalone yields the
-/// run's own rows.
 #[tokio::test]
 async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
     let h = harness().await;
@@ -908,9 +802,6 @@ async fn a_windowed_run_query_reexecutes_standalone_with_identical_bounds() {
     );
 }
 
-/// Without a window the saved DSL is executed verbatim and the run claims
-/// no coverage at all — three NULL bound columns, not a window of zero
-/// width (ruling 6). The cadence is still the planned one.
 #[tokio::test]
 async fn query_mode_schedules_fire_on_planned_boundaries_with_no_window() {
     let h = harness().await;
@@ -937,10 +828,6 @@ async fn query_mode_schedules_fire_on_planned_boundaries_with_no_window() {
     );
 }
 
-/// A windowed schedule whose saved DSL grew its own time clause claims
-/// nothing and moves nothing, so the tick fails it again on every poll
-/// until an operator repairs it (rulings 7 and 11).
-///
 /// The tick swallows the refusal into a log, so the evidence here is the
 /// state it left; that the claim itself answers the typed policy error is
 /// `claim_due_run_refuses_a_query_that_owns_its_own_window` in
@@ -971,22 +858,14 @@ async fn a_materialize_failure_is_loud_and_leaves_the_cursor() {
          the schedule was created owing coverage from"
     );
 
-    // Still refused on the next poll, and still with nothing written.
     h.tick(at(hours(5))).await;
     assert!(h.runs(sq).await.is_empty());
     assert_eq!(h.cursor(sq).await, (t0(), Some(at(hours(-1)))));
 }
 
-/// A stored query that a newer release refuses fails its own run and
-/// nothing else (issue #382).
-///
-/// The texts are planted straight in the column, below the write-time gate,
-/// because that is how they reach a scheduler after an upgrade: they were
-/// saved by a release that accepted them. Each refused schedule records one
-/// failed run that carries the refusal sentence, keeps its row enabled, and
-/// moves its cursor on the ordinary cadence like any other failed run. Its
-/// coverage watermark does not move. A valid schedule in the same tick runs
-/// normally.
+/// The refused texts are planted straight in the column, below the
+/// write-time gate, because that is how they reach a scheduler after an
+/// upgrade: they were saved by a release that accepted them.
 ///
 /// The expression grammar spells equality `==`, so the aggregate texts use
 /// a comparison the parser accepts and reach the position check, not a
@@ -1087,8 +966,6 @@ async fn stored_semantic_refusal_does_not_stop_scheduler() {
     );
     assert_eq!(h.run_rows(&runs[0]).len(), fixture_offsets().len());
 
-    // The next boundary fails each refused text again, on cadence, and the
-    // valid schedule keeps running.
     h.tick(at(hours(1) + Duration::seconds(3))).await;
     for (sq, text, _, watermark) in refused {
         let runs = h.runs(sq).await;
@@ -1104,8 +981,6 @@ async fn stored_semantic_refusal_does_not_stop_scheduler() {
     assert_eq!(runs[1].status, RunStatus::Success);
 }
 
-/// Renaming affects lookup only; recorded legacy paths stay readable, while
-/// new runs use their ID and cannot interpret display-name punctuation as a path.
 #[tokio::test]
 async fn readable_name_rename_preserves_legacy_and_new_run_paths() {
     let h = harness().await;
@@ -1155,11 +1030,6 @@ async fn readable_name_rename_preserves_legacy_and_new_run_paths() {
     assert!(runs.iter().skip(1).any(|run| run.result_path.is_some()));
 }
 
-// ---------------------------------------------------------------------------
-// the real loop's start
-// ---------------------------------------------------------------------------
-
-/// Wait under the hang guard until `ready` holds, polling every 20 ms.
 async fn until<F, Fut>(what: &str, mut ready: F)
 where
     F: FnMut() -> Fut,
@@ -1175,7 +1045,6 @@ where
     }
 }
 
-/// Every run of `saved_id` as `(id, status, finished_at set, error_message)`.
 async fn runs_of(db: &PgPool, saved_id: i64) -> Vec<(i64, String, bool, Option<String>)> {
     sqlx::query_as(
         "SELECT id, status, finished_at IS NOT NULL, error_message
@@ -1187,18 +1056,12 @@ async fn runs_of(db: &PgPool, saved_id: i64) -> Vec<(i64, String, bool, Option<S
     .unwrap()
 }
 
-/// Starting the scheduler cannot interrupt a fresh claim: a manual run
-/// claimed after boot, whose work is parked at `Seam::Started`, stays
-/// `running` through the loop's first complete iteration, and then
-/// finishes `success`.
-///
-/// The real loop runs, over the shared fixture that boots through
-/// `boot::prepare_corpus`. The target net A fires a day out, so the loop
-/// never claims it. The sentinel net B is due, so B getting its run shows
-/// that the iteration's claim pass ran, and stopping and joining the loop
-/// shows that the pass finished. The manual run takes no scheduled-run
-/// lease, so B's lease is free. The default poll interval keeps report-run
-/// retention out of the first iteration.
+/// The target net A fires a day out, so the loop never claims it. The
+/// sentinel net B is due, so B getting its run shows that the iteration's
+/// claim pass ran, and stopping and joining the loop shows that the pass
+/// finished. The manual run takes no scheduled-run lease, so B's lease is
+/// free. The default poll interval keeps report-run retention out of the
+/// first iteration.
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduler_start_keeps_a_fresh_manual_claim() {
     let server = common::setup().await;
@@ -1302,15 +1165,6 @@ async fn scheduler_start_keeps_a_fresh_manual_claim() {
     assert_eq!(sentinel_runs[0].1, "success", "{sentinel_runs:?}");
 }
 
-// ---------------------------------------------------------------------------
-// retention against a live run (#350, ADR-0018 amendment 2026-11-06)
-// ---------------------------------------------------------------------------
-
-/// Retention during a run keeps the schedule claimed, in sequence: a claim,
-/// retention at limits that would match the running row, a second claim
-/// refused as already running, then a finish that persists over a result
-/// file that is still there.
-///
 /// The scheduler unlinks exactly the paths retention returns. A finished
 /// run's file is among them (the positive control), and the live run's
 /// file, already on disk the way the executor leaves it before
@@ -1407,11 +1261,6 @@ async fn retention_during_a_run_keeps_the_schedule_claimed() {
     assert!(file.exists(), "the run's result file is kept");
 }
 
-/// Retention below the cap no longer refills it (ADR-0018 amended
-/// 2026-11-06). Under a keep of one, a schedule capped at three runs claims
-/// exactly three across the retention passes, then refuses every later
-/// boundary. Its cursor stays on the first boundary it refused, so raising
-/// the cap would resume there.
 #[tokio::test]
 async fn retention_below_the_cap_stops_at_the_cap() {
     let h = harness().await;
@@ -1465,11 +1314,6 @@ async fn retention_below_the_cap_stops_at_the_cap() {
     );
 }
 
-/// The same transition on the real scheduled path: a due 60 s schedule's
-/// run is parked at `Seam::Started`, retention runs at limits that would
-/// match it, the schedule stays claimed, and once released the one run
-/// finishes `success` with its result file in place.
-///
 /// `poll_and_execute` is called directly and its handles kept, because
 /// `Harness::tick` awaits them and would deadlock on the hold.
 #[tokio::test(flavor = "multi_thread")]
@@ -1531,15 +1375,6 @@ async fn retention_during_a_scheduled_run_keeps_its_result() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// scheduled runs in flight (ADR-0018, amended 2026-11-09)
-// ---------------------------------------------------------------------------
-
-/// A tick starts at most half the executor permits' worth of scheduled
-/// runs. On a pool of 4 permits with 6 schedules due and every run's work
-/// parked at `Seam::Started`, one tick starts exactly 2. The 4 it did not
-/// reach keep their cursor, watermark and run budget, and have no run row:
-/// a later tick claims each as a missed run.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_tick_starts_at_most_half_the_permits() {
     let h = harness_with(4).await;
@@ -1594,11 +1429,6 @@ async fn a_tick_starts_at_most_half_the_permits() {
     }
 }
 
-/// A run whose request timed out keeps its lease while its work still
-/// runs: on a pool of 2 permits, whose one lease that run holds, the next
-/// tick starts nothing and the deferred schedules keep their state. Once
-/// the parked work ends the lease is free, and the next tick starts the
-/// OLDEST deferred schedule, which has the higher id of the two.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_timed_out_run_keeps_its_lease_until_its_work_ends() {
     let h = harness_with(2).await;
@@ -1654,9 +1484,6 @@ async fn a_timed_out_run_keeps_its_lease_until_its_work_ends() {
     assert!(h.runs(newer).await.is_empty(), "the newer cursor waits");
 }
 
-/// A manual run takes no scheduled-run lease: with every scheduled-run
-/// lease of the server's pool held, a run triggered over HTTP still starts
-/// its work under its own manual-run lease, and finishes.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_manual_run_takes_no_lease() {
     let server = common::setup().await;
@@ -1715,20 +1542,12 @@ async fn a_manual_run_takes_no_lease() {
     drop(leases);
 }
 
-// ---------------------------------------------------------------------------
-// the manual-run gate (ADR-0018, amended 2026-11-11)
-// ---------------------------------------------------------------------------
-
-/// The fixed text of a busy refusal: it names no setting and no count.
 const MANUAL_RUN_BUSY: &str =
     "a manual run is already running; retry after the Retry-After interval";
 
-/// The DSL every manual-run net over the shared fixture runs.
 const NGINX_DSL: &str = "service=nginx | stats count()";
 
-/// A net of `key_id` on `server` over [`NGINX_DSL`]: its hourly schedule
-/// fires a day out, so no tick claims it. Returns the saved-query and
-/// schedule ids.
+/// The net's hourly schedule fires a day out, so no tick claims it.
 async fn server_net(
     server: &common::TestServer,
     key_id: i64,
@@ -1758,8 +1577,6 @@ async fn server_net(
     (saved.id, schedule.id)
 }
 
-/// What a manual claim moves or spends, and what it writes: the fire
-/// cursor, the watermark, the run budget spent and the run rows' ids.
 type ClaimSnapshot = (DateTime<Utc>, Option<DateTime<Utc>>, u64, Vec<i64>);
 
 async fn claim_snapshot(
@@ -1785,8 +1602,6 @@ async fn claim_snapshot(
     )
 }
 
-/// The 429 `manual_run_busy` a refused press answers, with its fixed text
-/// and a numeric `Retry-After` of at least 1 s. Returns the Retry-After.
 fn assert_busy(
     what: &str,
     outcome: Result<trawl_api::ReportRunSummary, trawl_client::ClientError>,
@@ -1809,7 +1624,6 @@ fn assert_busy(
     }
 }
 
-/// The status and message of a refused press that is no busy refusal.
 fn refused(
     what: &str,
     outcome: Result<trawl_api::ReportRunSummary, trawl_client::ClientError>,
@@ -1823,7 +1637,6 @@ fn refused(
     }
 }
 
-/// Wait until `server`'s manual-run gate holds no lease.
 async fn gate_drained(server: &common::TestServer) {
     until("the manual-run gate drained", || async {
         server.state.query.pool.manual_leases_in_use() == 0
@@ -1831,8 +1644,6 @@ async fn gate_drained(server: &common::TestServer) {
     .await;
 }
 
-/// Wait until every run of `saved_id` finished and the gate drained, and
-/// answer the runs.
 async fn settled_runs(
     server: &common::TestServer,
     db: &PgPool,
@@ -1849,7 +1660,6 @@ async fn settled_runs(
     runs_of(db, saved_id).await
 }
 
-/// How many backends of the app-state database wait on a lock.
 async fn lock_waiters(db: &PgPool) -> i64 {
     sqlx::query_scalar(
         "SELECT COUNT(*) FROM pg_stat_activity
@@ -1860,11 +1670,6 @@ async fn lock_waiters(db: &PgPool) -> i64 {
     .unwrap()
 }
 
-/// A refused press is refused before the claim: while a key's first
-/// manual run is held at `Seam::Started`, its press on another net answers
-/// 429 `manual_run_busy`, and so does its press on the running net itself,
-/// never a 409. Neither moves a cursor or a watermark, spends budget, or
-/// writes a run row.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_refusal_is_preclaim() {
     let server = common::setup().await;
@@ -1937,9 +1742,6 @@ async fn manual_run_refusal_is_preclaim() {
     assert!(runs_of(&db, second).await.is_empty());
 }
 
-/// The installation-wide cap: at 4 permits a quarter is one place, so
-/// while one key holds it, another key's press is refused before its
-/// claim. Once the first run ends, the second key's press starts.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_runs_installation_wide_are_capped() {
     let dir = tempfile::tempdir().unwrap();
@@ -2006,9 +1808,6 @@ async fn manual_runs_installation_wide_are_capped() {
     );
 }
 
-/// The scheduled and the manual gate are separate: with every scheduled
-/// lease held, a manual run starts; with the manual gate full, the tick
-/// still claims and starts a due schedule.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_run_gates_do_not_block_each_other() {
     let server = common::setup().await;
@@ -2044,7 +1843,6 @@ async fn the_run_gates_do_not_block_each_other() {
     .await;
     assert_eq!(pool.manual_leases_in_use(), pool.manual_lease_limit());
 
-    // The manual gate is full; give the tick its lease back.
     drop(leases);
     let handles = poll_and_execute(
         &storage.schedule,
@@ -2079,10 +1877,6 @@ async fn the_run_gates_do_not_block_each_other() {
     );
 }
 
-/// A request dropped while its claim is in flight leaves no orphan: the
-/// claim is parked on a fixture's `saved_queries` row lock, the request is
-/// dropped, and the lock goes. The claim commits and its run executes and
-/// finishes under the same lease, with no `running` row left behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_request_after_claim_still_runs() {
     use tower::ServiceExt as _;
@@ -2138,12 +1932,6 @@ async fn a_dropped_request_after_claim_still_runs() {
     assert!(runs[0].2, "{runs:?}");
 }
 
-/// Every claim that starts no run gives the lease back before it answers:
-/// right after each refusal the gate is empty, and the same key's next
-/// press answers 200. The refusals are no schedule (400), a run already in
-/// progress (409), a spent budget (409), an empty window (409), a window
-/// the claim cannot resolve (400), and a claim the store fails (503): its
-/// connection ends while it waits on a fixture's row lock.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_claim_refusals_return_the_lease() {
     let server = common::setup().await;
@@ -2241,7 +2029,6 @@ async fn manual_claim_refusals_return_the_lease() {
     assert_eq!(runs_of(&db, busy).await.len(), 1, "only the seeded run");
 }
 
-/// The key's next press on `good` answers 200, and its run succeeds.
 async fn next_press_runs(
     what: &str,
     server: &common::TestServer,
@@ -2261,9 +2048,6 @@ async fn next_press_runs(
     );
 }
 
-/// The claim-error case of [`manual_claim_refusals_return_the_lease`]: a
-/// claim waiting on a fixture's row lock loses its connection, answers 503,
-/// and its lease is back before the answer. Returns the net's id.
 async fn claim_error_returns_the_lease(
     server: &common::TestServer,
     key_id: i64,
@@ -2303,17 +2087,6 @@ async fn claim_error_returns_the_lease(
     failed
 }
 
-/// A manual run's lease lasts as long as its physical work, not as long as
-/// its request or its run row: on a server whose runs time out after 1 s,
-/// a claim whose window resolution is parked (`Resolving`) answers 503 at
-/// its deadline and the parked resolution still holds the gate. A run
-/// parked in its preparation (`Preparing`, `Prepared`) or in its executor
-/// work (`Started`) records `timeout`, and its lease still holds the gate,
-/// so the key's press on another net is refused. Deleting and re-creating
-/// the net frees nothing. On servers of their own, a run parked before
-/// writing its result (`RunWriting`) and a run parked in finishing its row
-/// (behind a fixture lock on its schedule row, which `finish_run` takes)
-/// hold it too. Each lease returns once its last work ends.
 #[tokio::test(flavor = "multi_thread")]
 async fn manual_run_lease_outlives_its_request() {
     use trawl_server::pool::seam::Seam;
@@ -2385,11 +2158,6 @@ async fn manual_run_lease_outlives_its_request() {
     finishing_keeps_the_lease().await;
 }
 
-/// The result-writing phase of [`manual_run_lease_outlives_its_request`]:
-/// a run parked after its query returned and before its result is written
-/// (`RunWriting`) is still `running`, and its frame keeps the lease, so
-/// the key's press on another net is refused until the write and the
-/// finish end.
 async fn writing_keeps_the_lease() {
     use trawl_server::pool::seam::Seam;
 
@@ -2428,11 +2196,6 @@ async fn writing_keeps_the_lease() {
     assert!(runs_of(&db, other).await.is_empty());
 }
 
-/// The window-resolution phase of [`manual_run_lease_outlives_its_request`]:
-/// a claim whose resolution is parked at `Seam::Resolving` stops waiting at
-/// its deadline and answers 503, with nothing claimed. The parked
-/// resolution keeps the run's lease past that deadline and past the
-/// request, so the key's press on another net is refused, until it ends.
 async fn resolution_keeps_the_lease(
     server: &common::TestServer,
     key_id: i64,
@@ -2496,9 +2259,6 @@ async fn resolution_keeps_the_lease(
     assert!(runs_of(db, other).await.is_empty());
 }
 
-/// The finishing phase of [`manual_run_lease_outlives_its_request`]: the
-/// run's row is still `running` while its frame waits to finish it, and
-/// the frame keeps the lease.
 async fn finishing_keeps_the_lease() {
     use trawl_server::pool::seam::Seam;
 
@@ -2553,12 +2313,6 @@ async fn finishing_keeps_the_lease() {
     assert!(runs_of(&db, other).await.is_empty());
 }
 
-// ---------------------------------------------------------------------------
-// claim deadlines (ADR-0018, amended 2026-11-11)
-// ---------------------------------------------------------------------------
-
-/// The events this binary's code logs, captured process-wide.
-///
 /// The tick logs on the test's task, but a server logs from its workers
 /// too, so the capture is the global subscriber, and a process has one:
 /// under nextest each test is a process of its own, while under `cargo
@@ -2585,7 +2339,6 @@ fn tick_log() -> &'static common::audit_capture::Capture {
     })
 }
 
-/// Every captured `event_type` event whose `field` is exactly `value`.
 fn logged(event_type: &str, field: &str, value: i64) -> Vec<common::audit_capture::Captured> {
     let event_type = format!("{event_type:?}");
     let value = value.to_string();
@@ -2598,13 +2351,6 @@ fn logged(event_type: &str, field: &str, value: i64) -> Vec<common::audit_captur
         .collect()
 }
 
-/// A claim stuck on a row lock ends at its deadline. With the oldest due
-/// schedule's saved query held `FOR UPDATE` by a fixture, its claim ends
-/// after [`CLAIM_WAIT`] as `wait_expired`, leaves its cursor, watermark
-/// and run budget, and gives its lease back: on a pool with one scheduled
-/// lease, the same tick starts the next due schedule under it. A listing
-/// that runs out, behind a fixture's `ACCESS EXCLUSIVE` lock on
-/// `schedules`, ends the tick with nothing claimed.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_claim_stuck_on_a_row_lock_ends_at_its_deadline() {
     tick_log();
@@ -2666,7 +2412,6 @@ async fn a_claim_stuck_on_a_row_lock_ends_at_its_deadline() {
     })
     .await;
 
-    // A listing that runs out ends the tick: `stuck` is still due.
     let mut lock = h.app_pool.begin().await.unwrap();
     sqlx::query("LOCK TABLE schedules IN ACCESS EXCLUSIVE MODE")
         .execute(&mut *lock)
@@ -2683,16 +2428,12 @@ async fn a_claim_stuck_on_a_row_lock_ends_at_its_deadline() {
     assert!(h.runs(stuck).await.is_empty());
     assert_eq!(h.claim_state(stuck).await, before);
 
-    // Nothing else held it back: with the lock gone, the next tick runs it.
     h.tick(now).await;
     let runs = h.runs(stuck).await;
     assert_eq!(runs.len(), 1, "{runs:?}");
     assert_eq!(runs[0].status, RunStatus::Success, "{runs:?}");
 }
 
-/// A manual claim stuck on a row lock answers 503 `service_unavailable`
-/// at its deadline, having claimed nothing, and its lease is back before
-/// the answer: once the lock goes, the key's next press answers 200.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_manual_claim_stuck_on_a_row_lock_answers_503() {
     let server = common::setup().await;
@@ -2742,13 +2483,6 @@ async fn a_manual_claim_stuck_on_a_row_lock_answers_503() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// the key memo (ADR-0018, amended 2026-11-11)
-// ---------------------------------------------------------------------------
-
-/// Mint a key that can run scheduled queries and give it one hourly
-/// schedule per name, each with its fire cursor at [`t0`], in that order.
-/// Returns the key and the saved-query ids.
 async fn key_with_schedules(
     h: &Harness,
     key: &str,
@@ -2780,7 +2514,6 @@ async fn key_with_schedules(
     (key, saved_ids)
 }
 
-/// A schedule's fire cursor and its runs, as a skipped claim leaves them.
 async fn untouched(h: &Harness, saved_id: i64, key_id: i64) -> (DateTime<Utc>, usize) {
     let schedule = h
         .schedules
@@ -2796,10 +2529,6 @@ async fn untouched(h: &Harness, saved_id: i64, key_id: i64) -> (DateTime<Utc>, u
     (schedule.next_fire_at, runs.len())
 }
 
-/// An unusable key is checked once per tick. Three due schedules of one
-/// revoked key cost the tick one key lookup and one `scheduler_skip`
-/// naming the key with `schedules = 3`, and none of them is claimed. The
-/// next tick remembers nothing of this one: it looks the key up again.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unusable_key_is_checked_once_per_tick() {
     tick_log();
@@ -2840,12 +2569,6 @@ async fn an_unusable_key_is_checked_once_per_tick() {
     assert_eq!(logged("scheduler_skip", "key_id", key.info.id).len(), 2);
 }
 
-/// A usable key is checked at every claim. Two due schedules of one key
-/// share a tick; the first claim waits on a fixture's row lock on its
-/// saved query while the key is revoked. The first claim, checked before
-/// the revocation, runs. The second is checked again, after it, and is
-/// refused: its cursor stays, it has no run, and the tick logs one
-/// `scheduler_skip` for the key with `schedules = 1`.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_usable_key_is_checked_at_every_claim() {
     tick_log();

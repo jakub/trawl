@@ -4,33 +4,7 @@
 
 //! Engine-assumption probe (ADR-0009, ADR-0011): every claim the conform
 //! path makes about `DuckDB` is executed here against the bundled engine,
-//! never assumed — the cast domains, the round-trip guard, the
-//! `read_json` inference classes a hot snapshot can produce, and the
-//! agreement between the two conform lanes and their live mirrors.
-//!
-//! # The probe matrix is the contract
-//!
-//! Where a live mirror in [`trawl_core::compare`] claims to reproduce a
-//! `DuckDB` reading, the pair runs here side by side over a matrix of
-//! inputs, and a divergence the matrix does not name is a bug in the
-//! mirror, not something to work around at the call site. Both engines
-//! answer the same user question: the batch query reads the conformed
-//! column off disk while the live tail reads the wire JSON, so a mirror
-//! that is merely close makes a stream fire on events the equivalent
-//! query drops (or drop events it returns) with nothing in the request
-//! to explain it.
-//!
-//! When a new divergence turns up: add the input to the matrix, then fix
-//! the mirror against what the engine actually does. Every divergence
-//! that survives is a deliberate, one-directional residual with its cost
-//! written down and its own test asserting it stays one-directional (see
-//! [`the_timestamp_mirror_residuals_are_one_directional`]) — the mirror
-//! may under-read what `DuckDB` reads, never the reverse.
-//!
-//! Ground truth comes from execution, not from a parser's documentation:
-//! the timestamp divergences ADR-0011 ruling #4 settled (`epoch`, a
-//! trailing ` UTC`, hour-24 rollover, `T09:00+00:00`) were all in rules
-//! that had been reasoned out rather than run.
+//! never assumed.
 
 use std::io::Write as _;
 
@@ -45,8 +19,6 @@ fn hot_reader(path: &std::path::Path) -> String {
     )
 }
 
-/// A connection configured the way every conforming connection is
-/// ([`trawl_core::conform::SESSION_TIME_ZONE_SQL`]).
 fn conn() -> duckdb::Connection {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
@@ -62,10 +34,6 @@ fn conform(quoted: &str, pin: CanonicalType) -> String {
     guarded_cast(&untyped_text(quoted), pin)
 }
 
-/// The emitted negated-list predicate against a real VARCHAR parquet
-/// column: every element must use the dual text/DECIMAL equality rule,
-/// and the search-stage NULL widening must survive their AND
-/// composition.
 #[test]
 fn varchar_negated_list_executes_as_pin_aware_not_in_with_null_widening() {
     let dir = tempfile::tempdir().unwrap();
@@ -127,13 +95,11 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("hot.ndjson");
     let mut f = std::fs::File::create(&file).unwrap();
-    // s: all strings -> VARCHAR; m: mixed -> JSON; b: all ints -> BIGINT.
     writeln!(f, r#"{{"s":"n/a","m":5,"b":410}}"#).unwrap();
     writeln!(f, r#"{{"s":"ok","m":"n/a","b":420}}"#).unwrap();
     f.sync_all().unwrap();
 
     let conn = duckdb::Connection::open_in_memory().unwrap();
-    // Confirm the fixture really lands in the three classes above.
     let mut stmt = conn
         .prepare(&format!("DESCRIBE SELECT * FROM {}", hot_reader(&file)))
         .unwrap();
@@ -175,30 +141,8 @@ fn untyped_varchar_conform_expression_is_unquoted_across_inference_classes() {
     );
 }
 
-/// The pin ladder and the conform step guard every typed cast with a
-/// round-trip check (ADR-0009): `TRY_CAST` to a numeric type rounds
-/// rather than fails — `1.5 → 2` counts as a "success" — so a bare
-/// `count(TRY_CAST(...))` would score a fractional batch ≥90% BIGINT and
-/// silently round every value on write, with no `field_conflicts` row.
-/// This pins both halves across the inference classes the WAL can produce
-/// (VARCHAR, JSON-mixed, HUGEINT numeric):
-///
-/// 1. the premise: the unguarded cast really does round (a `DuckDB` bump
-///    that makes it fail instead would let the guard be simplified), and
-/// 2. the guard as both lanes emit it
-///    ([`trawl_core::conform::guarded_cast`]): BIGINT compares the cast
-///    against the value's canonical text re-parsed as `DECIMAL(38,6)` —
-///    exact across the whole BIGINT range, where a DOUBLE-space comparison
-///    is blind above 2^53 (both sides collapse to one double, so
-///    `1735689600123456710.7` conforms BIGINT silently); representation
-///    drift is tolerated (`4.0 → 4`, `"042" → 42`), as is a fraction
-///    below DECIMAL(38,6)'s half-microstep (`4.0000001 → 4`, the
-///    documented residual tolerance). DOUBLE stays in DOUBLE space
-///    (`u64::MAX` → DOUBLE with precision loss, which is what pinning
-///    DOUBLE means); BOOLEAN compares strict text (`true`/`false` only,
-///    so `1` never conforms to a BOOLEAN pin).
 #[test]
-#[allow(clippy::too_many_lines)] // one probe per comparison-space decision, kept together
+#[allow(clippy::too_many_lines)]
 fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     let dir = tempfile::tempdir().unwrap();
     let conn = conn();
@@ -208,7 +152,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         stmt.query_row([], |row| row.get(1)).unwrap()
     };
 
-    // --- inference classes: mixed values infer JSON, u64-range HUGEINT ---
     let mixed = dir.path().join("mixed.ndjson");
     {
         let mut f = std::fs::File::create(&mixed).unwrap();
@@ -228,7 +171,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "u64-range integers must infer HUGEINT"
     );
 
-    // --- the premise: TRY_CAST rounds, it does not fail ---
     let one = |sql: &str| -> Option<i64> { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
     assert_eq!(
         one("SELECT TRY_CAST(m AS BIGINT) FROM (SELECT m FROM read_json('MIXED', format='newline_delimited', records=true, auto_detect=true, field_appearance_threshold=0)) WHERE json_extract_string(m,'$') = '1.5'"
@@ -255,7 +197,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "the JSON class rounds through the real reader as well"
     );
 
-    // --- the guard, exactly as the shared builder emits it ---
     let guard_bigint_json = conform("m", CanonicalType::BigInt);
     let rows: Vec<(String, Option<i64>)> = {
         let mut stmt = conn
@@ -275,7 +216,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "the guarded BIGINT cast must NULL a fractional value instead of rounding"
     );
 
-    // VARCHAR class: strings that survive vs strings that round.
     let varchar_cases: Vec<(String, Option<i64>)> = {
         let guard = conform("v", CanonicalType::BigInt);
         let mut stmt = conn
@@ -292,17 +232,14 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     assert_eq!(
         varchar_cases,
         vec![
-            ("042".into(), Some(42)), // representation drift tolerated (numeric space)
-            ("1.5".into(), None),     // rounding refused
+            ("042".into(), Some(42)),
+            ("1.5".into(), None),
             ("42".into(), Some(42)),
             ("n/a".into(), None),
         ],
         "VARCHAR class: numeric-space round-trip"
     );
 
-    // HUGEINT class: u64::MAX must fail the BIGINT guard but still conform
-    // to DOUBLE — the DOUBLE rung deliberately tolerates the precision
-    // loss, since a u64-range batch pins DOUBLE.
     let (bigint, double): (Option<i64>, Option<f64>) = conn
         .query_row(
             &format!(
@@ -321,9 +258,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
         "u64::MAX: the BIGINT cast NULLs, the DOUBLE rung keeps it lossily"
     );
 
-    // BOOLEAN: TRY_CAST(true AS BIGINT) = 1, so an unguarded count scores
-    // a boolean batch as BIGINT and the BOOLEAN rung is unreachable. Under
-    // the guard booleans fail BIGINT and pass only the strict-text rung.
     let bools = dir.path().join("bools.ndjson");
     {
         let mut f = std::fs::File::create(&bools).unwrap();
@@ -362,10 +296,6 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     );
     assert_eq!((ok_bi, ok_bool), (0, 19), "guarded: booleans pin BOOLEAN");
 
-    // TIMESTAMP: the rung reads the format drift a wire timestamp carries
-    // (RFC 3339 `T`/`Z`, DuckDB's own space-separated rendering, a bare
-    // date) and NULLs a text no parser reads. Zone handling has its own
-    // probe (`timestamp_conform_applies_the_offset...`).
     let ts_cases: Vec<(String, Option<String>)> = {
         let guard = conform("v", CanonicalType::Timestamp);
         let mut stmt = conn
@@ -398,23 +328,10 @@ fn typed_casts_round_so_the_conform_guard_must_round_trip() {
     );
 }
 
-/// Why the BIGINT rung compares in `DECIMAL(38,6)` space and not DOUBLE:
-/// above 2^53 both sides of a DOUBLE comparison collapse to the same
-/// double, so a nanosecond-epoch-magnitude fractional value
-/// (`1735689600123456710.7`) would "round-trip" and conform BIGINT as
-/// `...711` — the silent-rounding failure mode the guard exists to refuse,
-/// moved up the number line. This pins the boundary classes: 2^53 ± 1 must
-/// stay exact accepts, the >2^53 fractional must fail, a >2^53 integer must
-/// still pass (DECIMAL is exact where DOUBLE space cannot distinguish),
-/// `u64::MAX` still NULLs the cast, and the residual
-/// tolerance — a fraction below DECIMAL(38,6)'s half-microstep quantizes
-/// away (`4.0000001 → 4` accepted, `4.5` refused) — is deliberate and
-/// documented, not an accident a bump may silently change.
 #[test]
 fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
     let conn = conn();
 
-    // The DOUBLE-space blindness the DECIMAL rung avoids, as the premise.
     let blind: bool = conn
         .query_row(
             "SELECT TRY_CAST('1735689600123456710.7' AS DOUBLE) = \
@@ -467,9 +384,6 @@ fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
          rounding above the half-microstep"
     );
 
-    // The DOUBLE rung deliberately keeps DOUBLE space: the >2^53 fractional
-    // the BIGINT rung refuses still passes DOUBLE (it pins DOUBLE with
-    // DOUBLE's precision, which is what pinning DOUBLE means).
     let db_ok: bool = conn
         .query_row(
             "SELECT TRY_CAST('1735689600123456710.7' AS DOUBLE) = \
@@ -481,13 +395,6 @@ fn bigint_round_trip_is_exact_in_decimal_space_beyond_2_pow_53() {
     assert!(db_ok, "the value stays representable on the DOUBLE rung");
 }
 
-/// `DuckDB` identifiers are case-INSENSITIVE, but only over ASCII — a
-/// `REPLACE` list naming two ASCII case-variants is a hard parse error,
-/// not a degraded read. This pins both halves of the equivalence the
-/// ingest canonicalizer's field-name fold is built on
-/// (`envelope::fold_field_names`, ADR-0009): what `DuckDB` collapses
-/// (ASCII case) and what it must NOT (folding `CAFÉ` onto `café` would
-/// merge two real columns — the fold maps `CAFÉ` to `cafÉ` instead).
 #[test]
 fn replace_list_identifier_folding_is_ascii_only() {
     let dir = tempfile::tempdir().unwrap();
@@ -506,18 +413,14 @@ fn replace_list_identifier_folding_is_ascii_only() {
         .map(|e| e.to_string())
     };
 
-    // ASCII case-variants are ONE column: naming both is a parse error.
     let err = replace(r#"to_json("Status") AS "Status", to_json("status") AS "status""#)
         .expect("two ASCII case-variants must be rejected");
     assert!(
         err.contains("Duplicate entry"),
         "expected a duplicate-entry parse error, got: {err}"
     );
-    // ...and either spelling alone binds the column.
     assert_eq!(replace(r#"to_json("STATUS") AS "STATUS""#), None);
 
-    // Non-ASCII case is NOT folded — these stay distinct identifiers, so
-    // the emitter must not fold them either.
     for (name, variant) in [("café", "CAFÉ"), ("Ωx", "ωx")] {
         let err = replace(&format!(r#"to_json("{variant}") AS "{variant}""#))
             .unwrap_or_else(|| panic!("{variant} unexpectedly bound {name}"));
@@ -528,14 +431,6 @@ fn replace_list_identifier_folding_is_ascii_only() {
     }
 }
 
-/// A snapshot carrying BOTH spellings of one field is not two nameable
-/// columns: `read_json` renames the collided key (`duration` + `Duration_1`),
-/// and a `REPLACE` naming either spelling binds the FIRST column. So a pin
-/// applied there conforms the WRONG column — retyping one service's values
-/// while the pinned field's own data sits untouched in `Duration_1`. This is
-/// the execution evidence for folding field names at the one ingest door
-/// every producer enters (ADR-0009) rather than trying to pin either
-/// spelling once both have reached a snapshot.
 #[test]
 fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -554,7 +449,6 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
             .collect()
     };
 
-    // The second spelling is not its own name: it comes back suffixed.
     let plain = describe(&format!("SELECT * FROM {}", hot_reader(&file)));
     assert_eq!(
         plain,
@@ -566,8 +460,6 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
         "expected read_json to rename the case-collided key"
     );
 
-    // Naming the pinned spelling rewrites the OTHER service's column, and
-    // leaves the pinned field's real values (`Duration_1`) alone.
     let replaced = describe(&format!(
         "SELECT * REPLACE (json_extract_string(to_json(\"Duration\"), '$') AS \"Duration\") \
          FROM {}",
@@ -585,26 +477,12 @@ fn case_collided_json_keys_are_renamed_and_replace_binds_the_first() {
     );
 }
 
-/// Two engine facts behind folding every producer's field names at the
-/// one ingest door (`envelope::canonicalize`, ADR-0009):
-///
-/// 1. an UNCONFORMED hot column can throw the WHOLE composite source — the
-///    union binds types for every column, so a query whose DSL never names
-///    the field fails too; and
-/// 2. `UNION ALL BY NAME` matches column names case-INSENSITIVELY, and a
-///    `VARCHAR` hot column unions with every cold scalar type.
-///
-/// Together: two spellings of one identifier in a hot snapshot leave an
-/// unnameable `_1` twin that can fail every query, which is why field
-/// names are folded to one spelling BEFORE they can reach the buffer —
-/// and why a `VARCHAR` conform under the surviving spelling is safe.
 #[test]
 fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
     let dir = tempfile::tempdir().unwrap();
     let hot = dir.path().join("hot.ndjson");
     let cold = dir.path().join("cold.parquet");
     let mut f = std::fs::File::create(&hot).unwrap();
-    // Mixed values -> JSON, under the OTHER spelling of every cold column.
     writeln!(
         f,
         r#"{{"service":"svc","Duration":"1.5s","Started":1700000000}}"#
@@ -630,9 +508,6 @@ fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
         )
     };
     let count = |sql: &str| -> Result<usize, duckdb::Error> {
-        // The shape every trawl query has: a filter naming one field, `*` for
-        // the projection. Nothing here mentions the collided field — the
-        // union binds it anyway.
         let mut stmt = conn.prepare(&format!(
             "SELECT * FROM ({sql}) WHERE service = 'svc' LIMIT 5"
         ))?;
@@ -644,16 +519,12 @@ fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
         Ok(n)
     };
 
-    // Unconformed: cold VARCHAR x hot JSON is irreconcilable, and it takes
-    // the unrelated query down with it.
     let err = count(&union("")).expect_err("an unconformed hot column must throw the union");
     assert!(
         err.to_string().contains("Malformed JSON"),
         "expected the JSON-vs-VARCHAR union conflict, got: {err}"
     );
 
-    // Conformed to VARCHAR under the hot spelling: BY NAME folds the case,
-    // so both columns line up and every pair promotes instead of throwing.
     let replace = "REPLACE (json_extract_string(to_json(\"Duration\"), '$') AS \"Duration\", \
                    json_extract_string(to_json(\"Started\"), '$') AS \"Started\")";
     assert_eq!(
@@ -681,14 +552,6 @@ fn unconformed_hot_column_throws_the_union_and_varchar_conform_saves_it() {
     );
 }
 
-// ── pin-aware comparison rules, execution-evidenced (ADR-0011) ──
-//
-// One probe per emission rule, against real VARCHAR and BIGINT columns.
-// The pin-blind shapes are probed beside them, so a DuckDB bump that
-// alters the implicit-cast outcome surfaces here, not in production.
-
-/// A VARCHAR column seeded with mixed numeric-looking and word values —
-/// the shape a VARCHAR pin guarantees on disk.
 fn varchar_status_conn() -> duckdb::Connection {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     conn.execute_batch(
@@ -702,14 +565,6 @@ fn count(conn: &duckdb::Connection, sql: &str) -> Result<i64, duckdb::Error> {
     conn.query_row(sql, [], |row| row.get(0))
 }
 
-/// Why a VARCHAR pin needs its own rule: pin-blind emission binds an
-/// INTEGER parameter against the VARCHAR column, and the outcome is an
-/// error either way — `=`/IN make `DuckDB` cast the COLUMN to INT64 and
-/// the first word value throws a Conversion error; ordered comparisons
-/// refuse to bind at all (Binder: "Cannot compare values of type VARCHAR
-/// and type BIGINT"). Pinned here with bound parameters (exactly what the
-/// emitter produces) so a `DuckDB` bump that changes the implicit-cast
-/// outcome surfaces.
 #[test]
 fn pin_blind_int_comparison_on_varchar_column_errors() {
     let conn = varchar_status_conn();
@@ -748,9 +603,6 @@ fn pin_blind_int_comparison_on_varchar_column_errors() {
     );
 }
 
-/// Rule: VARCHAR pin + `=`/`!=`/IN binds text — matches exactly the
-/// stored string, never errors, and does not equate numeric variants
-/// ('200' != '200.0').
 #[test]
 fn varchar_text_equality_matches_exact_string_only() {
     let conn = varchar_status_conn();
@@ -766,7 +618,6 @@ fn varchar_text_equality_matches_exact_string_only() {
         .unwrap(),
         2
     );
-    // != with the OR-IS-NULL policy over a column with no NULLs: everything else.
     assert_eq!(
         count(
             &conn,
@@ -775,20 +626,12 @@ fn varchar_text_equality_matches_exact_string_only() {
         .unwrap(),
         4
     );
-    // Text equality is exact: no numeric equivalence.
     assert_eq!(
         count(&conn, "SELECT count(*)::BIGINT FROM t WHERE v = '200.0'").unwrap(),
         0
     );
 }
 
-/// Rule: VARCHAR pin + ordered numeric literal → both sides read through
-/// [`decimal_reading`]. Numeric-looking strings order numerically,
-/// values outside the space are NULL (excluded), and nothing throws.
-///
-/// The comparison is built from the shared expression rather than a
-/// hand-written cast, so a change to the space fails here instead of
-/// silently leaving this probe testing an expression nothing emits.
 #[test]
 fn varchar_ordered_rung_compares_in_the_decimal_space() {
     let conn = varchar_status_conn();
@@ -803,31 +646,15 @@ fn varchar_ordered_rung_compares_in_the_decimal_space() {
         )
         .unwrap()
     };
-    assert_eq!(
-        ordered(">=", "400"),
-        2, // '404', '500'; 'accepted' NULLs out, '200'/'1.5' below
-    );
-    assert_eq!(
-        ordered(">", "1"),
-        4, // '1.5', '200', '404', '500' — the fraction survives the space
-    );
-    // The reading of 'accepted' is NULL: excluded from BOTH sides of the
-    // comparison, never an error.
+    assert_eq!(ordered(">=", "400"), 2,);
+    assert_eq!(ordered(">", "1"), 4,);
     assert_eq!(ordered("<", "1000"), 4);
-    // A LITERAL the space cannot read needs no special case: its own cast
-    // is NULL, so every row is UNKNOWN and none match.
     for literal in ["nan", "inf", "1e40"] {
         assert_eq!(ordered(">", literal), 0, "{literal}");
         assert_eq!(ordered("<", literal), 0, "{literal}");
     }
 }
 
-/// The DOUBLE cast's DOMAIN, run on both engines side by side:
-/// `TRY_CAST(v AS DOUBLE)` in `DuckDB` against `compare::try_cast_double`
-/// in the live matcher — the reading behind the DOUBLE pin's pattern text
-/// and the `tonumber()` scalar. `str::parse::<f64>` is NOT that domain —
-/// `DuckDB` trims ASCII whitespace and honours `_` digit separators — and
-/// every disagreement costs the stream a row the batch query returns.
 #[test]
 fn try_cast_double_domain_matches_the_live_mirror() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -864,7 +691,6 @@ fn try_cast_double_domain_matches_the_live_mirror() {
         "1_e3",
         "1e_3",
         "_",
-        // Shapes the two engines already agree on.
         "200",
         "1.5",
         "-0.5",
@@ -915,11 +741,7 @@ fn try_cast_double_domain_matches_the_live_mirror() {
     }
 }
 
-/// The texts [`decimal_comparison_space_domain_matches_the_live_mirror`]
-/// runs through both engines — hoisted so the matrix can grow without the
-/// test body growing with it.
 const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
-    // Whitespace: trimmed both ends, ASCII only.
     " 200",
     "200 ",
     "\t200\n",
@@ -929,7 +751,6 @@ const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
     "2 00",
     " ",
     "",
-    // `_` digit separators, only between ASCII digits.
     "200_000",
     "1_000.5",
     "1e1_0",
@@ -937,7 +758,6 @@ const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
     "200_",
     "1__0",
     "1_.5",
-    // Spelling drift that denotes the same number.
     "200",
     "200.0",
     "200.000000",
@@ -951,7 +771,6 @@ const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
     "1E3",
     "1e-3",
     "00200",
-    // Exact where a DOUBLE reading collapses.
     "1737000000123456788",
     "1737000000123456789",
     "1737000000123456790",
@@ -975,7 +794,6 @@ const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
     "1e40",
     "1e400",
     "1e-400",
-    // No reading at all — the DOUBLE domain read the first three.
     "nan",
     "NaN",
     "inf",
@@ -1086,16 +904,6 @@ const DECIMAL_DOMAIN_INPUTS: &[&str] = &[
     "9.9e31",
 ];
 
-/// The comparison space's DOMAIN, run on both engines side by side:
-/// [`decimal_reading`] in `DuckDB` against `compare::decimal_micros` in
-/// the live matcher. It is `DuckDB`'s cast domain, not Rust's number
-/// parser — whitespace is trimmed, `_` separates digits, `'0404'` is 404 —
-/// and every disagreement is a row the stream and the batch query answer
-/// differently.
-///
-/// The engine side is read back as TEXT: `DECIMAL(38,6)` renders with
-/// exactly six fractional digits, which is the scaled integer the mirror
-/// carries with the point put back.
 #[test]
 fn decimal_comparison_space_domain_matches_the_live_mirror() {
     let conn = conn();
@@ -1127,13 +935,6 @@ fn render_micros(micros: i128) -> String {
     )
 }
 
-/// The emitter binds the query literal as a STRING and casts it with the
-/// same expression it casts the column with, so this pins what a bound
-/// parameter does inside that cast: `DuckDB` keeps it VARCHAR and the
-/// `TRY_CAST` degrades to NULL. It must not resolve the parameter's type
-/// from the cast target — that would make an unreadable literal a
-/// conversion ERROR at execution time instead of an UNKNOWN row, turning
-/// `status=nan` from "matches the text `nan`" into a failed query.
 #[test]
 fn a_bound_literal_casts_as_text_and_nulls_instead_of_throwing() {
     let conn = conn();
@@ -1158,15 +959,6 @@ fn a_bound_literal_casts_as_text_and_nulls_instead_of_throwing() {
     }
 }
 
-/// The VARCHAR-pinned equality and `!=` shapes the emitter builds, run
-/// over ids that differ by one.
-///
-/// In DOUBLE space every id above 2^53 collapses onto its neighbours, so
-/// `id=1737000000123456789` returns three distinct stored ids and
-/// `id!=9007199254740993` silently suppresses `9007199254740992`. Both
-/// engines collapse identically, so parity testing cannot see it — only
-/// execution against stored data can. The DOUBLE half stays as the
-/// premise: it is what makes the DECIMAL assertions mean something.
 #[test]
 fn the_decimal_comparison_space_separates_ids_a_double_equates() {
     let conn = conn();
@@ -1177,9 +969,6 @@ fn the_decimal_comparison_space_separates_ids_a_double_equates() {
     )
     .unwrap();
 
-    // The two shapes the emitter builds, with the numeric arm in each
-    // space. `!=` carries its OR-IS-NULL policy and is asked which rows it
-    // EXCLUDES, because a suppressed row is invisible rather than wrong.
     let equality = |space: &dyn Fn(&str) -> String, literal: &str| {
         format!(
             "(v = '{literal}' OR COALESCE({} = {}, FALSE))",
@@ -1215,8 +1004,6 @@ fn the_decimal_comparison_space_separates_ids_a_double_equates() {
         ["1737000000123456789"],
         "the comparison space must match exactly the stored id"
     );
-    // The rule the numeric arm exists for still holds: one number, two
-    // spellings, both matched.
     assert_eq!(
         rows(&equality(&decimal_reading, "200")),
         ["200", "200.0"],
@@ -1238,12 +1025,6 @@ fn the_decimal_comparison_space_separates_ids_a_double_equates() {
     );
 }
 
-/// Why the comparison space is never a per-literal BIGINT domain:
-/// `TRY_CAST('1.5' AS BIGINT)` ROUNDS to 2, so an integer space would make
-/// `dur>1` and `dur>1.5` disagree about the same stored value.
-/// `DECIMAL(38,6)` keeps 1.5 as 1.5 — and unlike DOUBLE it also keeps
-/// every `i64` distinct. (The rounding premise itself is also pinned by
-/// the conform-guard probes above.)
 #[test]
 fn try_cast_bigint_rounds_where_the_comparison_space_preserves() {
     let conn = conn();
@@ -1261,10 +1042,6 @@ fn try_cast_bigint_rounds_where_the_comparison_space_preserves() {
     assert_eq!(as_decimal, "1.500000", "the comparison space preserves");
 }
 
-/// GLOB and `regexp_matches` both refuse a numeric column outright
-/// (Binder: no `~~~(INTEGER, UNKNOWN)` / `regexp_matches(INTEGER,
-/// UNKNOWN)` overload), which is why the pattern rules cast a typed pin
-/// to text rather than matching the column directly.
 #[test]
 fn pin_blind_patterns_on_bigint_column_refuse_to_bind() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1280,12 +1057,6 @@ fn pin_blind_patterns_on_bigint_column_refuse_to_bind() {
     }
 }
 
-/// RE2 reads class set syntax as plain characters (ADR-0063). Inside a
-/// class, `&&`, `--` and `~~` are characters and every operand joins one
-/// union, and `[` is a character, so the first `]` closes the class. The
-/// `regex` crate reads `[\pL&&a]` as `a` alone, so the batch lane would
-/// match `b` and `&` where the live lane matches neither. The parser
-/// refuses every such body, and an escaped `&` or `[` reads alike in both.
 #[test]
 fn re2_reads_class_set_syntax_as_plain_characters() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1295,16 +1066,12 @@ fn re2_reads_class_set_syntax_as_plain_characters() {
         })
         .unwrap()
     };
-    // The intersection is a union: any letter, `&` and `a`.
     for subject in ["a", "b", "&"] {
         assert!(matches(subject, r"^[\pL&&a]$"), "{subject}");
     }
-    // The difference and symmetric difference are unions too.
     assert!(matches("-", "^[a-z--b]$"));
     assert!(matches("b", "^[a-z--b]$"));
     assert!(matches("~", r"^[\pL~~\pL]$"));
-    // The nested class's `]` closes the outer one: `[[ab]` is a class of
-    // `[`, `a` and `b`, then `c` and a literal `]`.
     assert!(matches("ac]", "^[[ab]c]$"));
     assert!(!matches("c", "^[[ab]c]$"));
 
@@ -1315,27 +1082,12 @@ fn re2_reads_class_set_syntax_as_plain_characters() {
             "{body}: {errors:?}"
         );
     }
-    // Escaped, they are characters in both engines, and the parser admits
-    // them.
     assert!(matches("&", r"^[a\&&b]$"));
     assert!(!matches("c", r"^[a\&&b]$"));
     assert!(matches("[", r"^[\[]$"));
     assert!(trawl_core::parser::parse(r"msg=/[a\&&b][\[]/").is_ok());
 }
 
-/// Rule (ADR-0001's amendment of 2026-11-09): a search-stage glob matches
-/// in the live lane and the kv batch tail exactly as `DuckDB`'s `GLOB`
-/// matches it in batch SQL. `GLOB` reads bytes: `?` is one byte, a class
-/// is a set of bytes, `[!` negates and `^` is a member, `\` escapes the
-/// next byte outside a class and is a member inside one, and a malformed
-/// glob matches nothing. A range compares C `char` values, signed on
-/// `x86_64`, so `[Ã-a]` holds `Z`.
-///
-/// Each row states `DuckDB`'s answer, checks it against the bundled engine
-/// (`SELECT ? GLOB ?`, the shape the batch lane emits), then builds the
-/// glob through the pattern owner and checks the live `is_match` against
-/// it. Every glob must build: a malformed one builds as a pattern that
-/// matches nothing, never as a syntax error.
 #[test]
 fn glob_lane_semantics_probe() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1351,7 +1103,6 @@ fn glob_lane_semantics_probe() {
             .unwrap_or_else(|e| panic!("{subject:?} against {glob:?}: {e}"))
     };
     let rows: &[(&str, &str, bool)] = &[
-        // The issue's table.
         ("4", "[^4]", true),
         ("é", "?", false),
         ("é", "??", true),
@@ -1365,8 +1116,6 @@ fn glob_lane_semantics_probe() {
         ("[", "[", false),
         ("x", "[]", false),
         ("b", "[!a]", true),
-        // `?` and `[!…]` over a newline, an empty value, and two-, three-
-        // and four-byte characters.
         ("\n", "?", true),
         ("\n", "[!a]", true),
         ("", "?", false),
@@ -1392,7 +1141,6 @@ fn glob_lane_semantics_probe() {
         ("Z", "[Ã-a]", true),
         ("a", "[é-a]", true),
         ("a", "[a-é]", false),
-        // A trailing `\` escapes nothing, so the glob matches nothing.
         ("x", "x\\", false),
         ("x\\", "x\\", false),
         // A member followed by `-` takes the next byte as the range end,
@@ -1400,7 +1148,6 @@ fn glob_lane_semantics_probe() {
         ("-", "[a-]]", false),
         ("]", "[a-]]", false),
         ("a", "[a-]]", false),
-        // `]` as the first member is a member.
         ("]", "[]]", true),
         ("x", "[]]", false),
         ("x", "[!]]", true),
@@ -1410,23 +1157,18 @@ fn glob_lane_semantics_probe() {
         ("^", "[]-a]", true),
         ("a", "[]-a]", true),
         ("b", "[]-a]", false),
-        // A leading `-` is a member.
         ("-", "[-a]", true),
         ("a", "[-a]", true),
-        // A reversed range adds nothing.
         ("x", "[z-a]*", false),
         ("", "[z-a]*", false),
         ("x", "[!z-a]", true),
         ("é", "[!z-a]", false),
         ("q", "[z-aq]", true),
         ("z", "[z-aq]", false),
-        // An unterminated class anywhere makes the whole glob match nothing.
         ("a", "*[", false),
         ("[", "*[", false),
-        // Inside a class, `*` is a member.
         ("*", "[*]", true),
         ("a", "[*]", false),
-        // Outside a class, `\` escapes the next byte.
         ("*", r"\*", true),
         ("a", r"\*", false),
         ("?", r"\?", true),
@@ -1434,10 +1176,8 @@ fn glob_lane_semantics_probe() {
         ("[", r"\[", true),
         ("é", r"\é", true),
         (r"\", r"\\", true),
-        // The empty glob matches only the empty value.
         ("", "", true),
         ("a", "", false),
-        // `?` takes a NUL byte.
         ("\0", "?", true),
         ("a\0b", "a?b", true),
     ];
@@ -1452,8 +1192,6 @@ fn glob_lane_semantics_probe() {
     }
 }
 
-/// Rule: typed pins glob/regex via `CAST(col AS VARCHAR)` — both match
-/// the text form of BIGINT values, explicitly.
 #[test]
 fn cast_text_patterns_match_bigint_text_form() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1473,16 +1211,11 @@ fn cast_text_patterns_match_bigint_text_form() {
             "SELECT count(*)::BIGINT FROM t WHERE regexp_matches(CAST(v AS VARCHAR), '^[45]0[04]$')"
         )
         .unwrap(),
-        2, // 404 and 500; 200 starts with neither 4 nor 5
+        2,
     );
 }
 
-/// The wire texts [`bigint_pattern_text_is_the_cast_reading_on_both_engines`]
-/// runs through both engines — hoisted so the matrix can grow without the
-/// test body growing with it.
 const BIGINT_PATTERN_INPUTS: &[&str] = &[
-    // Plain integers, incl. the leading-zero case the wire text and the
-    // stored value spell differently.
     "404",
     "0404",
     "00200",
@@ -1490,14 +1223,12 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
     "-0",
     "9223372036854775807",
     "-9223372036854775808",
-    // Whitespace and `_` separators, as for the DOUBLE domain.
     " 404 ",
     "\t404\n",
     "404_000",
     "1_0",
     "1_0.5",
     "1e1_0",
-    // Fractional / exponent texts ROUND, half AWAY FROM ZERO.
     "1.5",
     "1.4",
     "2.5",
@@ -1514,7 +1245,6 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
     "1e18",
     "1.5e18",
     "1.0000000000000001",
-    // Radix prefixes bind on the raw text: no sign, no whitespace.
     "0x10",
     "0X10",
     "0b101",
@@ -1526,7 +1256,6 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
     "0x1.5",
     "0o17",
     "010",
-    // No reading at all.
     "accepted",
     "",
     "true",
@@ -1538,7 +1267,6 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
     "1e",
     "e1",
     "-",
-    // Out of BIGINT range: NULL, never a saturated approximation.
     "9223372036854775808",
     "-9223372036854775809",
     "1e19",
@@ -1557,23 +1285,12 @@ const BIGINT_PATTERN_INPUTS: &[&str] = &[
     "9223372036854775808.0",
     "-9223372036854775808.0",
     "1735689600123456710.7",
-    // …and the lax terminators, which reach the BIGINT reading
-    // through its DECIMAL guard.
     "- ",
     "1e ",
     "1e0.",
     "5e-8",
 ];
 
-/// The BIGINT pin's pattern text is the CONFORMED integer's rendering, and
-/// the live mirror (`compare::conformed_bigint`) must read the same value
-/// out of the same wire text — stringifying the wire text instead answers
-/// `status=0*` TRUE for a stored 404 and `status=a*` TRUE for a value the
-/// column stores as NULL.
-///
-/// Both sides are the GUARDED reading, not the bare cast: the value a
-/// pinned column holds is what the guard admitted, so a text the cast
-/// would round (`'1.5'`) or respell (`'0x10'`) has no pattern text at all.
 #[test]
 fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     let conn = conn();
@@ -1590,8 +1307,6 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
         assert_eq!(live, sql, "BIGINT pattern text disagrees for {input:?}");
     }
 
-    // The guard's residuals, on both engines: a text the cast rounds has
-    // no reading, and neither does one the DECIMAL space cannot re-read.
     for input in ["9223372036854775807.4", "1.5", "0x10"] {
         let sql: Option<String> = conn
             .query_row(
@@ -1604,8 +1319,6 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
         assert_eq!(trawl_core::compare::conformed_bigint(input), None);
     }
 
-    // The whole point: a stored 404 renders `404`, so the wire text's own
-    // leading zero matches on neither side.
     let matched: bool = conn
         .query_row(
             &format!("SELECT CAST({guard} AS VARCHAR) GLOB '0*' FROM (SELECT '0404' AS v) t"),
@@ -1616,11 +1329,6 @@ fn bigint_pattern_text_is_the_cast_reading_on_both_engines() {
     assert!(!matched, "the stored BIGINT is 404, so `0*` misses");
 }
 
-/// The BOOLEAN pin's pattern text is `true`/`false` and nothing else: the
-/// CAST takes a wide case-insensitive vocabulary, and the round-trip guard
-/// keeps only the two spellings `DuckDB` writes back. A matcher reading
-/// the CAST instead of the CONFORM would answer `flag=/^true$/` TRUE for a
-/// wire `"TRUE"`/`"yes"`/`1` the column stores as NULL.
 #[test]
 fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
     let conn = conn();
@@ -1645,7 +1353,7 @@ fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
         "nO",
         "N",
         "n",
-        "0", // Outside the vocabulary: NULL.
+        "0",
         "on",
         "off",
         "",
@@ -1672,9 +1380,6 @@ fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
         assert_eq!(live, sql, "BOOLEAN pattern text disagrees for {input:?}");
     }
 
-    // The premise the guard exists for: the CAST reads far more than the
-    // conform keeps, so reading the cast would invent values the corpus
-    // does not hold.
     let cast_reads: i64 = conn
         .query_row(
             "SELECT count(TRY_CAST(v AS BOOLEAN))::BIGINT \
@@ -1685,9 +1390,6 @@ fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
         .unwrap();
     assert_eq!(cast_reads, 5, "premise: the CAST's vocabulary is wide");
 
-    // A numeric wire value has NO boolean reading once the guard applies:
-    // the cast answers `true` for `'200'` in a JSON-inferred column, and
-    // `'true'` is not the text `'200'`.
     let numeric: Option<String> = conn
         .query_row(
             &format!("SELECT CAST({guard} AS VARCHAR) FROM (SELECT '200' AS v) t"),
@@ -1698,13 +1400,6 @@ fn boolean_pattern_text_is_the_cast_reading_on_both_engines() {
     assert_eq!(numeric, None, "a numeric text must not conform to BOOLEAN");
 }
 
-/// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, and the
-/// live mirror (`compare::canonical_double_text`) must produce the same
-/// string for the same stored value — the wire number's own
-/// stringification does NOT (`200` vs `200.0`, `1e-7` vs `1e-07`,
-/// `123456789012345680` vs `1.2345678901234568e+17`), so a matcher that
-/// stringified the wire value would answer `dur=/^200$/` TRUE where the
-/// batch query answers FALSE.
 #[test]
 fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1726,9 +1421,6 @@ fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
         f64::INFINITY,
         f64::NEG_INFINITY,
         f64::NAN,
-        // A NaN renders with its SIGN, and a DOUBLE-pinned column can
-        // hold either spelling (`a_rendered_nan_keeps_its_sign`), so the
-        // pattern text has to carry the sign too.
         -f64::NAN,
     ];
     for input in inputs {
@@ -1743,9 +1435,6 @@ fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
         assert_eq!(live, sql, "canonical pattern text disagrees for {input}");
     }
 
-    // The whole point: an anchored pattern means the same thing on both
-    // sides of the same value — and `^200$` matches NEITHER, because the
-    // stored double renders `200.0`.
     let matched: bool = conn
         .query_row(
             "SELECT regexp_matches(CAST(CAST(200 AS DOUBLE) AS VARCHAR), '^200$')",
@@ -1757,10 +1446,6 @@ fn double_pattern_text_is_duckdb_rendering_on_both_engines() {
     assert_eq!(trawl_core::compare::canonical_double_text(200.0), "200.0");
 }
 
-/// Why a TIMESTAMP pin needs its own pattern text: `DuckDB`'s plain CAST
-/// rendering is space-separated, zoneless and fraction-trimmed — a form
-/// no live event carries. Globbing that would make `_time=/T09:/` match
-/// live and miss in batch, on every install (`_time` is seeded TIMESTAMP).
 #[test]
 fn timestamp_cast_text_form_is_space_separated() {
     let conn = duckdb::Connection::open_in_memory().unwrap();
@@ -1774,15 +1459,7 @@ fn timestamp_cast_text_form_is_space_separated() {
     assert_eq!(rendered, "2026-01-15 09:00:00");
 }
 
-/// Every text shape whose TIMESTAMP reading the two engines must agree
-/// on — the matrix the module doc's contract refers to.
-///
-/// Grouped by the rule each row exercises, and deliberately including the
-/// shapes nobody would write on purpose: `epoch`, a trailing ` UTC`,
-/// hour-24 rollover and `T09:00+00:00` were all unpredicted divergences.
-/// Add rather than replace.
 const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
-    // The wire form ingest canonicalizes _time into, and its variants.
     "2026-01-15T09:00:00.000000Z",
     "2026-01-15T09:00:00Z",
     "2026-01-15 09:00:00",
@@ -1795,7 +1472,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15\t09:00:00",
     "2026-01-15\n09:00:00",
     "2026-01-15 T09:00:00",
-    // Offsets, in every spelling and both directions.
     "2026-01-15T09:00:00+05:30",
     "2026-01-15T09:00:00-08:00",
     "2026-01-15T09:00:00+02",
@@ -1838,7 +1514,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15T09:00:00-",
     "2026-01-15T09:00:00.123-",
     "2026-01-15T09:00:00,123Z",
-    // Fractional seconds: padded, truncated, empty, absurd.
     "2026-01-15T09:00:00.123Z",
     "2026-01-15T09:00:00.1234567",
     "2026-01-15T09:00:00.0000000000Z",
@@ -1850,7 +1525,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15T09:00:00.0Z",
     "2026-01-15T09:00:00.Z",
     "2026-01-15T09:00:00.",
-    // Dates: slash form, unpadded and over-padded components, junk.
     "2026-01-15",
     "  2026-01-15",
     "2026/01/15",
@@ -1910,7 +1584,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15 23:59:60",
     "2026-01-15T09:60:00Z",
     "2026-01-15T09:00:60Z",
-    // Keyword instants — including the two that render as words.
     "epoch",
     "EpOcH",
     " epoch ",
@@ -1928,7 +1601,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "today",
     "tomorrow",
     "yesterday",
-    // Zone NAMES that mean UTC for all time, and the near-misses.
     "2026-01-15 09:00:00 UTC",
     "2026-01-15T09:00:00 UTC",
     "2026-01-15 09:00:00 uTc",
@@ -1964,7 +1636,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15 09:00:00 UT",
     "2026-01-15 09:00:00 GMT+2",
     "2026-01-15 09:00:00 Narnia/Cair_Paravel",
-    // Years outside four digits, and outside DuckDB's own range.
     "0001-01-01 00:00:00",
     "1-01-01",
     "0-01-01",
@@ -1978,7 +1649,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "1969-12-31T23:59:59Z",
     "300000-01-01 00:00:00",
     "-290308-01-01 00:00:00",
-    // Not timestamps at all — epoch numerals included.
     "yesterday-ish",
     "",
     "accepted",
@@ -2030,20 +1700,6 @@ const TIMESTAMP_TEXT_MATRIX: &[&str] = &[
     "2026-01-15T09:00:00 UTC\t",
 ];
 
-/// The rule: a TIMESTAMP pin globs/regexes against ONE canonical text —
-/// `strftime(<the conform>, TIMESTAMP_PATTERN_SQL_FORMAT)` in SQL,
-/// `compare::canonical_timestamp_text` in the live matcher — so both
-/// engines answer the same string for the same wire value.
-///
-/// The conform is [`trawl_core::conform::guarded_cast`] itself, not a
-/// hand-written cast: the mirror owes its answer to what the corpus
-/// DURABLY holds, so a change to the rung has to break this test rather
-/// than quietly retire it. That rung parses through `TIMESTAMPTZ`, so the
-/// session must be pinned to UTC ([`conn`]) or the expectations move with
-/// `/etc/localtime`.
-///
-/// Every row of [`TIMESTAMP_TEXT_MATRIX`] runs through both engines. A
-/// mismatch is a MIRROR bug — see the module doc.
 #[test]
 fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
     let conn = conn();
@@ -2067,8 +1723,6 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
         assert_eq!(live, sql, "canonical pattern text disagrees for {input:?}");
     }
 
-    // The whole point: an anchored pattern means the same thing on both
-    // sides of the same value.
     let matched: bool = conn
         .query_row(
             &format!(
@@ -2081,8 +1735,6 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
         .unwrap();
     assert!(matched, "batch matches the separator-anchored pattern");
 
-    // A non-timestamp value is NULL, not the empty string: GLOB over it is
-    // NULL (UNKNOWN), which is what the live matcher's `None` mirrors.
     let unknown: Option<bool> = conn
         .query_row(
             &format!(
@@ -2096,19 +1748,6 @@ fn timestamp_pattern_text_is_rfc3339_micros_on_both_engines() {
     assert_eq!(unknown, None);
 }
 
-/// A bound LITERAL meets a typed column through the COLUMN's cast, and
-/// that cast is not always the conform's — which is why
-/// `compare::literal_timestamp` exists beside `conformed_timestamp`.
-///
-/// Every row here is what the live matcher's `pin_literal` claims
-/// (`trawl_core::pin_match`), executed: a BOOLEAN column takes the cast's WIDE
-/// vocabulary from a string literal (`flag=TRUE` and `flag=yes` match a
-/// stored `true`, where the same texts STORED conform to NULL) and casts
-/// ITSELF to meet a number; a TIMESTAMP column casts the literal
-/// wall-clock, so an offset spelled in the literal is IGNORED where the
-/// same offset in a stored value is applied; and the pairs `DuckDB`
-/// refuses outright raise a conversion or binder ERROR, which returns no
-/// rows at all.
 #[test]
 fn a_typed_columns_literal_takes_the_columns_own_cast() {
     let conn = conn();
@@ -2121,7 +1760,6 @@ fn a_typed_columns_literal_takes_the_columns_own_cast() {
         conn.query_row(sql, [param], |row| row.get(0))
     };
 
-    // BOOLEAN: the wide cast vocabulary, on the LITERAL side only.
     for (literal, expected) in [("true", true), ("TRUE", true), ("yes", true), ("1", true)] {
         assert_eq!(
             text_param("SELECT f = ? FROM t", literal).unwrap(),
@@ -2134,12 +1772,9 @@ fn a_typed_columns_literal_takes_the_columns_own_cast() {
             "the mirror reads the literal the same way"
         );
     }
-    // …and the same texts STORED conform to NULL under the guard, which
-    // is the asymmetry the mirror encodes.
     for stored in ["TRUE", "yes", "1"] {
         assert_eq!(trawl_core::compare::conformed_boolean(stored), None);
     }
-    // BOOLEAN meeting a NUMBER: the column casts itself.
     assert!(
         conn.query_row("SELECT f = ? FROM t", [1i64], |row| row.get::<_, bool>(0))
             .unwrap()
@@ -2158,15 +1793,11 @@ fn a_typed_columns_literal_takes_the_columns_own_cast() {
             .unwrap()
     );
 
-    // BIGINT meeting a fractional literal: promoted to DOUBLE, so the
-    // mirror's `as f64` promotion is DuckDB's own.
     assert!(
         conn.query_row("SELECT b > ? FROM t", [1.5f64], |row| row.get::<_, bool>(0))
             .unwrap()
     );
 
-    // TIMESTAMP: the literal is cast WALL-CLOCK — an offset in it is
-    // ignored, where the same offset in a stored value shifts the instant.
     assert!(
         text_param("SELECT ts = ? FROM t", "2026-01-15T09:00:00+05:30").unwrap(),
         "a literal's offset is ignored"
@@ -2174,8 +1805,6 @@ fn a_typed_columns_literal_takes_the_columns_own_cast() {
     assert!(text_param("SELECT ts = ? FROM t", "2026-01-15T09:00:00Z").unwrap());
     assert!(text_param("SELECT ts > ? FROM t", "2026-01-15").unwrap());
 
-    // The comparisons DuckDB refuses: no row set to agree with, which the
-    // mirror answers with UNKNOWN.
     for (sql, param) in [
         ("SELECT b = ? FROM t", "accepted"),
         ("SELECT d = ? FROM t", "accepted"),
@@ -2196,9 +1825,6 @@ fn a_typed_columns_literal_takes_the_columns_own_cast() {
     }
 }
 
-/// The literal's wall-clock cast reads the SAME syntax the conform does
-/// and differs only in what it does with a zone — run over the whole
-/// timestamp matrix, so a syntax rule cannot drift between the two.
 #[test]
 fn the_literal_timestamp_cast_differs_from_the_conform_only_in_the_zone() {
     let conn = conn();
@@ -2219,9 +1845,6 @@ fn the_literal_timestamp_cast_differs_from_the_conform_only_in_the_zone() {
             .map(trawl_core::compare::Instant::pattern_text);
         assert_eq!(live, sql, "literal timestamp cast disagrees for {input:?}");
     }
-    // The one syntax rule that IS different: the wall-clock cast resolves
-    // exactly one zone NAME, where the conform's ICU-backed cast takes
-    // every name `pg_timezone_names()` lists.
     for name in ["UTC", "utc"] {
         assert!(
             trawl_core::compare::literal_timestamp(&format!("2026-01-15 09:00:00 {name}"))
@@ -2253,27 +1876,6 @@ fn the_literal_timestamp_cast_differs_from_the_conform_only_in_the_zone() {
     }
 }
 
-/// The shapes the live mirror deliberately does NOT read, pinned as
-/// EXPECTED divergences so they stay a known cost.
-///
-/// Both classes are one-directional: `DuckDB` has a reading, the mirror
-/// answers `None`, so a live tail under-matches a batch query and can
-/// never invent a match it does not have.
-///
-/// 1. **zone names beyond the definitionally-UTC set.** `DuckDB` links ICU
-///    and resolves all 638 of `pg_timezone_names()` — with DST rules and
-///    pre-1970 local mean time, which is why an offset TABLE cannot stand
-///    in for it (`Africa/Abidjan` is +00:00 today and +00:16:08 in 1800).
-///    Mirroring it means a tz database inside `trawl-core`, which compiles
-///    to wasm for the SPA, and two tzdata versions drifting apart would be
-///    a SILENT divergence in place of this loud one.
-/// 2. **years outside chrono's calendar** (`NaiveDate` spans
-///    `-262143-01-01` to `+262142-12-31` in this build) where `DuckDB`'s
-///    microsecond range reaches ±~290 000.
-///
-/// This test also proves the first residual is drawn where the mirror
-/// claims: every name in its table really is UTC to `DuckDB`, at two
-/// instants a century apart.
 #[test]
 fn the_timestamp_mirror_residuals_are_one_directional() {
     let conn = conn();
@@ -2299,8 +1901,6 @@ fn the_timestamp_mirror_residuals_are_one_directional() {
         );
     }
 
-    // The residual line is drawn at names that are UTC for ALL time, so
-    // the mirror's table has to hold at an instant far from today's rules.
     for name in [
         "Etc/GMT",
         "Etc/GMT+0",
@@ -2343,9 +1943,6 @@ fn the_timestamp_mirror_residuals_are_one_directional() {
     }
 }
 
-/// The inputs [`the_timestamp_mirror_residuals_are_one_directional`] owns,
-/// kept out of [`TIMESTAMP_TEXT_MATRIX`] because the two engines are
-/// EXPECTED to disagree on them.
 fn timestamp_mirror_residuals() -> Vec<&'static str> {
     vec![
         "2026-01-15 09:00:00 America/New_York",
@@ -2361,16 +1958,10 @@ fn timestamp_mirror_residuals() -> Vec<&'static str> {
     ]
 }
 
-/// The rules over `read_json` columns — the hot-only fallback's untyped
-/// source (no REPLACE conformance). A VARCHAR-inferred column behaves
-/// like the parquet case: text eq exact, TRY_CAST-DOUBLE orders and NULLs
-/// words. A BIGINT-inferred column under the VARCHAR pin's text-eq form
-/// implicit-casts the literal to the column side and still matches.
 #[test]
 fn pinned_rules_hold_over_read_json_columns() {
     let dir = tempfile::tempdir().unwrap();
 
-    // VARCHAR inference (strings, incl. a word).
     let strings = dir.path().join("strings.ndjson");
     {
         let mut f = std::fs::File::create(&strings).unwrap();
@@ -2397,9 +1988,6 @@ fn pinned_rules_hold_over_read_json_columns() {
         1
     );
 
-    // BIGINT inference (a hot event sent numbers for a VARCHAR-pinned
-    // field before conformance): the text literal implicit-casts onto the
-    // BIGINT column and matches the numeric value.
     let ints = dir.path().join("ints.ndjson");
     {
         let mut f = std::fs::File::create(&ints).unwrap();
@@ -2426,31 +2014,11 @@ fn pinned_rules_hold_over_read_json_columns() {
     );
 }
 
-/// The two conform lanes must read one value out of one event: whatever
-/// the hot branch shows a query is what compaction will durably store, or
-/// a result flips minutes later when the compactor runs (ADR-0011).
-///
-/// The matrix is the shapes that can disagree — a boolean spelling the
-/// cast reads but the rendering does not round-trip, a fraction the cast
-/// rounds, a leading-zero integer, the whitespace and `_` widenings, a
-/// numeric that a JSON-inferred column casts to `true` — read three ways
-/// over the same texts:
-///
-/// 1. through a snapshot where the field holds only strings (VARCHAR),
-/// 2. through one where a JSON number shares the field (JSON), and
-/// 3. through the live mirror (`compare::conformed_*`).
-///
-/// All three must agree, and the probe carries its own premise for why
-/// that is not automatic: a bare cast answers differently in the two
-/// inference classes, so an event's reading would depend on what happened
-/// to share its buffer.
 #[test]
-#[allow(clippy::too_many_lines)] // one matrix, kept in one place to stay readable
+#[allow(clippy::too_many_lines)]
 fn hot_and_compaction_conform_agree_across_inference_classes() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("hot.ndjson");
-    // `s` holds only strings (VARCHAR); `m` holds the same texts beside a
-    // JSON number (JSON). `n` is the number itself, for the BOOLEAN case.
     let texts = ["TRUE", "true", "1.5", "0404", " 200", "200_000", "nan"];
     {
         let mut f = std::fs::File::create(&file).unwrap();
@@ -2463,7 +2031,6 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
     let reader = hot_reader(&file);
     let conn = conn();
 
-    // The inference classes this probe exists to tell apart.
     let types: Vec<(String, String)> = {
         let mut stmt = conn
             .prepare(&format!("DESCRIBE SELECT s, m, n FROM {reader}"))
@@ -2527,8 +2094,6 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
     ] {
         let expected: Vec<Option<String>> =
             expected.into_iter().map(|v| v.map(str::to_owned)).collect();
-        // The premise: a bare cast reads the two inference classes
-        // differently.
         if pin == CanonicalType::BigInt {
             assert_ne!(
                 read(&format!("TRY_CAST(m AS {})", pin.as_duckdb())),
@@ -2539,7 +2104,6 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
         for (class, expr) in [("VARCHAR", conform("s", pin)), ("JSON", conform("m", pin))] {
             assert_eq!(read(&expr), expected, "{class} conform for {pin:?}");
         }
-        // The live mirror answers the same for every one of those texts.
         let live: Vec<Option<String>> = texts
             .iter()
             .map(|t| match pin {
@@ -2557,9 +2121,6 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
         assert_eq!(live, expected, "live mirror for {pin:?}");
     }
 
-    // A JSON NUMBER under a BOOLEAN pin: the bare cast reads it as `true`
-    // in the JSON class and NULL in the VARCHAR class — the sharpest form
-    // of the state-dependence — while both conform lanes answer NULL.
     let numeric_row = |expr: &str| -> Option<String> {
         conn.query_row(
             &format!("SELECT CAST(({expr}) AS VARCHAR) FROM {reader} WHERE i = 99"),
@@ -2585,17 +2146,6 @@ fn hot_and_compaction_conform_agree_across_inference_classes() {
     }
 }
 
-/// The TIMESTAMP rung is ZONE-AWARE: an offset in the text is applied, a
-/// zoneless text reads as UTC — the semantics ingest already ratified for
-/// `_time` (ADR-0008), now the same in every lane that conforms.
-///
-/// Both halves are pinned, because both are easy to get wrong: the plain
-/// TIMESTAMP cast IGNORES an offset (storing `09:00` for
-/// `09:00:00+05:30`, where `read_json`'s own inference stores `03:30`),
-/// and the `TIMESTAMPTZ` parse that fixes it reads the SESSION zone — which
-/// the shared `DuckDB` runtime includes ICU for and defaults to the HOST zone. Under
-/// a hostile session the same conform writes a different instant, which is
-/// what `conform::SESSION_TIME_ZONE_SQL` exists to prevent.
 #[test]
 fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     let conn = conn();
@@ -2609,7 +2159,6 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
         .unwrap()
     };
 
-    // The premise: the plain cast drops the offset instead of applying it.
     let wall: Option<String> = conn
         .query_row(
             "SELECT CAST(TRY_CAST('2026-01-15T09:00:00+05:30' AS TIMESTAMP) AS VARCHAR)",
@@ -2624,11 +2173,9 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     );
 
     for (text, expected) in [
-        // Offsets are applied, in both directions and in the basic form.
         ("2026-01-15T09:00:00+05:30", "2026-01-15 03:30:00"),
         ("2026-01-15T09:00:00-08:00", "2026-01-15 17:00:00"),
         ("2026-01-15T09:00:00+02", "2026-01-15 07:00:00"),
-        // Zoneless is UTC — the wall clock, unmoved.
         ("2026-01-15T09:00:00Z", "2026-01-15 09:00:00"),
         ("2026-01-15 09:00:00", "2026-01-15 09:00:00"),
         ("2026/01/15 09:00:00", "2026-01-15 09:00:00"),
@@ -2637,14 +2184,10 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     ] {
         assert_eq!(read(&conn, text).as_deref(), Some(expected), "{text:?}");
     }
-    // No reading at all — epoch numerals included, which are not
-    // timestamps to DuckDB.
     for text in ["yesterday-ish", "", "1737000000", "2026-01-15T"] {
         assert_eq!(read(&conn, text), None, "{text:?}");
     }
 
-    // The session pin is load-bearing, not decoration: without it the
-    // same expression writes a different instant on a non-UTC host.
     let hostile = duckdb::Connection::open_in_memory().unwrap();
     hostile
         .execute_batch("SET TimeZone='Asia/Kolkata'")
@@ -2664,16 +2207,6 @@ fn timestamp_conform_applies_the_offset_under_the_pinned_session() {
     );
 }
 
-/// `Executor::configure` runs on every connection the pool makes, clones
-/// included, and that is load-bearing rather than defensive: `try_clone()`
-/// shares the DATABASE, not the session, so a clone starts from the
-/// process default — which the shared ICU runtime takes from the HOST — and
-/// would read a zoneless text in `/etc/localtime`'s zone.
-///
-/// Written host-independently: the assertion is that a clone reports the
-/// default a FRESH connection reports, whatever the parent was set to, and
-/// that at least one of the two zones exercised really did differ from
-/// that default, so the test cannot pass by the host happening to match.
 #[test]
 fn a_cloned_connection_starts_from_the_process_default_not_the_parent() {
     let zone_of = |conn: &duckdb::Connection| -> String {
@@ -2706,8 +2239,6 @@ fn a_cloned_connection_starts_from_the_process_default_not_the_parent() {
         "neither probe zone differed from the host default — the test proved nothing"
     );
 
-    // The pin is what makes the answer independent of the host, and it
-    // has to be applied to the clone itself.
     let clone = parent.try_clone().unwrap();
     clone
         .execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)
@@ -2715,14 +2246,6 @@ fn a_cloned_connection_starts_from_the_process_default_not_the_parent() {
     assert_eq!(zone_of(&clone), "UTC");
 }
 
-/// A `_time` conform can never produce NULL on a standing file, zone-aware
-/// rung or not: a NULL partition key sorts first and falls outside every
-/// `last=Xh` filter, so the row would survive the rewrite yet become
-/// permanently unqueryable by time (ADR-0008).
-///
-/// This is the composition `guard_partition_key` writes — the conform
-/// wrapped in `COALESCE(…, <the file's own partition instant>)` — proved
-/// total over every shape the rung can refuse.
 #[test]
 fn time_conform_never_nulls_the_partition_key() {
     let conn = conn();
@@ -2748,7 +2271,6 @@ fn time_conform_never_nulls_the_partition_key() {
             .unwrap();
         assert!(value.is_some(), "partition key NULLed for {text:?}");
     }
-    // And a genuinely NULL input still takes the fallback.
     let value: Option<String> = conn
         .query_row(
             &format!(
@@ -2762,19 +2284,6 @@ fn time_conform_never_nulls_the_partition_key() {
     assert_eq!(value.as_deref(), Some("2026-01-15 07:00:00"));
 }
 
-/// The two text forms a DOUBLE can take are NOT the same string —
-/// `CAST(v AS VARCHAR)` writes `1e+20` and `1.7356896001234568e+18` where
-/// `json_extract_string(to_json(v), '$')` writes `100000000000000000000.0`
-/// and `1735689600123456800.0` — which is why the lanes cannot each pick
-/// their own.
-///
-/// Under the TYPED pins it would not have mattered: both renderings are
-/// shortest-round-trip and every rung's guarded cast reads them alike, so
-/// the conformed value is the same either way. Under the VARCHAR pin there
-/// IS no cast — [`guarded_cast`] is the identity — so the text form is the
-/// stored value itself, and a per-lane spelling is a per-lane corpus: a hot
-/// `note=/^1e/` would match and the same query stop matching minutes
-/// later, when the compactor rewrites the value it had already shown.
 #[test]
 fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
     let conn = conn();
@@ -2805,14 +2314,12 @@ fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
             .map(Result::unwrap)
             .collect()
     };
-    // The premise: the spellings really are different.
     let cast_text = "TRY_CAST(v AS VARCHAR)";
     assert_ne!(
         read(cast_text),
         read(&untyped_text("v")),
         "premise: the two text renderings of a DOUBLE differ"
     );
-    // Under the VARCHAR pin that difference IS the stored value.
     assert_ne!(
         read(&guarded_cast(cast_text, CanonicalType::Varchar)),
         read(&conform("v", CanonicalType::Varchar)),
@@ -2823,8 +2330,6 @@ fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
         read(&untyped_text("v")),
         "the VARCHAR conform is the shared text form, verbatim"
     );
-    // Under the typed pins the guard absorbs the spelling, which is why
-    // the divergence is invisible there.
     for pin in [
         CanonicalType::BigInt,
         CanonicalType::Double,
@@ -2839,15 +2344,6 @@ fn the_varchar_pin_stores_the_text_form_so_both_lanes_must_share_one() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The pinned comparison shapes in the pipeline positions: SELECT-list
-// values (`| let`) and the LIKE/ILIKE pattern operators (ADR-0011).
-// ---------------------------------------------------------------------------
-
-/// The VARCHAR-pin comparison shapes as SELECT-LIST values: `| let x =
-/// status >= 400` stores TRUE/FALSE/NULL per row, three-valued exactly as
-/// the where-position shapes filter — UNKNOWN is a stored NULL, not an
-/// error and not FALSE.
 #[test]
 fn pinned_comparison_shapes_as_select_list_values() {
     let conn = varchar_status_conn();
@@ -2902,10 +2398,6 @@ fn pinned_comparison_shapes_as_select_list_values() {
     );
 }
 
-/// Why `| let x = status > 400` needs the pin: a pin-blind SELECT-list
-/// comparison binds an INTEGER against the VARCHAR column and refuses to
-/// bind, erroring the whole query. The pinned rules answer three-valued
-/// instead (above).
 #[test]
 fn pin_blind_select_list_comparison_on_varchar_column_errors() {
     let conn = varchar_status_conn();
@@ -2920,10 +2412,6 @@ fn pin_blind_select_list_comparison_on_varchar_column_errors() {
     );
 }
 
-/// The where-position pattern targets under LIKE/ILIKE — the operators
-/// the pipeline lane adds beyond the search stage's GLOB/regexp: a typed
-/// pin's canonical text form takes LIKE patterns exactly as it takes
-/// globs.
 #[test]
 fn pattern_targets_take_like_and_ilike() {
     let conn = conn();
@@ -2945,8 +2433,6 @@ fn pattern_targets_take_like_and_ilike() {
     assert_eq!(matched("CAST(b AS VARCHAR) LIKE '2%'"), 0);
     assert_eq!(matched("CAST(d AS VARCHAR) LIKE '200._'"), 1);
     assert_eq!(matched("CAST(f AS VARCHAR) ILIKE 'TRU%'"), 1);
-    // The TIMESTAMP target is the strftime RFC 3339 text, so a LIKE can
-    // anchor on the `T` separator the wire form carries.
     assert_eq!(
         matched("strftime(ts, '%Y-%m-%dT%H:%M:%S.%fZ') LIKE '2026-01-15T03:30%'"),
         1
@@ -2958,23 +2444,11 @@ fn pattern_targets_take_like_and_ilike() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The repin rewrite's engine assumptions (ADR-0011).
-// ---------------------------------------------------------------------------
-
-/// The repin rewrite's target-column expression
-/// ([`trawl_core::conform::resurrection_expr`]): the stored value's guarded
-/// reading first, and where the column is NULL — a prior conform shelved the
-/// value — the `_raw` re-extraction's guarded reading. Executed per ladder
-/// target over a conflict-shaped corpus.
 #[test]
 fn resurrection_recovers_shelved_values_per_ladder_target() {
     use trawl_core::conform::{RepinTarget, resurrection_expr};
 
     let conn = conn();
-    // A BIGINT-pinned column after a lossy conform: `404` survived, the
-    // rest were nulled and live only in `_raw` (one of them not even JSON —
-    // a client-supplied verbatim `_raw` is honoured, not validated).
     conn.execute_batch(
         "CREATE TABLE t (v BIGINT, _raw VARCHAR); \
          INSERT INTO t VALUES \
@@ -2985,9 +2459,6 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
     )
     .unwrap();
 
-    // Repin BIGINT -> VARCHAR: the stored value keeps its canonical text,
-    // the shelved values come back as their wire text, non-JSON `_raw`
-    // resurrects nothing.
     let expr = resurrection_expr(
         "v",
         "\"_raw\"",
@@ -3011,8 +2482,6 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
         ]
     );
 
-    // Repin BIGINT -> DOUBLE: the numeric raw value reads, the enum text
-    // has no reading (NULL, counted as a projected null).
     let expr = resurrection_expr(
         "v",
         "\"_raw\"",
@@ -3028,8 +2497,6 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
         .unwrap();
     assert_eq!(got, vec![Some(404.0), None, Some(200.0), None]);
 
-    // The guarded rungs stay guarded through resurrection: a raw `"1.5"`
-    // must NOT round into a BIGINT 2.
     conn.execute_batch(
         "CREATE TABLE g (v VARCHAR, _raw VARCHAR); \
          INSERT INTO g VALUES \
@@ -3059,11 +2526,6 @@ fn resurrection_recovers_shelved_values_per_ladder_target() {
     );
 }
 
-/// The `_raw` lookup is an EXACT key lookup in JSON Pointer form — never a
-/// `JSONPath` parse — so a client key carrying `.`/`"`/`'`/`[`/`$`/`/`/`~`
-/// resolves as itself. The case-variant fallback recovers a mixed-case
-/// original, because `_raw` is captured before the fold (or carries a
-/// client's own spelling); the exact spelling wins when both exist.
 #[test]
 fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
     use trawl_core::conform::{RepinTarget, resurrection_expr};
@@ -3098,8 +2560,6 @@ fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
         );
     }
 
-    // Case-variant fallback: the catalog key is folded, `_raw` holds the
-    // client's original spelling.
     assert_eq!(
         read("dur", r#"{"Dur":"9"}"#).as_deref(),
         Some("9"),
@@ -3110,16 +2570,10 @@ fn raw_extraction_is_exact_key_lookup_and_survives_hostile_keys() {
         Some("exact"),
         "the exact spelling wins over a variant"
     );
-    // And the fallback is harmless where `_raw` is valid JSON but not an
-    // object at all.
     assert_eq!(read("dur", "[1,2]"), None);
     assert_eq!(read("dur", "42"), None);
 }
 
-/// The `json_valid` guard must hold under VECTORIZED execution: a batch
-/// mixing valid and invalid `_raw` rows must answer NULL for the invalid
-/// ones without erroring the whole scan (a `CASE` that eagerly evaluated
-/// its THEN arm over every row would throw on the cast).
 #[test]
 fn raw_guard_is_vector_safe_over_mixed_validity() {
     use std::fmt::Write as _;
@@ -3158,18 +2612,6 @@ fn raw_guard_is_vector_safe_over_mixed_validity() {
     );
 }
 
-/// What `read_parquet(union_by_name=true)` actually does over each mixed
-/// scalar ladder pair: it PROMOTES silently — it does not error. Executed
-/// over every ordered pair of the five canonical types.
-///
-/// This kills a load-bearing assumption the repin design could otherwise
-/// lean on: a half-swapped corpus (one env repinned, another not) would NOT
-/// fail loudly — it would answer queries with silently promoted values
-/// (`BIGINT ∪ VARCHAR` reads VARCHAR, `BIGINT ∪ BOOLEAN` reads the booleans
-/// as 0/1). The cutover therefore may not rely on union errors for
-/// atomicity: the exclusion primitives (all query permits held across the
-/// swap and the pin flip) are the ONLY thing keeping a mixed-type corpus
-/// unobservable, and this probe is why they are mandatory.
 #[test]
 fn mixed_ladder_pair_unions_promote_rather_than_error() {
     let all = [
@@ -3185,13 +2627,8 @@ fn mixed_ladder_pair_unions_promote_rather_than_error() {
         CanonicalType::Boolean => "TRUE",
         CanonicalType::Timestamp => "TIMESTAMP '2026-01-15 10:00:00'",
         CanonicalType::Varchar => "'text'",
-        // Not in `all`: SEVERITY is physically BIGINT, so it can never be
-        // one half of a MIXED pair.
         CanonicalType::Severity => unreachable!("physically BIGINT"),
     };
-    // The promoted type per unordered pair, probed by execution: VARCHAR
-    // absorbs everything, TIMESTAMP absorbs the remaining scalars, DOUBLE
-    // absorbs BIGINT and BOOLEAN, BIGINT absorbs BOOLEAN.
     let promoted = |a: CanonicalType, b: CanonicalType| -> &'static str {
         let has = |t| a == t || b == t;
         if has(CanonicalType::Varchar) {
@@ -3243,11 +2680,6 @@ fn mixed_ladder_pair_unions_promote_rather_than_error() {
     }
 }
 
-/// `DuckDB`'s recursive glob descends into dot-directories: a shadow
-/// generation staged INSIDE the data root — however it is named — would be
-/// unioned into every fallback-glob query as duplicate rows. This is why
-/// the repin build stages as a SIBLING of the data root (the epoch
-/// set-aside pattern), which no data-root glob or walk can reach.
 #[test]
 fn recursive_glob_descends_into_dot_directories() {
     let dir = tempfile::tempdir().unwrap();
@@ -3287,33 +2719,9 @@ fn recursive_glob_descends_into_dot_directories() {
     );
 }
 
-/// The misfit-sample capture shape (ADR-0011): what compaction runs, per
-/// conflicted column, in the same phase as the conflict tally — the only
-/// moment the value the conform is about to null is still in the table.
-///
-/// Four claims, all executed rather than reasoned about, because the Rust
-/// that reads the result depends on every one of them:
-///
-/// - `FILTER (WHERE …)` composes with `list(DISTINCT …)`, so the misfit
-///   predicate (a non-NULL source value whose guarded cast reads NULL) can
-///   be expressed once instead of smuggled into a `CASE` whose NULL arm
-///   would then rely on `list`'s own NULL handling;
-/// - `DISTINCT` collapses a repeated misfit, so one sender looping the same
-///   bad value spends one sample slot, not five;
-/// - `array_slice(l, 1, 5)` is 1-based and inclusive, and is a no-op below
-///   the cap — the count bound;
-/// - `to_json(list)::VARCHAR` is a JSON array of strings for every value a
-///   client can send, so the transport out of `DuckDB` is one `VARCHAR`
-///   column parsed by `serde_json`, not a `LIST` binding.
-///
-/// And the shape a caller must handle: a filter matching nothing aggregates
-/// to SQL NULL, and `to_json` of NULL is NULL — never `[]` and never the
-/// JSON literal `null`, so the column binds as `Option<String>`.
 #[test]
 fn misfit_sample_capture_is_distinct_null_free_and_capped() {
     let conn = conn();
-    // Ten rows: six distinct misfits under a BIGINT pin, one of them
-    // repeated, plus a SQL NULL and two values that convert cleanly.
     conn.execute_batch(
         "CREATE TABLE b AS SELECT * FROM (VALUES \
          ('a'), ('b'), ('c'), ('d'), ('e'), ('f'), ('a'), (NULL), ('1'), ('2')) t(v)",
@@ -3345,7 +2753,6 @@ fn misfit_sample_capture_is_distinct_null_free_and_capped() {
          value that converts: {samples:?}"
     );
 
-    // Below the cap the slice is the identity, and the JSON is still an array.
     let sql = format!(
         "SELECT to_json(array_slice(list(DISTINCT {text}) \
          FILTER (WHERE v IS NOT NULL AND {cast} IS NULL), 1, 5))::VARCHAR \
@@ -3356,7 +2763,6 @@ fn misfit_sample_capture_is_distinct_null_free_and_capped() {
     samples.sort();
     assert_eq!(samples, vec!["a".to_owned(), "b".to_owned()]);
 
-    // No misfit at all: the aggregate is SQL NULL, and so is the rendering.
     let sql = format!(
         "SELECT to_json(array_slice(list(DISTINCT {text}) \
          FILTER (WHERE v IS NOT NULL AND {cast} IS NULL), 1, 5))::VARCHAR \
@@ -3370,15 +2776,9 @@ fn misfit_sample_capture_is_distinct_null_free_and_capped() {
     );
 }
 
-/// A misfit value carries whatever bytes a client sent, so the sample is
-/// truncated before it is aggregated — but `DuckDB`'s `left()` counts
-/// CHARACTERS, not bytes, so it bounds accumulation only, never the wire
-/// size. The byte cap the store promises is therefore applied in Rust, on
-/// a `char` boundary; this probe is why it cannot be pushed into the SQL.
 #[test]
 fn left_truncates_by_character_not_by_byte() {
     let conn = conn();
-    // Four-byte astral characters: 8 chars, 32 bytes.
     let value = "\u{1F600}".repeat(8);
     let mut stmt = conn
         .prepare("SELECT left(?, 8), length(left(?, 8))")
@@ -3397,14 +2797,6 @@ fn left_truncates_by_character_not_by_byte() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The SEVERITY canonical type (ADR-0013)
-// ---------------------------------------------------------------------------
-
-/// The severity reading matrix: the cases where the two engines have
-/// their OWN opinions about a value, shared by every probe that pairs a
-/// reading against the Rust kernel (the conform rung in either dialect,
-/// and the dialect-ambiguity classifier).
 const SEVERITY_READING_CASES: &[&str] = &[
     "error",
     "ERR",
@@ -3440,9 +2832,7 @@ const SEVERITY_READING_CASES: &[&str] = &[
     "inf",
     // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
     // `lower('İ')` is `i`, so an ungated token CASE would read `İNFO`
-    // as 9 in SQL and as nothing in Rust. Both dotted/dotless Turkish i,
-    // a full-width digit (which `TRY_CAST` also refuses), and a
-    // Kelvin sign that folds to `k`.
+    // as 9 in SQL and as nothing in Rust.
     "İNFO",
     "info\u{307}",
     "ı",
@@ -3452,11 +2842,6 @@ const SEVERITY_READING_CASES: &[&str] = &[
     "１７",
     "ERROR",
     "Warning",
-    // The trim set is the Unicode `White_Space` property on BOTH
-    // engines (`DuckDB` matches a multibyte character set by
-    // character, which is what licenses the wide set): a padded
-    // token has a reading at ingest, and narrowing the set here
-    // would drop it silently.
     "\u{a0}error\u{a0}",
     "\u{2003}error",
     "\u{3000}error\u{3000}",
@@ -3466,18 +2851,6 @@ const SEVERITY_READING_CASES: &[&str] = &[
     "er\u{a0}ror",
 ];
 
-/// The reading matrix (ADR-0013 ruling 9): `severity_reading_sql`
-/// answers what `severity::reading` answers, case by case, in BOTH
-/// dialects — the whole basis for one kernel serving ingest, `sev()` and
-/// the conform rung.
-///
-/// The cases the probe exists for are the ones where the two engines have
-/// their OWN opinions: `TRY_CAST` reads `'1e1'` as 10 and `'0x10'` as 16
-/// where `str::parse` reads neither (so the SQL guards with a digits-only
-/// `regexp_full_match` first), `'+17'` is a sign both must accept,
-/// `trim(s, chars)` must trim the same six ASCII characters `trim_matches`
-/// does and no Unicode space, and an integer past `i64` must overflow to
-/// NULL on both sides rather than saturating on one.
 #[test]
 fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
     use trawl_core::severity::{self, Dialect};
@@ -3488,10 +2861,6 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
         for text in cases {
             let escaped = text.replace('\'', "''");
             let kernel = severity::reading_text(text, dialect).map(i64::from);
-            // BOTH shapes — the repeated one the conform rung emits and
-            // the bind-once one `sev()` emits — answer the kernel. They
-            // share an arm generator, and this is what proves the two
-            // wrappers around it are the same reading.
             for build in [
                 trawl_core::conform::severity_reading_sql,
                 trawl_core::conform::severity_reading_sql_bind_once,
@@ -3504,7 +2873,6 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
                 );
             }
         }
-        // A NULL input has no reading on either side.
         let sql = format!(
             "SELECT {}",
             trawl_core::conform::severity_reading_sql("CAST(NULL AS VARCHAR)", dialect)
@@ -3514,17 +2882,11 @@ fn severity_reading_sql_matches_the_rust_kernel_in_both_dialects() {
     }
 }
 
-/// The generated arms, the result TYPE, and the bind-once shape's reason
-/// for existing — the half of the reading contract that is not the
-/// input matrix.
 #[test]
 fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
     use trawl_core::severity::{self, Dialect};
 
     let conn = conn();
-    // Every token spelling and every exact short name, through the SQL:
-    // the arms are generated from the kernel's tables, so a table edit
-    // that misses the generator fails here.
     for (token, number) in severity::token_entries() {
         for spelling in [token.to_owned(), token.to_uppercase()] {
             let sql = format!(
@@ -3545,9 +2907,6 @@ fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
         assert_eq!(engine, Some(i64::from(n)), "exact name {name}");
     }
 
-    // The reading types as the physical BIGINT a SEVERITY column holds —
-    // an INTEGER-typed conform would disagree with the parquet side and
-    // throw the hot+cold union.
     for build in [
         trawl_core::conform::severity_reading_sql,
         trawl_core::conform::severity_reading_sql_bind_once,
@@ -3557,11 +2916,6 @@ fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
         assert_eq!(ty, CanonicalType::Severity.as_duckdb());
     }
 
-    // The bind-once shape exists so a subject carrying a BOUND PARAMETER
-    // is pushed once and read once: `DuckDB` binds `?` positionally, so
-    // the repeated shape would need four copies of one value — and
-    // `to_json(?)` types nothing, which is why the parameter arrives
-    // pre-cast (`emitter::expr::typed_literal`).
     let subject = trawl_core::conform::untyped_text("CAST(? AS VARCHAR)");
     let sql = format!(
         "SELECT {}",
@@ -3578,15 +2932,6 @@ fn severity_reading_sql_generates_its_arms_and_types_as_bigint() {
     assert_eq!(reading, Some(17));
 }
 
-/// The trim set is ONE set in two spellings — `severity::WHITESPACE` in
-/// Rust, an RE2 class in the SQL — and this is what makes them one: every
-/// character of the const is trimmed by the SQL reader, and a
-/// look-alike that is NOT `White_Space` (U+200B ZERO WIDTH SPACE, U+180E,
-/// U+FEFF) survives on both sides.
-///
-/// The wide set is deliberate: a `severity` padded with U+00A0 has a
-/// reading, and an ASCII-only trim would drop it with no repair code and
-/// nothing in the event to explain the loss.
 #[test]
 fn the_trim_set_is_the_same_on_both_engines() {
     use trawl_core::severity::{self, Dialect, WHITESPACE};
@@ -3616,7 +2961,6 @@ fn the_trim_set_is_the_same_on_both_engines() {
         );
     }
 
-    // Not `White_Space`, so it is part of the value on both engines.
     for c in ['\u{200b}', '\u{180e}', '\u{feff}'] {
         let padded = format!("{c}error");
         let sql = format!(
@@ -3634,12 +2978,6 @@ fn the_trim_set_is_the_same_on_both_engines() {
     }
 }
 
-/// The SEVERITY conform rung is the reading kernel, and its LIVE mirror
-/// (`compare::conformed_severity`) reads the same domain — executed, not
-/// reasoned. Out-of-ladder numbers (`0`, `25`, `-3`) conform to NULL in
-/// both engines, so a stored value always has a token rendering, and a
-/// TOKEN (`error`) conforms to its number on both sides (ADR-0013 ruling
-/// 10: the pin's lifetime meaning is the full reading).
 #[test]
 fn severity_conform_rung_bounds_the_ladder_on_both_engines() {
     let conn = conn();
@@ -3671,15 +3009,6 @@ fn severity_conform_rung_bounds_the_ladder_on_both_engines() {
     }
 }
 
-/// The SEVERITY conform rung under an asserted dialect: a repin may
-/// declare that a corpus's numerals are syslog PRI, and the rung
-/// it gets must be the kernel's syslog reading — not a second expression
-/// that agrees on the cases somebody thought of.
-///
-/// Executed over the whole reading matrix in both dialects, against the
-/// Rust kernel, because this is the expression an operator's `--dialect`
-/// flag reaches: a drift here rewrites a corpus to numbers no lane will
-/// ever read back.
 #[test]
 fn severity_conform_rung_reads_the_asserted_dialect() {
     use trawl_core::severity::{self, Dialect};
@@ -3689,8 +3018,6 @@ fn severity_conform_rung_reads_the_asserted_dialect() {
         for text in SEVERITY_READING_CASES {
             let escaped = text.replace('\'', "''");
             let subject = format!("'{escaped}'");
-            // The rung IS the reading, byte for byte — the same identity
-            // the OTel rung has, one dialect over.
             assert_eq!(
                 trawl_core::conform::guarded_cast_in(&subject, CanonicalType::Severity, dialect),
                 trawl_core::conform::severity_reading_sql(&subject, dialect),
@@ -3709,9 +3036,6 @@ fn severity_conform_rung_reads_the_asserted_dialect() {
         }
     }
 
-    // The inversion is the whole point: the same stored numeral conforms
-    // to its OTel rung under one assertion and to the syslog rung under
-    // the other, so the dialect is data-changing and must be asserted.
     for (numeral, otel, syslog) in [(3i64, 3i64, 17i64), (7, 7, 5), (1, 1, 23)] {
         for (dialect, want) in [(Dialect::Otel, otel), (Dialect::Syslog, syslog)] {
             let sql = format!(
@@ -3727,8 +3051,6 @@ fn severity_conform_rung_reads_the_asserted_dialect() {
         }
     }
 
-    // Every other pin is dialect-INVARIANT by execution as well as by
-    // spelling, which is what lets one dialect ride a pin-generic plan.
     for pin in [
         CanonicalType::BigInt,
         CanonicalType::Double,
@@ -3744,15 +3066,6 @@ fn severity_conform_rung_reads_the_asserted_dialect() {
     }
 }
 
-/// The dialect-ambiguity classifier is ONE predicate in two engines:
-/// `conform::severity_dialect_ambiguous_sql` in SQL,
-/// `severity::dialect_ambiguous` in Rust. The repin's force gate fires on
-/// the SQL half and the operator reads the Rust half's vocabulary, so a
-/// divergence is a refusal (or a silent mistranslation) nobody can explain.
-///
-/// A one-dialect value must answer FALSE rather than NULL: an unreadable
-/// value is visible loss the plan already counts as a projected null, and
-/// only a value both ladders claim differently needs a human's assertion.
 #[test]
 fn dialect_ambiguity_pairs_across_both_engines() {
     let conn = conn();
@@ -3772,11 +3085,6 @@ fn dialect_ambiguity_pairs_across_both_engines() {
             "ambiguity disagreed on {text:?}"
         );
     }
-    // The overlap is exactly 1-7 on both engines, shoulders included. The
-    // whole `-30..=30` sweep is pinned Rust-side (`severity::tests`); here
-    // it is every rung of the overlap plus both shoulders, because each
-    // case is a PREPARE of a two-reading expression and the sweep would
-    // cost minutes to say the same thing.
     for n in [-30i64, -7, -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 17, 24, 25, 30] {
         let text = n.to_string();
         let engine = ask(&format!("'{text}'"));
@@ -3787,14 +3095,9 @@ fn dialect_ambiguity_pairs_across_both_engines() {
             "engines disagreed on {n}"
         );
     }
-    // A NULL subject is not ambiguous — it is nothing at all.
     assert_eq!(ask("CAST(NULL AS VARCHAR)"), Some(false));
 }
 
-/// The canonical token TEXT is one table, rendered by
-/// `conform::severity_token_text_sql` in SQL and `severity::otel_name` in
-/// Rust. Probed over the whole ladder plus both out-of-range shoulders and
-/// NULL, so a glob can never mean one thing live and another in batch.
 #[test]
 fn severity_token_text_matches_the_rust_mirror_over_the_ladder() {
     let conn = conn();
@@ -3818,9 +3121,6 @@ fn severity_token_text_matches_the_rust_mirror_over_the_ladder() {
     assert_eq!(rendered, None, "a NULL severity has no token text");
 }
 
-/// A SEVERITY-pinned hot column conforms to the same physical BIGINT the
-/// parquet side holds, so the hot+cold union types cleanly — the whole
-/// reason the pin's physical spelling stays `BIGINT`.
 #[test]
 fn severity_conform_yields_the_physical_bigint() {
     let dir = tempfile::tempdir().unwrap();
@@ -3852,16 +3152,9 @@ fn severity_conform_yields_the_physical_bigint() {
         .unwrap()
         .map(Result::unwrap)
         .collect();
-    // Both conform: the rung is the token-aware reading (ADR-0013 ruling
-    // 10), so a stored `warn` is 13 and not a shelved conflict.
     assert_eq!(rows, vec![Some(13), Some(17)]);
 }
 
-/// Backticks are LEXING: the name a query spells with them is the
-/// identifier in the SQL and the column name `DuckDB` hands back
-/// (ADR-0013 ruling 7). Executed rather than assumed — the whole point
-/// of the escape is that a name reachable in the DSL is reachable end to
-/// end, so `DESCRIBE` is where that claim is settled.
 #[test]
 fn backticked_names_describe_as_the_names_the_dsl_spells() {
     let dir = tempfile::tempdir().unwrap();
@@ -3941,10 +3234,7 @@ fn pivot_cte_finalization_preserves_multiline_literal_matching() {
     assert_eq!(matched, 1, "the historical multiline value must match");
 }
 
-/// An `eventstats` alias naming an incoming column OVERWRITES it, the
-/// way `let` does (ADR-0013 ruling 8 documents exactly that, which is
-/// why the collision check admits the shape). Executed, because the
-/// wildcard is `DuckDB`'s to expand: a plain `SELECT *, … AS status`
+/// The wildcard is `DuckDB`'s to expand: a plain `SELECT *, … AS status`
 /// hands the original column BACK beside the window value, so the alias
 /// names must leave the wildcard before the window expressions land.
 #[test]
@@ -3988,11 +3278,6 @@ fn eventstats_alias_overwrites_the_incoming_column() {
     assert_eq!(rows, vec![2, 2], "the window value replaced the original");
 }
 
-/// The overwrite holds for a CASE-VARIANT alias too, because `DuckDB`
-/// binds identifiers case-insensitively while the `COLUMNS` lambda
-/// compares plain strings: an unfolded `c NOT IN ('Status')` leaves the
-/// incoming `status` in the wildcard and hands back TWO columns of one
-/// folded name — exactly the output schema ruling 8 exists to prevent.
 #[test]
 fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
     let dir = tempfile::tempdir().unwrap();
@@ -4026,15 +3311,9 @@ fn eventstats_case_variant_alias_overwrites_the_incoming_column() {
     );
 }
 
-/// The overwrite projection every write site shares — `let`, `rename`,
-/// `extract` and `eventstats` — compares column names with ASCII case
-/// folded on both sides, and the SQL half of that fold has to be the EXACT
-/// mirror of `schema::catalog_key`. `lower()` is not: it folds non-ASCII
-/// too, where `DuckDB`'s own identifier binding does not — so `lower()`
-/// would drop a column named `Ä` from the passthrough for an alias `ä`
-/// that never names it. `translate` over the 26 ASCII letters is the
-/// mirror, and all three claims run here so a future "simplify this to
-/// `lower()`" refactor fails loudly instead of silently losing a column.
+/// The SQL half of the overwrite projection's ASCII case fold has to be
+/// the EXACT mirror of `schema::catalog_key`. `lower()` is not: it folds
+/// non-ASCII too, where `DuckDB`'s own identifier binding does not.
 #[test]
 fn the_columns_exclusion_fold_mirrors_catalog_key() {
     fn fold_sql(expr: &str) -> String {
@@ -4045,7 +3324,6 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
     conn.execute_batch(r#"CREATE TABLE t AS SELECT 'x' AS "Service", 'y' AS "Ä";"#)
         .unwrap();
 
-    // 1. the fold agrees with `catalog_key` on both classes of input
     for name in ["SerVice", "Ä", "ÄX", "host", "_Time", "CAFÉ"] {
         let sql = fold_sql(&format!("'{name}'"));
         let mut stmt = conn.prepare(&format!("SELECT {sql}")).unwrap();
@@ -4057,7 +3335,6 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
         );
     }
 
-    // 2. a case-variant alias REPLACES the input column
     let mut stmt = conn
         .prepare(&format!(
             "DESCRIBE SELECT COLUMNS(c -> {fold_c} NOT IN ('service')), 1 AS \"Service\" FROM t"
@@ -4077,8 +3354,6 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
         "one `service` column, once: {columns:?}"
     );
 
-    // 3. …and `DuckDB` really does bind identifiers ASCII-insensitively
-    // but NOT beyond, which is why the mirror may not use `lower()`.
     assert!(
         conn.prepare(r#"SELECT "SERVICE" FROM t"#).is_ok(),
         "ASCII case is insensitive"
@@ -4089,18 +3364,10 @@ fn the_columns_exclusion_fold_mirrors_catalog_key() {
     );
 }
 
-// ── the numeric / type leaves (ADR-0017 §1, §4) ────────────────────
-//
-// What `typeof`, `tonumber`, `ceil`, `floor` and `round` answer, taken
-// through the shape the batch lane actually executes, which is not the
-// shape a hand-written SQL literal has: the emitter pushes one bound
-// `SqlValue` per DSL literal (`emitter::emit`), so a DSL `1` reaches
-// `DuckDB` as a BIGINT PARAMETER. A bare `typeof(1)` typed into SQL
+// The emitter pushes one bound `SqlValue` per DSL literal, so a DSL `1`
+// reaches `DuckDB` as a BIGINT PARAMETER. A bare `typeof(1)` typed into SQL
 // answers `INTEGER` and is simply a different question.
 
-/// One scalar expression, executed and read back as (`typeof`, text) —
-/// the two facts a value-domain mirror has to reproduce.
-///
 /// `expr` carries `?` placeholders and appears exactly ONCE (inside a
 /// subquery), so the bound parameter list is the caller's rather than
 /// silently doubled by a second mention of the same expression.
@@ -4114,16 +3381,8 @@ fn scalar_type_and_text(
         .map_err(|error| error.to_string())
 }
 
-/// The type name `DuckDB` gives a value the DSL lane BOUND, per literal
-/// shape the emitter can push.
 const BOUND_TYPEOF_SPELLINGS: &[&str] = &["BIGINT", "BIGINT", "DOUBLE", "BOOLEAN", "VARCHAR"];
 
-/// The shapes that reach `DuckDB` as SQL text rather than a parameter.
-///
-/// The last two are recorded, not mirrored: streaming eval spells the
-/// NULL type `NULL` (no quotes) and every list `ARRAY`, where `DuckDB`
-/// spells a list by its element type. Both stay pinned as unruled
-/// divergences in `trawl-core/tests/scalar_parity.rs`.
 const LITERAL_TYPEOF_SPELLINGS: &[(&str, &str)] = &[
     ("TIMESTAMP '2026-01-15 10:20:30'", "TIMESTAMP"),
     ("NULL", "\"NULL\""),
@@ -4154,8 +3413,6 @@ fn typeof_spells_a_bound_dsl_literal_by_its_bound_type() {
 
 #[test]
 fn a_boolean_casts_to_double_as_one_and_zero() {
-    // `tonumber(x)` emits `TRY_CAST(x AS DOUBLE)`, so a boolean argument
-    // has a reading rather than NULL, which is what eval mirrors.
     let conn = conn();
     for (value, want) in [(true, "1.0"), (false, "0.0")] {
         let (dtype, text) =
@@ -4166,9 +3423,6 @@ fn a_boolean_casts_to_double_as_one_and_zero() {
 }
 
 /// (function, return type over a BIGINT argument, over a DOUBLE one).
-///
-/// `round` is the odd one out: it is the only one of the three that keeps
-/// an integer argument integral.
 const ROUNDING_RETURN_TYPES: &[(&str, &str, &str)] = &[
     ("ceil", "DOUBLE", "DOUBLE"),
     ("floor", "DOUBLE", "DOUBLE"),
@@ -4185,9 +3439,7 @@ const ROUNDING_INTEGER_MATRIX: &[(i64, &str, &str, &str)] = &[
 /// (bound DOUBLE argument, ceil text, floor text, round text).
 ///
 /// The negative-zero rows are load-bearing: `DuckDB` KEEPS the sign
-/// (`ceil(-0.5)` is `-0.0`, not `0.0`), which is also what Rust's
-/// `f64::ceil` produces — a mirror that rounded through `i64` could not
-/// express it at all. `round` is half-away-from-zero on both engines.
+/// (`ceil(-0.5)` is `-0.0`, not `0.0`).
 const ROUNDING_DOUBLE_MATRIX: &[(f64, &str, &str, &str)] = &[
     (1.5, "2.0", "1.0", "2.0"),
     (-1.5, "-1.0", "-2.0", "-2.0"),
@@ -4228,10 +3480,6 @@ fn ceil_floor_and_round_split_their_return_type_on_the_argument_type() {
 
 #[test]
 fn round_takes_a_precision_only_as_an_inlined_integer() {
-    // There is no `round(DOUBLE, BIGINT)` overload, which is exactly why
-    // `emitter::functions::literal_int_positions` inlines `round`'s
-    // second argument instead of binding it. Probed so a future overload
-    // does not quietly make that inlining look optional.
     let conn = conn();
     let error = scalar_type_and_text(&conn, "round(?, ?)", &[&1.5_f64, &1_i64]).unwrap_err();
     assert!(
@@ -4252,22 +3500,9 @@ fn round_takes_a_precision_only_as_an_inlined_integer() {
             "round({argument}, {precision})"
         );
     }
-    // An integer argument keeps its BIGINT shape whatever the precision.
     let (dtype, text) = scalar_type_and_text(&conn, "round(?, 1)", &[&5_i64]).unwrap();
     assert_eq!((dtype.as_str(), text.as_deref()), ("BIGINT", Some("5")));
 }
-
-// ── the arithmetic value domain (ADR-0017 §4) ──────────────────────
-//
-// Three claims eval.rs makes about `+ - * / %`, measured: `/` is true
-// division (never truncating), division by zero answers an IEEE special
-// where integer `%` by zero answers NULL, and an integer overflow is an
-// ERROR — which is what licenses the streaming lane's NULL for it, since
-// SSE cannot raise a per-event error and ADR-0017 §5's rule is "eval
-// nulls where batch errors". The comparison rows are here for the same
-// reason: once `/` can produce NaN, every comparison over one has to
-// answer as DuckDB does, and DuckDB orders NaN GREATEST rather than
-// leaving it unordered.
 
 /// One scalar expression read back as a DOUBLE — the shape a text
 /// comparison cannot express, since `CAST(0/0 AS VARCHAR)` renders the
@@ -4282,11 +3517,6 @@ fn scalar_double(
 }
 
 /// (dividend, divisor, quotient) — `/` over two BIGINTs.
-///
-/// The last row is the i64 promotion: both operands go through DOUBLE,
-/// so a dividend above 2^53 comes back ROUNDED, and `i64::MIN / -1` —
-/// the one integer division that has no i64 answer — is an ordinary
-/// value rather than the overflow the `%` of the same pair raises.
 const TRUE_DIVISION_MATRIX: &[(i64, i64, f64)] = &[
     (5, 2, 2.5),
     (-5, 2, -2.5),
@@ -4310,9 +3540,6 @@ fn integer_division_is_true_division_through_double() {
 }
 
 /// (dividend, divisor, remainder) — `%` over two BIGINTs, both signs.
-///
-/// Truncated remainder (the sign follows the DIVIDEND), which is Rust's
-/// `%` and not a floored modulo.
 const INTEGER_REMAINDER_MATRIX: &[(i64, i64, i64)] = &[(5, 2, 1), (-5, 2, -1), (5, -2, 1)];
 
 /// (dividend, divisor, remainder) — `%` where either side is a DOUBLE.
@@ -4339,8 +3566,6 @@ fn division_by_zero_is_an_ieee_special_and_integer_modulo_by_zero_is_null() {
         "0 / 0 is NaN"
     );
 
-    // `%` splits on the operand types where `/` does not: all-integer is
-    // NULL, and any DOUBLE operand takes the IEEE path.
     let (dtype, text) = scalar_type_and_text(&conn, "? % ?", &[&5_i64, &0_i64]).unwrap();
     assert_eq!((dtype.as_str(), text), ("BIGINT", None));
     for params in [
@@ -4375,8 +3600,6 @@ const INTEGER_OVERFLOW_MATRIX: &[(&str, i64, i64, &str)] = &[
     ("? + ?", i64::MAX, 1, "Overflow in addition of INT64"),
     ("? - ?", i64::MIN, 1, "Overflow in subtraction of INT64"),
     ("? * ?", i64::MAX, 2, "Overflow in multiplication of INT64"),
-    // `%` is the only remainder that overflows, and it reports itself as
-    // a DIVISION overflow.
     ("? % ?", i64::MIN, -1, "Overflow in division of"),
 ];
 
@@ -4390,8 +3613,6 @@ fn integer_arithmetic_overflow_is_an_error_never_a_wrap() {
             "{lhs} {expr} {rhs}: wanted {expected:?}, got {error}"
         );
     }
-    // The DOUBLE side does NOT error — it saturates to infinity, so an
-    // overflow rule written over `as_f64` operands would be wrong.
     for (expr, rhs) in [("? + ?", f64::MAX), ("? * ?", 2.0)] {
         assert_eq!(
             scalar_double(&conn, expr, &[&f64::MAX, &rhs]).unwrap(),
@@ -4402,11 +3623,6 @@ fn integer_arithmetic_overflow_is_an_error_never_a_wrap() {
 }
 
 /// (expression, left, right, `DuckDB`'s answer) over the IEEE specials.
-///
-/// NaN is EQUAL to itself and GREATER than everything else — a total
-/// order, not Rust's `partial_cmp` (which answers `None` and would make
-/// eval null out where batch returns a row). The two zeros tie, which
-/// Rust's `partial_cmp` already gets right.
 const DOUBLE_COMPARISON_MATRIX: &[(&str, f64, f64, bool)] = &[
     ("? = ?", f64::NAN, f64::NAN, true),
     ("? != ?", f64::NAN, f64::NAN, false),
@@ -4431,9 +3647,6 @@ fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
             Some(if *want { "true" } else { "false" }),
             "{lhs} {expr} {rhs}"
         );
-        // …and the live mirror, side by side with the engine: one owner
-        // for this order, read by eval's comparison arms and by the
-        // pinned matcher's `apply_f64`.
         let ordering = trawl_core::compare::double_total_cmp(*lhs, *rhs);
         let mirrored = match *expr {
             "? = ?" => ordering.is_eq(),
@@ -4448,12 +3661,9 @@ fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
             "double_total_cmp disagrees: {lhs} {expr} {rhs}"
         );
     }
-    // A NaN of either sign is the same value to the comparison — the
-    // rendering keeps the sign bit, the ordering does not.
     let (_, text) = scalar_type_and_text(&conn, "'-nan'::DOUBLE = 'NaN'::DOUBLE", &[]).unwrap();
     assert_eq!(text.as_deref(), Some("true"));
 
-    // …and the same order sorts, with SQL NULL after all of them.
     let mut statement = conn
         .prepare(
             "SELECT CAST(x AS VARCHAR) FROM (VALUES ('-inf'::DOUBLE), ('NaN'::DOUBLE), \
@@ -4477,18 +3687,6 @@ fn double_comparison_orders_nan_greatest_and_ties_the_two_zeros() {
     );
 }
 
-// ── the condition domain of `if` / `case` (ADR-0017 §4) ────────────
-//
-// `DuckDB` reads an `IF`/`CASE WHEN` condition as a BOOLEAN CAST, not as
-// truthiness: a string outside the boolean vocabulary is a Conversion
-// ERROR, and a TIMESTAMP or a list has no cast at all. A truthiness rule
-// (non-empty string is true) would silently take the THEN branch where
-// the batch lane refuses the query. These probes pin the whole domain:
-// which values are readable, which error, and the order `CASE` reads its
-// arms in, since "the whole call is NULL" and "skip this arm" are
-// different answers for a multi-arm `case`.
-
-/// The branch `DuckDB` took, or the text of its Conversion error.
 fn conditional_branch(
     conn: &duckdb::Connection,
     sql: &str,
@@ -4498,15 +3696,10 @@ fn conditional_branch(
         .map_err(|error| error.to_string())
 }
 
-/// `IF(cond, 1, 2)` and the `CASE` that must answer identically.
 const IF_OVER_BOUND_CONDITION: &str = "SELECT IF(?, 1, 2)";
 const CASE_OVER_BOUND_CONDITION: &str = "SELECT CASE WHEN ? THEN 1 ELSE 2 END";
 
 /// (text, the BOOLEAN `DuckDB` casts it to — `None` = Conversion error).
-///
-/// The same closed, case-insensitive, UNTRIMMED vocabulary
-/// `compare::try_cast_boolean` mirrors, which is why this probe asserts
-/// the mirror beside the engine rather than beside a second list.
 const CONDITION_STRINGS: &[(&str, Option<bool>)] = &[
     ("true", Some(true)),
     ("TRUE", Some(true)),
@@ -4527,8 +3720,7 @@ const CONDITION_STRINGS: &[(&str, Option<bool>)] = &[
     ("on", None),
 ];
 
-/// (bound BIGINT condition, the branch it takes) — zero is the only
-/// false one, and a negative is TRUE.
+/// (bound BIGINT condition, the branch it takes).
 const CONDITION_INTEGERS: &[(i64, bool)] = &[
     (0, false),
     (1, true),
@@ -4538,9 +3730,7 @@ const CONDITION_INTEGERS: &[(i64, bool)] = &[
     (i64::MIN, true),
 ];
 
-/// (bound DOUBLE condition, the branch it takes) — both zeros are false
-/// and NaN is TRUE, so the reading is `!= 0`, not `> 0` and not a cast
-/// through an integer.
+/// (bound DOUBLE condition, the branch it takes).
 const CONDITION_DOUBLES: &[(f64, bool)] = &[
     (0.0, false),
     (-0.0, false),
@@ -4569,7 +3759,6 @@ fn an_if_condition_is_a_boolean_cast_not_truthiness() {
                 );
             }
         }
-        // The live mirror of that same cast, side by side with it.
         assert_eq!(
             trawl_core::compare::try_cast_boolean(text),
             *reading,
@@ -4596,8 +3785,6 @@ fn an_if_condition_is_a_boolean_cast_not_truthiness() {
         }
     }
 
-    // NULL takes the ELSE branch — it is a false condition, not an
-    // unreadable one.
     for sql in [
         "SELECT IF(NULL, 1, 2)",
         "SELECT CASE WHEN NULL THEN 1 ELSE 2 END",
@@ -4609,7 +3796,6 @@ fn an_if_condition_is_a_boolean_cast_not_truthiness() {
         );
     }
 
-    // …while a TIMESTAMP or a list has no boolean cast at all.
     for condition in ["TIMESTAMP '2026-01-15 10:20:30'", "[1, 2]"] {
         for shape in [
             format!("SELECT IF({condition}, 1, 2)"),
@@ -4626,9 +3812,6 @@ fn an_if_condition_is_a_boolean_cast_not_truthiness() {
 
 #[test]
 fn a_case_reads_its_arms_in_order_and_stops_at_the_first_true() {
-    // The distinction eval has to reproduce: an unreadable condition is
-    // not "this arm does not match". It kills the whole call — unless an
-    // EARLIER arm already matched, in which case DuckDB never reads it.
     let conn = conn();
     let two_arms = "SELECT CASE WHEN ? THEN 1 WHEN ? THEN 2 ELSE 3 END";
 
@@ -4653,8 +3836,7 @@ fn a_case_reads_its_arms_in_order_and_stops_at_the_first_true() {
 }
 
 /// The stored DOUBLE column a filter really compares against, spelled so
-/// every row is a value the SQL parser cannot constant-fold away: both
-/// NaN SIGNS, both zeros, both infinities.
+/// every row is a value the SQL parser cannot constant-fold away.
 const STORED_DOUBLE_ROWS: &[&str] = &[
     "'nan'::DOUBLE",
     "-('nan'::DOUBLE)",
@@ -4666,9 +3848,7 @@ const STORED_DOUBLE_ROWS: &[&str] = &[
     "CAST(NULL AS DOUBLE)",
 ];
 
-/// The same rows as [`STORED_DOUBLE_ROWS`], as (rendering, value) — what
-/// the live mirror reads. `None` is the SQL NULL row, which no comparison
-/// matches.
+/// The same rows as [`STORED_DOUBLE_ROWS`], as (rendering, value).
 const STORED_DOUBLE_ROW_VALUES: &[(&str, Option<f64>)] = &[
     ("nan", Some(f64::NAN)),
     ("-nan", Some(-f64::NAN)),
@@ -4681,13 +3861,6 @@ const STORED_DOUBLE_ROW_VALUES: &[(&str, Option<f64>)] = &[
 ];
 
 /// (operator, bound literal, the stored rows it returns — rendered).
-///
-/// The COLUMN shape, which is the one a pinned live filter mirrors: the
-/// scalar matrix above compares two bound values, and a constant-folded
-/// answer would prove nothing about a column read off parquet. Both
-/// answers are the same total order — every NaN equal to every other
-/// whatever its sign, NaN above `inf`, the two zeros tied, SQL NULL
-/// matching nothing.
 const STORED_DOUBLE_COMPARISONS: &[(&str, f64, &[&str])] = &[
     ("=", f64::NAN, &["nan", "-nan"]),
     ("=", -f64::NAN, &["nan", "-nan"]),
@@ -4725,19 +3898,11 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
             .unwrap()
             .map(Result::unwrap)
             .collect();
-        // A filtered scan has no ORDER BY, so the ROW SET is what this
-        // case pins, not the order a parquet scan happens to hand back.
-        // Sorted rather than set-compared, so multiplicity still counts.
-        // The dedicated ordering assertion at the end of this test is the
-        // one that pins an ORDER.
         matched.sort();
         let mut want: Vec<String> = expected.iter().map(|text| (*text).to_owned()).collect();
         want.sort();
         assert_eq!(matched, want, "metric {op} {literal}");
 
-        // The mirror decides the same row set from the same order. The
-        // stored rows are named by their RENDERING here, so the mirror
-        // reads the value each name stands for.
         let mut mirrored: Vec<String> = STORED_DOUBLE_ROW_VALUES
             .iter()
             .filter_map(|(text, value)| {
@@ -4760,8 +3925,6 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
         );
     }
 
-    // …and the sort agrees with the comparison: the NaNs tie at the top,
-    // above `inf`, with SQL NULL after all of them.
     let sql = format!(
         "SELECT CAST(metric AS VARCHAR) FROM read_parquet('{}') ORDER BY metric",
         file.display()
@@ -4789,10 +3952,7 @@ fn a_stored_double_column_compares_in_that_same_total_order() {
 
 /// (SQL producing a NaN of a KNOWN sign, the text `DuckDB` renders).
 ///
-/// `DuckDB`'s DOUBLE → VARCHAR cast honours the SIGN BIT, so a NaN has
-/// two renderings and a mirror with one is wrong for half of them. Every
-/// row here builds its NaN sign-EXPLICITLY — parsed from text, or negated
-/// (which flips the bit, probed below) — never from arithmetic: the sign
+/// Every row builds its NaN sign-EXPLICITLY, never from arithmetic: the sign
 /// of a computed NaN like `0.0 / 0.0` is the hardware's business and
 /// differs across platforms, so pinning one would pin this machine.
 const NAN_SIGN_RENDERINGS: &[(&str, &str)] = &[
@@ -4815,8 +3975,6 @@ fn a_rendered_nan_keeps_its_sign() {
         assert_eq!(text.as_deref(), Some(*want), "{expr}");
     }
 
-    // The same through a BOUND parameter, which is how a computed value
-    // reaches the engine from Rust.
     for (value, want) in [
         (f64::NAN, "nan"),
         (-f64::NAN, "-nan"),
@@ -4832,9 +3990,6 @@ fn a_rendered_nan_keeps_its_sign() {
         );
     }
 
-    // Both spellings survive the DOUBLE pin's round-trip guard, so both
-    // are values a conformed column really holds — which is what makes
-    // the rendering a live-mirror question rather than a curiosity.
     for text in ["nan", "-nan"] {
         let conformed: Option<String> = conn
             .query_row(
@@ -4850,31 +4005,13 @@ fn a_rendered_nan_keeps_its_sign() {
     }
 }
 
-// ── the TIMESTAMP value domain (ADR-0017 §1) ───────────────────────
-//
-// How an instant RENDERS, what each date scalar answers over an
-// infinity, and what an infinity looks like coming back through
-// duckdb-rs (which the parity harness has to recognise). A bare
-// `NaiveDateTime` cannot spell the two values a `DuckDB` TIMESTAMP holds
-// beyond the calendar, which is why the mirror carries `compare::Instant`
-// instead.
-
 /// (SQL timestamp expression, its `CAST(… AS VARCHAR)`).
-///
-/// The SCALAR rendering, which is NOT the TIMESTAMP pin's pattern text:
-/// that one is RFC 3339 with a `Z` for globbing a stored column
-/// (`TIMESTAMP_PATTERN_SQL_FORMAT`), this one is the space-separated form
-/// `tostring()` and a projected cell show. Two renderings, two owners; a
-/// mirror that reused the pattern text here would print the wrong string
-/// for every finite instant.
 const TIMESTAMP_CAST_TEXTS: &[(&str, &str)] = &[
     ("TIMESTAMP '2026-01-15 09:00:00'", "2026-01-15 09:00:00"),
     (
         "TIMESTAMP '2026-01-15 09:00:00.123456'",
         "2026-01-15 09:00:00.123456",
     ),
-    // Trailing fractional zeros are trimmed, exactly as the live
-    // renderer trims them.
     (
         "TIMESTAMP '2026-01-15 09:00:00.100000'",
         "2026-01-15 09:00:00.1",
@@ -4884,8 +4021,6 @@ const TIMESTAMP_CAST_TEXTS: &[(&str, &str)] = &[
         "TIMESTAMP '9999-12-31 23:59:59.999999'",
         "9999-12-31 23:59:59.999999",
     ),
-    // The two instants no calendar date can express render as WORDS —
-    // and both spellings of the input reach the same value.
     ("'infinity'::TIMESTAMP", "infinity"),
     ("'-infinity'::TIMESTAMP", "-infinity"),
     ("TRY_CAST('inf' AS TIMESTAMP)", "infinity"),
@@ -4899,24 +4034,12 @@ fn a_timestamp_casts_to_the_text_duckdb_prints() {
         assert_eq!(dtype, "TIMESTAMP", "{expr}");
         assert_eq!(text.as_deref(), Some(*want), "{expr}");
 
-        // The live mirror beside the engine: the instant that text
-        // denotes renders back to the same text.
         let instant = trawl_core::compare::literal_timestamp(want)
             .unwrap_or_else(|| panic!("the mirror must read {want:?}"));
         assert_eq!(instant.cast_text(), *want, "cast_text disagrees for {expr}");
     }
 }
 
-/// A search bound executes as [`trawl_core::compare::bound_instant`]'s
-/// instant, and the SQL lane binds that instant's `cast_text` in place of
-/// the written text (ADR-0017's amendment of 2026-11-08). So every
-/// instant `bound_instant` accepts must read back through
-/// `TRY_CAST(? AS TIMESTAMP)` as that same instant, and as the same
-/// value the written text reads as.
-///
-/// The refused years are the other half of the premise: a finite year
-/// above 9999 reads, but its cast text (`+10000-…`) is NULL to the
-/// engine, so binding it would bound nothing.
 #[test]
 fn a_bound_instant_reads_back_through_duckdb() {
     use trawl_core::compare::{bound_instant, literal_timestamp};
@@ -4931,8 +4054,6 @@ fn a_bound_instant_reads_back_through_duckdb() {
         )
         .unwrap()
     };
-    // The spellings ADR-0017's amendment names, each of which must be a
-    // bound, on top of every matrix row the mirror reads.
     let named = [
         "2026-03-14",
         "2026-03-14T09:00:00",
@@ -4968,7 +4089,6 @@ fn a_bound_instant_reads_back_through_duckdb() {
     }
     assert!(accepted > 50, "only {accepted} matrix rows were bounds");
 
-    // Read by the mirror and by the engine, but not as cast text.
     for text in ["10000-01-01", "262142-12-31 23:59:59"] {
         let instant = literal_timestamp(text).expect("the mirror reads the text");
         assert!(engine(text).is_some(), "the engine reads {text:?}");
@@ -4976,22 +4096,11 @@ fn a_bound_instant_reads_back_through_duckdb() {
         assert_eq!(engine(&instant.cast_text()), None, "{text:?}");
         assert_eq!(bound_instant(text), None, "{text:?}");
     }
-    // Outside both calendars.
     assert_eq!(literal_timestamp("300000-01-01"), None);
     assert_eq!(engine("300000-01-01"), None);
     assert_eq!(bound_instant("300000-01-01"), None);
 }
 
-/// What each date scalar answers for `infinity` and `-infinity`.
-///
-/// Measured, not reasoned: the three families do three DIFFERENT things,
-/// and no rule derived from one of them predicts the others.
-///
-/// - `date_part` is NULL for EVERY unit, `epoch` included;
-/// - `date_trunc` returns the infinity UNCHANGED, for every unit;
-/// - `date_diff` is NULL whenever EITHER side is infinite — including
-///   both sides, and including two infinities of the same sign;
-/// - `strftime` renders the WORD whatever the format asks for.
 #[test]
 fn the_date_scalars_answer_for_an_infinity() {
     let conn = conn();
@@ -5044,14 +4153,6 @@ fn the_date_scalars_answer_for_an_infinity() {
     }
 }
 
-/// The i64 SENTINELS duckdb-rs hands back for the two infinities.
-///
-/// A result cell arrives as `Value::Timestamp(Microsecond, i64)`, and the
-/// infinities are the extremes of that range — note `-infinity` is
-/// `-i64::MAX`, NOT `i64::MIN`. The scalar parity harness compares eval
-/// against these cells, so it has to know the sentinels by value; a
-/// matcher that treated them as ordinary microsecond counts would read
-/// them as dates 292 thousand years out.
 #[test]
 fn an_infinity_timestamp_cell_is_an_i64_sentinel() {
     let conn = conn();
@@ -5070,18 +4171,8 @@ fn an_infinity_timestamp_cell_is_an_i64_sentinel() {
     }
 }
 
-// ── `date_part('epoch', ts)` ───────────────────────────────────────
-
-/// Timestamp texts spanning the epoch reading's whole range: the epoch
-/// itself, a pre-1970 instant with a fraction, an ordinary one, the
-/// far-future fixture whose rounding this test exists for, and the ends
-/// of the range BOTH engines can express.
-///
 /// `262143-12-31` is deliberately absent: `DuckDB` reads it and the
-/// mirror does not (chrono's calendar stops at +262142), which is one of
-/// [`trawl_core::compare::literal_timestamp`]'s two documented
-/// one-directional residuals — under-reading, never over-reading — and
-/// is guarded by `the_timestamp_mirror_residuals_are_one_directional`.
+/// mirror does not (chrono's calendar stops at +262142).
 const EPOCH_MATRIX: &[&str] = &[
     "1970-01-01 00:00:00",
     "1969-12-31 23:59:59.5",
@@ -5097,9 +4188,6 @@ const EPOCH_MATRIX: &[&str] = &[
     "-262143-01-01 00:00:00",
 ];
 
-/// The live mirror under test: the instant's whole MICROSECOND count,
-/// divided once ([`trawl_core::compare::Instant::epoch_seconds`], which
-/// `date_part('epoch', …)` reads through in both in-memory lanes).
 fn epoch_candidate(instant: trawl_core::compare::Instant) -> Option<f64> {
     instant.epoch_seconds()
 }
@@ -5129,7 +4217,6 @@ fn the_epoch_reading_is_the_micro_count_divided_once() {
         );
     }
 
-    // An infinity has no epoch reading on either side.
     for (sql, instant) in [
         (
             "'infinity'::TIMESTAMP",
@@ -5150,21 +4237,11 @@ fn the_epoch_reading_is_the_micro_count_divided_once() {
     }
 }
 
-// ── `%f` is SIX-DIGIT MICROSECONDS ─────────────────────────────────
-//
-// The one strftime/strptime specifier where `DuckDB` and chrono read the
-// same letter as different units: `DuckDB`'s bare `%f` is a 6-digit
-// microsecond field, chrono's is an UNSCALED NANOSECOND count (9 digits
-// out, and a variable-length run read as nanoseconds in). Handing
-// chrono's `%f` straight through prints `123456000` live against
-// `123456` in batch, and reads `….5` as five NANOseconds where the
-// engine reads half a second.
+// `DuckDB`'s bare `%f` is a 6-digit microsecond field, chrono's is an
+// UNSCALED NANOSECOND count (9 digits out, and a variable-length run
+// read as nanoseconds in).
 
 /// (fractional part of the instant, the text `strftime(ts, '%f')` gives).
-///
-/// Always six digits, zero-padded and zero-FILLED: a `.5` is `500000`,
-/// not `5`, so the field is a fraction scaled to microseconds rather
-/// than a count of them.
 const PERCENT_F_RENDERINGS: &[(&str, &str)] = &[
     ("2026-01-15 09:00:00.123456", "123456"),
     ("2026-01-15 09:00:00.5", "500000"),
@@ -5187,9 +4264,6 @@ fn percent_f_is_six_digit_microseconds() {
         assert_eq!(rendered.as_deref(), Some(*want), "strftime({text:?}, '%f')");
     }
 
-    // An ESCAPED percent is not a specifier: `%%f` is a literal `%` then
-    // the letter `f`, so a translation that rewrote `%f` blindly would
-    // corrupt it.
     for (fmt, want) in [("%%f", "%f"), ("x%%fy", "x%fy"), ("%%%f", "%123456")] {
         let rendered: Option<String> = conn
             .query_row(
@@ -5203,10 +4277,6 @@ fn percent_f_is_six_digit_microseconds() {
 }
 
 /// (input, the instant `strptime(input, '%Y-%m-%d %H:%M:%S.%f')` reads).
-///
-/// The fraction is VARIABLE length on the way in — `.5` is half a second
-/// — which is the half chrono's fixed-width `%6f` cannot reproduce for
-/// anything other than exactly six digits.
 const PERCENT_F_PARSES: &[(&str, &str)] = &[
     ("2026-01-15 09:00:00.123456", "2026-01-15 09:00:00.123456"),
     ("2026-01-15 09:00:00.500000", "2026-01-15 09:00:00.5"),
@@ -5229,19 +4299,7 @@ fn percent_f_parses_a_variable_length_fraction() {
     }
 }
 
-// ── `json_extract` returns JSON TEXT ───────────────────────────────
-//
-// `json_extract` yields JSON, not a decoded scalar: a string keeps its
-// QUOTES, a number is its own text, a composite is compact JSON. The
-// live mirror renders through `serde_json`, whose text IS `DuckDB`'s for
-// every shape but one — a positive exponent, which serde spells `e+300`
-// and `DuckDB` spells `e300`.
-
 /// (document, path, the TEXT `json_extract` returns).
-///
-/// Every class the mirror claims to reproduce: integers, floats, the
-/// exponent spellings, strings WITH escapes, booleans, JSON null,
-/// arrays, objects, a nested extract, and a missing path (SQL NULL).
 const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
     (r#"{"a":1}"#, "$.a", Some("1")),
     (r#"{"a":-1}"#, "$.a", Some("-1")),
@@ -5250,7 +4308,6 @@ const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
     (r#"{"a":0.1}"#, "$.a", Some("0.1")),
     (r#"{"a":-0.0}"#, "$.a", Some("-0.0")),
     (r#"{"a":1e2}"#, "$.a", Some("100.0")),
-    // The spelling the mirror normalizes…
     (r#"{"a":1e300}"#, "$.a", Some("1e300")),
     (r#"{"a":-1e300}"#, "$.a", Some("-1e300")),
     (
@@ -5258,17 +4315,14 @@ const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
         "$.a",
         Some("1.7976931348623157e308"),
     ),
-    // …and the negative exponent that needs no normalizing.
     (r#"{"a":1e-7}"#, "$.a", Some("1e-7")),
     (r#"{"a":5e-324}"#, "$.a", Some("5e-324")),
-    // Integers up to the width serde keeps exactly.
     (r#"{"a":9007199254740993}"#, "$.a", Some("9007199254740993")),
     (
         r#"{"a":18446744073709551615}"#,
         "$.a",
         Some("18446744073709551615"),
     ),
-    // Strings keep their QUOTES and their escaping.
     (r#"{"a":"x"}"#, "$.a", Some(r#""x""#)),
     (
         r#"{"a":"he said \"hi\""}"#,
@@ -5289,7 +4343,6 @@ const JSON_EXTRACT_TEXTS: &[(&str, &str, Option<&str>)] = &[
     ),
     (r#"{"a":{"b":"x"}}"#, "$.a.b", Some(r#""x""#)),
     ("[1,2]", "$", Some("[1,2]")),
-    // A missing path is SQL NULL, where a JSON `null` above is a VALUE.
     (r#"{"a":1}"#, "$.missing", None),
 ];
 
@@ -5325,14 +4378,6 @@ fn json_extract_returns_the_values_json_text() {
 
 /// The residual: `serde_json` re-renders a number from its `f64`, where
 /// `DuckDB` renders from the SOURCE spelling.
-///
-/// Two sub-classes, one cause. An exponent-form source below 1e21 is
-/// EXPANDED by `DuckDB` and kept in exponent form by serde; a digit-form
-/// source too wide for `u64` keeps its digits in `DuckDB` and collapses
-/// to exponent form in serde. Both need the source text, which only
-/// `serde_json`'s `arbitrary_precision` feature preserves — rejected,
-/// because that flag changes number handling across the whole ingest
-/// path.
 const JSON_NUMBER_SPELLING_RESIDUALS: &[(&str, &str, &str)] = &[
     // (document, DuckDB's text, the mirror's text)
     (r#"{"a":1e16}"#, "10000000000000000.0", "1e16"),
@@ -5363,9 +4408,6 @@ fn current_json_number_spelling_follows_serdes_f64() {
         );
     }
 
-    // A number outside `f64`'s range is a step further: serde cannot
-    // PARSE the document at all, so the whole call is NULL where the
-    // engine answers the number's text.
     let doc = r#"{"a":1e400}"#;
     let engine: Option<String> = conn
         .query_row("SELECT json_extract(?, '$.a')", [doc], |row| row.get(0))
@@ -5374,13 +4416,8 @@ fn current_json_number_spelling_follows_serdes_f64() {
     assert_eq!(json_extract_mirror(doc, "$.a"), None);
 }
 
-// ── the json document guard (ADR-0017, amendment of 2026-11-13) ─────
-//
-// Batch emits each json function over `TRY_CAST(<document> AS JSON)`, so
-// a document that is not JSON reads as NULL instead of failing the
-// statement. These probes pin the engine facts that guard rests on.
+// the json document guard (ADR-0017)
 
-/// Hand-picked documents at the edge of what `DuckDB` calls JSON.
 const JSON_GUARD_DOCUMENTS: &[&str] = &[
     "",
     " ",
@@ -5403,13 +4440,10 @@ const JSON_GUARD_DOCUMENTS: &[&str] = &[
     "\u{feff}{}",
 ];
 
-/// The fragments the generated documents are built from.
 const JSON_GUARD_FRAGMENTS: &[&str] = &[
     "{", "}", "[", "]", "\"", ":", ",", "1", "a", "null", "true", "-", ".", "e", "\\", " ", "x",
 ];
 
-/// Deterministic documents stitched from [`JSON_GUARD_FRAGMENTS`], so the
-/// corpus reaches shapes nobody thought to write down.
 fn generated_json_guard_documents() -> Vec<String> {
     let mut state: u64 = 0x0457_0457_0457_0457;
     let mut next = move || {
@@ -5428,10 +4462,6 @@ fn generated_json_guard_documents() -> Vec<String> {
         .collect()
 }
 
-/// `TRY_CAST(varchar AS JSON)` nulls exactly the text `json_valid`
-/// rejects, and keeps every other text byte for byte. If either half
-/// moves, the guard either lets a raising document through or changes
-/// what a valid one reads as.
 #[test]
 fn try_cast_to_json_nulls_exactly_what_json_valid_rejects() {
     let conn = conn();
@@ -5459,18 +4489,12 @@ fn try_cast_to_json_nulls_exactly_what_json_valid_rejects() {
             assert_eq!(cast, None, "an invalid document survived the cast: {doc:?}");
         }
     }
-    // Both sides of the line were exercised.
     assert!(
         valid >= 10 && invalid >= 10,
         "valid={valid} invalid={invalid}"
     );
 }
 
-/// A parquet column of type JSON holding text that is not JSON fails at
-/// scan, before any json function runs, and the document guard cannot
-/// help: `TRY_CAST(json AS JSON)` is elided. This is the out-of-scope
-/// residual of ADR-0017's 2026-11-13 amendment: such a source stays an
-/// engine error.
 #[test]
 fn a_parquet_json_column_holding_invalid_text_fails_at_scan() {
     let dir = tempfile::tempdir().unwrap();
@@ -5529,11 +4553,6 @@ fn a_parquet_json_column_holding_invalid_text_fails_at_scan() {
     }
 }
 
-/// Negative control for the guard's form: an output that selects both a
-/// `TRY(…)`-wrapped call and a `CASE WHEN json_valid` guarded call over
-/// one document still raises, because `DuckDB` folds the equal paths and
-/// hoists the shared call out of both guards. The emitted
-/// `TRY_CAST(<document> AS JSON)` form over the same pair does not.
 #[test]
 fn a_try_and_case_guard_pair_still_raises_where_the_cast_guard_does_not() {
     let conn = conn();
@@ -5573,17 +4592,6 @@ fn a_try_and_case_guard_pair_still_raises_where_the_cast_guard_does_not() {
     );
 }
 
-// ── the now() anchor's bound TIMESTAMP (ADR-0017 §3) ─────────────────
-//
-// `now()` does not emit `DuckDB`'s own clock: the statement's instant is
-// captured in Rust and BOUND as a microsecond TIMESTAMP under an
-// explicit `CAST(? AS TIMESTAMP)` (`emitter::functions`). Three claims
-// that design rests on are measured here rather than assumed — what the
-// bound parameter's TYPE is, what it RENDERS as, and that the typed
-// literal the PIVOT lane inlines instead names the same instant.
-
-/// The anchor as duckdb-rs binds it: microseconds since the epoch, the
-/// domain `EvalContext` truncates to at capture.
 fn bound_anchor(at: chrono::NaiveDateTime) -> duckdb::types::Value {
     duckdb::types::Value::Timestamp(
         duckdb::types::TimeUnit::Microsecond,
@@ -5591,8 +4599,6 @@ fn bound_anchor(at: chrono::NaiveDateTime) -> duckdb::types::Value {
     )
 }
 
-/// The two anchor shapes the emitter can produce: a fractional instant
-/// and a whole-second one (whose canonical text carries NO fraction).
 fn anchor_probe_instants() -> Vec<chrono::NaiveDateTime> {
     ["2026-02-03T04:05:06.789012Z", "2026-02-03T04:05:06Z"]
         .iter()
@@ -5617,9 +4623,6 @@ fn a_bound_anchor_is_a_timestamp_not_a_timestamptz() {
     }
 }
 
-/// The bound anchor renders as the canonical text the in-memory lane
-/// prints for the same instant — so a `now()` cell computed by the SQL
-/// prefix and one computed by the `rust_stages` tail are the same string.
 #[test]
 fn a_bound_anchor_renders_as_the_canonical_timestamp_text() {
     let conn = conn();
@@ -5635,9 +4638,7 @@ fn a_bound_anchor_renders_as_the_canonical_timestamp_text() {
 }
 
 /// The PIVOT lane cannot take parameters, so it INLINES the anchor as a
-/// typed literal. The literal and the bound form must be
-/// indistinguishable — same type, same text — or one query shape would
-/// answer `now()` differently from another.
+/// typed literal.
 #[test]
 fn the_inlined_anchor_literal_matches_the_bound_form() {
     let conn = conn();
@@ -5655,15 +4656,8 @@ fn the_inlined_anchor_literal_matches_the_bound_form() {
     }
 }
 
-/// A year outside `0..=9999` must still produce a literal `DuckDB` can
-/// parse.
-///
-/// chrono SIGNS such a year — `+10000-01-01` — and `DuckDB`'s timestamp
-/// parser accepts a leading `-` but not a leading `+`, so an unhandled
-/// `+` makes the inlined PIVOT literal a conversion error while the bound
-/// parameter for the same instant is fine: two renderings of one anchor
-/// disagreeing at the edge of the domain. Unreachable from a production
-/// clock, but `EvalContext::at` is public.
+/// chrono SIGNS a year past 9999 (`+10000-01-01`), and `DuckDB`'s
+/// timestamp parser accepts a leading `-` but not a leading `+`.
 #[test]
 fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
     let conn = conn();
@@ -5683,19 +4677,12 @@ fn the_anchor_literal_parses_at_every_year_chrono_can_render() {
             .unwrap_or_else(|error| panic!("{literal} must parse: {error}"));
         assert_eq!(inlined.0, "TIMESTAMP", "{literal}");
 
-        // And it must denote the same instant the parameter binds — the
-        // whole point of there being ONE rendering.
         let bound = scalar_type_and_text(&conn, "CAST(? AS TIMESTAMP)", &[&bound_anchor(at)])
             .unwrap_or_else(|error| panic!("the bound form of {literal} must run: {error}"));
         assert_eq!(inlined, bound, "{literal} must denote the bound instant");
     }
 }
 
-// ---------------------------------------------------------------------------
-// The absolute time window is half-open: [earliest, latest)
-// ---------------------------------------------------------------------------
-
-/// Bind an emitted query's parameters the way the executor does.
 fn bound(emitted: &trawl_core::emitter::EmittedQuery) -> Vec<Box<dyn duckdb::ToSql>> {
     emitted
         .params
@@ -5717,9 +4704,6 @@ fn bound(emitted: &trawl_core::emitter::EmittedQuery) -> Vec<Box<dyn duckdb::ToS
         .collect()
 }
 
-/// Run a DSL query's EMITTED sql over `file` and return the matching ids.
-/// The WHERE clause is never handwritten here: the point is what the
-/// emitter produces, executed.
 fn matching_ids(conn: &duckdb::Connection, file: &std::path::Path, dsl: &str) -> Vec<String> {
     let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
     let emitted = trawl_core::emitter::emit_with_pins(
@@ -5743,21 +4727,11 @@ fn matching_ids(conn: &duckdb::Connection, file: &std::path::Path, dsl: &str) ->
         .collect()
 }
 
-/// The window `earliest=`/`latest=` describes is half-open, and this is
-/// the boundary microsecond that says so: an event stamped exactly `T`
-/// is INSIDE `earliest="T"` and OUTSIDE `latest="T"` (ADR-0018 ruling
-/// 10). That is what lets a scheduler tile consecutive report windows
-/// `[a, b)`, `[b, c)` without the event at `b` landing in both runs.
-///
-/// Executed against real parquet through the emitter's own SQL, because
-/// a bound this design leans on should be pinned by what `DuckDB`
-/// answers, not by reading `>=` and `<` in the emitter.
 #[test]
 fn the_absolute_time_window_is_half_open_at_the_microsecond() {
     let dir = tempfile::tempdir().unwrap();
     let file = dir.path().join("events.parquet");
     let conn = conn();
-    // T = 2026-03-14T03:00:00.123456Z, and its two microsecond neighbours.
     conn.execute_batch(&format!(
         "COPY (SELECT * FROM (VALUES \
          ('before', TIMESTAMP '2026-03-14 03:00:00.123455'), \
@@ -5789,16 +4763,8 @@ fn the_absolute_time_window_is_half_open_at_the_microsecond() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The bind-time expansion budget's copy counts, after the PARSER
-// ---------------------------------------------------------------------------
-
-/// One SQL expression's `DuckDB` parse tree, serialized.
-///
 /// `json_serialize_sql` takes a constant, not a parameter, so the
-/// expression is inlined and its quotes doubled. What comes back is the
-/// tree the BINDER will walk — which is the tree the expansion budget is
-/// trying to bound, and it is not the same shape as the text.
+/// expression is inlined and its quotes doubled.
 fn parse_tree(conn: &duckdb::Connection, expr: &str) -> String {
     let statement = format!("SELECT {expr}").replace('\'', "''");
     conn.prepare(&format!("SELECT json_serialize_sql('{statement}')"))
@@ -5812,20 +4778,10 @@ fn parse_tree(conn: &duckdb::Connection, expr: &str) -> String {
 /// contains it.
 const COPY_MARKER: &str = "__c0__";
 
-/// How many times a rendering's subject survives into the parse tree.
 fn parsed_copies(conn: &duckdb::Connection, expr: &str) -> u64 {
     parse_tree(conn, expr).matches(COPY_MARKER).count() as u64
 }
 
-/// `DuckDB`'s parser rewrites a SIMPLE `CASE` before the binder sees it,
-/// and that rewrite duplicates the subject.
-///
-/// `CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END` arrives at the binder as
-/// `CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END`: two whole copies
-/// of `x`, from one written occurrence. A SEARCHED `CASE` has no subject
-/// and is not rewritten. This is the mechanism the rest of this section
-/// measures, pinned on its own so a failure here reads as "the parser
-/// changed" rather than "a profile is wrong".
 #[test]
 fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
     let conn = conn();
@@ -5841,8 +4797,6 @@ fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
             "a {arms}-arm simple CASE copies its subject once per arm"
         );
     }
-    // The searched form names its subject exactly as often as it is
-    // written, however many arms it has.
     assert_eq!(
         parsed_copies(
             &conn,
@@ -5854,25 +4808,12 @@ fn duckdb_rewrites_a_simple_case_into_one_equality_per_arm() {
     );
 }
 
-/// How many expression nodes a parse tree holds.
-///
 /// `json_serialize_sql` writes one `"class"` key per expression node, so
-/// counting them counts the nodes the binder will walk. It is a coarse
-/// measure by design: the budget's `fixed` counts are one-sided upper
-/// bounds, and this says what the floor under them is.
+/// counting them counts the nodes the binder will walk.
 fn parsed_nodes(conn: &duckdb::Connection, expr: &str) -> u64 {
     parse_tree(conn, expr).matches("\"class\":").count() as u64
 }
 
-/// A `CASE` written without an `ELSE` is bound WITH one.
-///
-/// `case(flag, status)` emits `CASE WHEN flag THEN status END`, and the
-/// parser hands the binder `… ELSE NULL END`: a node the SQL text never
-/// shows. The odd arity writes its fallback, so its node is one of the
-/// operands. Both parities are measured here rather than reasoned about,
-/// because `complexity::FunctionShape::Case` prices them differently and
-/// a node missed per reference is the difference between refusing a query
-/// and admitting it (one reference short of the cap, at 256 reads).
 #[test]
 fn an_else_less_case_still_binds_an_else_node() {
     use trawl_core::complexity::{FunctionShape, Rendering, profile};
@@ -5908,20 +4849,6 @@ fn an_else_less_case_still_binds_an_else_node() {
     }
 }
 
-/// Every `CASE`-bearing renderer the expansion budget prices, measured
-/// against the tree `DuckDB` actually builds.
-///
-/// The text-level guard in `trawl-core/tests/complexity_emission_bounds.rs`
-/// counts the emitter's OUTPUT, which is the wrong side of the parser for
-/// a simple `CASE`: `conform::severity_token_text_sql` writes its subject
-/// once and hands the binder twenty-four copies. Understating a copy count
-/// turns a refused query into an admitted one, so the class is closed here
-/// instead — by asking the engine.
-///
-/// One-sided on purpose: a profile may declare more copies than the parser
-/// produces (`profile` overcounts a `CASE`'s `ELSE` by one node, and the
-/// pin-maximizing walk deliberately takes the widest interpretation). It
-/// may never declare fewer.
 #[test]
 fn declared_copy_counts_cover_the_parsed_tree() {
     use trawl_core::complexity::{ConformShape, FunctionShape, Rendering, profile};
@@ -5937,8 +4864,6 @@ fn declared_copy_counts_cover_the_parsed_tree() {
             Rendering::Conform(ConformShape::SeverityTokenText),
             conform::severity_token_text_sql(&subject),
         ),
-        // A pattern operator over a SEVERITY pin renders THROUGH that
-        // kernel, so the composition has to carry its copies too.
         (
             "pattern over the severity token text".to_owned(),
             Rendering::Pattern(trawl_core::compare::PatternForm::SeverityText),
@@ -5959,8 +4884,6 @@ fn declared_copy_counts_cover_the_parsed_tree() {
             Rendering::Conform(ConformShape::SeverityReadingBindOnce(dialect)),
             conform::severity_reading_sql_bind_once(&subject, dialect),
         ));
-        // `sev()`'s emission is that bind-once reading over the argument's
-        // canonical text form.
         cases.push((
             format!("sev() emission ({dialect:?})"),
             Rendering::Function(FunctionShape::Sev { dialect, argc: 1 }),
@@ -5994,13 +4917,6 @@ fn declared_copy_counts_cover_the_parsed_tree() {
     }
 }
 
-/// The numbers behind the one-sided bound above, pinned exactly.
-///
-/// A bound that only ever says "at least" would pass just as well if a
-/// profile declared a million copies, and would never tell anyone that the
-/// severity reading got cheaper. These are the counts on the bundled
-/// engine; a change here is a real change in what the binder is asked to
-/// do, and the profiles should move with it.
 #[test]
 fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
     use trawl_core::conform;
@@ -6009,14 +4925,10 @@ fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
     let conn = conn();
     let subject = format!("\"{COPY_MARKER}\"");
 
-    // Twenty-four ladder arms, one copy each.
     assert_eq!(
         parsed_copies(&conn, &conform::severity_token_text_sql(&subject)),
         24
     );
-    // Thirty-eight token arms over a head that names the subject twice,
-    // plus the numeric fallthrough: 76 + 3 under OTel, and 76 + 9 under
-    // syslog, whose numeric rung is a SECOND simple CASE with eight arms.
     assert_eq!(
         parsed_copies(
             &conn,
@@ -6031,9 +4943,6 @@ fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
         ),
         85
     );
-    // The bind-once shape is the whole reason `sev()` can carry bound
-    // parameters: the rewrite multiplies the lambda-local `_sev`, and the
-    // caller's expression lands exactly once.
     for dialect in [Dialect::Otel, Dialect::Syslog] {
         assert_eq!(
             parsed_copies(
@@ -6046,15 +4955,6 @@ fn the_severity_kernels_parse_to_their_pinned_copy_counts() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// What the binder does with a same-stage alias (ADR-0024, #150)
-// ---------------------------------------------------------------------------
-
-/// The bundled engine build. Every claim in this section is a claim about
-/// THIS engine: the workspace pins `>=1.10500, <1.10600` (`DuckDB` 1.5.x)
-/// and the calibration in `visual-evidence/issue-150/bind-calibration.md`
-/// was measured on v1.5.5, so the version rides in each failure message
-/// and a bump out of the pinned line fails here first.
 fn engine_version(conn: &duckdb::Connection) -> String {
     conn.query_row("SELECT version()", [], |row| row.get::<_, String>(0))
         .unwrap()
@@ -6069,10 +4969,6 @@ fn the_bind_time_probes_run_against_the_pinned_engine_line() {
     );
 }
 
-/// A one-row parquet with a declared schema, owned by the test. The
-/// bind-time cost this section measures is a property of the SQL, not of
-/// the corpus, so the fixture exists only to make the emitted source
-/// readable.
 fn bind_fixture(conn: &duckdb::Connection, dir: &std::path::Path) -> String {
     let file = dir.join("bind.parquet");
     conn.execute_batch(&format!(
@@ -6084,8 +4980,6 @@ fn bind_fixture(conn: &duckdb::Connection, dir: &std::path::Path) -> String {
     file.display().to_string()
 }
 
-/// The SQL one DSL query emits over `source`, with no pins: what the
-/// server hands `prepare`.
 fn emitted_sql(source: &str, dsl: &str) -> String {
     let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
     trawl_core::emitter::emit(&query, source, trawl_core::context::EvalContext::capture())
@@ -6093,7 +4987,6 @@ fn emitted_sql(source: &str, dsl: &str) -> String {
         .sql
 }
 
-/// The admission verdict and the score behind it (`trawl_core::complexity`).
 fn admission(dsl: &str) -> (bool, u64) {
     let query = trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl} parses: {e:?}"));
     let (verdict, stats) =
@@ -6101,12 +4994,6 @@ fn admission(dsl: &str) -> (bool, u64) {
     (verdict.is_ok(), stats.lateral_delta)
 }
 
-/// The emitted statement's SELECT lists, in order: the text between each
-/// `SELECT` line and the `FROM` that closes it.
-///
-/// Which list an output lands in is the whole question: two outputs in ONE
-/// list can substitute into each other, and outputs in different lists
-/// (separate `| let` stages, hence separate CTE bodies) cannot.
 fn select_lists(sql: &str) -> Vec<String> {
     let mut lists = Vec::new();
     let mut current: Option<String> = None;
@@ -6132,13 +5019,6 @@ fn select_lists(sql: &str) -> Vec<String> {
     lists
 }
 
-/// `DuckDB` substitutes a same-list alias's EXPRESSION; it does not read a
-/// finished column. The engine says so itself.
-///
-/// `SELECT random() AS r, r AS r2` is refused with "the expression has side
-/// effects", which is only a problem if the reference means "evaluate that
-/// expression again here". A column read would be harmless. This is the
-/// mechanism the whole expansion budget prices, stated by the binder.
 #[test]
 fn a_same_list_alias_reference_copies_its_expression() {
     let conn = conn();
@@ -6151,8 +5031,6 @@ fn a_same_list_alias_reference_copies_its_expression() {
         error.contains("has side effects"),
         "{version}: expected the side-effect refusal, got {error}"
     );
-    // Without side effects the substitution goes through silently, which
-    // is exactly why nothing downstream can see how much work it caused.
     let doubled: i64 = conn
         .prepare("SELECT 21 AS r, r + r AS r2")
         .unwrap()
@@ -6161,14 +5039,6 @@ fn a_same_list_alias_reference_copies_its_expression() {
     assert_eq!(doubled, 42, "{version}");
 }
 
-/// A scalar output of `stats` or `timechart` naming an earlier output of
-/// the SAME stage lands in the same SELECT list as that output, so it
-/// reaches the substitution above, so the aggregating stages can build the
-/// same chains `let` can, which is why ADR-0024 walks all three.
-///
-/// The contrast in the same test is the boundary that makes the claim
-/// precise: split the two outputs across stages and they land in different
-/// SELECT lists, where no substitution is possible.
 #[test]
 fn a_scalar_stats_or_timechart_output_shares_the_select_list_it_substitutes_into() {
     let dir = tempfile::tempdir().unwrap();
@@ -6201,8 +5071,6 @@ fn a_scalar_stats_or_timechart_output_shares_the_select_list_it_substitutes_into
         assert_eq!(value, expected, "{dsl}: {sql}");
     }
 
-    // The same computation, one stage per output: two lists, and the
-    // second reads a column the first finished.
     let split = emitted_sql(&source, "* | stats count() as n | let m = abs(n)");
     let lists = select_lists(&split);
     assert!(
@@ -6214,9 +5082,6 @@ fn a_scalar_stats_or_timechart_output_shares_the_select_list_it_substitutes_into
         "the split form defines each output in its own SELECT list: {split}"
     );
 
-    // An AGGREGATE over an earlier alias is not substituted at all: the
-    // alias is not a column, so the reference simply does not resolve.
-    // Only scalar heads reach the mechanism, which is what ADR-0024 says.
     let nested = emitted_sql(&source, "* | stats count() as n, sum(n) as m");
     let error = conn
         .prepare(&nested)
@@ -6228,20 +5093,6 @@ fn a_scalar_stats_or_timechart_output_shares_the_select_list_it_substitutes_into
     );
 }
 
-/// `eventstats` wraps every output in `OVER (…)`, and `DuckDB` 1.5.5
-/// refuses a substituted alias inside that wrapper: the copied
-/// `COUNT(*) OVER (…)` lands inside `ABS(…)`, which is a nested window
-/// function. What the error proves is that the copy happened; it says
-/// nothing about the order the binder does its work in, which is why
-/// ADR-0024 treats the rejection as a dependency behavior rather than a
-/// defence.
-///
-/// ADR-0024 records this dependency behavior and deliberately does NOT
-/// lean on it: the checker scores the stage exactly as it scores `let`,
-/// admits this one on its own arithmetic, and would keep admitting it if a
-/// later `DuckDB` bound the copy instead of rejecting it. The assertion
-/// below is on the engine, and the assertion on the checker beside it is
-/// the independence claim.
 #[test]
 fn eventstats_refuses_a_substituted_alias_inside_its_window() {
     let dir = tempfile::tempdir().unwrap();
@@ -6276,19 +5127,6 @@ fn eventstats_refuses_a_substituted_alias_inside_its_window() {
     );
 }
 
-/// The severity-chain mechanism, measured at a depth that stays small.
-///
-/// One `sev(x) in (1,3,5,…,23)` writes its subject twelve times, once per
-/// disjoint ladder range. Each of those is a place the binder substitutes
-/// the whole expression the subject names, so a chain of such assignments
-/// multiplies by twelve per link: the eight links ADR-0024 describes are
-/// twelve to the eighth copies of the seed.
-///
-/// This runs the substitution the binder would perform, textually, at ONE
-/// and TWO links and counts the seed in `DuckDB`'s own parse tree: 24
-/// then 288, from 15 KB then 191 KB of SQL. The eight-link chain is never
-/// built, prepared, or handed to the engine here; the last assertion is
-/// that the checker refuses it, which is why the engine never sees it.
 #[test]
 fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
     let dir = tempfile::tempdir().unwrap();
@@ -6296,7 +5134,6 @@ fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
     let source = bind_fixture(&conn, dir.path());
     let points = "1,3,5,7,9,11,13,15,17,19,21,23";
 
-    // One link's emitted predicate, over a field named `a0`.
     let sql = emitted_sql(&source, &format!("* | where sev(a0) in ({points})"));
     let link = sql
         .rsplit_once("WHERE ")
@@ -6310,8 +5147,6 @@ fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
         "one written subject per disjoint ladder range: {link}"
     );
 
-    // Substitute the way the binder substitutes: the alias reference is
-    // replaced by the expression the alias named, everywhere it occurs.
     let seed = format!("(\"{COPY_MARKER}\" + \"{COPY_MARKER}\")");
     let one_link = link.replace("\"a0\"", &seed);
     let two_links = link.replace("\"a0\"", &format!("({one_link})"));
@@ -6322,9 +5157,6 @@ fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
         "SQL text grows twelvefold per link while the DSL grows by one assignment"
     );
 
-    // One link is admitted; two links are already refused. The third-link
-    // DSL never gets emitted, and the eight-link chain ADR-0024 describes
-    // is refused by arithmetic alone.
     let chain = |links: usize| {
         let mut dsl = String::from("* | let a0 = _severity + _severity");
         for i in 1..=links {
@@ -6343,14 +5175,6 @@ fn a_severity_chain_multiplies_its_subject_twelve_times_per_link() {
     }
 }
 
-/// The remedy the refusal names, at the depth the refusal bites: the same
-/// twenty-four doublings that are impossible in one `| let` are ordinary
-/// once each one is its own stage.
-///
-/// Splitting works because each stage becomes its own SELECT: the next one
-/// reads a finished column instead of a same-list alias, so there is no
-/// substitution to multiply. It says nothing about materialization:
-/// nothing here promises the optimizer computes a stage once.
 #[test]
 fn the_split_let_remedy_admits_a_depth_twenty_four_chain() {
     let dir = tempfile::tempdir().unwrap();
@@ -6396,18 +5220,12 @@ fn the_split_let_remedy_admits_a_depth_twenty_four_chain() {
         .unwrap_or_else(|e| panic!("{version}: the split chain prepares: {e}"));
 }
 
-// ── absent-field resolution premises (ADR-0062, issue #333) ──
-//
-// Each probe pins one SQL behaviour a ruling in the #333 plan rests on.
-// The doc comment on each test names the ruling. Where the engine
-// answers differently from the plan's premise, the test asserts what
-// the engine does and says so.
+// absent-field resolution premises (ADR-0062)
 mod absent_field_premises {
     use std::io::Write as _;
 
     use super::{conn, hot_reader};
 
-    /// `DESCRIBE <sql>` as (name, type) pairs.
     fn describe(
         conn: &duckdb::Connection,
         sql: &str,
@@ -6423,7 +5241,6 @@ mod absent_field_premises {
             .collect()
     }
 
-    /// The first column of every row, as optional text.
     fn column0(
         conn: &duckdb::Connection,
         sql: &str,
@@ -6453,9 +5270,6 @@ mod absent_field_premises {
         .unwrap();
     }
 
-    /// R4: an unpinned absent operand is untyped `NULL`, and it must
-    /// prepare and run against a VARCHAR parameter under every operator
-    /// the emitter binds, yielding SQL's unknown (so no row passes).
     #[test]
     fn untyped_null_binds_against_parameters() {
         let conn = conn();
@@ -6480,16 +5294,6 @@ mod absent_field_premises {
         }
     }
 
-    /// ADR-0062, lateral `let` after a pivot: a read of an earlier alias
-    /// of the same `let` that is NULL by construction binds the pivot's
-    /// column of that name first, when the data made one. Where that
-    /// column can carry data, a cast would convert it, so the emitter
-    /// types the read with `COALESCE(x, CAST(NULL AS T))` instead. That
-    /// hint has to type the alias's NULL as `T`, leave a `T` column's
-    /// values as they are, and refuse at bind, never convert, every other
-    /// type a pivot aggregate yields. `T` is a type an overloaded position
-    /// reads: TIMESTAMP (`date_part`, `date_trunc`, `date_diff`) or
-    /// VARCHAR (`contains`).
     #[test]
     fn a_coalesce_hint_types_a_null_and_converts_nothing() {
         let conn = conn();
@@ -6501,7 +5305,6 @@ mod absent_field_premises {
         .unwrap();
         let hint = |column: &str, ty: &str| format!("COALESCE({column}, CAST(NULL AS {ty}))");
 
-        // The alias's NULL takes the hint, where it alone cannot bind.
         assert!(
             conn.prepare("SELECT NULL AS a, date_part('day', a) AS y FROM p")
                 .is_err(),
@@ -6526,8 +5329,6 @@ mod absent_field_premises {
             );
         }
 
-        // A `T` column comes through unchanged, and an input column binds
-        // before the alias of the same name.
         for (ty, column) in [("TIMESTAMP", "ts"), ("VARCHAR", "text")] {
             let hinted = hint(column, ty);
             assert_eq!(
@@ -6552,7 +5353,6 @@ mod absent_field_premises {
             );
         }
 
-        // Every other type a pivot aggregate yields is refused at bind.
         for (ty, others) in [
             ("TIMESTAMP", ["big", "huge", "dbl", "text", "flag"]),
             ("VARCHAR", ["big", "huge", "dbl", "ts", "flag"]),
@@ -6571,8 +5371,6 @@ mod absent_field_premises {
         }
     }
 
-    /// R3: absence needs no CTE split because `DuckDB`'s WHERE binds a
-    /// FROM column before a same-SELECT alias of the same name.
     #[test]
     fn where_prefers_the_from_column() {
         let conn = conn();
@@ -6586,11 +5384,6 @@ mod absent_field_premises {
         );
     }
 
-    /// R4: a projected untyped `NULL AS f` is INTEGER and a cast one is
-    /// VARCHAR. `sum` takes the INTEGER one and refuses the VARCHAR one,
-    /// so the VARCHAR cast belongs only at the final boundary, and a read
-    /// of a lineage column inside the pipeline resolves to the operand
-    /// literal, not the identifier.
     #[test]
     fn projected_untyped_null_is_integer() {
         let conn = conn();
@@ -6616,12 +5409,6 @@ mod absent_field_premises {
         assert!(err.to_string().contains("sum"), "{err}");
     }
 
-    /// R4: whether `f = ?` with a VARCHAR parameter breaks over an
-    /// INTEGER-typed NULL column depends on the plan shape. An inline
-    /// `NULL AS f` constant folds away and passes no row. A real INTEGER
-    /// column, even one holding only NULL, casts the parameter to INTEGER
-    /// and throws a conversion error at execute. A pipeline cannot rely
-    /// on the fold, so R4 re-resolves a lineage read to the literal.
     #[test]
     fn integer_null_column_against_a_varchar_parameter() {
         let conn = conn();
@@ -6653,10 +5440,6 @@ mod absent_field_premises {
         }
     }
 
-    /// R4 (Sol gap 8): bare `ORDER BY NULL` is refused at bind time as a
-    /// non-integer literal. Every typed null cast is accepted as a
-    /// constant key that leaves the order to the other keys, and none is
-    /// read as a position or an alias.
     #[test]
     fn order_by_absent_key() {
         let conn = conn();
@@ -6694,9 +5477,6 @@ mod absent_field_premises {
         }
     }
 
-    /// R13 (out of scope): ORDER BY binds a SELECT alias before a FROM
-    /// column of the same name. This is the known `sort X | rename Y as X`
-    /// defect, present with or without absent fields.
     #[test]
     fn order_by_binds_the_select_alias() {
         let conn = conn();
@@ -6710,12 +5490,6 @@ mod absent_field_premises {
         );
     }
 
-    /// R6: the pivot fill is a zero-row `UNION ALL BY NAME` branch whose
-    /// columns are a NULL of one type, here BIGINT. A present column of
-    /// that type keeps it and its left-side spelling, names match
-    /// case-insensitively, absent names come out of the fill's type, and
-    /// the row count is unchanged. Without `HAVING FALSE` the aggregate
-    /// gives one row.
     #[test]
     fn zero_row_fill_keeps_type_and_folds_case() {
         let conn = conn();
@@ -6744,11 +5518,6 @@ mod absent_field_premises {
         );
     }
 
-    /// R6: the same fill works with a PIVOT subquery (the emitter's
-    /// spelling) as its left side. The fill's value is the pivot's
-    /// aggregate over the pivot's input with no rows, which has the type
-    /// of every value column the pivot makes. A column the pivot consumed,
-    /// here the USING argument `v`, reads NULL through the fill.
     #[test]
     fn pivot_subquery_takes_a_fill_branch() {
         let conn = conn();
@@ -6786,11 +5555,6 @@ mod absent_field_premises {
         );
     }
 
-    /// R7: `read_json` infers JSON for a key that is only ever JSON null,
-    /// so an inferred type is no proof of null-only. EXCLUDE and a typed
-    /// REPLACE both work on it. A cold BIGINT unioned BY NAME with that
-    /// hot key comes out JSON for every row, cold rows included. The
-    /// typed REPLACE restores BIGINT.
     #[test]
     fn exclude_replace_on_read_json() {
         let conn = conn();
@@ -6839,12 +5603,8 @@ mod absent_field_premises {
         );
     }
 
-    /// R1, R8: the probe of a from-saved source with no result files,
-    /// `ZERO_COLUMN_SOURCE` in `trawl_server::from_saved`, sees one
-    /// dummy column named `1`, which the resolver must hide.
     #[test]
     fn describe_of_a_zero_column_source() {
-        // Keep in step with trawl_server::from_saved::ZERO_COLUMN_SOURCE.
         const ZERO_COLUMN_SOURCE: &str = "(SELECT 1 WHERE FALSE)";
         let conn = conn();
         let expected = pairs(&[("1", "INTEGER")]);
@@ -6856,9 +5616,6 @@ mod absent_field_premises {
         );
     }
 
-    /// R1: the probe `DESCRIBE SELECT * FROM read_parquet([...],
-    /// union_by_name=true)` returns the union of the files' columns with
-    /// their types.
     #[test]
     fn describe_select_star_over_union_by_name_parquet() {
         let conn = conn();

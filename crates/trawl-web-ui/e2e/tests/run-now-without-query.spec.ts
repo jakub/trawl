@@ -3,14 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 // Run now and a run's stored rows need `query` beside `saved_query`
-// (issue #444, ADR-0018 as amended on 2026-11-11). A session missing
-// either is offered no Run now in the net drawer or the nets list, its
-// run rows do not expand, and the browser never asks for a run's rows:
-// not from the drawer, not from the runs page. Each absence runs once
-// with `saved_query` alone, which trawld lets list a net's runs, and once
-// with `query` alone, so a control gated on `query` by itself fails here.
-// The last test is the control: with both permissions every one of those
-// is there.
+// (ADR-0018).
 
 import { test, expect, resetScenario, CORPUS, SCHEDULE } from '../fixtures';
 import { SEL, COPY } from '../selectors';
@@ -24,11 +17,8 @@ const MISSING_ONE: [string, string[]][] = [
 ];
 const QUERY_AND_SAVED = ['query', 'saved_query'];
 
-/** The single-run read: one run's summary and its stored rows. */
 const RUN_READ = /\/api\/v1\/saved\/\d+\/runs\/\d+(\?|$)/;
 
-/** Serve the session with exactly `permissions`, and record every
- * single-run read the browser sends. */
 async function sessionWith(page: Page, permissions: string[]): Promise<string[]> {
   await page.route('**/api/auth/me', async (route) => {
     const response = await route.fetch();
@@ -75,13 +65,10 @@ for (const [who, permissions] of MISSING_ONE) {
     const rows = page.locator(SEL.netRunRow);
     await expect(rows).toHaveCount(3);
 
-    // Clicking where a readable row's control sits expands nothing and
-    // reads nothing.
     await rows.first().locator('td').first().click();
     await page.waitForLoadState('networkidle');
     expect(reads).toEqual([]);
     await expect(page.locator(SEL.netRunPreview)).toHaveCount(0);
-    // A row is plain text, not a disclosure control.
     await expect(rows.locator(SEL.rowStretch)).toHaveCount(0);
     await expect(rows.locator('[aria-expanded]')).toHaveCount(0);
   });

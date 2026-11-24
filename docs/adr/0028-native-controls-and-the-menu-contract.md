@@ -1,6 +1,6 @@
 # Native controls and the menu contract: a fleet-ui control is a `<button>`, a menu is a `None` layer with one tab stop, and tabs are a named tablist that owns no panes
 
-status: accepted (2026-09-07) — prep ruling record for #100 slice D
+status: accepted (2026-09-07) — prep ruling record for #100 slice D; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 > **amendment (2026-09-23, #242):** a `Drawer`'s dialog is named by a
 > REQUIRED `label` prop (a reactive string), not by its title slot. The
@@ -209,3 +209,14 @@ does not establish first-paint behavior.
 ## Amendment: time zone preference group, 2026-10-02
 
 ADR-0051 adds a second radio group, "Time zone", to the account menu, after "Theme". It follows the theme group's contract: `menuitemradio` items, a visible selected indicator, `aria-checked` derived from the stored preference, and no shortcut. Opening the menu still focuses the checked theme choice. The menu has no submenus, so the group holds Browser, UTC and eight named zones. This takes effect when #201 lands.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **A menu's outside-mousedown check treats the trigger as inside the menu.** `MenuPanel` tests containment against `wrap_ref`, the wrapper around the trigger and the panel. A press on the trigger of an open menu is then one clean toggle. If the check used the panel alone, the press would close the menu and the trigger's click would open it again.
+- **The overlay runs its focus-candidate query again on every scan, and drops the candidates that have no layout box.** `focusable_descendants` runs the `FOCUSABLE` query each time because a cached `NodeList` is stale after the panel re-renders. A selector cannot see layout, so the `is_rendered` filter drops an element with no offset box and no client rects, which is true of every element in a `display:none` subtree, such as an inactive tab pane. Without that filter, a Tab wrap can move focus to an element that is not displayed, and the user loses visible focus.
+- **A menu's tab stop follows focus. A tab strip's tab stop follows selection.** In `Tabs`, `aria-selected`, `tabindex` and the active class are one predicate over `roving::resolve_selected`, so the strip keeps no focus state. Arrow keys move focus but leave the tab stop on the selected tab. Only activation moves it. This deviates on purpose from the APG strip, where the tab stop follows focus. trawl's tabs write `?ntab=` to the URL, and a tab stop that followed focus would disagree with the pane on screen after the user arrows away without activating.
+- **An `active` id that matches no tab selects the first tab.** The ids come from the URL, so `?ntab=bogus` is a normal input. If no tab were selected, every tab would carry `tabindex="-1"`, no keyboard could enter the strip, and the pane beneath would still show the first tab.
+- **A `Tabs` strip with no items renders no `role` and no `aria-label`.** The field case drawer uses the strip container only as a bar for its meta text. An assistive technology reports a named tablist with no tabs as an empty widget.
+- **The chart type picker is a group of native `input type=radio` elements, not `role="radio"` buttons.** The browser then owns arrow-key movement inside the group, the single tab stop and the checked state. With ARIA buttons, `ChartTypePicker` would have to build all three itself. The segmented look comes from the labels, through the `.chart-type-input:checked + .seg-opt` rule in `crates/trawl-web-ui/styles/main.css`.

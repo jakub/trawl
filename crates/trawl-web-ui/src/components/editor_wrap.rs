@@ -5,30 +5,6 @@
 //! `<EditorWrap/>` — the query console's header, the DSL editor, and
 //! the date-range picker, Haul button and query tools stacked in a
 //! column on its right.
-//!
-//! The console header says what the box is ("Query") and whether the
-//! buffer has been edited since the link ran. That draft state is
-//! derived, never stored: it compares the editor buffer against the
-//! executed query in the URL and navigates nothing (ADR-0027).
-//!
-//! An empty buffer shows a muted example query and the Haul chord over
-//! the editor's first line. The hint is decoration: hidden from
-//! assistive technology, transparent to the pointer, and gone as soon as
-//! the buffer holds a character.
-//!
-//! The stack order is date range, Haul, then the Save as Net / Copy
-//! search URL / Format tool row. Haul mirrors ⌘⏎ in the editor — both
-//! call the parent's submit callback.
-//!
-//! Under the editor row sits the draft diagnostic: the local parser's
-//! first error on the buffer as a visible line, `Line L:C — message`,
-//! with any further errors behind a `+N more` disclosure (ADR-0039). A
-//! buffer that parses shows its advice the same way, in the advice tone
-//! (ADR-0068); errors take precedence. Like the draft state it is derived
-//! from the buffer and announces nothing:
-//! no live region, no control of its own, and it never gates Haul. The
-//! server's verdict on a sent query is the results region's notice, not
-//! this line.
 
 use leptos::prelude::*;
 use leptos::web_sys;
@@ -40,38 +16,19 @@ use fleet_ui::{CopyButton, RangeDialog, RangePreset, RangeValue, ToastBus, Toast
 
 #[component]
 pub fn EditorWrap(
-    /// Editor buffer — bound to the `DslEditor` document.
     query: RwSignal<String>,
-    /// Triggered on ⌘⏎ from the editor and on Run button click.
-    #[prop(into)]
-    on_submit: Callback<()>,
-    /// Currently selected range — read-only here; mutations flow out
-    /// via `on_range_change` to the parent, which translates them into
-    /// URL navigation.
-    #[prop(into)]
-    range: Signal<RangeSpec>,
+    #[prop(into)] on_submit: Callback<()>,
+    #[prop(into)] range: Signal<RangeSpec>,
     #[prop(into)] reset_key: Signal<String>,
-    /// Accept or refuse a raw range selection from the shared dialog.
     on_range_change: Callback<RangeValue, Result<(), String>>,
-    /// True while a query is in flight; flips Run → Hauling…
-    #[prop(into)]
-    running: Signal<bool>,
-    /// True while the link in the address bar cannot be read. Every
-    /// control here that would run the query or rewrite the URL is
-    /// disabled, so the banner's repair stays the only way forward
-    /// (ADR-0027). Typing is unaffected: the editor is a buffer, not a
-    /// navigation.
-    #[prop(into)]
-    blocked: Signal<bool>,
+    #[prop(into)] running: Signal<bool>,
+    #[prop(into)] blocked: Signal<bool>,
     /// True while the editor buffer differs from the query the current
     /// link executed. Read-only here: the header states it, and only
     /// Haul resolves it.
     #[prop(into)]
     draft_dirty: Signal<bool>,
-    /// Bubbles "save" click to the parent so it can open the save modal.
     on_save: Callback<()>,
-    /// Fired by the date-range popover's Real-time tab — the parent
-    /// re-runs the current query in SSE live mode.
     on_live: Callback<(), Result<(), String>>,
 ) -> impl IntoView {
     let bus = expect_context::<ToastBus>();
@@ -177,8 +134,6 @@ pub fn EditorWrap(
                             text=share_text
                             success_detail="Search URL copied to clipboard."
                         >"Copy search URL"</CopyButton>
-                        // Format acts on click, so a native button makes
-                        // it keyboard accessible, ADR-0028.
                         <button
                             type="button"
                             class="tool"
@@ -192,9 +147,6 @@ pub fn EditorWrap(
     }
 }
 
-/// The DSL editor with the empty-buffer hint laid over its first line.
-/// The chord names the key the editor binds: ⌘⏎ where ⌘ is the primary
-/// modifier, Ctrl+Enter elsewhere.
 #[component]
 fn EditorField(
     query: RwSignal<String>,
@@ -223,9 +175,6 @@ fn EditorField(
     }
 }
 
-/// The first diagnostic with its `Line L:C` location set apart, so the
-/// location carries the error tone and the message reads as detail. A
-/// message without a location renders whole. The text is unchanged.
 fn located(first: String) -> AnyView {
     match first.split_once(" — ") {
         Some((at, message)) if at.starts_with("Line ") => {
@@ -236,10 +185,6 @@ fn located(first: String) -> AnyView {
     }
 }
 
-/// The local parser's verdict on the buffer: nothing while it parses
-/// with no advice, else the first error (or, on a draft that parses, the
-/// first advice note) in full and the rest behind a disclosure. Advice
-/// past the core's cap is counted on a line of its own.
 #[component]
 fn DraftDiagnosticLine(query: RwSignal<String>) -> impl IntoView {
     let diagnostic = Memo::new(move |_| draft_diagnostic(&query.get()));

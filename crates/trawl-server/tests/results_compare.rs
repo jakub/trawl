@@ -5,15 +5,6 @@
 //! `POST /api/v1/results/compare` end to end (ADR-0058): a filter's group
 //! rates in a foreground window against a baseline, from one statement,
 //! captured as the ranked table.
-//!
-//! The corpus sits on 2024-01-19, which no other seed touches. On `prod`,
-//! `authsvc` logs auth failures per `user`: 10:00-11:00 holds alice 6, bob
-//! 5 and dave 3; 11:00-12:00 holds alice 30, bob 5 and carol 2. `auth ok`
-//! rows of the same users stay out of the filter. On `staging` the only
-//! date partition is 2024-01-19, so a window starting the day before
-//! reaches past what retention kept.
-//!
-//! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -116,7 +107,6 @@ async fn page(server: &TestServer, id: &str) -> ResultPage {
     serde_json::from_value(body).expect("a result page")
 }
 
-/// One ranked row: user, foreground and baseline counts, status.
 #[derive(Debug, PartialEq)]
 struct Ranked {
     user: Option<String>,
@@ -186,11 +176,6 @@ fn float(page: &ResultPage, index: usize, name: &str) -> Option<f64> {
     }
 }
 
-/// The issue's question: did auth failures rise against the previous
-/// hour? Counts, rates per minute, absolute and relative change, a group
-/// new in the foreground, a vanished one, ranked by absolute rate change,
-/// from one statement over the hull. The baseline defaults to the hour
-/// before.
 #[tokio::test(flavor = "multi_thread")]
 async fn auth_failures_rising_hour_over_hour_are_ranked_from_one_statement() {
     let server = boot().await;
@@ -261,7 +246,6 @@ async fn auth_failures_rising_hour_over_hour_are_ranked_from_one_statement() {
     assert_eq!(page.result.correlation, result.correlation);
 }
 
-/// The same request twice ranks byte for byte the same.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_ranking_is_the_same_across_runs() {
     let server = boot().await;
@@ -279,8 +263,6 @@ async fn the_ranking_is_the_same_across_runs() {
     );
 }
 
-/// A baseline that touches the foreground is accepted and is the default;
-/// `min_count` lists a group only when either window reaches it.
 #[tokio::test(flavor = "multi_thread")]
 async fn touching_windows_are_accepted_and_min_count_filters_groups() {
     let server = boot().await;
@@ -316,7 +298,6 @@ async fn touching_windows_are_accepted_and_min_count_filters_groups() {
         vec![row("alice", 30, 6, "both")]
     );
 
-    // No group field: one row of totals.
     let totals = compare(
         &server,
         json!({ "filter": FILTER, "foreground": foreground() }),
@@ -341,8 +322,6 @@ async fn touching_windows_are_accepted_and_min_count_filters_groups() {
     );
 }
 
-/// A retention reach and a degraded group field each warn, and neither
-/// warning claims completeness.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_window_past_retention_and_a_degraded_group_field_each_warn() {
     let server = boot().await;
@@ -397,8 +376,6 @@ async fn a_window_past_retention_and_a_degraded_group_field_each_warn() {
         ]
     );
 
-    // A foreground inside what retention kept, and no degraded group
-    // field, warns of nothing.
     *server.state.query.degraded_fields.lock() = Arc::new(DegradedSnapshot::default());
     let quiet = compare(
         &server,
@@ -416,12 +393,8 @@ async fn a_window_past_retention_and_a_degraded_group_field_each_warn() {
     );
 }
 
-// -- one snapshot ------------------------------------------------------------
-
-/// The service of the hot events in the one-snapshot test.
 const HOT_SERVICE: &str = "hotcompare";
 
-/// Insert one hot batch of [`HOT_SERVICE`] events, one per instant.
 fn insert_hot(hot: &trawl_server::hot_buffer::HotBuffer, batch: &str, times: &[&str]) {
     let events: Vec<serde_json::Map<String, serde_json::Value>> = times
         .iter()
@@ -444,7 +417,6 @@ fn insert_hot(hot: &trawl_server::hot_buffer::HotBuffer, batch: &str, times: &[&
     }));
 }
 
-/// The foreground and baseline counts summed over a compare's ranked rows.
 fn window_totals(page: &ResultPage) -> (i64, i64) {
     let at = |name: &str| {
         page.page
@@ -463,19 +435,6 @@ fn window_totals(page: &ResultPage) -> (i64, i64) {
         })
 }
 
-/// AC6: both halves of a compare come from one hot snapshot and one pin
-/// snapshot while ingest runs. The test holds the capture lane at its
-/// `Snapshotted` seam, after the hot snapshot and the pin read and before
-/// the engine runs the statement, inserts late events into both windows,
-/// which advances the generation, and releases. The compare logged exactly
-/// one hot snapshot and one pin read, its two windows together count
-/// exactly the events resident at that snapshot, none of the late ones,
-/// and the next compare counts them in both.
-///
-/// Planted negatives: an extra `field_catalog.all()` or an extra
-/// `hb.snapshot()` in the capture lane each fail this test, naming the
-/// duplicate read, and the seam moved before the hot snapshot fails it at
-/// the hold.
 #[tokio::test(flavor = "multi_thread")]
 async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs() {
     use trawl_server::pool::seam::Seam;
@@ -582,8 +541,6 @@ async fn both_windows_come_from_one_hot_and_one_pin_snapshot_while_ingest_runs()
     assert_eq!(hot.snapshots_for_test()[0].events, 11);
 }
 
-// -- refusals before the capture ---------------------------------------------
-
 async fn assert_refused(server: &TestServer, body: serde_json::Value, expected: &str) -> String {
     let before = server.state.query.pool.available_permits();
     let (status, _, answer) =
@@ -600,8 +557,6 @@ async fn assert_refused(server: &TestServer, body: serde_json::Value, expected: 
     answer["error"]["message"].as_str().unwrap().to_owned()
 }
 
-/// Overlapping windows are refused by name; a hull over seven days is the
-/// capture's span refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn overlapping_windows_and_a_hull_over_seven_days_are_refused() {
     let server = boot().await;
@@ -638,8 +593,6 @@ async fn overlapping_windows_and_a_hull_over_seven_days_are_refused() {
     assert!(message.contains("at most 7d"), "{message}");
 }
 
-/// The filter is search tokens only: a pipe stage or a time clause is
-/// `correlation_invalid`, naming what it found.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filter_with_a_pipe_stage_or_a_time_clause_is_refused() {
     let server = boot().await;
@@ -659,9 +612,6 @@ async fn a_filter_with_a_pipe_stage_or_a_time_clause_is_refused() {
     assert!(message.contains("last="), "{message}");
 }
 
-/// A filter that does not parse, at the parser's input limit, is refused
-/// with an excerpt of the parser's message, which echoes the filter, so
-/// the answer stays under 1 KiB.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_unparseable_filter_at_the_input_limit_is_refused_in_under_a_kib() {
     let server = boot().await;
@@ -680,9 +630,6 @@ async fn an_unparseable_filter_at_the_input_limit_is_refused_in_under_a_kib() {
     );
 }
 
-/// A time clause under `NOT (…)` or `NOT NOT` does not parse (ADR-0061
-/// ruling 2): `correlation_invalid` with the parser's message, before
-/// anything is admitted, not the bounds' window-and-clause error.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() {
     let server = boot().await;
@@ -702,7 +649,6 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
         );
     }
     assert_eq!(started.arrivals(), 0, "no work was admitted");
-    // The control: the same watch sees an allowed compare start its work.
     let body = json!({ "filter": FILTER, "foreground": foreground() });
     let (status, _, answer) =
         captured::correlate(&server, &server.analyst_token, "compare", &body).await;
@@ -710,10 +656,6 @@ async fn a_nested_time_clause_in_the_filter_is_refused_as_correlation_invalid() 
     assert_eq!(started.arrivals(), 1, "the allowed compare was admitted");
 }
 
-/// A filter the parser admits can leave no room for the statement around
-/// it. That is the caller's input, refused by its size as
-/// `correlation_invalid` before anything is admitted, never the reparse
-/// proof's defect.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_filter_too_long_to_compose_is_refused_by_its_size() {
     let server = boot().await;
@@ -735,9 +677,6 @@ async fn a_filter_too_long_to_compose_is_refused_by_its_size() {
     assert_eq!(started.arrivals(), 0, "no work was admitted");
 }
 
-/// A group field or a window value far over its limit is refused by its
-/// length before anything formats it: the answer names the limit and the
-/// length, never the value, and stays under 1 KiB.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_oversized_group_field_or_window_value_is_refused_by_its_length() {
     let server = boot().await;
@@ -775,8 +714,6 @@ async fn an_oversized_group_field_or_window_value_is_refused_by_its_length() {
     }
 }
 
-/// At most two group fields, distinct under the fold; a name the statement
-/// assigns is the builder's refusal.
 #[tokio::test(flavor = "multi_thread")]
 async fn group_fields_are_capped_distinct_and_never_the_statements_own() {
     let server = boot().await;
@@ -803,10 +740,8 @@ async fn group_fields_are_capped_distinct_and_never_the_statements_own() {
     assert!(message.contains("\"Compare_Status\""), "{message}");
 }
 
-/// Every column the statement assigns is `compare_`-prefixed, so a user
-/// field named `status` groups, and the ranking carries the read's own
-/// outcome as `compare_status` beside it. The two groups tie on rate
-/// change, so the larger foreground count ranks first.
+/// The two groups tie on rate change, so the larger foreground count
+/// ranks first.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_user_field_named_status_groups_beside_compare_status() {
     let event = |at: &str, status: &str| {
@@ -880,11 +815,9 @@ async fn a_user_field_named_status_groups_beside_compare_status() {
     );
 }
 
-/// AC9 for all three reads: a selection over `source_max_bytes` is
-/// refused with `capture_source_too_large` before the work starts, and
-/// nothing is held. The budget is exactly the `authsvc` file of 10:00 on
-/// `prod`, so a focus capture of that service fits, while each read's
-/// selection adds a second file.
+/// The budget is exactly the `authsvc` file of 10:00 on `prod`, so a
+/// focus capture of that service fits, while each read's selection adds
+/// a second file.
 #[tokio::test(flavor = "multi_thread")]
 async fn every_read_over_the_source_budget_is_refused_before_work_starts() {
     let mut rows = corpus();
@@ -961,7 +894,6 @@ async fn every_read_over_the_source_budget_is_refused_before_work_starts() {
     );
 }
 
-/// A key without `query` is refused.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_without_query_is_refused() {
     let server = boot().await;

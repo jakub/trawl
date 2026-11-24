@@ -2,16 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Exact big integers in the browser (issue #214, ADR-0035 amended
-// 2026-10-22).
+// Exact big integers in the browser (ADR-0035).
 //
-// An `integer` column travels as decimal strings, so a value past 2^53
-// reaches the SPA with every digit. These specs read that value back out
-// of every surface that classifies a number: the grid's text, its sort,
-// the filter rail's values and the filter they build, the exact table,
-// and both charts. A JavaScript `Number` would spell 2^53 + 1 as
-// 9007199254740992 and u64::MAX as 18446744073709552000, so each
-// assertion below names the true digits.
+// A JavaScript `Number` would spell 2^53 + 1 as
+// 9007199254740992 and u64::MAX as 18446744073709552000.
 //
 // The bodies are `harness/wire/query-big-integers*.json`, written by the
 // result wire's own encoder in tests/e2e_big_integer_fixtures.rs; this
@@ -34,12 +28,8 @@ const TWO_63 = '9223372036854775808';
 const U64_MAX = '18446744073709551615';
 const NEGATIVE = '-9007199254740993';
 
-/** The `bytes` cells in ascending order, null first, as the grid's sort
- * puts them: numeric, so 2^53 + 1 sorts before 2^63 and u64::MAX last. A
- * text sort would put `18…` before `9…`. */
 const ASCENDING = ['NULL', NEGATIVE, ABOVE_2_53, I64_MAX, TWO_63, U64_MAX];
 
-/** Answer every query by shape, and keep the DSL each one asked. */
 async function serve(page: Pg): Promise<string[]> {
   const asked: string[] = [];
   await page.route('**/api/v1/query', (route) => {
@@ -51,8 +41,7 @@ async function serve(page: Pg): Promise<string[]> {
   return asked;
 }
 
-/** The `bytes` column's cells as the grid prints them, top to bottom. The
- * first cell of a row is the expander, so `bytes` is the fourth. */
+// The first cell of a row is the expander, so `bytes` is the fourth.
 const bytesCells = (page: Pg) => page.locator(`${SEL.resultsRow} > td:nth-child(4)`).allTextContents();
 
 test('the grid prints every digit and sorts the column as numbers', async ({ page }, testInfo) => {
@@ -60,10 +49,7 @@ test('the grid prints every digit and sorts the column as numbers', async ({ pag
   await page.goto('/search?q=service%3Dnginx');
   await expect(page.locator(SEL.resultsRow)).toHaveCount(6);
 
-  // Wire order, every digit.
   expect(await bytesCells(page)).toEqual([U64_MAX, ABOVE_2_53, 'NULL', TWO_63, NEGATIVE, I64_MAX]);
-  // The `_time` column is `timestamp`-typed, so it prints its short form:
-  // every row is on one date, which the header states once.
   await expect(page.locator(`${SEL.resultsRow} > td:nth-child(2)`).first()).toHaveText('10:00:00.000');
   await expect(page.locator('.results-table thead th.sortable').first()).toHaveText(/^_time UTC 2026-09-01/);
 
@@ -73,7 +59,6 @@ test('the grid prints every digit and sorts the column as numbers', async ({ pag
   await sort.click();
   await expect.poll(() => bytesCells(page)).toEqual(ASCENDING);
 
-  // The capture the PR cites: the grid, sorted ascending.
   await page.locator('#search-results').screenshot({ path: testInfo.outputPath('big-integers-grid.png') });
 });
 
@@ -82,8 +67,6 @@ test('the filter rail counts the column and filters on its exact digits', async 
   await page.goto('/search?q=service%3Dnginx');
   await expect(page.locator(SEL.resultsRow)).toHaveCount(6);
 
-  // Five values, each one a facet value spelled with all its digits:
-  // the rail keys an integer by its text, never by a rounded number.
   const group = page.locator(SEL.facetGroup).filter({
     has: page.getByRole('button', { name: nameFrom(COPY.facetGroupName, 'bytes', '5'), exact: true }),
   });
@@ -119,8 +102,6 @@ test('a stats by result keeps exact counts in its table and draws them to scale'
   expect(await table.locator('tbody tr > td:nth-child(2)').allTextContents())
     .toEqual([U64_MAX, ABOVE_2_53, TWO_63, I64_MAX]);
 
-  // The bars beside the table: each value printed whole, and each width
-  // measured against u64::MAX, so 2^63 is exactly half of it.
   const bars = page.locator(`${SEL.catChart} .cat-bars li`);
   await expect(bars).toHaveCount(4);
   const drawn = await bars.evaluateAll((items) => Object.fromEntries(items.map((li) => [
@@ -132,7 +113,6 @@ test('a stats by result keeps exact counts in its table and draws them to scale'
   expect(drawn['web-04']).toEqual([I64_MAX, 'width:50.00%']);
   expect(drawn['web-02']![0]).toBe(ABOVE_2_53);
 
-  // The Visualization tab classifies the same column as a numeric metric.
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
   const host = page.locator(SEL.chartHost);
   await expect(host).toHaveAttribute('data-chart-type', 'column');
@@ -145,7 +125,6 @@ test('a timechart of big counts draws a line and keeps its exact table', async (
   await serve(page);
   await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart span=1h count()'));
 
-  // The exact table: bucket instants in their short form, counts whole.
   const table = page.locator(SEL.exactTable);
   await expect(table.locator('tbody tr')).toHaveCount(4);
   expect(await table.locator('tbody tr > td:nth-child(1)').allTextContents()).toEqual([
@@ -154,8 +133,6 @@ test('a timechart of big counts draws a line and keeps its exact table', async (
   expect(await table.locator('tbody tr > td:nth-child(2)').allTextContents())
     .toEqual([ABOVE_2_53, I64_MAX, TWO_63, U64_MAX]);
 
-  // The series chart takes the column as its metric: one line over the
-  // four buckets, not a refusal for a non-numeric metric.
   await page.getByRole('tab', { name: 'Visualization', exact: true }).click();
   const host = page.locator(SEL.chartHost);
   await expect(host).toHaveAttribute('data-chart-type', 'line');

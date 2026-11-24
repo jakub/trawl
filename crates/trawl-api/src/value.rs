@@ -4,18 +4,8 @@
 
 //! Result types for query execution.
 //!
-//! These types are deliberately decoupled from `DuckDB`'s internal types
-//! to keep the public API stable across duckdb crate version changes.
-//!
 //! A [`QueryResult`] is the wire format of every API result surface
-//! (ADR-0035, amended 2026-10-22). Each [`Column`] carries a
-//! [`ColumnType`], and every cell is encoded and decoded under it:
-//! integers travel as canonical decimal strings, floats as JSON numbers
-//! with `NaN`, `Infinity` and `-Infinity` spelled as strings, and each
-//! non-null cell of a `mixed` column carries its own type tag. [`Value`]
-//! has no serde of its own, so a cell reaches the wire only through its
-//! column's type. Export files want plain JSON numbers instead and ask for
-//! them by name with [`Value::to_plain_json`].
+//! (ADR-0035).
 
 use std::cmp::Ordering;
 use std::fmt;
@@ -26,18 +16,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 /// A cell value from a query result row.
 ///
-/// Integers land in the narrowest variant that holds them exactly:
-/// [`Integer`](Self::Integer) up to `i64::MAX`, then [`UInt`](Self::UInt)
-/// for the unsigned range above it — see [`land_u64`] and [`land_i128`],
-/// the one rule every producer and decoder applies. Nothing rounds to
-/// `f64` on the way: a rounded reading and an exact one are different
-/// answers. A magnitude outside `i64` ∪ `u64` has no variant, and its
-/// producer refuses it instead of carrying digits or a float.
-///
 /// Timestamps, dates and times are [`String`](Self::String) cells; their
-/// column's [`ColumnType`] says which. A `Value` has no wire spelling of
-/// its own: [`QueryResult`]'s serde encodes each cell under its column
-/// type.
+/// column's [`ColumnType`] says which.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     Null,
@@ -53,13 +33,6 @@ pub enum Value {
 }
 
 /// Land a `u64` without rounding it.
-///
-/// Up to `i64::MAX` the value is a [`Value::Integer`]; above that it is a
-/// [`Value::UInt`]. Both are `integer` cells on the wire, the rule
-/// `trawl-engine`'s executor applies to a `DuckDB` `UBIGINT`. Never a
-/// float and never text: a reader sorts, charts and compares a number by
-/// its variant, and a rounded reading is a different answer from an exact
-/// one.
 #[must_use]
 pub fn land_u64(v: u64) -> Value {
     i64::try_from(v).map_or(Value::UInt(v), Value::Integer)
@@ -67,12 +40,6 @@ pub fn land_u64(v: u64) -> Value {
 
 /// Land an `i128` without rounding it, the signed twin of [`land_u64`]
 /// (`DuckDB`'s `HUGEINT`).
-///
-/// Inside `i64` range the value is a [`Value::Integer`], and inside the
-/// unsigned range above it a [`Value::UInt`]. A magnitude past `u64::MAX`,
-/// or any negative past `i64::MIN`, has no variant to hold it: `None`, and
-/// the caller refuses the cell by its column name. A checked narrowing,
-/// never digits as text and never a float.
 #[must_use]
 pub fn land_i128(v: i128) -> Option<Value> {
     if let Ok(i) = i64::try_from(v) {
@@ -86,13 +53,6 @@ pub fn land_i128(v: i128) -> Option<Value> {
 
 impl Value {
     /// This cell as plain JSON, for export files.
-    ///
-    /// Export files are not the wire (ADR-0035, amended 2026-10-22): a JSON
-    /// or NDJSON export keeps integers as JSON numbers, exact for both
-    /// variants, because jq and Vector read them natively and a quoted
-    /// number becomes a label there. A non-finite float is `null`, the
-    /// spelling JSON exports have always used. An API result response never
-    /// goes through here; [`QueryResult`]'s serde is the wire.
     #[must_use]
     pub fn to_plain_json(&self) -> serde_json::Value {
         match self {
@@ -110,7 +70,6 @@ impl Value {
         }
     }
 
-    /// The variant's name, for a refusal that has to say what it found.
     fn kind(&self) -> &'static str {
         match self {
             Self::Null => "null",
@@ -140,19 +99,7 @@ impl fmt::Display for Value {
     }
 }
 
-/// The type of a result column (ADR-0035, amended 2026-10-22).
-///
-/// A closed set. `integer` covers `i64` and `u64` together: its cells are
-/// canonical decimal strings, landed by range into [`Value::Integer`] and
-/// [`Value::UInt`]. `timestamp`, `date` and `time` cells are text. A
-/// `list` names its element type in `items`, recursively. `mixed` is for a
-/// column a Rust-side stage produced whose cells are not of one type; each
-/// of its non-null cells carries its own tag.
-///
-/// Spelled as an object, `{"type":"integer"}` or
-/// `{"type":"list","items":{"type":"float"}}`, so [`Column`] flattens it
-/// beside the name and a mixed cell's tag reuses the same shape. A missing
-/// or unknown `type` does not decode.
+/// The type of a result column (ADR-0035).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum ColumnType {
@@ -168,7 +115,6 @@ pub enum ColumnType {
 }
 
 impl ColumnType {
-    /// The wire name, the `type` member's value.
     #[must_use]
     pub fn name(&self) -> &'static str {
         match self {
@@ -184,7 +130,6 @@ impl ColumnType {
         }
     }
 
-    /// A list of `items`.
     #[must_use]
     pub fn list(items: Self) -> Self {
         Self::List {
@@ -213,15 +158,6 @@ impl fmt::Display for ColumnType {
 }
 
 /// Evidence for a column's type, folded cell by cell.
-///
-/// One type of cell gives that type, cells of different types give
-/// [`ColumnType::Mixed`], and a null adds nothing. A list's elements fold
-/// the same way into its `items`, so an empty list is a list whose items
-/// have no evidence yet, and lists of integers and lists of floats make
-/// `list<mixed>`. A column with no evidence at all has no type of its own;
-/// [`finish`](Self::finish) says so with `None` and the caller decides
-/// (`string` by the ADR's no-evidence rule, or the type a Rust tail's
-/// static output schema carries for the column).
 #[derive(Debug, Clone, Default)]
 pub struct TypeFold(Option<Shape>);
 
@@ -253,9 +189,6 @@ impl Shape {
         }
     }
 
-    /// The folded type, with `carried` filling each hole the evidence
-    /// left: a list with no item evidence takes the carried list's items,
-    /// at any depth, and an evidenced leaf ignores `carried`.
     fn finish_with(self, carried: Option<&ColumnType>) -> ColumnType {
         match self {
             Self::Leaf(ty) => ty,
@@ -290,7 +223,6 @@ impl TypeFold {
         self.add(Shape::List(items.0.map(Box::new)));
     }
 
-    /// A cell, typed by its own variant ([`ColumnType::of_value`]).
     pub fn observe_value(&mut self, value: &Value) {
         let ty = match value {
             Value::Null => return,
@@ -313,10 +245,8 @@ impl TypeFold {
     /// A cell of a column a result typed `ty`, for merging typed results
     /// (the live ring's frames, the TUI's live buffer).
     ///
-    /// The column's type is the cell's evidence, with two refinements: a
-    /// null adds nothing, whatever its column says (a one-row frame types
-    /// a null cell `string` for want of evidence), and a list's items fold
-    /// element by element, so an empty list adds no item evidence.
+    /// A null adds nothing, whatever its column says (a one-row frame types
+    /// a null cell `string` for want of evidence).
     pub fn observe_typed(&mut self, ty: &ColumnType, value: &Value) {
         match (ty, value) {
             (_, Value::Null) => {}
@@ -331,14 +261,12 @@ impl TypeFold {
         }
     }
 
-    /// Another fold's evidence, as if its cells were observed here.
     pub fn merge(&mut self, other: Self) {
         if let Some(shape) = other.0 {
             self.add(shape);
         }
     }
 
-    /// Whether any non-null cell was observed.
     #[must_use]
     pub fn has_evidence(&self) -> bool {
         self.0.is_some()
@@ -373,11 +301,6 @@ impl TypeFold {
 }
 /// Fields that appear first in reordered query results (ADR-0009 envelope).
 ///
-/// When a query has no explicit column selection (`table`/`fields`) and no
-/// aggregation (`stats`/`top`/etc.), columns are reordered so these appear
-/// first in this order, followed by remaining columns in their original
-/// order, with [`TRAILING_LOG_FIELDS`] demoted to the very end.
-///
 /// Kept in sync with `trawl_core::schema::LEADING_LOG_FIELDS` (duplicated
 /// because trawl-api does not depend on trawl-core; a trawl-engine test
 /// asserts parity).
@@ -389,13 +312,6 @@ pub const WELL_KNOWN_LOG_FIELDS: &[&str] =
 /// Kept in sync with `trawl_core::schema::TRAILING_LOG_FIELDS`.
 pub const TRAILING_LOG_FIELDS: &[&str] = &["_raw", "_ingested", "_repairs", "_producer"];
 
-/// Display rank for a field name, mirroring query-result column order:
-/// `0` = leading envelope field ([`WELL_KNOWN_LOG_FIELDS`], in declared
-/// order), `1` = custom field, `2` = trailing metadata
-/// ([`TRAILING_LOG_FIELDS`], in declared order).
-///
-/// Callers do not sort on this directly — [`sort_by_display_rank`] owns the
-/// `(rank, name)` ordering every schema listing shares.
 #[must_use]
 pub fn field_display_rank(name: &str) -> (u8, usize) {
     if let Some(i) = WELL_KNOWN_LOG_FIELDS.iter().position(|f| *f == name) {
@@ -407,8 +323,6 @@ pub fn field_display_rank(name: &str) -> (u8, usize) {
     }
 }
 
-/// Compare two field names in schema display order: [`field_display_rank`]
-/// first, name as the tie-break.
 #[must_use]
 pub fn cmp_by_display_rank(a: &str, b: &str) -> Ordering {
     field_display_rank(a)
@@ -416,23 +330,10 @@ pub fn cmp_by_display_rank(a: &str, b: &str) -> Ordering {
         .then_with(|| a.cmp(b))
 }
 
-/// Sort a schema listing into display order, keying each item by its field
-/// name via `name`.
-///
-/// The single home of this ordering, so the `/api/v1/schema` columns,
-/// `/api/v1/schema/fields` rows and `/api/v1/schema/services` columns cannot
-/// drift apart, and the CLI tables that print those rows inherit it: they
-/// present columns the way query results order them, instead of a raw
-/// alphabetical sort that would put `_ingested` first.
 pub fn sort_by_display_rank<T>(items: &mut [T], name: impl Fn(&T) -> &str) {
     items.sort_by(|a, b| cmp_by_display_rank(name(a), name(b)));
 }
 
-/// A result column: its name and its [`ColumnType`].
-///
-/// The type is flattened beside the name on the wire,
-/// `{"name":"status","type":"integer"}`, and required: a column without
-/// one does not decode.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Column {
     pub name: String,
@@ -461,10 +362,6 @@ pub struct QueryResult {
 }
 
 impl QueryResult {
-    /// An empty result set with no columns or rows.
-    ///
-    /// The answer when a query's source matches no parquet file: no data is
-    /// not an error.
     #[must_use]
     pub fn empty() -> Self {
         Self {
@@ -482,26 +379,14 @@ impl QueryResult {
         self.rows.is_empty()
     }
 
-    /// Reorder columns for log display: [`WELL_KNOWN_LOG_FIELDS`] first,
-    /// [`TRAILING_LOG_FIELDS`] last, everything else in between in its
-    /// original order.
     pub fn reorder_log_columns(&mut self) {
         self.reorder_columns_full(WELL_KNOWN_LOG_FIELDS, TRAILING_LOG_FIELDS);
     }
 
-    /// Reorder columns so `preferred` field names appear first.
-    ///
-    /// Fields in `preferred` that exist in the result are moved to the front
-    /// (in the order they appear in `preferred`), followed by all remaining
-    /// columns in their original order. Missing fields are silently skipped.
-    ///
-    /// Both `columns` and every row in `rows` are permuted together.
     pub fn reorder_columns(&mut self, preferred: &[&str]) {
         self.reorder_columns_full(preferred, &[]);
     }
 
-    /// Reorder columns: `preferred` first, `trailing` demoted to the end,
-    /// remaining columns in their original order between them.
     pub fn reorder_columns_full(&mut self, preferred: &[&str], trailing: &[&str]) {
         if self.columns.is_empty() {
             return;
@@ -532,7 +417,6 @@ impl QueryResult {
             }
         }
 
-        // Skip allocation if already in order.
         if order.iter().enumerate().all(|(new, &old)| new == old) {
             return;
         }
@@ -544,14 +428,6 @@ impl QueryResult {
         }
     }
 
-    /// Apply offset/limit pagination to result rows (post-executor).
-    ///
-    /// This is a convenience method for client-side pagination. If `offset`
-    /// exceeds the number of rows, the result will be empty. The `limit` is
-    /// capped at the remaining rows after the offset.
-    ///
-    /// Uses in-place operations (no new Vec allocation): `drain(..offset)`
-    /// removes leading elements, then `truncate(limit)` caps the remainder.
     #[must_use]
     pub fn paginate(mut self, offset: usize, limit: usize) -> Self {
         if offset >= self.rows.len() {
@@ -563,16 +439,10 @@ impl QueryResult {
         self
     }
 }
-// -- the result wire -----------------------------------------------------------
 
-/// A cell that does not fit its column's type, refused by the encoder or
-/// the decoder. Rendered as `column "status": …`, so the refusal names the
-/// column.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellError {
-    /// The column the cell belongs to.
     pub column: String,
-    /// What was wrong with it.
     pub reason: String,
 }
 
@@ -584,9 +454,6 @@ impl fmt::Display for CellError {
 
 impl std::error::Error for CellError {}
 
-/// The encoder: `columns` as they are, then every cell under its column's
-/// type.
-///
 /// The encoder also checks that each cell's variant agrees with its column
 /// type and refuses one that does not, naming the column. That check is a
 /// backstop: producers type their columns from the cells they emit, and a
@@ -651,7 +518,6 @@ impl Serialize for RowRef<'_> {
     }
 }
 
-/// One cell, encoded under `ty`.
 struct CellRef<'a> {
     column: &'a str,
     ty: &'a ColumnType,
@@ -704,24 +570,19 @@ impl Serialize for CellRef<'_> {
     }
 }
 
-/// The length in bytes of one cell's #214 wire JSON under `ty`.
+/// The length in bytes of one cell's wire JSON under `ty`.
 ///
-/// Encoded through the same serializer [`QueryResult`]'s `Serialize` uses
-/// for each cell, so the number equals the cell's byte length inside a
-/// result body by construction: the separators, brackets and column list
-/// around it are not counted. A captured result measures its wire-size cap
-/// in these lengths (ADR-0057). A cell that does not fit `ty` is refused
-/// the way the encoder refuses it, with `column` named in the error.
+/// The number equals the cell's byte length inside a result body: the
+/// separators, brackets and column list around it are not counted
+/// (ADR-0057).
 pub fn wire_cell_len(column: &str, ty: &ColumnType, value: &Value) -> serde_json::Result<usize> {
     let mut counter = ByteCount(0);
     serde_json::to_writer(&mut counter, &CellRef { column, ty, value })?;
     Ok(counter.0)
 }
 
-/// One cell's #214 wire JSON under `ty`, as text: the bytes
-/// [`wire_cell_len`] counts and a result body carries for the cell. A
-/// captured result's cell route serves byte ranges of it (ADR-0057). A
-/// cell that does not fit `ty` is refused as [`wire_cell_len`] refuses it.
+/// One cell's wire JSON under `ty`, as text: the bytes
+/// [`wire_cell_len`] counts and a result body carries for the cell.
 pub fn wire_cell_text(column: &str, ty: &ColumnType, value: &Value) -> serde_json::Result<String> {
     serde_json::to_string(&CellRef { column, ty, value })
 }
@@ -737,7 +598,6 @@ pub(crate) fn serialize_cell<S: Serializer>(
     CellRef { column, ty, value }.serialize(serializer)
 }
 
-/// A writer that keeps only the number of bytes written to it.
 struct ByteCount(usize);
 
 impl std::io::Write for ByteCount {
@@ -751,8 +611,6 @@ impl std::io::Write for ByteCount {
     }
 }
 
-/// A float as a JSON number, or one of the three strings JSON has no
-/// number for.
 fn serialize_float<S: Serializer>(f: f64, serializer: S) -> Result<S::Ok, S::Error> {
     if f.is_nan() {
         serializer.serialize_str("NaN")
@@ -784,10 +642,6 @@ struct WireResult {
     rows: Vec<Vec<serde_json::Value>>,
 }
 
-/// The decoder: one schema-directed landing for every result consumer, so
-/// the client, CLI, TUI and SPA all classify cells by the variants it
-/// lands. A cell that does not fit its column's type is refused with the
-/// column named ([`CellError`]); nothing is guessed from a cell's spelling.
 impl<'de> Deserialize<'de> for QueryResult {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let WireResult { columns, rows } = WireResult::deserialize(deserializer)?;
@@ -818,12 +672,7 @@ impl<'de> Deserialize<'de> for QueryResult {
 
 /// Land one wire cell under `ty`, or say why it does not fit.
 ///
-/// The #214 wire decoder for one cell, the same landing [`QueryResult`]'s
-/// `Deserialize` applies to every cell of a body. A caller that holds a
-/// cell's wire JSON outside a result body (a captured result stores a
-/// `mixed` column, or an integer column no single engine type can hold, as
-/// each cell's wire text, ADR-0057) lands it here so it reads exactly as it
-/// would have inside one. The refusal does not name the column; the caller
+/// The refusal does not name the column; the caller
 /// does, as [`CellError`].
 pub fn land_cell(ty: &ColumnType, cell: serde_json::Value) -> Result<Value, String> {
     use serde_json::Value as Json;
@@ -887,13 +736,6 @@ pub fn land_cell(ty: &ColumnType, cell: serde_json::Value) -> Result<Value, Stri
     }
 }
 
-/// Land a decimal-string integer by range: `i64` first, then the unsigned
-/// range above it, else refuse.
-///
-/// Only the canonical spelling `-?(0|[1-9][0-9]*)` decodes, exactly what
-/// the encoder writes: no sign on a positive, no leading zeros, no `-0`,
-/// no whitespace. A lax reader would let hand-written clients drift into
-/// spellings other readers take differently.
 fn land_decimal(text: &str) -> Result<Value, String> {
     let digits = text.strip_prefix('-').unwrap_or(text);
     let canonical = !digits.is_empty()
@@ -967,7 +809,6 @@ pub struct SchemaColumn {
 /// The result of a schema introspection query.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SchemaResult {
-    /// Columns discovered in the data source.
     pub columns: Vec<SchemaColumn>,
     /// Number of parquet files matching the configured glob.
     pub file_count: u64,
@@ -981,9 +822,7 @@ pub struct SchemaResult {
 pub struct ParquetColumnStats {
     /// Column name (`path_in_schema`).
     pub column_name: String,
-    /// Total values across all row groups.
     pub total_count: u64,
-    /// Total null values across all row groups.
     pub null_count: u64,
     /// Minimum value (stringified).
     pub min_value: Option<String>,
@@ -993,8 +832,6 @@ pub struct ParquetColumnStats {
     pub compressed_bytes: u64,
 }
 
-/// The result wire, golden in both directions: every type, the integer
-/// boundaries, the float specials, lists and tagged mixed cells.
 #[cfg(test)]
 mod wire_tests {
     use super::*;
@@ -1110,8 +947,6 @@ mod wire_tests {
         }
     }
 
-    /// Outside `i64` ∪ `u64` the decoder refuses, naming the column, and
-    /// never collapses the value to a float.
     #[test]
     fn out_of_range_integers_are_refused_with_the_column_named() {
         for text in ["18446744073709551616", "-9223372036854775809"] {
@@ -1129,8 +964,6 @@ mod wire_tests {
         }
     }
 
-    /// Only the canonical spelling decodes, and a JSON number is not an
-    /// integer cell at all.
     #[test]
     fn non_canonical_integers_are_refused() {
         for text in ["+1", "01", "-0", " 1", "1 ", "", "-", "1e3", "1.0", "0x1"] {
@@ -1157,9 +990,6 @@ mod wire_tests {
         );
     }
 
-    /// A `timestamp` cell is RFC 3339, or `infinity`/`-infinity`; a year
-    /// RFC 3339 cannot spell takes ISO 8601's expanded form, with the
-    /// real year's leap rule. Anything else is refused by column.
     #[test]
     fn timestamp_cells_are_rfc3339() {
         for text in [
@@ -1207,8 +1037,6 @@ mod wire_tests {
         }
     }
 
-    /// A decimal string under any type but `integer` is refused, and so is
-    /// any cell whose JSON kind its type does not take.
     #[test]
     fn wrong_type_cells_are_refused_with_the_column_named() {
         let cases = [
@@ -1253,8 +1081,6 @@ mod wire_tests {
         assert!(err.contains("items"), "{err}");
     }
 
-    /// Floats are JSON numbers, and the three values JSON has no number
-    /// for are the strings a JavaScript reader parses back.
     #[test]
     fn float_specials_are_strings() {
         let floats = result(
@@ -1293,9 +1119,6 @@ mod wire_tests {
         );
     }
 
-    /// Every non-null cell of a `mixed` column carries its own tag, a list
-    /// cell's tag names the items its elements fold to, and a null stays
-    /// bare. Each cell decodes from the column type and itself.
     #[test]
     fn mixed_cells_are_tagged_and_round_trip() {
         let mixed = result(
@@ -1363,8 +1186,6 @@ mod wire_tests {
         }
     }
 
-    /// The encoder refuses a cell its column type disagrees with, naming
-    /// the column; a producer bug is never spelled as some other type.
     #[test]
     fn the_encoder_refuses_a_cell_its_type_disagrees_with() {
         let cases = [
@@ -1402,9 +1223,6 @@ mod wire_tests {
         assert!(err.contains("row 0 has 0 cells for 1 columns"), "{err}");
     }
 
-    /// The fold behind a mixed cell's tag and the client-side merges: one
-    /// type stays itself, two make `mixed`, nulls add nothing, and list
-    /// items fold the same way.
     #[test]
     fn type_fold_rules() {
         let fold = |cells: &[Value]| {
@@ -1444,9 +1262,6 @@ mod wire_tests {
         assert_eq!(timestamps.finish(), Some(ColumnType::Mixed));
     }
 
-    /// A carried type fills the holes the cells left and nothing else:
-    /// no evidence takes it whole, an empty list takes its items at any
-    /// depth, and an evidenced leaf or item keeps its own type.
     #[test]
     fn a_carried_type_fills_only_the_holes_in_the_evidence() {
         let fold = |cells: &[Value], carried: &ColumnType| {
@@ -1554,8 +1369,6 @@ mod wire_tests {
         assert_eq!(land_i128(i128::from(i64::MIN) - 1), None);
     }
 
-    /// Export files keep plain JSON numbers, exact for both integer
-    /// variants, with a non-finite float as `null`.
     #[test]
     fn plain_json_keeps_numbers_for_exports() {
         let row = [
@@ -1675,14 +1488,11 @@ mod wire_tests {
             9,
             "every ColumnType variant has a case: {types_seen:?}"
         );
-        // A null has the same four bytes under every type.
         for (ty, _) in &cases {
             assert_eq!(wire_cell_len("c", ty, &Value::Null).unwrap(), 4, "{ty}");
         }
     }
 
-    /// Summed over a row, the cell lengths are the body's growth for that
-    /// row less its separators: no framing is counted.
     #[test]
     fn wire_cell_len_counts_no_framing() {
         let columns = vec![
@@ -1708,7 +1518,6 @@ mod wire_tests {
             .sum();
         // `[` `]` around the row and one `,` between each pair of cells.
         assert_eq!(one - empty, cells + 2 + (columns.len() - 1));
-        // And the texts are those very bytes.
         let body = serde_json::to_string(&result(columns.clone(), vec![row.clone()])).unwrap();
         let texts: Vec<String> = columns
             .iter()
@@ -1727,8 +1536,6 @@ mod wire_tests {
         assert!(err.contains("cannot be encoded as integer"), "{err}");
     }
 
-    /// `land_cell` reads back what the cell encoder wrote, for the one-cell
-    /// texts a captured result stores.
     #[test]
     fn land_cell_reads_back_a_lone_cell() {
         for (ty, value) in [
@@ -1764,20 +1571,13 @@ mod tests {
 
     #[test]
     fn field_display_rank_orders_envelope_custom_trailing() {
-        // Envelope fields rank first, in declared order.
         assert_eq!(field_display_rank("_time"), (0, 0));
         assert_eq!(field_display_rank("_severity"), (0, 4));
         assert_eq!(field_display_rank("message"), (0, 5));
-        // Custom fields sit between envelope and trailing metadata; callers
-        // break ties by name.
         assert_eq!(field_display_rank("duration").0, 1);
-        // Trailing metadata is demoted to the very end, in declared order.
         assert_eq!(field_display_rank("_raw"), (2, 0));
         assert_eq!(field_display_rank("_repairs"), (2, 2));
 
-        // Sorting by (rank, name) reproduces query-result column order:
-        // envelope first, custom alphabetical, metadata last — never
-        // `_ingested` alphabetically first.
         let mut names = vec!["duration", "_ingested", "service", "_time", "alpha"];
         sort_by_display_rank(&mut names, |n| n);
         assert_eq!(
@@ -1809,7 +1609,6 @@ mod tests {
 
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
         assert_eq!(names, vec!["_time", "host", "message", "pid", "status"]);
-        // Row data must follow the same permutation.
         assert_eq!(result.rows[0][0], Value::String("2026-01-01".into()));
         assert_eq!(result.rows[0][1], Value::String("web-1".into()));
         assert_eq!(result.rows[0][2], Value::String("ok".into()));
@@ -1817,8 +1616,6 @@ mod tests {
         assert_eq!(result.rows[0][4], Value::Integer(200));
     }
 
-    /// The full log ordering: leading envelope first, `_raw`/`_ingested`/
-    /// `_repairs` demoted to the very end, user fields in between.
     #[test]
     fn reorder_log_columns_demotes_trailing() {
         let mut result = QueryResult {
@@ -1857,7 +1654,6 @@ mod tests {
                 "_repairs"
             ]
         );
-        // Rows permute with the columns.
         assert_eq!(result.rows[0][0], Value::String("t".into()));
         assert_eq!(result.rows[0][4], Value::String("raw".into()));
         assert_eq!(result.rows[0][6], Value::Null);
@@ -1873,7 +1669,7 @@ mod tests {
         result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
 
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, vec!["status", "uri"]); // unchanged
+        assert_eq!(names, vec!["status", "uri"]);
     }
 
     #[test]
@@ -1896,7 +1692,7 @@ mod tests {
     #[test]
     fn reorder_columns_empty_result() {
         let mut result = QueryResult::empty();
-        result.reorder_columns(WELL_KNOWN_LOG_FIELDS); // should not panic
+        result.reorder_columns(WELL_KNOWN_LOG_FIELDS);
         assert!(result.columns.is_empty());
     }
 }

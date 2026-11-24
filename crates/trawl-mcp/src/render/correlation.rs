@@ -3,37 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The block a correlation read prints before its rows (ADR-0058).
-//!
-//! `context`, `sightings` and `compare` answer with the layout of a search
-//! result, and between the four truncation facts and the proposed next
-//! calls they print what the read established. `read` prints the same
-//! block on every page of such a result, so the denominators and the
-//! warnings travel with every page.
-//!
-//! - context: the scope used, the focus row, the three groups as ranges of
-//!   captured rows, and [`NO_ORDER`].
-//! - sightings: the literal, the [`denominators`] sentence, the (env,
-//!   service) groups with first and last seen, the per-service and per-env
-//!   totals summed here from the groups, the fields holding the literal
-//!   with how many more trawld did not list, and the `_raw`-only count.
-//! - compare: both windows with their durations, the grouping, the rate
-//!   unit, and every warning in trawld's words.
-//!
-//! A read attached to an investigation prints the investigation, the
-//! result kept for it and the activity after the block, as `search` prints
-//! them after its result head.
-//!
-//! The block is never dropped to fit. The fitting gives up rows, an
-//! attached read's activity entries from the end, facets, next calls, the
-//! search URL and hints first; only when the reply still does not fit does
-//! it leave entries off the ends of the sightings lists, and the block
-//! says how many. A dropped activity entry prints again on the session's
-//! next attached call, since `seen` does not move past it; a dropped list
-//! entry is part of the answer lost. A context or compare block is fixed
-//! in size, and a warning is never cut.
-//!
-//! Every value from stored events (a service, an env, a field name, the
-//! literal) prints as JSON; trawld's warning text prints on one line.
 
 use rmcp::model::CallToolResult;
 use serde_json::json;
@@ -54,10 +23,8 @@ use super::{
     one_line, plural_u64, record_read, success, tail_lines, utc_micros,
 };
 
-/// What every context block says about its rows.
 pub const NO_ORDER: &str = "this is a new read; equal timestamps establish no order";
 
-/// The sentence naming what a sightings read's counts are over.
 #[must_use]
 pub fn denominators(captured: u64, matches_total: u64) -> String {
     format!(
@@ -66,8 +33,6 @@ pub fn denominators(captured: u64, matches_total: u64) -> String {
     )
 }
 
-/// A correlation reply as a tool result fitted under `budget`; `page_rows`
-/// is the page size a continuation the fitting creates asks for.
 #[must_use]
 pub fn correlation(mut reply: CorrelationReply, budget: Budget, page_rows: u64) -> CallToolResult {
     record_read(&mut reply.result);
@@ -85,8 +50,6 @@ pub fn correlation(mut reply: CorrelationReply, budget: Budget, page_rows: u64) 
     }
 }
 
-/// The text block of a correlation reply, unfitted. `budget` is the one
-/// the presentation facts name when the fitting dropped something.
 #[must_use]
 pub fn correlation_text(reply: &CorrelationReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -126,7 +89,6 @@ impl Fit for CorrelationReply {
     }
 }
 
-/// The outcome line of a correlation read that captured `result`.
 #[must_use]
 pub fn outcome(result: &CapturedResult, view: &CorrelationView) -> String {
     let id = json_string(&result.id);
@@ -180,9 +142,6 @@ pub fn outcome(result: &CapturedResult, view: &CorrelationView) -> String {
     format!("The correlation read is captured as result {id}.")
 }
 
-/// The view of a correlation read's facts. A sightings view states its
-/// attribution restriction from the facts alone, so the first read and
-/// every later page of one capture say the same.
 #[must_use]
 pub fn view(correlation: &Correlation) -> CorrelationView {
     match correlation {
@@ -284,7 +243,6 @@ fn sightings_view(facts: &SightingsFacts) -> SightingsView {
     }
 }
 
-/// Counts summed per key, most first, then by key with null first.
 fn totals(counts: impl Iterator<Item = (Option<String>, u64)>) -> Vec<KeyCount> {
     let mut summed: std::collections::BTreeMap<Option<String>, u64> =
         std::collections::BTreeMap::new();
@@ -308,7 +266,6 @@ fn window_view(window: &CompareWindow) -> WindowView {
     }
 }
 
-/// A serde unit enum's wire name.
 fn wire_name<T: serde::Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()
@@ -336,7 +293,6 @@ fn compare_view(facts: &CompareFacts) -> CompareView {
     }
 }
 
-/// The block's lines, for a reply's text.
 pub(crate) fn block_lines(view: &CorrelationView, budget: Budget, lines: &mut Vec<String>) {
     if let Some(context) = &view.context {
         context_lines(context, lines);
@@ -349,7 +305,6 @@ pub(crate) fn block_lines(view: &CorrelationView, budget: Budget, lines: &mut Ve
     }
 }
 
-/// An optional key as JSON: a JSON string, or `null`.
 fn key(value: Option<&String>) -> String {
     json_text(&value)
 }
@@ -396,7 +351,6 @@ fn context_lines(context: &ContextView, lines: &mut Vec<String>) {
     lines.push(context.statement.clone());
 }
 
-/// `[key, count]` pairs on one line.
 fn pairs(counts: &[KeyCount]) -> String {
     counts
         .iter()
@@ -471,8 +425,6 @@ fn sightings_lines(sightings: &SightingsView, budget: Budget, lines: &mut Vec<St
     }
 }
 
-/// A duration in milliseconds in the largest whole unit that states it
-/// exactly.
 fn duration(ms: u64) -> String {
     const UNITS: [(u64, &str); 4] = [
         (86_400_000, "d"),
@@ -536,8 +488,6 @@ fn compare_lines(compare: &CompareView, lines: &mut Vec<String>) {
     }
 }
 
-/// Leave all but the first `kept` entries off each sightings list, and
-/// count what was left off; a view of another kind is unchanged.
 pub(crate) fn keep_entries(view: &mut CorrelationView, kept: usize) {
     let Some(sightings) = view.sightings.as_mut() else {
         return;
@@ -559,8 +509,6 @@ pub(crate) fn keep_entries(view: &mut CorrelationView, kept: usize) {
     sightings.entries_dropped_to_fit = super::rows::as_u64(dropped);
 }
 
-/// The longest sightings list, the most entries [`keep_entries`] can keep
-/// per list; 0 for a view of another kind.
 pub(crate) fn longest_list(view: &CorrelationView) -> usize {
     view.sightings.as_ref().map_or(0, |sightings| {
         [

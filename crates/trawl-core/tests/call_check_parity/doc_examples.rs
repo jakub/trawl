@@ -4,24 +4,12 @@
 
 //! Every query the documentation shows, as an explicit manifest.
 //!
-//! A row is one complete query occurrence: where it is written, the exact
-//! source text that anchors it, the query it is, and what the call check
-//! must answer. [`candidates`] scans each source for the places a query
-//! can be written: every line of a fenced block that is not a shell
-//! block, every `trawl query`, `trawl validate` or `trawl tail` command in
-//! a shell block or in prose, every backticked prose span that
-//! [`is_query_shaped`], and, in `dsl::ESSENTIALS`, every backticked span
-//! and every indented example line. Each candidate must be accounted for
-//! by a row or by an [`Exclusion`] that says why it is not a query, so a
-//! new example cannot appear unaccounted.
-//!
 //! `dsl::ESSENTIALS` lives in `trawl-mcp`, which depends on this crate, so
 //! the rows carry copies anchored in that file's text through
 //! [`essentials`], which decodes the string literal's escapes explicitly.
 
 use trawl_core::parser::suggest::KNOWN_PIPE_STAGES;
 
-/// A document that shows queries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Source {
     DslReference,
@@ -53,8 +41,6 @@ impl Source {
         }
     }
 
-    /// The text the rows are anchored in: a markdown page, or the decoded
-    /// `ESSENTIALS` literal.
     pub fn text(self) -> String {
         match self {
             Self::DslReference => {
@@ -78,7 +64,6 @@ impl Source {
     }
 }
 
-/// How a row's excerpt sits in its source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Site {
     /// Whole lines of a fenced block (or of `ESSENTIALS`' indented
@@ -93,10 +78,8 @@ pub enum Site {
     Inline,
 }
 
-/// What the call check must answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Expect {
-    /// Parses, and `validate_pipeline` accepts it.
     Valid,
     /// A deliberate negative the parser refuses.
     Parser,
@@ -113,7 +96,6 @@ pub struct Example {
     pub expect: Expect,
 }
 
-/// Why a candidate is not a query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Excluded {
     /// A grammar line, with placeholders.
@@ -140,10 +122,8 @@ pub struct Exclusion {
     pub reason: &'static str,
 }
 
-/// One place a query can be written.
 #[derive(Debug)]
 pub struct Candidate {
-    /// The fenced block it sits in, by index; `None` outside fences.
     pub block: Option<usize>,
     /// A backticked prose span.
     pub span: bool,
@@ -181,8 +161,6 @@ pub fn essentials() -> String {
 
 const SHELL_LABELS: &[&str] = &["bash", "sh", "shell", "console"];
 
-/// A shell command that runs a query: `trawl` with a `query`, `validate`
-/// or `tail` word.
 pub fn is_query_command(command: &str) -> bool {
     command.contains("trawl")
         && command
@@ -190,7 +168,6 @@ pub fn is_query_command(command: &str) -> bool {
             .any(|word| matches!(word, "query" | "validate" | "tail"))
 }
 
-/// A prose line that writes a query command with a quoted argument.
 fn is_prose_query_command(line: &str) -> bool {
     is_query_command(line)
         && ["query", "validate", "tail"]
@@ -198,10 +175,8 @@ fn is_prose_query_command(line: &str) -> bool {
             .any(|word| line.contains(&format!("{word} '")) || line.contains(&format!("{word} \"")))
 }
 
-/// Whether a backticked prose span is written like a query, and so must
-/// be a row or an exclusion: it starts with `|`, it starts with a pipe
-/// stage keyword and a space, or it holds ` | `. This is deliberately
-/// broad; a fragment or placeholder it catches is excluded by name.
+/// Deliberately broad; a fragment or placeholder this catches is excluded
+/// by name.
 pub fn is_query_shaped(span: &str) -> bool {
     span.starts_with('|')
         || span.contains(" | ")
@@ -211,9 +186,6 @@ pub fn is_query_shaped(span: &str) -> bool {
         })
 }
 
-/// The backticked spans of `source`'s prose. In a Markdown page these are
-/// the code spans outside fenced blocks; in `ESSENTIALS`, the text between
-/// paired backticks on a line.
 pub fn spans(source: Source) -> Vec<String> {
     let text = source.text();
     if source == Source::Essentials {
@@ -263,11 +235,7 @@ pub fn spans(source: Source) -> Vec<String> {
     found
 }
 
-/// The code spans of one Markdown block, as the Markdown spec reads them:
-/// a run of n backticks opens a span that the next run of exactly n
-/// closes, a line break inside a span reads as a space, and one space is
-/// stripped from each end when both ends have one. An opening run with no
-/// closing run is literal text, and so is a backslash-escaped backtick.
+/// The code spans of one Markdown block, as the Markdown spec reads them.
 fn code_spans(block: &str, found: &mut Vec<String>) {
     let bytes = block.as_bytes();
     let run_end = |mut i: usize| {
@@ -314,7 +282,6 @@ fn code_spans(block: &str, found: &mut Vec<String>) {
     }
 }
 
-/// Every place `source` can write a query.
 pub fn candidates(source: Source) -> Vec<Candidate> {
     let text = source.text();
     let prose = spans(source).into_iter();
@@ -357,7 +324,6 @@ pub fn candidates(source: Source) -> Vec<Candidate> {
                 break;
             }
             if shell {
-                // Join a command's `\` continuations into one line.
                 if let Some(head) = trimmed.strip_suffix('\\') {
                     command.push_str(head.trim_end());
                     command.push(' ');
@@ -394,9 +360,6 @@ pub fn candidates(source: Source) -> Vec<Candidate> {
     found
 }
 
-/// The DSL a quoted shell argument passes. Single quotes pass their text
-/// verbatim; double quotes are accepted only with nothing the shell would
-/// expand or unescape inside.
 pub fn unquote(argument: &str) -> &str {
     if let Some(inner) = argument
         .strip_prefix('\'')
@@ -996,7 +959,6 @@ pub const EXAMPLES: &[Example] = &[
         site: Site::Fenced,
         excerpt: "| stats count() by count",
         query: "| stats count() by count",
-        // A deliberate negative: two producers naming one column.
         expect: Expect::Validate(
             "invalid aggregation: `stats` would project two columns named `count`: the group key `count` and the aggregate `count()` — give one an explicit name with `as`",
         ),
@@ -1006,7 +968,6 @@ pub const EXAMPLES: &[Example] = &[
         site: Site::Fenced,
         excerpt: "| stats count() as n, sum(x) as N",
         query: "| stats count() as n, sum(x) as N",
-        // A deliberate negative: two producers naming one column.
         expect: Expect::Validate(
             "invalid aggregation: `stats` would project two columns named `n`: the aggregate `count() as n` and the aggregate `sum(x) as N` — give one an explicit name with `as`",
         ),
@@ -1016,7 +977,6 @@ pub const EXAMPLES: &[Example] = &[
         site: Site::Fenced,
         excerpt: "| timechart span=1h count() by _time",
         query: "| timechart span=1h count() by _time",
-        // A deliberate negative: two producers naming one column.
         expect: Expect::Validate(
             "invalid aggregation: `timechart` would project two columns named `_time`: the `timechart` time bucket `_time` and the group key `_time` — `timechart` always projects its bucket as `_time`, so `_time` cannot also be a group key",
         ),
@@ -1026,7 +986,6 @@ pub const EXAMPLES: &[Example] = &[
         site: Site::Fenced,
         excerpt: "| top 5 count",
         query: "| top 5 count",
-        // A deliberate negative: two producers naming one column.
         expect: Expect::Validate(
             "invalid aggregation: `top` would project two columns named `count`: the counted field `count` and the `count` column the stage mints — `top` always mints its own `count` column and cannot spell `as` — write it as `stats count() as <name> by <field>` instead",
         ),
@@ -1413,7 +1372,6 @@ pub const EXAMPLES: &[Example] = &[
         query: "status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10",
         expect: Expect::Valid,
     },
-    // Queries written in prose spans.
     Example {
         source: Source::DslReference,
         site: Site::Inline,
@@ -1732,8 +1690,6 @@ pub const EXAMPLES: &[Example] = &[
         query: "service=checkout _severity>=error | stats count() as errors by service",
         expect: Expect::Valid,
     },
-    // Escapes, negated field-shaped terms and the search stage's lack of
-    // `in (…)`.
     Example {
         source: Source::DslReference,
         site: Site::Fenced,
@@ -1832,7 +1788,6 @@ pub const EXAMPLES: &[Example] = &[
         query: r#"| where not event_type in ("a", "b")"#,
         expect: Expect::Valid,
     },
-    // Deliberate negatives the reference states in prose.
     Example {
         source: Source::DslReference,
         site: Site::Inline,

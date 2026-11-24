@@ -135,8 +135,6 @@ test('hidden jobs pause polling, visible jobs refresh immediately, and cleanup i
     document.dispatchEvent(new Event('visibilitychange'));
   });
   await expect.poll(() => reads).toBe(2);
-  // Runs polls its list and its stats; the nets feed left with the
-  // retired "Active nets" card.
   expect(await timerCount()).toBe(2);
   await expect.poll(() => Boolean(release)).toBe(true);
   await page.getByRole('link', { name: 'Nets', exact: true }).click();

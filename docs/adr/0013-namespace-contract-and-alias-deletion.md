@@ -2,7 +2,7 @@
 
 status: accepted (2026-08-14) — prep ruling record for #60; slice 1 is #60,
 slice 2 is the producer-profile/operator-surface issue filed beside it; amended (2026-10-08): status-only collectors; amended (2026-10-14):
-repair classes and three split codes, prep record for #302, see the Amendment; amended (2026-11-08): a `_time` more than 15 minutes ahead of arrival is replaced by arrival, see the Amendment
+repair classes and three split codes, prep record for #302, see the Amendment; amended (2026-11-08): a `_time` more than 15 minutes ahead of arrival is replaced by arrival, see the Amendment; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 ADR-0009 declared the event envelope and made ingest canonicalize into it, but
 it inherited a rule trawl never wrote down and then broke: a name that ingest
@@ -574,3 +574,38 @@ written with. Trawl is forward-only, so no migration rewrites them. A
 backward step of the server clock between arrival and compaction larger than
 `MAX_TIME_LEAD` can still place a row outside the walk. That case is out of
 scope.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Reading severity.**
+
+- **The severity reader reads whole ladder positions only.** A string reads as a band token, then as an exact OTel short name, then as a strict `[+-]?[0-9]+` integer. Ingest's `severity::reading` takes a JSON number only when it fits `i64`, so `17.0` and `1.5` have no reading, and a boolean, null, array or object has no reading. Rust `sev()` passes a string to `severity::reading_text` and an integer to `severity::reading_number`, and any other value reads as null. SQL `sev()` and the SQL conform rung read the value as text through `conform::severity_reading_sql` and its bind-once form, which mirror the same rules. A fractional value names no position on the ladder. Every lane reads by the same rules, so a lane that read more widely would split batch from live.
+- **Before it reads a word, the severity reader trims the full Unicode `White_Space` set (`severity::WHITESPACE`), and the SQL reader trims the same set.** Look-alikes outside that set (U+200B, U+180E, U+FEFF) stay in both. With an ASCII-only trim, a `severity` padded with U+00A0 would leave `_severity` NULL with no repair code and nothing in the event to explain it.
+- **A function's declared result pin belongs to the function, not to the catalog, so `sev()` binds as `SEVERITY` under an unpinned scope too.** That makes `sev()` the way to read severity from a corpus trawl did not write, such as embedded `--data` over foreign Parquet, where no catalog pin exists.
+
+**Rendering severity.**
+
+- **A query's `severity_columns` come from the catalog snapshot the run executed under, never from a fresh read, and a run that failed, timed out or never started carries none.** `repin --to severity` can retype a field while a query runs. A later snapshot would token-render rows produced under a `BIGINT` or `VARCHAR` pin, or strip tokens from rows that a `SEVERITY` pin produced.
+- **A `from saved` query presents its result from an empty pin scope, so its `severity_columns` hold only what the stages after `| from saved` declare, such as a `sev()` output.** `PinScope` clears the scope at `FromSaved`, and the saved-run branch of `pool.rs` passes an empty `FieldTypes` to `present`. The run's stored columns were written under the pins of the run that produced them. What the corpus pins now says nothing about them. Execution still takes live pins for the names the run carries (ADR-0062).
+
+**Producer profiles.**
+
+- **The `http` and `syslog` profiles let a payload propose a string `_raw`, and the `trawld` profile does not.** This limits the `_raw` row of the §3 table, which makes a string `_raw` proposable on every door. A telemetry field named `_raw` takes the standard strip to bare `raw`, and the door writes the serialization from before repairs as `_raw`. A remote sender or a syslog frame has an original form trawl never saw, so its proposal is the most original form available. The trawld payload is itself the original. If a tracing field could claim `_raw`, ruling 3's "value findable in `_raw`" would be false on the door that asserts identity hardest.
+- **A payload value for a profile-asserted slot earns `field.producer_asserted` only when it displaces something.** This limits slice 2 ruling 3, which gives every payload key that collides with an asserted slot a repair code. A value equal to the assertion earns no code. A JSON `null` counts as absence and earns no code. `claim_slot` writes the asserted value over the null, or removes the null when the profile asserts nothing for that optional slot. A sender that agrees with the profile has lost nothing, and most serializers emit explicit nulls, so a code for agreement or for null would put a repair on nearly every event. The null is removed because an absent optional envelope field is omitted, not stored as JSON null (ADR-0009).
+- **The syslog profile takes `service` from the `source_service_map` entry for the source IP first, then a valid APP-NAME verbatim, then `default_service`.** An invalid APP-NAME is never sanitized: it falls to `default_service` with `service.from_profile`. A frame with no APP-NAME takes the default with no repair. Sanitizing `Living Room AP` to `LivingRoomAP` would invent a service the sender never named and file data under it. The default plus a repair code is honest, and the original APP-NAME stays in `_raw`.
+- **A configured `severity_from` or `time_from` list holds at most `MAX_DERIVATION_SOURCES` = 8 entries, and a longer list is boot-fatal.** A profile's fixed sources do not count against the bound. Derivation scans the list for every event on the ingest path, so its length is a cost every sender pays. Eight is well past any real chain, and the fixed sources belong to trawl, not to the operator.
+
+**The DSL.**
+
+- **A backtick-quoted name is a parse error when it is empty or holds a character that cannot render as itself (`sanitize::is_unsafe_display_char`).** That set covers controls, the line and paragraph separators, bidi and zero-width format characters, and the soft hyphen. It widens ruling 7's "control-char names". Such a character lets one field name display as a different one in the schema, autocomplete and error text.
+- **Correction.** §5 lists `extract (?P<_foo>…)` among the parse errors. The parser does not refuse it. The batch lane refuses a reserved capture name in `validate_extract`, and the stream lane refuses it in `stream::compile_stream_plan` with `StreamPlanError::ReservedName`. Both use `schema::is_reserved_name`. Capture names are read from the pattern after parsing, and the stream compiler never runs `validate_pipeline`, so each lane refuses them itself.
+
+**Repin to `SEVERITY`.**
+
+- **A repin to `SEVERITY` with no dialect resolves to `otel`, and a dialect on any other target is a 400.** Every other lane reads `otel`, so a repin never changes the ladder by omission. A dialect accepted where nothing reads it would tell the operator that trawl honoured an assertion it ignored.
+- **The web repin modal offers the five physical targets (`repin_flow::REPIN_LADDER`) and never `SEVERITY`, so `repin --to severity` is a CLI decision.** A repin to `SEVERITY` asserts the dialect of a sender's numerals, and that is the operator's decision about provenance. The modal sends no dialect, so a `SEVERITY` target there would read a syslog dump as `otel` without the operator choosing it.
+- **`requires_force` has three states: absent until the job's scan records a plan, then true or false.** Before the plan exists, the counts are zeros that mean "not measured". A false there would tell an operator who polls the status route that a job about to refuse with 409 is clean.
+- **The liveness warning counts a field as live when `field_services.last_seen` falls within `LIVENESS_WINDOW` = 24 hours, whatever `retention.max_age_days` is.** Retention says how much corpus a listing describes, not whether a sender is still connected. One day matches the shortest span of the degraded-pin analyzer, the shortest window over which "still writing" is a fact and not a coincidence.
+- **A failed catalog read for liveness logs and omits the warning, and never fails the dry run or the repin.** Liveness is advice. A warning that trawl cannot produce is a missing warning, not a reason to refuse the repin.

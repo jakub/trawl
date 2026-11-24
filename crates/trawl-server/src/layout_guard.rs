@@ -2,9 +2,6 @@
 //!
 //! [`crate::env_dirs`] owns what a date and an hour directory are, and
 //! [`crate::pool::ExecutorPool::base_dir`] holds the configured data root.
-//! This test scans the crate's production source for the two shapes that
-//! used to stand in for them: a date checked by its byte shape (`[4] ==
-//! b'-'`), and a root recovered by cutting a glob at its first `*`.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +22,6 @@ const FORBIDDEN: &[(&str, &str, bool)] = &[
     ("find(\"*\",)", GLOB_CUT, false),
 ];
 
-/// The layout owner, which may spell date shapes but not glob cuts.
 const OWNER: &str = "env_dirs.rs";
 
 fn rust_files(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -181,6 +177,5 @@ mod pg_tests {
         lines(violations(source, false)),
         ["5", "6", "7", "10", "13", "24"]
     );
-    // The owner may spell a date shape, never a glob cut.
     assert_eq!(lines(violations(source, true)), ["7", "13", "24"]);
 }

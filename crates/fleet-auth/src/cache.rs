@@ -4,88 +4,28 @@
 
 //! Argon2id result cache for the auth verification hot path.
 //!
-//! ## Why a cache at all
+//! Keying on `(prefix, stored_hash)` alone is broken: after one successful
+//! `verify_key("flt_AAAAAAAA<...>")`, `verify_key("flt_AAAAAAAA<garbage>")`
+//! would hit the cache, skip argon2id, and succeed. Binding the key to
+//! `blake3(plaintext)` closes the bypass.
 //!
-//! `verify_key` runs argon2id (production: ~200 ms / 128 MiB / 3 iter) on
-//! every authenticated request. Caching the successful KDF result lets the
-//! second and subsequent calls return in ~1 ms (just the Postgres liveness
-//! query) without sacrificing revocation latency — the `active` flag check
-//! always runs against the database, never the cache.
-//!
-//! ## Why three-component key
-//!
-//! Naively, you'd key the cache on `(prefix, stored_hash)`. That is broken:
-//! after one successful `verify_key("flt_AAAAAAAA<...>")`, any subsequent
-//! `verify_key("flt_AAAAAAAA<garbage>")` would hit the cache (same prefix,
-//! same row, same stored hash), skip argon2id, and succeed. Auth bypass.
-//!
-//! Binding the key to a non-secret fingerprint of the presented token
-//! (`blake3(plaintext)`) closes the bypass: a different plaintext produces a
-//! different fingerprint and misses the cache, forcing argon2id to run.
-//!
-//! ## Why a fixed capacity, oldest-insertion-first
-//!
-//! The cache holds at most [`VERIFICATION_CACHE_CAPACITY`] entries. Only a
-//! verification that ran argon2id and then passed every database check
-//! inserts, and argon2id admits one plaintext per stored hash, so an
-//! attacker without a key cannot grow the map. Growth comes from legitimate
-//! churn instead: automation that mints many short-lived keys over a long
-//! uptime, and rotations that leave entries for the old hash behind. Each
-//! would once have grown the map until restart.
-//!
-//! When the cache is full, the oldest insertion is evicted first. A lookup
-//! is not a use and does not reorder anything, and a duplicate insert
-//! neither adds a second queue record nor renews the entry, so the queue
-//! and the set stay the same size. A short mutex covers the evict-and-insert
-//! step, which is what holds the cap exactly under concurrent inserts; the
-//! lock is never held across an await or the KDF. An evicted key's next
-//! request reruns argon2id under the process-wide permit limit, which costs
-//! latency, never authorization.
-//!
-//! There is no TTL, because nothing a TTL would refresh lives here. The
-//! cache only records "argon2id already accepted this exact plaintext for
-//! this stored hash". Activity, expiry, revocation and roles are read from
+//! There is no TTL: activity, expiry, revocation and roles are read from
 //! Postgres on every request, so revoking or expiring a key refuses its
-//! next use whether or not its entry is cached, and a rotated key changes
-//! `stored_hash`, which makes the old entry unreachable until it ages out.
-//! A rotation that commits while a verification is in flight refuses that
-//! verification too, cached or not: its `last_used` update requires the
-//! hash it read, so the old plaintext is never authenticated against a
-//! hash it was not checked under.
+//! next use whether or not its entry is cached.
 
 use std::collections::{HashSet, VecDeque};
 use std::sync::{Arc, Mutex, PoisonError};
 
-/// How many successful verifications the cache holds at most.
-///
-/// A shared Fleet contract with no config surface: a few thousand live
-/// tokens is far above the fleet's scale, and an installation that somehow
-/// exceeds it pays argon2id more often, not a wrong answer.
 pub const VERIFICATION_CACHE_CAPACITY: usize = 4096;
 
-/// Three-component key for the argon2id result cache.
-///
-/// `prefix` and `stored_hash` invalidate naturally on rotation (the stored
-/// hash changes); `token_fingerprint` (blake3 of the plaintext) binds the
-/// cache entry to the exact token that produced it, preventing the
-/// "same-prefix bypass" described in the module docs.
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct VerificationCacheKey {
-    /// The 8-char operational prefix from the token body.
     pub prefix: String,
-    /// The PHC hash string as currently stored in the database for this
-    /// prefix. Changes on rotation; ensures cached entries become unreachable
-    /// after a hash change.
     pub stored_hash: String,
-    /// blake3 fingerprint of the full plaintext token. Non-secret on its own
-    /// (and never exposed) but binds the cache entry to the exact token that
-    /// successfully verified.
     pub token_fingerprint: [u8; 32],
 }
 
 impl VerificationCacheKey {
-    /// Compute the key for a presented plaintext + the stored hash returned
-    /// by the indexed Postgres lookup.
     pub fn build(prefix: &str, plaintext: &str, stored_hash: &str) -> Self {
         let fp = blake3::hash(plaintext.as_bytes());
         Self {
@@ -96,36 +36,23 @@ impl VerificationCacheKey {
     }
 }
 
-/// Snapshot of cache state for observability / tests.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct VerificationCacheStats {
-    /// Current number of cached successful KDF results.
     pub entries: usize,
 }
 
-/// The state behind the mutex: the presence set and the insertion order.
-///
-/// Both hold the same `Arc`s, so a key is stored once. `order` has no
-/// duplicates, because a duplicate insert returns before pushing, so
-/// `order.len() == entries.len()` always holds and the front of `order`
-/// is the oldest live entry.
+/// `order` has no duplicates, because a duplicate insert returns before
+/// pushing, so `order.len() == entries.len()` always holds and the front of
+/// `order` is the oldest live entry.
 #[derive(Debug)]
 struct Inner {
     entries: HashSet<Arc<VerificationCacheKey>>,
     order: VecDeque<Arc<VerificationCacheKey>>,
     capacity: usize,
-    /// How many `insert` calls reached the cache, duplicates included. A
-    /// test seam for the store: a cache hit must not call `insert` at all.
     #[cfg(test)]
     insert_calls: usize,
 }
 
-/// Bounded, concurrent, presence-only cache of successful argon2id
-/// verifications. See the module docs for the capacity and the eviction
-/// policy.
-///
-/// `Clone` is cheap (`Arc`-shared state), so `KeyStore` can derive `Clone`
-/// for free axum extractor / `FromRef` ergonomics.
 #[derive(Clone, Debug)]
 pub struct VerificationCache {
     inner: Arc<Mutex<Inner>>,
@@ -138,14 +65,10 @@ impl Default for VerificationCache {
 }
 
 impl VerificationCache {
-    /// A cache that holds [`VERIFICATION_CACHE_CAPACITY`] entries.
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// A cache that holds `capacity` entries. Crate-private: the store's
-    /// tests use a small capacity to reach eviction without thousands of
-    /// inserts, and the product always uses [`VERIFICATION_CACHE_CAPACITY`].
     pub(crate) fn with_capacity(capacity: usize) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner {
@@ -165,19 +88,10 @@ impl VerificationCache {
         self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// True if the key is present (KDF already verified for this exact
-    /// `(prefix, stored_hash, plaintext)` tuple). A lookup does not count
-    /// as a use: it never reorders the eviction queue.
     pub fn contains(&self, key: &VerificationCacheKey) -> bool {
         self.lock().entries.contains(key)
     }
 
-    /// Insert a successful verification.
-    ///
-    /// A key that is already present is left exactly as it was: it is not
-    /// queued again and its position in the eviction order does not change.
-    /// A new key evicts the oldest insertion first when the cache is full,
-    /// under the one lock, so the entry count never passes the capacity.
     pub fn insert(&self, key: VerificationCacheKey) {
         let mut inner = self.lock();
         #[cfg(test)]
@@ -200,16 +114,12 @@ impl VerificationCache {
         inner.entries.insert(key);
     }
 
-    /// Snapshot stats for observability or testing.
     pub fn stats(&self) -> VerificationCacheStats {
         VerificationCacheStats {
             entries: self.lock().entries.len(),
         }
     }
 
-    /// How many times `insert` was called on this cache, duplicates
-    /// included. The store's tests read it to prove a cache hit inserts
-    /// nothing.
     #[cfg(test)]
     pub(crate) fn insert_calls(&self) -> usize {
         self.lock().insert_calls
@@ -240,9 +150,6 @@ mod tests {
 
     #[test]
     fn different_plaintext_produces_different_key_even_with_same_prefix_and_hash() {
-        // The security test for the cache-key shape: without
-        // `token_fingerprint` in the key, both lookups would hit and the
-        // second (wrong) token would skip argon2id.
         let cache = VerificationCache::new();
         let k_legit = key(
             "AAAAAAAA",
@@ -265,8 +172,6 @@ mod tests {
 
     #[test]
     fn different_stored_hash_invalidates() {
-        // Simulates key rotation: same prefix, same plaintext, but DB now
-        // stores a fresh hash → cache miss, argon2id re-runs, new entry inserted.
         let cache = VerificationCache::new();
         let plaintext = "flt_AAAAAAAAtoken_body_xxxxxxxxxxxxxxxxxxxxxxx";
         let pre = key("AAAAAAAA", plaintext, "$argon2id$v=19$m=1024$old$old");
@@ -306,12 +211,6 @@ mod tests {
         assert_eq!(cache.stats().entries, 32);
     }
 
-    // ------------------------------------------------------------------
-    // Capacity bound (#304): the cache never holds more than its capacity,
-    // evicts the oldest insertion first, and a duplicate insert neither
-    // grows the queue nor renews the entry.
-    // ------------------------------------------------------------------
-
     fn body_key(i: usize) -> VerificationCacheKey {
         key(
             "AAAAAAAA",
@@ -333,7 +232,6 @@ mod tests {
         }
         assert_eq!(cache.stats().entries, 8);
 
-        // The shipped constant, not only the seam.
         let cache = VerificationCache::new();
         for i in 0..=VERIFICATION_CACHE_CAPACITY {
             cache.insert(body_key(i));
@@ -439,9 +337,6 @@ mod tests {
         cache.insert(b.clone());
         assert_eq!(cache.stats().entries, 2);
 
-        // Re-inserting `a` must not renew it: it stays the oldest insertion,
-        // so the next eviction removes `a`, not `b`. Were the duplicate
-        // queued again, `b` would go first and `a` would outlive it.
         cache.insert(a.clone());
         cache.insert(c.clone());
         assert_eq!(cache.stats().entries, 2);
@@ -449,8 +344,6 @@ mod tests {
         assert!(cache.contains(&b));
         assert!(cache.contains(&c));
 
-        // And the queue did not grow behind the set: one more insert evicts
-        // exactly one live entry, leaving the other two.
         cache.insert(body_key(3));
         assert_eq!(cache.stats().entries, 2);
         assert!(!cache.contains(&b));

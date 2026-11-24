@@ -16,10 +16,6 @@
 //! is self-signed. The child sets `SSL_CERT_FILE` to that certificate, which
 //! the system root loader (rustls-native-certs) reads in place of the
 //! platform store. No test-only trust source exists in the doctor.
-//!
-//! The child writes the report as JSON and as text to a directory the parent
-//! owns, then exits with the verdict's status, so each test asserts on the
-//! real exit status and on both renderings of one report.
 
 mod common;
 
@@ -33,15 +29,10 @@ use trawl_api::doctor::{Check, Outcome, Report, Verdict};
 use trawl_cli::doctor::{self, Format, REQUESTS, resolve};
 use trawl_server::config::RateLimitConfig;
 
-/// Set only in the child: the directory the child writes its report into.
 const CHILD_OUT: &str = "DOCTOR_PG_CHILD_OUT";
-/// The child's `--url`.
 const CHILD_URL: &str = "DOCTOR_PG_URL";
-/// The child's `--token-file`.
 const CHILD_TOKEN_FILE: &str = "DOCTOR_PG_TOKEN_FILE";
-/// The child's `--profile`.
 const CHILD_PROFILE: &str = "DOCTOR_PG_PROFILE";
-/// The child's `-c`.
 const CHILD_CONFIG: &str = "DOCTOR_PG_CONFIG";
 
 /// The variables clap binds for `trawl doctor`, which the doctor refuses.
@@ -53,8 +44,6 @@ const REFUSED_ENV: [&str; 4] = [
     "TRAWL_INSECURE",
 ];
 
-/// The dynamic loader's search path, the one part of the parent's
-/// environment the child keeps.
 const LOADER_PATH: [&str; 3] = [
     "LD_LIBRARY_PATH",
     "DYLD_LIBRARY_PATH",
@@ -95,18 +84,17 @@ async fn doctor_child() {
     std::process::exit(i32::from(report.verdict().exit_code()));
 }
 
-/// How the child selects its target.
 enum Target<'a> {
-    /// `--url`, trusting system roots, with an optional `--token-file`.
     Url {
         url: &'a str,
         token_file: Option<&'a Path>,
     },
-    /// `--profile NAME -c CONFIG`.
-    Profile { name: &'a str, config: &'a Path },
+    Profile {
+        name: &'a str,
+        config: &'a Path,
+    },
 }
 
-/// One finished doctor run.
 struct Run {
     status: i32,
     report: Report,
@@ -128,10 +116,6 @@ impl Run {
     }
 }
 
-/// Run the doctor in a child process and collect its report.
-///
-/// `ssl_cert_file` becomes the child's `SSL_CERT_FILE`; `None` leaves the
-/// system roots to the platform store.
 async fn run_doctor(target: Target<'_>, ssl_cert_file: Option<&Path>) -> Run {
     let out = tempfile::tempdir().expect("create the child's output dir");
     let mut command = Command::new(std::env::current_exe().expect("locate this test binary"));
@@ -193,20 +177,16 @@ async fn run_doctor(target: Target<'_>, ssl_cert_file: Option<&Path>) -> Run {
     }
 }
 
-/// The certificate every harness server presents.
 fn harness_ca() -> PathBuf {
     common::ensure_test_cert().0
 }
 
-/// Write `token` to a file in `dir` for `--token-file`.
 fn token_file(dir: &Path, token: &str) -> PathBuf {
     let path = dir.join("key");
     std::fs::write(&path, token).expect("write the token file");
     path
 }
 
-/// Assert `run` quotes neither the token nor the key prefix in either
-/// rendering.
 fn assert_no_secrets(run: &Run, token: &str, prefix: &str) {
     for (format, rendered) in [("JSON", &run.json), ("text", &run.text)] {
         assert!(
@@ -220,7 +200,6 @@ fn assert_no_secrets(run: &Run, token: &str, prefix: &str) {
     }
 }
 
-/// Assert every `api.*` check but identity completed.
 fn assert_api_reachable(run: &Run) {
     for id in [
         "connection.config",
@@ -311,7 +290,6 @@ async fn doctor_identity_reports_permissions_without_secrets() {
     let ca = harness_ca();
     let dir = tempfile::tempdir().expect("create a temp dir");
 
-    // --url with --token-file, trusting system roots via SSL_CERT_FILE.
     let key_path = token_file(dir.path(), &token);
     let by_url = run_doctor(
         Target::Url {
@@ -322,8 +300,6 @@ async fn doctor_identity_reports_permissions_without_secrets() {
     )
     .await;
 
-    // A profile that binds the URL, the pinned harness CA, and the key in
-    // its own table.
     let config = dir.path().join("config.toml");
     std::fs::write(
         &config,
@@ -357,7 +333,6 @@ async fn doctor_identity_reports_permissions_without_secrets() {
         }
         assert_no_secrets(run, &token, &prefix);
     }
-    // An analyst key cannot ingest, and the server reports ingest capacity.
     assert!(
         by_profile
             .report
@@ -470,7 +445,6 @@ async fn doctor_rate_limited_is_incomplete() {
     assert_eq!(identity.reason.as_deref(), Some("rate_limited"));
 }
 
-/// Every `http_request` span trawld opens, as method and path.
 #[derive(Clone, Default)]
 struct RequestCapture {
     requests: Arc<Mutex<Vec<(String, String)>>>,
@@ -592,9 +566,6 @@ async fn doctor_request_allowlist() {
              {seen:?}"
         );
     }
-    // No query, no ingest, no sign-in: every request is a GET, and the only
-    // paths are health and whoami. Three runs, one health request each, and
-    // one whoami for each of the two runs with a key.
     let count = |path: &str| {
         seen.iter()
             .filter(|(method, seen_path)| method == "GET" && seen_path == path)

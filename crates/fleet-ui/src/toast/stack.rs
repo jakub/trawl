@@ -2,20 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure toast-stack state machine. No `leptos`, no `web_sys`, no I/O —
-//! builds on every target so the "a success toast and an error toast
-//! are now live" outcome is enforced by `cargo nextest run
-//! --workspace`, not just eyeballed in a browser.
-//!
-//! [`runtime`](super::runtime) wraps a [`ToastStack`] in a reactive
-//! `RwSignal` and drives auto-dismiss; every mutation it performs is a
-//! call into this module. Keeping the id allocation + push/dismiss
-//! transitions here means they're unit-tested directly.
-
 use super::kinds::ToastKind;
 
-/// A destination a toast offers, such as the record an operation just
-/// created. The host renders it as a native anchor after the detail.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToastLink {
     href: String,
@@ -84,9 +72,6 @@ impl Toast {
     }
 }
 
-/// Ordered stack of live toasts plus the monotonic id counter. Pure
-/// value type — `runtime`'s `ToastBus` holds one inside an `RwSignal`
-/// and all its mutations funnel through [`Self::push`] / [`Self::dismiss`].
 #[derive(Debug, Clone, Default)]
 pub struct ToastStack {
     items: Vec<Toast>,
@@ -99,8 +84,6 @@ impl ToastStack {
         Self::default()
     }
 
-    /// Allocate the next monotonic id, append a toast of `kind`, and
-    /// return the id so the caller can schedule a later [`Self::dismiss`].
     /// Ids are never reused, so they stay unique as `<For>` keys even
     /// after intervening dismissals.
     pub fn push(
@@ -112,7 +95,6 @@ impl ToastStack {
         self.append(kind, title.into(), detail, None)
     }
 
-    /// [`Self::push`] for a toast that also offers `link`.
     pub fn push_with_link(
         &mut self,
         kind: ToastKind,
@@ -142,14 +124,10 @@ impl ToastStack {
         id
     }
 
-    /// Remove the toast with `id`. No-op if it's already gone (e.g. the
-    /// user dismissed it before the auto-dismiss timeout fired).
     pub fn dismiss(&mut self, id: u64) {
         self.items.retain(|t| t.id != id);
     }
 
-    /// Live toasts, oldest first — the render order of the `<Toasts/>`
-    /// host.
     #[must_use]
     pub fn items(&self) -> &[Toast] {
         &self.items
@@ -160,9 +138,6 @@ impl ToastStack {
 mod tests {
     use super::*;
 
-    /// No browser required: pushing a success then an error leaves
-    /// exactly those two toasts live, in order, with the kinds the app
-    /// asked for.
     #[test]
     fn success_then_error_are_both_live() {
         let mut stack = ToastStack::new();
@@ -193,13 +168,10 @@ mod tests {
         assert_eq!(stack.items().len(), 1);
         assert_eq!(stack.items()[0].id(), b);
 
-        // A later push does not recycle the dismissed id.
         let c = stack.push(ToastKind::Info, "c", None);
         assert_eq!(c, 3);
     }
 
-    /// A linked toast carries its destination and label; a plain push
-    /// carries none, so existing callers render exactly as before.
     #[test]
     fn a_linked_toast_carries_its_link_and_a_plain_one_none() {
         let mut stack = ToastStack::new();
@@ -221,8 +193,6 @@ mod tests {
         assert_eq!(link.label(), "View run");
     }
 
-    /// Linked and plain toasts share one id sequence, so `<For>` keys
-    /// stay unique across both kinds of push.
     #[test]
     fn linked_and_plain_pushes_share_one_id_sequence() {
         let mut stack = ToastStack::new();

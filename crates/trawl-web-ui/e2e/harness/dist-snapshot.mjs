@@ -32,25 +32,18 @@ import { fileURLToPath } from 'node:url';
 const HARNESS_DIR = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HARNESS_DIR, '..', '..', '..', '..');
 
-/** Where the snapshot for one server lives: under the repository root,
- * never inside crates/trawl-web-ui. `trunk serve` watches that crate and
- * rebuilds on any write below it, and a rebuild applying its distribution
- * clears `dist/.stage` under a concurrent `trunk build` — so copying a
- * dist into the source tree breaks the very builds this suite runs
- * against. Keyed by port so parallel suites in one worktree (E2E_PORT),
- * and the per-worker servers of one suite, own separate copies. */
+/** Under the repository root, never inside crates/trawl-web-ui. `trunk
+ * serve` watches that crate and rebuilds on any write below it, and a
+ * rebuild applying its distribution clears `dist/.stage` under a
+ * concurrent `trunk build`. */
 export function snapshotPath(port) {
   return path.join(REPO_ROOT, 'e2e-artifacts', `dist-snapshot-${port}`);
 }
 
-/** Local assets index.html names, as dist-relative paths. */
 function referenced(html) {
   return [...html.matchAll(/(?:href|src)="\/([^"'?#]+)"/g)].map((m) => m[1]);
 }
 
-/** Trunk's autoreload client, identified by the placeholder only trunk's
- * own server can fill in. A `trunk build` index.html has no such script
- * and comes through untouched. */
 function withoutAutoreload(html) {
   return html.replace(/<script\b[^>]*>[\s\S]*?<\/script>/g, (script) =>
     script.includes('__TRUNK_ADDRESS__') ? '' : script,
@@ -58,22 +51,15 @@ function withoutAutoreload(html) {
 }
 
 /**
- * Copy `source` to this port's snapshot directory and return the path.
- *
  * A copy taken while trunk is applying a new distribution can be torn —
  * an index.html naming assets the copy does not have — so the copy is
- * checked and retaken. The check is also the only thing standing between
- * a half-written dist and a suite-wide cascade of 404s.
+ * checked and retaken.
  */
 export function snapshotDist(source, port, { attempts = 5, log = () => {} } = {}) {
   const target = snapshotPath(port);
   let missing = [];
   fs.mkdirSync(path.dirname(target), { recursive: true });
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    // The copy runs against a directory trunk may be rewriting: a file
-    // that vanishes between enumeration and copy, or an index.html not
-    // yet written, throws here rather than producing a torn copy, and
-    // is the same rebuild-in-flight case as the torn index below.
     const indexPath = path.join(target, 'index.html');
     let html;
     try {

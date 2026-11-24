@@ -3,22 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Whole-file recognition of live WAL writer output (ADR-0041 slice 2).
-//!
-//! Hydration loads a WAL file only if its bytes are exactly what the live
-//! writer produces: a writer file name ([`WalName`]) on a regular file, and
-//! lines that each parse to an object of scalar values with folded keys and
-//! encode back to the same bytes through [`wal::encode_line`]. The check
-//! covers the whole file. A file that fails anywhere is rejected whole,
-//! never loaded as a prefix, and stays for compaction's decoder, which
-//! handles every other file as it always has. Hydration never
-//! canonicalizes an event again, and it takes no row whose envelope
-//! instants compaction would repair, so a hydrated event reads the same hot
-//! as it will cold.
-//!
-//! A Unix host opens a WAL file without following a symlink and without
-//! blocking on a FIFO. Off Unix every entry is [`Rejection::Unreadable`],
-//! so the boot hydrates nothing and compaction clears the WAL as
-//! overhang.
 
 use std::fs::File;
 use std::io::Read as _;
@@ -38,7 +22,6 @@ pub(crate) type Event = Map<String, Value>;
 #[derive(Debug)]
 pub(crate) struct Recognized {
     pub name: WalName,
-    /// One event per line, in file order.
     pub events: Vec<Event>,
     /// The file's length: exactly the ndjson bytes `ServiceBatch::push`
     /// charged for `events`.
@@ -71,12 +54,10 @@ pub(crate) struct Limits {
     pub events: usize,
 }
 
-/// Examine one WAL entry: its name, then the file, which is read in full
-/// if it is at most `limits.bytes` long, then its lines, which are parsed
-/// only if there are at most `limits.events` of them. Counting the
-/// newlines of bytes already read costs no allocation, so a file of tiny
-/// lines never builds more events than fit. Every byte read is added to
-/// `spent`, including the bytes of a file rejected after reading.
+/// Counting the newlines of bytes already read costs no allocation, so a
+/// file of tiny lines is rejected before it builds more than `limits.events`
+/// events. Every byte read is added to `spent`, including the bytes of a
+/// file rejected after reading.
 pub(crate) fn examine(
     path: &Path,
     limits: Limits,
@@ -108,20 +89,10 @@ pub(crate) fn examine(
 /// The events of a whole WAL file, if and only if `bytes` is exactly what
 /// the live writer produces for them. `None` rejects the whole file.
 ///
-/// Accepted: non-empty UTF-8 with no NUL, ending in `\n`, with no blank
-/// line, where every line is a JSON object whose values are scalars
-/// (null, bool, number, string), whose keys are folded
-/// ([`is_folded_name`]), whose `_time` and `_ingested` compaction's repair
-/// leaves as they are ([`compaction::repair_leaves_unchanged`]), and where
-/// [`wal::encode_line`] of the parsed object gives back that line byte for
-/// byte. The last check rejects whitespace, key order, escapes and number
-/// spellings the writer does not produce, and a duplicate key, which
-/// parses to one fewer key. Float values need `serde_json`'s
+/// The [`wal::encode_line`] check rejects whitespace, key order, escapes
+/// and number spellings the writer does not produce, and a duplicate key,
+/// which parses to one fewer key. Float values need `serde_json`'s
 /// `float_roundtrip` to parse back to the value the writer printed.
-///
-/// The charge of the returned events is `(events.len(), bytes.len())`,
-/// what `ServiceBatch::push` charged for them, and `events.len()` is the
-/// number of newlines in `bytes`.
 pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
     if bytes.is_empty() || bytes.contains(&0) {
         return None;
@@ -159,12 +130,9 @@ pub(crate) fn recognize(bytes: &[u8]) -> Option<Vec<Event>> {
 
 #[cfg(test)]
 thread_local! {
-    /// Lines [`recognize`] parsed on this thread.
     static PARSED_LINES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// How many lines [`recognize`] has parsed on this thread, for a test that
-/// checks a file was refused before any of its lines was parsed.
 #[cfg(test)]
 pub(crate) fn parsed_lines_for_test() -> u64 {
     PARSED_LINES.with(std::cell::Cell::get)
@@ -174,7 +142,6 @@ const fn is_scalar(value: &Value) -> bool {
     !matches!(value, Value::Array(_) | Value::Object(_))
 }
 
-/// A WAL entry opened as a regular file, without following a symlink.
 #[derive(Debug)]
 struct WalFile {
     file: File,
@@ -183,9 +150,6 @@ struct WalFile {
 }
 
 impl WalFile {
-    /// Open `path` read-only, refusing a symlink at the last component, and
-    /// check with `fstat` on the descriptor that it is a regular file. The
-    /// open does not block: a FIFO is refused after it opens, never read.
     fn open(path: &Path) -> std::io::Result<Self> {
         let file = no_follow::open(path)?;
         let metadata = file.metadata()?;
@@ -201,9 +165,6 @@ impl WalFile {
         })
     }
 
-    /// Read exactly [`Self::len`] bytes, adding every byte read to `spent`.
-    /// A file that is shorter than that, or whose length changed by the
-    /// end of the read, is an error.
     fn read_whole(mut self, spent: &mut u64) -> std::io::Result<Vec<u8>> {
         let capacity = usize::try_from(self.len).map_err(std::io::Error::other)?;
         let mut bytes = Vec::with_capacity(capacity);
@@ -233,9 +194,6 @@ mod tests {
     use super::*;
     use crate::ingest::pipeline::ServiceBatch;
 
-    /// Events the canonicalizer can emit, with values chosen to be awkward
-    /// to round-trip: floats that need exact parsing, extreme integers,
-    /// escapes and non-ASCII text.
     fn awkward_events() -> Vec<Event> {
         let floats = [
             0.1,
@@ -302,7 +260,6 @@ mod tests {
         format!("{},", line.strip_suffix("}\n").unwrap())
     }
 
-    /// The bytes and charge the live writer produces for `events`.
     fn written(events: &[Event]) -> ServiceBatch {
         let mut batch = ServiceBatch::default();
         for event in events {
@@ -311,7 +268,6 @@ mod tests {
         batch
     }
 
-    /// One writer line for `event`.
     fn line(event: &Event) -> Vec<u8> {
         let mut out = Vec::new();
         wal::encode_line(event, &mut out).unwrap();
@@ -329,7 +285,6 @@ mod tests {
         bytes
     }
 
-    /// Limits of `bytes` and as many events as the lines any test writes.
     fn limits(bytes: u64) -> Limits {
         Limits {
             bytes,
@@ -545,9 +500,8 @@ mod tests {
         }
     }
 
-    /// The row from the final review: `_time` is not an instant, so
-    /// compaction's repair would replace it with the file name's instant
-    /// while the hot read casts it to NULL.
+    /// `_time` is not an instant, so compaction's repair would replace it with
+    /// the file name's instant while the hot read casts it to NULL.
     #[test]
     fn rejects_a_row_compaction_would_repair() {
         assert_rejected(
@@ -558,9 +512,6 @@ mod tests {
         );
     }
 
-    /// Every envelope instant compaction repairs is checked, and each value
-    /// its repair would replace, or that is not spelled as ingest spells
-    /// it, rejects the file.
     #[test]
     fn rejects_each_instant_compaction_would_repair() {
         let unrepaired = [
@@ -596,8 +547,6 @@ mod tests {
         assert!(recognize(&line(&stamped(Event::new()))).is_some());
     }
 
-    /// Real writer output: client events through the canonicalizer, then
-    /// the writer's `ServiceBatch::push`.
     #[test]
     fn canonicalized_events_are_recognized() {
         use crate::ingest::envelope::{EnvelopeContext, canonicalize};

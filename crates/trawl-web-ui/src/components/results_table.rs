@@ -4,32 +4,9 @@
 
 //! `<ResultsTable/>` — paginated snapshot results table.
 //!
-//! Sans-serif column headers with a sort affordance, expandable rows that
-//! reveal a `_time` / field tag detail panel with Copy _raw / Show context /
-//! Find similar action buttons. Detail-row tag clicks add filters through a
-//! parent-supplied callback, paired with the executed query they belong to,
-//! and every row action is gated on that query's field provenance
+//! Every row action is gated on the executed query's field provenance
 //! ([`Capabilities`]): a `let` or a rename can leave a field that no raw
 //! event carries, and an aggregation has no raw row to copy.
-//!
-//! Two optional reading modes ride on top, both off by default so the
-//! markup below is exactly the pre-ADR-0032 table until a reader turns
-//! one on:
-//!
-//! - `details == Inspector` moves the expanded row into a panel docked
-//!   beside the table ([`fleet_ui::Drawer`] in its docked presentation).
-//!   The selection is a `(generation, original row index)` pair owned by
-//!   the page, so a new response or a page turn closes the panel rather
-//!   than repointing it at a different event, and `j`/`k` walk the
-//!   SORTED order while never changing which event is selected.
-//! - `rows == MessageFirst` reduces the columns to time, severity and
-//!   message, with the rest of the row as a muted secondary line.
-//!
-//! Both detail presentations fold an event's null fields behind one
-//! "Show N null fields" disclosure ([`partition_detail_fields`]). Its
-//! open state is one signal the search page owns and passes in, so it
-//! survives selecting another event, re-mounting the inspector and a new
-//! response, and it is not in the URL.
 
 use crate::api::PAGE_SIZE;
 use crate::context_query::SearchNavigation;
@@ -60,30 +37,16 @@ pub fn ResultsTable(
     #[prop(into)] page: Signal<usize>,
     rows: LocalResource<Result<ExecutedResponse, ExecutedFailure>>,
     #[prop(into)] busy: Signal<bool>,
-    /// Called with the new page index when prev/next is clicked. Parent
-    /// captures a router navigator and translates to URL navigation.
     on_paginate: Callback<usize>,
-    /// Called when a detail-row field tag is clicked — adds an include
-    /// filter for that `field = value`, against the query that produced
-    /// the row.
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
-    /// Navigate to a fresh snapshot search with its own query and range. Used by "Show context" and "Find similar".
     on_navigate: Callback<SearchNavigation>,
-    /// Where a row's fields are read: in place, or in the docked
-    /// inspector. `Inline` is the default and renders today's markup.
-    #[prop(into)]
-    details: Signal<Details>,
-    /// Compact column table, or message-first rows. `Compact` is the
-    /// default and renders today's markup.
-    #[prop(into)]
-    rows_mode: Signal<Rows>,
+    #[prop(into)] details: Signal<Details>,
+    #[prop(into)] rows_mode: Signal<Rows>,
     /// The inspector's selection, owned by the page: only the page knows
     /// when a new response, a page turn or a new effective query has
     /// landed under it.
     selected: RwSignal<Option<(u64, usize)>>,
-    /// The response generation that selection is keyed on.
-    #[prop(into)]
-    generation: Signal<u64>,
+    #[prop(into)] generation: Signal<u64>,
     /// The null-field disclosure's open state, shared by the inline
     /// expansion and the inspector. Owned by the page, which outlives
     /// this table: the table is rebuilt for every response.
@@ -172,14 +135,6 @@ pub fn ResultsTable(
     }
 }
 
-/// Escape and `j`/`k` for the results region while the inspector is the
-/// reading mode.
-///
-/// `j`/`k` walk the SORTED order (`order`, republished on every re-sort)
-/// but address rows by their ORIGINAL index, so a re-sort moves where
-/// the next keystroke goes without moving the selection itself. A
-/// keystroke from anywhere but the region or one of its row controls is
-/// ignored: a letter typed into a field is not a navigation.
 fn inspector_keys(
     details: Signal<Details>,
     selected: RwSignal<Option<(u64, usize)>>,
@@ -238,22 +193,11 @@ fn inspector_keys(
     }
 }
 
-/// The docked inspector: the expanded row's key/value grid and its three
-/// actions, rendered beside the table instead of inside it.
-///
-/// A [`Drawer`] in its docked presentation (ADR-0032), so the header,
-/// close affordance and body scroll are the fleet's, not a second
-/// hand-rolled panel. It registers no overlay layer, which is what keeps
-/// the command palette's chord live while a row is open. The same
-/// provenance gates apply as inline: a field the executed query changed,
-/// or an instant or the raw event ([`Capabilities::detail_filter`]), gets
-/// no filter buttons, and a row with no raw source gets no raw actions.
 #[component]
 fn InspectorPanel(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
-    /// Each column's type, by the same index as `columns`.
     types: Vec<ColumnType>,
     executed_query: ExecutedQuery,
     capabilities: Capabilities,
@@ -375,13 +319,8 @@ fn InspectorPanel(
     }
 }
 
-/// The inspector's field grid, which its null-field disclosure controls.
 const INSPECTOR_FIELDS_ID: &str = "search-inspector-fields";
 
-/// The "Show N null fields" disclosure under a detail grid: a real button
-/// with `aria-expanded`, so Enter and Space work natively, and nothing at
-/// all when the event has no null field. Hidden null rows are not
-/// rendered, so they are not keyboard stops either.
 #[component]
 fn NullFieldsToggle(count: usize, open: RwSignal<bool>, controls: String) -> impl IntoView {
     (count > 0).then(|| {
@@ -439,9 +378,6 @@ fn ResultsTableBody(
     let types: Vec<ColumnType> = resp.result.columns.iter().map(|c| c.ty.clone()).collect();
     let rows_data = resp.result.rows.clone();
     let returned = resp.pagination.returned;
-    // A first page with no rows quotes the exact query the server ran,
-    // range and rail filters included, then gives the next step on its
-    // own line. A later empty page keeps the one-line notice.
     let empty_message = if resp.pagination.offset == 0 {
         let ran = executed_query.effective.clone();
         view! {
@@ -475,9 +411,6 @@ fn ResultsTableBody(
     let expanded = RwSignal::new(None::<usize>);
     let sort = RwSignal::new(None::<SortState>);
 
-    // The message-first plan for THIS response, if it has a message to
-    // lead with. Computed once; the memo below decides whether the mode
-    // in force actually uses it.
     let plan = message_first(&columns, &severity_cols);
     let layout = Memo::new(move |_| {
         if rows_mode.get() == Rows::MessageFirst {
@@ -487,9 +420,6 @@ fn ResultsTableBody(
         }
     });
 
-    // The compact table states the page's one `_time` date in the header
-    // and prints each cell's clock. Read from this response's rows, so a
-    // page turn recomputes it and a sort leaves it alone.
     let shared = shared_date(&columns, &types, &rows_data);
     let compact_date = Memo::new(move |_| layout.get().is_none().then(|| shared.clone()).flatten());
 
@@ -498,10 +428,6 @@ fn ResultsTableBody(
         .map(|i| zone_unit(types.get(i)))
         .collect();
     let cols_for_view = columns.clone();
-    // One header cell, by original column index. A closure rather than a
-    // pre-built Vec because the message-first layout renders three of
-    // these and the compact layout renders all of them, and both need
-    // the same `th-sort` markup and the same sort state.
     let sort_header = move |i: usize,
                             name: String,
                             unit: Option<&'static str>,
@@ -518,9 +444,6 @@ fn ResultsTableBody(
             .collect::<Vec<_>>()
             .join(" ");
         view! {
-            // A real `<table>`, so direction is announced by `aria-sort`
-            // on the sorted `<th>` alone (ADR-0029) and the glyph is
-            // decoration. The control is the button inside, never the cell.
             <th
                 class="sortable"
                 class:sorted=move || sort.get().is_some_and(|s| s.col == i)
@@ -667,8 +590,6 @@ fn ResultsTableBody(
     .into_any()
 }
 
-/// Sort indirection: the table renders rows by index, applying the
-/// current sort lazily on each render. Avoids cloning rows.
 #[derive(Clone, Copy)]
 struct SortedIndices {
     indices: Memo<Vec<usize>>,
@@ -725,30 +646,19 @@ impl SortedIndices {
     }
 }
 
-/// Everything a row needs that is the same for every row: the two
-/// callbacks, the toast bus, the reading modes, the inspector's
-/// selection, and the executed query with its field provenance. One
-/// struct rather than nine parameters, because the row fragment already
-/// carries its own data and passing the page's wiring through by name
-/// made both call sites unreadable.
 #[derive(Clone)]
 struct RowWiring {
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
     on_navigate: Callback<SearchNavigation>,
     bus: ToastBus,
     details: Signal<Details>,
-    /// The message-first plan in force, or `None` for the compact table.
     layout: Memo<Option<MessageFirst>>,
-    /// The `_time` date the compact table states in its header, if any.
     compact_date: Memo<Option<SharedDate>>,
-    /// Cells per row including the expander column, for the detail
-    /// row's `colspan`.
     span: Memo<usize>,
     selected: RwSignal<Option<(u64, usize)>>,
     generation: Signal<u64>,
     executed_query: ExecutedQuery,
     capabilities: Capabilities,
-    /// The null-field disclosure's open state, shared with the inspector.
     show_nulls: RwSignal<bool>,
 }
 
@@ -757,7 +667,6 @@ fn RowFragment(
     idx: usize,
     row: Vec<Value>,
     columns: Vec<String>,
-    /// Each column's type, by the same index as `columns`.
     types: Vec<ColumnType>,
     severity_cols: Vec<usize>,
     expanded: RwSignal<Option<usize>>,
@@ -779,8 +688,6 @@ fn RowFragment(
     } = wiring;
     let raw_actions = capabilities.raw_actions();
 
-    // Which mode owns this row's disclosure. Inline is the default and
-    // the only one that renders a sibling detail `<tr>`.
     let inspecting = move || details.get() == Details::Inspector;
     let is_selected = move || inspector_selection(generation.get(), selected.get()) == Some(idx);
     let is_open = move || {
@@ -820,9 +727,6 @@ fn RowFragment(
             <tr class:expanded=move || !inspecting() && expanded.get() == Some(idx)
                 class:selected=move || inspecting() && is_selected()>
                 <td class="exp-col">
-                    // The row's one control (ADR-0029): the caret button
-                    // stretches over the row, so a pointer anywhere on it
-                    // toggles the detail exactly once.
                     <button
                         type="button"
                         class="row-stretch"
@@ -1012,8 +916,6 @@ fn FindSimilarButton(
     }
 }
 
-/// The compact layout's cells: one per column, in wire order. With a
-/// shared date, the `_time` cell prints only its clock.
 fn compact_cells(
     row: &[Value],
     types: &[ColumnType],
@@ -1041,12 +943,6 @@ fn compact_cells(
         .collect()
 }
 
-/// The message-first layout's cells: time, severity pill, then the
-/// message at full width with service / host / latency under it.
-///
-/// Every column this drops is still reachable in the inline detail or
-/// the docked inspector — the mode trades the columns for one readable
-/// message, it does not hide data.
 fn message_first_cells(
     row: &[Value],
     columns: &[String],
@@ -1100,8 +996,6 @@ fn raw_or_synthesized(row: &[Value], columns: &[String]) -> String {
     {
         return value_to_string(v);
     }
-    // Fallback: join "key=value" pairs so the user still gets something
-    // copy-pastable.
     columns
         .iter()
         .zip(row.iter())
@@ -1110,7 +1004,6 @@ fn raw_or_synthesized(row: &[Value], columns: &[String]) -> String {
         .join(" ")
 }
 
-/// Build a phrase-match query on the first ~60 chars of the row's message.
 fn build_similar_query(row: &[Value], columns: &[String]) -> Option<String> {
     let mi = find_col(columns, &["message", "msg"])?;
     let msg = value_to_string(row.get(mi)?);

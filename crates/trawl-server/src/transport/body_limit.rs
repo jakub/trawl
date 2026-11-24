@@ -9,14 +9,8 @@
 //! `[ingest] max_body_bytes` for `/ingest`. The configured value is the
 //! only limit; axum's own default extractor limit is off.
 //!
-//! The limit is lazy. [`limit_body`] wraps the request body, and nothing
-//! reads it until the handler's body extractor does. Authentication and
-//! the grant read headers only, and every handler that reads a body names
-//! its permission with an authority extractor, [`crate::policy::Authorized`]
-//! or `/ingest`'s `IngestKey`, which axum runs before the body extractor
-//! (ADR-0059). So a bad token is 401 and a key without the route's
-//! permission 403 before a byte of the body is read, and only a key that
-//! may use the route learns the body was too large.
+//! The limit is lazy: nothing reads the body until the handler's body
+//! extractor does, behind its authority extractor (ADR-0059).
 //!
 //! A body whose announced `Content-Length` is past the limit fails its
 //! first read, before a byte of it is read; one without fails once a read
@@ -33,18 +27,12 @@ use tokio_stream::StreamExt as _;
 
 use crate::error::ServerError;
 
-/// The body limit a router enforces.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct BodyLimit {
-    /// The setting's name as an operator writes it in the config.
     pub(crate) setting: &'static str,
-    /// The limit, in bytes.
     pub(crate) bytes: usize,
 }
 
-/// A body past its router's limit: the error a read of a limited body
-/// fails with, found again under the extractor's rejection by
-/// [`OverLimit::find`].
 #[derive(Debug)]
 pub(crate) struct OverLimit(BodyLimit);
 
@@ -84,10 +72,6 @@ impl From<&OverLimit> for ServerError {
     }
 }
 
-/// Bound the request's body by `limit`, lazily: the body is replaced by
-/// one that fails its first read with [`OverLimit`] when the announced
-/// length is past the limit, and otherwise counts what is read and fails
-/// once that passes the limit. Nothing here reads the body.
 pub(crate) async fn limit_body(
     State(limit): State<BodyLimit>,
     request: Request,
@@ -96,11 +80,9 @@ pub(crate) async fn limit_body(
     next.run(request.map(|body| limited(body, limit))).await
 }
 
-/// `body`, bounded by `limit`.
 fn limited(body: Body, limit: BodyLimit) -> Body {
     let announced = body.size_hint().lower();
     if announced > u64::try_from(limit.bytes).unwrap_or(u64::MAX) {
-        // The body is dropped unread.
         return Body::from_stream(tokio_stream::once(Err::<axum::body::Bytes, _>(OverLimit(
             limit,
         ))));

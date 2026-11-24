@@ -5,22 +5,9 @@
 //! The input-column descriptor changes nothing for a query whose fields
 //! are all present (ADR-0062).
 //!
-//! A field the input does not carry reads as NULL, and the emitter learns
-//! which fields those are from a schema probe of the selected sources. A
-//! query that reads only fields its input carries must emit exactly the
-//! statement it emitted before the probe existed, on every lane. That is
-//! read off the statement each lane actually prepared
-//! ([`prepare_probe::last_statement`]), recorded as snapshots on the tree
-//! before the descriptor landed.
-//!
 //! The fixture carries every field the queries read, in cold parquet and in
 //! the hot snapshot alike, with a non-null value on every event, so no
 //! query in that test reads an absent field or a null-only hot key.
-//!
-//! The probe itself is bounded too: one `DESCRIBE` of the resolved cold
-//! reader per request, inside the lane's cancellation latch and booked as
-//! `probe` ([`schema_probe`]), and a missing column that survives it is a
-//! loud 400 on every lane.
 
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -35,8 +22,6 @@ use trawl_engine::executor::{Executor, RowCap, hot_columns_of, prepare_probe, sc
 use trawl_engine::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase};
 use trawl_engine::value::Value;
 
-/// Present-field queries, one per stage the resolver rewrites a read in.
-/// Every one reads only fields the fixture carries.
 const QUERIES: &[&str] = &[
     "login",
     "login host=web1 status>=500",
@@ -68,7 +53,6 @@ fn export_queries() -> impl Iterator<Item = &'static str> {
         .filter(|dsl| !dsl.contains("extract kv"))
 }
 
-/// One event, written to cold parquet or to the hot snapshot.
 struct Event {
     hour: u32,
     second: u32,
@@ -130,12 +114,9 @@ const HOT: &[Event] = &[
     },
 ];
 
-/// The fixture on disk.
 struct Fixture {
     dir: tempfile::TempDir,
-    /// The cold source in the server's list shape, one hour per element.
     cold: String,
-    /// A list source no element of which reaches a file: the cold start.
     cold_start: String,
     hot: PathBuf,
 }
@@ -185,8 +166,6 @@ impl Fixture {
         self.hot.to_str().expect("utf-8 hot path")
     }
 
-    /// A statement with this fixture's temp directory spelled `<dir>`, so
-    /// the snapshot does not depend on where the run put its files.
     fn redact(&self, sql: &str) -> String {
         sql.replace(&self.dir.path().display().to_string(), "<dir>")
     }
@@ -217,7 +196,6 @@ fn write_cold_file(conn: &duckdb::Connection, path: &Path, events: &[&Event]) {
     .expect("cold parquet file");
 }
 
-/// The catalog the server would hold for this corpus.
 fn catalog() -> FieldTypes {
     let mut pins = FieldTypes::new();
     pins.insert("host", CanonicalType::Varchar);
@@ -226,13 +204,10 @@ fn catalog() -> FieldTypes {
     pins
 }
 
-/// Every hot event carries every catalog field, so the hot pins are the
-/// whole catalog, as the server cuts them.
 fn hot_pins() -> FieldTypes {
     catalog()
 }
 
-/// The statement this thread last handed `DuckDB`, after `run` succeeded.
 fn prepared<E: std::fmt::Debug>(
     lane: &str,
     dsl: &str,
@@ -244,7 +219,6 @@ fn prepared<E: std::fmt::Debug>(
     prepare_probe::last_statement().expect("the lane prepared a statement")
 }
 
-/// Every query's prepared statement on one lane, one block per query.
 fn lane_statements<'q>(
     fixture: &Fixture,
     lane: &str,
@@ -333,25 +307,15 @@ fn present_field_sql_is_unchanged() {
     insta::assert_snapshot!("export_hot_and_cold", export_hot);
 }
 
-// -- the probe itself ---------------------------------------------------------
-//
-// The emitter learns what the input carries from one `DESCRIBE` of the
-// resolved cold reader per request (ADR-0062), counted and recorded by
-// `executor::schema_probe`. The tests below read that record on the thread
-// that ran the lane, so parallel tests cannot see each other's probes.
+// The tests below read the probe record on the thread that ran the lane, so
+// parallel tests cannot see each other's probes.
 
-/// The lanes one request can take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Lane {
-    /// The query lane with no hot buffer: embedded `--data`, `from saved`.
     Cold,
-    /// The query lane over cold files and a hot snapshot.
     HotAndCold,
-    /// The query lane over a hot snapshot and a source no file is behind.
     ColdStart,
-    /// The Parquet export with no hot buffer.
     Export,
-    /// The Parquet export over cold files and a hot snapshot.
     ExportHotAndCold,
 }
 
@@ -364,8 +328,6 @@ impl Lane {
         Self::ExportHotAndCold,
     ];
 
-    /// The lanes whose source reaches cold files, so the probe has a
-    /// reader to describe.
     const OVER_COLD_FILES: [Self; 4] = [
         Self::Cold,
         Self::HotAndCold,
@@ -385,22 +347,17 @@ impl Lane {
     }
 }
 
-/// What one request on a lane reads.
 struct Request<'a> {
     fixture: &'a Fixture,
-    /// The hot snapshot file, for the lanes that read one.
     hot: &'a Path,
     hot_pins: &'a FieldTypes,
     pins: &'a FieldTypes,
 }
 
-/// What one request did.
 struct Measured {
     outcome: Result<(), EngineError>,
     totals: PhaseTotals,
-    /// `DESCRIBE`s this thread handed `DuckDB` during the request.
     describes: u64,
-    /// Where an export wrote, if it is an export.
     out: Option<PathBuf>,
 }
 
@@ -422,7 +379,6 @@ impl<'a> Request<'a> {
         }
     }
 
-    /// Run `dsl` on `lane` under `cancel`, booking its phases on `clock`.
     fn run_on(
         &self,
         exec: &Executor,
@@ -479,7 +435,6 @@ impl<'a> Request<'a> {
         (outcome, out)
     }
 
-    /// Run `dsl` on `lane` on this thread and count its probes.
     fn measure(&self, exec: &Executor, lane: Lane, dsl: &str) -> Measured {
         let clock = PhaseClock::new();
         let before = schema_probe::count_on_this_thread();
@@ -495,15 +450,11 @@ impl<'a> Request<'a> {
     }
 }
 
-/// The `DESCRIBE` the probe hands `DuckDB` for `source`: the emitter's own
-/// reader for it, verbatim.
 fn describe_of(source: &str) -> String {
     let reader = trawl_core::emitter::source_reader(source).expect("the source has a reader");
     format!("DESCRIBE SELECT * FROM {reader}")
 }
 
-/// A hot snapshot like the fixture's, every event also carrying `ghost`
-/// as JSON `null` and nothing else.
 fn null_only_hot(fixture: &Fixture) -> PathBuf {
     let text = std::fs::read_to_string(&fixture.hot).expect("the fixture's hot snapshot");
     let mut out = String::new();
@@ -518,9 +469,6 @@ fn null_only_hot(fixture: &Fixture) -> PathBuf {
     path
 }
 
-/// One probe per request, whatever it reads, booked as `probe` and never a
-/// bind attempt; none for a query that reads only the envelope's
-/// timestamps; and none for a query admission refuses.
 #[test]
 fn schema_probe_is_bounded() {
     let fixture = Fixture::build();
@@ -534,10 +482,6 @@ fn schema_probe_is_bounded() {
     no_probe_past_admission(&exec, &request);
 }
 
-/// A query that reads a field the input carries: one DESCRIBE of the
-/// resolved cold reader, on every lane that has one. The cold start's
-/// source reaches no file, which resolution already proved, so it has
-/// nothing to describe.
 fn one_probe_per_request(exec: &Executor, request: &Request<'_>) {
     for lane in Lane::ALL {
         let run = request.measure(exec, lane, "host=web1");
@@ -567,8 +511,7 @@ fn one_probe_per_request(exec: &Executor, request: &Request<'_>) {
         );
     }
 
-    // However many fields the input lacks, one probe. What the query
-    // answers is the absent-field oracle's to check.
+    // What the query answers is the absent-field oracle's to check.
     for lane in Lane::OVER_COLD_FILES {
         let run = request.measure(
             exec,
@@ -583,8 +526,6 @@ fn one_probe_per_request(exec: &Executor, request: &Request<'_>) {
     }
 }
 
-/// A query that reads only the envelope's timestamps, or nothing at
-/// all, needs no description of its input.
 fn no_probe_for_the_envelope(exec: &Executor, request: &Request<'_>) {
     for dsl in [
         "*",
@@ -645,8 +586,6 @@ fn a_null_only_hot_key_asks_once(exec: &Executor, fixture: &Fixture) {
     }
 }
 
-/// Admission refuses before anything reaches `DuckDB` (ADR-0024), the
-/// probe included.
 fn no_probe_past_admission(exec: &Executor, request: &Request<'_>) {
     let over_budget = format!(
         "host=web1{}",
@@ -663,11 +602,6 @@ fn no_probe_past_admission(exec: &Executor, request: &Request<'_>) {
     }
 }
 
-/// A probe parked inside `DuckDB` holds its lane: the lane does not return
-/// while the probe is parked, a cancellation that lands during the park
-/// stops the lane before its statement binds, and the whole park is booked
-/// as `probe`.
-///
 /// This is the engine half. The permit and the deadline belong to the
 /// server's pool, which runs the lane inside them, so a lane that has not
 /// returned still holds both.
@@ -737,12 +671,6 @@ fn parked_probe_keeps_its_permit() {
     }
 }
 
-/// A read of `_time` or `_ingested` over a source without them is refused
-/// loudly, never answered as empty: the envelope timestamps never read as
-/// NULL (ADR-0062), because NULL there would turn a time-windowed query
-/// into a silent empty answer. That holds whether the query needed the
-/// input described (the emitter refuses) or not (the binder's unknown
-/// field).
 #[test]
 fn envelope_timestamp_absent_is_loud() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -771,12 +699,9 @@ fn envelope_timestamp_absent_is_loud() {
     };
 
     for (dsl, column) in [
-        // Described first: the emitter refuses the read.
         (r#"earliest="2024-01-15T10:00:00Z" host=web1"#, "_time"),
         ("login | table _time, message", "_time"),
         ("host=web1 | stats max(_ingested) by host", "_ingested"),
-        // Envelope reads alone, which skip the probe: the binder's
-        // unknown field.
         ("last=1h", "_time"),
         ("* | sort _time", "_time"),
         ("* | where isnotnull(_ingested)", "_ingested"),
@@ -804,13 +729,6 @@ fn envelope_timestamp_absent_is_loud() {
     }
 }
 
-/// A missing column that survives to `DuckDB`'s binder is a resolver
-/// defect, and every lane answers it with the same sanitized 400: never an
-/// empty result, never a second bind against less data.
-///
-/// The defect is planted: the probe's description of the cold reader is
-/// made to claim a `phantom` column no file carries, so the emitter binds
-/// it as a column and `DuckDB` cannot.
 #[test]
 fn resolver_defect_is_loud_on_every_lane() {
     let fixture = Fixture::build();
@@ -855,26 +773,13 @@ fn resolver_defect_is_loud_on_every_lane() {
     }
 }
 
-// -- the probe and the execute see one file set -------------------------------
-//
-// The probe describes the source once, then the lane prepares and executes a
-// statement shaped by that description. A file published after the probe
-// read the source and before the statement did would be read under a stale
-// description: a column the description lacks would read as NULL from a
-// file that carries it. The engine does not close that window itself, and
-// it has no hook inside it. Its caller holds the files still across the
-// whole lane call: the server's publication read guard (ADR-0062), whose
-// write side compaction's publish takes before it renames. The test below
-// stands that guard in with a lock of its own. The server's own guard is
-// pinned by the pool twin of the same name in trawl-server.
+// The test below stands the server's publication read guard (ADR-0062) in
+// with a lock of its own. The server's own guard is pinned by the pool twin
+// of the same name in trawl-server.
 
-/// The host of the events the late file carries, and their `f`.
 const LATE_HOST: &str = "web9";
 const LATE_F: &str = "late";
 
-/// Stage a parquet file into the fixture's second cold hour whose events
-/// carry `f`, under a name the cold glob does not match, and return it with
-/// the name that publishes it.
 fn stage_late_file(fixture: &Fixture) -> (PathBuf, PathBuf) {
     let hour = fixture.dir.path().join("cold").join("11");
     let staged = hour.join("late.parquet.tmp");
@@ -894,8 +799,6 @@ fn stage_late_file(fixture: &Fixture) -> (PathBuf, PathBuf) {
     (staged, published)
 }
 
-/// `(host, f)` for every row `* | table host, f` answers on `lane`, read
-/// back from the written file on an export lane.
 fn host_and_f(
     exec: &Executor,
     fixture: &Fixture,
@@ -973,7 +876,6 @@ fn host_and_f(
         .collect())
 }
 
-/// The late file's rows in an answer, by their `f`.
 fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
     rows.iter()
         .filter(|(host, _)| host == LATE_HOST)
@@ -981,28 +883,13 @@ fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
         .collect()
 }
 
-/// A file published during a request is read with its real `f` or
-/// excluded, never answered as NULL from a description taken before it
-/// arrived.
-///
-/// Two legs, each parking the request's probe in `DuckDB` and publishing
-/// (write, then rename) a cold file whose events carry `f` while it is
-/// parked:
-/// - guarded: the request holds a read guard across the lane call and the
-///   publisher renames under the write side, as compaction does under the
-///   server's publication gate. The publish waits for the request, the
-///   request answers without the file, and the next request reads the
-///   file's real `f`;
-/// - unguarded: the rename lands during the park. The park sits after the
-///   probe's prepare and before its execute, and the `DESCRIBE` expands the
-///   source's globs when it executes, so the probe describes the published
-///   file and the statement reads its real `f`.
-///
-/// What the engine cannot show is a publish between the probe's execute
-/// and the statement's: nothing parks there. That window is the caller's
-/// guard to close, which the pool twin pins.
+/// `park_probe` holds the probe after its prepare and before its execute, and
+/// the `DESCRIBE` expands the source's globs when it executes, so an
+/// unguarded publish during the park is described and read with its real `f`.
+/// A publish between the probe's execute and the statement's cannot be shown:
+/// nothing parks there.
 #[test]
-#[allow(clippy::too_many_lines)] // two legs on every lane over cold files
+#[allow(clippy::too_many_lines)]
 fn probe_respects_the_publication_guard() {
     const PARK: Duration = Duration::from_millis(30);
     const WAIT: Duration = Duration::from_secs(30);
@@ -1087,8 +974,6 @@ fn probe_respects_the_publication_guard() {
     }
 }
 
-/// Park the next probe over `fixture` until the returned sender releases
-/// it. The receiver hears the park; the guard removes the hook.
 fn park_probe(
     fixture: &Fixture,
     wait: Duration,

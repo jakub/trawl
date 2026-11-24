@@ -3,35 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Which columns the relation a stage reads carries (ADR-0062).
-//!
-//! A field the current stage's input does not carry reads as NULL. The
-//! input is the selected sources at the root, and whatever the stages
-//! before this one left: `table`, `stats` and their kind replace the
-//! column set, `drop` and a `rename` source remove names, `let`, `rename`
-//! targets, regex `extract` and `eventstats` add them. [`Relation`] walks
-//! that beside [`crate::pin_scope::PinScope`], one stage at a time, and
-//! [`Relation::bind`] answers how a read of one name resolves at the
-//! current point of emission.
-//!
-//! A column that is itself a direct NULL standing for an absent field
-//! carries that lineage ([`Column::Null`]): `table f`, `let y = f`, a
-//! rename of an absent source, an absent group key. A later read of it
-//! resolves to the NULL literal again, never to the column's name, because
-//! `DuckDB` types a projected untyped NULL as INTEGER, and an INTEGER
-//! column throws against a text parameter and refuses `sum` over text.
-//! The column records the type its NULL was written with, the pin of the
-//! field it stands for or the type of the alias it copies, or no type at
-//! all, and the later read writes exactly that again, whatever pin its
-//! own name has ([`NullType`]).
-//!
-//! A column whose every value is a NULL with no type of its own carries
-//! that too ([`Column::Untyped`]): a `let` of `coalesce(f, g)` with both
-//! absent, a `max(f)` of an absent `f`. A later read of it binds by name,
-//! and [`Relation::nullness`] tells the emitter where such a read needs a
-//! type `DuckDB` cannot infer.
-//!
-//! Every name is folded through [`catalog_key`], `DuckDB`'s ASCII
-//! identifier fold.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -41,7 +12,6 @@ use crate::schema::{CanonicalType, catalog_key};
 
 use super::InputColumns;
 
-/// One column the relation carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Column {
     /// Real values: a source carried the field, or a stage computed it.
@@ -63,17 +33,13 @@ pub(crate) enum Column {
         spelling: String,
         ty: Option<CanonicalType>,
     },
-    /// `_time` or `_ingested`, which the described sources lack. Every
-    /// Trawl event carries both, so such a source is foreign or broken,
-    /// and a read that reaches it is refused rather than answered as NULL
-    /// (ADR-0062). Only the root holds it: a stage that replaces the
-    /// column set (a `timechart` writes its own `_time`) leaves the source
-    /// behind.
+    /// `_time` or `_ingested`, which the described sources lack. Only the root
+    /// holds it: a stage that replaces the column set (a `timechart` writes its
+    /// own `_time`) leaves the source behind.
     Missing,
 }
 
 impl Column {
-    /// How a read binds this column, when it is what the read reaches.
     fn binding(&self) -> Binding {
         match self {
             Self::Carried | Self::Untyped => Binding::Name,
@@ -84,7 +50,6 @@ impl Column {
     }
 }
 
-/// How one read of a name resolves.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Binding {
     /// Read the column by name: the relation carries it, or nobody
@@ -108,7 +73,6 @@ pub(crate) enum Binding {
     Ambiguous,
 }
 
-/// The type of the NULL literal a [`Binding::Null`] read writes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NullType {
     /// A read of a name that no column and no alias of the `let` holds:
@@ -160,7 +124,6 @@ pub(crate) enum Nullness {
     Typed,
 }
 
-/// The columns at one point of a pipeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Relation {
     /// Nobody described the input ([`InputColumns::unprobed`]), or it has
@@ -221,7 +184,6 @@ pub(crate) struct Lateral {
     padded: BTreeSet<String>,
 }
 
-/// One emitted assignment of a `let`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Assigned {
     key: String,
@@ -234,14 +196,12 @@ struct Assigned {
 }
 
 impl Lateral {
-    /// Outside a `let`: no alias and no target.
     pub(crate) const NONE: Self = Self {
         assigned: Vec::new(),
         targets: BTreeSet::new(),
         padded: BTreeSet::new(),
     };
 
-    /// A `let` about to emit its assignments to `targets`.
     pub(crate) fn new<'a>(targets: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
             targets: targets.into_iter().map(catalog_key).collect(),
@@ -259,7 +219,6 @@ impl Lateral {
         }
     }
 
-    /// One assignment was emitted: a later one can read it.
     pub(crate) fn push(&mut self, target: &str, column: Column, nullness: Nullness) {
         self.assigned.push(Assigned {
             key: catalog_key(target),
@@ -273,7 +232,6 @@ impl Lateral {
         self.assigned.iter().rev().find(|a| a.key == key)
     }
 
-    /// The columns the assignments wrote, in order.
     fn into_assigned(self) -> impl Iterator<Item = Column> {
         self.assigned.into_iter().map(|a| a.column)
     }
@@ -619,8 +577,6 @@ impl Relation {
         }
     }
 
-    /// A relation of exactly `columns`, as a stage that replaces the
-    /// column set writes it.
     fn replaced(columns: impl IntoIterator<Item = (String, Column)>) -> Self {
         Self::Known(
             columns
@@ -630,9 +586,6 @@ impl Relation {
         )
     }
 
-    /// Advance over one processed stage: before the call the relation is
-    /// the stage's input, after it the stage's output.
-    ///
     /// Exhaustive over [`PipeStage`] like
     /// [`crate::pin_scope::PinScope::advance`], and called beside it: a
     /// new stage has to say what it does to the column set.
@@ -695,9 +648,6 @@ impl Relation {
             }
             PipeStage::Extract(e) => match &e.mode {
                 crate::ast::ExtractMode::Regex(pattern) => {
-                    // The names come from the regex syntax tree, which
-                    // builds nothing (ADR-0063). The emitter refuses an
-                    // invalid regex before this.
                     if let Ok(captures) = crate::pattern::price::captures(pattern) {
                         for capture in captures {
                             self.insert(&capture.name, Column::Carried);
@@ -760,7 +710,6 @@ impl Relation {
         }
     }
 
-    /// `top`/`rare`'s output: the field, the `by` keys and `count`.
     fn frequency(&self, field: &str, by: &[String], pins: &PinScope) -> Self {
         let keys = std::iter::once(field)
             .chain(by.iter().map(String::as_str))
@@ -784,7 +733,6 @@ mod tests {
         )
     }
 
-    /// A `let` that has assigned `entries`, in order, and nothing else.
     fn aliases(entries: &[(&str, Column)]) -> Lateral {
         let mut lateral = Lateral::NONE;
         for (target, column) in entries {
@@ -820,8 +768,6 @@ mod tests {
         relation
     }
 
-    /// An undescribed root binds every name, and a stage that only filters
-    /// or adds columns keeps it that way.
     #[test]
     fn an_open_relation_binds_every_name_until_a_stage_sets_the_columns() {
         let relation = walk(
@@ -833,9 +779,6 @@ mod tests {
         assert!(relation.nulls().is_empty());
     }
 
-    /// An undescribed root is unknown, but what a stage sets or removes is
-    /// not: the walk from it gives what the walk from a described root
-    /// gives for every name a stage decided (ADR-0062).
     #[test]
     fn an_open_relation_advances_through_stages_that_set_or_remove_columns() {
         let table = walk("* | table _time", Relation::Open);
@@ -924,10 +867,6 @@ mod tests {
         );
     }
 
-    /// No cold file and no hot snapshot is no source at all, not a source
-    /// that lacks `_time`. Its statement's read of the empty reader is
-    /// what answers, empty or cold data unread, so every name binds as
-    /// written and nothing is refused.
     #[test]
     fn an_input_with_no_source_binds_every_name_as_written() {
         let nothing = InputColumns {
@@ -1023,8 +962,6 @@ mod tests {
         assert_eq!(top.nulls(), ["f"]);
     }
 
-    /// A name `table` repeats is one column, under the spelling its first
-    /// position wrote, as the emitted projection keeps it.
     #[test]
     fn a_repeated_table_name_keeps_its_first_spelling() {
         let relation = walk("* | table f, host, F, HOST", known(&["host"]));
@@ -1091,10 +1028,6 @@ mod tests {
         assert_eq!(chained.bind("d", &Lateral::NONE), Binding::Name);
     }
 
-    /// A lateral alias that is a NULL of a known type passes that type to
-    /// a later read of it in the same `let`, never the pin the scope gives
-    /// the alias's name, and every copy records it into the next stage,
-    /// over a known input and after a pivot whose name a stage removed.
     #[test]
     fn a_typed_null_alias_passes_its_type_on() {
         let double = Binding::Null(NullType::Typed(CanonicalType::Double));
@@ -1145,12 +1078,6 @@ mod tests {
         assert_eq!(unpinned.nulls(), ["a", "b"]);
     }
 
-    /// A NULL read is fresh, typed or untyped, and only a fresh read looks
-    /// up a pin, its own name's. With `a` and `b` pinned DOUBLE and `f`
-    /// unpinned, a fresh read of `a` is a DOUBLE NULL, but `let a = f`
-    /// writes an untyped NULL, and every copy of it stays untyped, in the
-    /// same `let` and in a later stage, where the scope pins `b` as `a`
-    /// is pinned.
     #[test]
     fn a_null_read_is_fresh_typed_or_untyped() {
         let mut catalog = crate::schema::FieldTypes::new();
@@ -1319,7 +1246,6 @@ mod tests {
         assert_eq!(absent_key.nulls(), ["g"]);
     }
 
-    /// The expression of `* | let y = <text>`.
     fn expr(text: &str) -> Expr {
         let query = parser::parse(&format!("* | let y = {text}")).expect("parses");
         match &query.pipeline[0].node {
@@ -1328,10 +1254,6 @@ mod tests {
         }
     }
 
-    /// A NULL with no type of its own by construction: an unpinned absent
-    /// read, the `null` literal, and the calls that return an argument as
-    /// their value when every such argument is one, at any depth.
-    /// Anything that can carry data, or that `DuckDB` types itself, is not.
     #[test]
     fn untyped_null_follows_the_passthrough_calls() {
         let relation = known(&["host", "n"]);
@@ -1381,9 +1303,6 @@ mod tests {
         assert!(untyped("coalesce(g, null)", &pinned));
     }
 
-    /// A column whose every value is an untyped NULL keeps that through
-    /// the stages that write it or carry it, and a later read of it binds
-    /// by name.
     #[test]
     fn untyped_columns_flow_through_the_stages() {
         let root = known(&["host", "service"]);
@@ -1421,12 +1340,6 @@ mod tests {
         assert!(!untyped(&counted, "web1"));
     }
 
-    /// After a pivot, a read of a `let` alias that is NULL by construction
-    /// binds the pivot's column of that name first, when the data made
-    /// one. That column is NULL by construction too after `max(f)` of an
-    /// absent `f`, so the read is untyped, and a copy of the alias is an
-    /// untyped column of the next stage. After `count()` the read is the
-    /// data's column or the NULL.
     #[test]
     fn a_lateral_alias_after_a_pivot_is_as_untyped_as_the_pivot() {
         let root = known(&["host", "service"]);

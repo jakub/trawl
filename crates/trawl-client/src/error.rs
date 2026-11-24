@@ -2,34 +2,26 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Client error types.
-
 use std::fmt;
 
 use trawl_api::{ErrorCode, ErrorDetail, ErrorEnvelope};
 
-/// Errors from the trawl client library.
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
-    /// HTTP transport failure.
     #[error(
         "network error: {0}{suffix}",
         suffix = RequestSuffix(.0.request_id.as_deref())
     )]
     Network(NetworkError),
 
-    /// Server returned a non-success status with structured error info.
     #[error(
         "server error (HTTP {status}): {}{}",
         error.message,
         RequestSuffix(request_id.as_deref())
     )]
     Server {
-        /// HTTP status code.
         status: u16,
-        /// Structured error envelope from the server.
         error: ErrorEnvelope,
-        /// The response's `X-Request-Id`, when it carried one.
         request_id: Option<String>,
         /// The response's `Retry-After` in seconds, when it carried the
         /// numeric form. The HTTP-date form, a value past `u32::MAX`, or
@@ -38,18 +30,13 @@ pub enum ClientError {
         retry_after_secs: Option<u32>,
     },
 
-    /// Failed to parse the server's response.
     #[error(
         "response parse error: {message}{}",
         RequestSuffix(request_id.as_deref())
     )]
     Parse {
-        /// What did not parse. Never quotes the body.
+        /// Never quotes the body.
         message: String,
-        /// The response's `X-Request-Id`, when the failure came from a
-        /// response that carried one. `None` for a failure with no
-        /// response behind it, such as a stream frame or a request body
-        /// that did not serialize.
         request_id: Option<String>,
     },
 
@@ -65,9 +52,7 @@ pub enum ClientError {
         RequestSuffix(request_id.as_deref())
     )]
     TooLarge {
-        /// The most bytes the endpoint's body may hold.
         cap: usize,
-        /// The response's `X-Request-Id`, when it carried one.
         request_id: Option<String>,
     },
 
@@ -77,10 +62,6 @@ pub enum ClientError {
     InvalidUrl(String),
 }
 
-/// What kind of transport failure a [`NetworkError`] is.
-///
-/// A typed classification, so a caller can tell an untrusted certificate
-/// from a closed port without reading the message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkKind {
     /// The TLS handshake failed because the server's certificate did not
@@ -103,28 +84,19 @@ pub enum NetworkKind {
     /// The server reset or closed the connection while a request that
     /// carries a body was in flight, and no response was read.
     UploadCutOff,
-    /// Any other transport failure.
     Other,
 }
 
-/// A transport failure: its kind and a sanitized message.
-///
 /// The message names the API origin at most, never URL userinfo, paths,
 /// query parameters, a certificate, or the TLS library's reason.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkError {
-    /// What kind of failure this is.
     pub kind: NetworkKind,
-    /// The sanitized, human-readable message.
     pub message: String,
-    /// The `X-Request-Id` of the response whose body failed, when the
-    /// failure struck after the headers arrived and they carried one.
-    /// `None` for a failure with no response behind it.
     pub request_id: Option<String>,
 }
 
 impl NetworkError {
-    /// A failure of `kind` described by `message`.
     pub fn new(kind: NetworkKind, message: impl Into<String>) -> Self {
         Self {
             kind,
@@ -133,8 +105,6 @@ impl NetworkError {
         }
     }
 
-    /// This failure, naming `id` as the request id of the response whose
-    /// body it struck.
     #[must_use]
     pub(crate) fn answered_by(mut self, id: Option<String>) -> Self {
         self.request_id = id;
@@ -148,8 +118,6 @@ impl fmt::Display for NetworkError {
     }
 }
 
-/// Renders ` (request <id>)` after an error's message when the response it
-/// came from named a request id, so a CLI user can quote it.
 struct RequestSuffix<'a>(Option<&'a str>);
 
 impl fmt::Display for RequestSuffix<'_> {
@@ -162,7 +130,6 @@ impl fmt::Display for RequestSuffix<'_> {
 }
 
 impl ClientError {
-    /// A parse failure with no response behind it.
     pub(crate) fn parse(message: impl Into<String>) -> Self {
         Self::Parse {
             message: message.into(),
@@ -170,18 +137,9 @@ impl ClientError {
         }
     }
 
-    /// The server's `X-Request-Id` for the response this error came from.
-    ///
-    /// The id is the server's correlation token for its own logs
-    /// (ADR-0040): quoting it lets an operator find the request's failure
-    /// event. The client never generates one, and reads one only as 1 to
-    /// [`crate::MAX_REQUEST_ID_BYTES`] visible ASCII bytes: a longer or
-    /// other header is absent. Present for every error that
-    /// saw response headers carrying it ([`Self::Server`], a response body
-    /// that did not parse, [`Self::TooLarge`], and a [`Self::Network`] that
-    /// struck the body after the headers arrived); `None` for any other
-    /// [`Self::Network`], [`Self::InvalidCa`] and [`Self::InvalidUrl`],
-    /// which have no response.
+    /// The server's `X-Request-Id` for the response this error came from
+    /// (ADR-0040). Read only as 1 to [`crate::MAX_REQUEST_ID_BYTES`] visible
+    /// ASCII bytes: a longer or other header is absent.
     pub fn request_id(&self) -> Option<&str> {
         match self {
             Self::Server { request_id, .. }
@@ -192,9 +150,6 @@ impl ClientError {
         }
     }
 
-    /// This error, naming `id` as its response's request id when it is a
-    /// response error that names none yet. For decode steps that only see
-    /// a body, so the caller holding the response attaches its id.
     pub(crate) fn answered_by(mut self, id: Option<&str>) -> Self {
         if let Self::Server { request_id, .. }
         | Self::Parse { request_id, .. }
@@ -206,7 +161,6 @@ impl ClientError {
         self
     }
 
-    /// The kind of transport failure, if this is a network error.
     pub fn network_kind(&self) -> Option<NetworkKind> {
         match self {
             Self::Network(error) => Some(error.kind),
@@ -214,7 +168,6 @@ impl ClientError {
         }
     }
 
-    /// Get the structured error envelope (if this is a server error).
     pub fn error_envelope(&self) -> Option<&ErrorEnvelope> {
         match self {
             Self::Server { error, .. } => Some(error),
@@ -222,7 +175,6 @@ impl ClientError {
         }
     }
 
-    /// Get the error details (spans, diagnostics). Empty for non-server errors.
     pub fn error_details(&self) -> &[ErrorDetail] {
         match self {
             Self::Server { error, .. } => &error.details,
@@ -230,7 +182,6 @@ impl ClientError {
         }
     }
 
-    /// Get the machine-readable error code (if this is a server error).
     pub fn error_code(&self) -> Option<&ErrorCode> {
         match self {
             Self::Server { error, .. } => Some(&error.code),
@@ -245,11 +196,8 @@ mod tests {
 
     const ID: &str = "01JBQ7ZK3M8X2V5N9R4T6W0YCD";
 
-    /// Builds one variant, with or without a request id.
     type Build = fn(Option<&str>) -> ClientError;
 
-    /// Every variant that carries a request id renders it once, as the
-    /// ` (request <id>)` suffix, and renders none without one.
     #[test]
     fn display_ends_with_the_request_id_when_there_is_one() {
         let server = |request_id: Option<&str>| ClientError::Server {
@@ -287,7 +235,6 @@ mod tests {
         }
     }
 
-    /// The variants with no response behind them render no suffix.
     #[test]
     fn display_of_a_response_less_error_has_no_suffix() {
         assert_eq!(

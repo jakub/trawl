@@ -70,7 +70,7 @@ for (const file of tracked.filter(f => f.startsWith('crates/') || f.startsWith('
 }
 assert.equal(sourceHash.digest('hex'), build.sourceHash, 'source changed since experiment preparation');
 // Reject wrong build/process/SPA associations before creating evidence or
-// reading a credential. These checks also verify unauthenticated asset bytes.
+// reading a credential.
 await verifyRunIdentity(run, instance, buildRecord);
 const output = path.join(run, 'issue188-evidence');
 await fs.mkdir(output, { mode: 0o700 }); // Refuse accidental overwrite/reseed.
@@ -120,7 +120,6 @@ try {
   const { chromium } = require('@playwright/test');
   browser = await chromium.launch({ headless: true });
   context = await browser.newContext({ viewport: { width: 1440, height: 900 }, timezoneId: 'UTC', locale: 'en-US', reducedMotion: 'reduce', serviceWorkers: 'block' });
-  // Block all traffic outside this owned browser origin, including redirects.
   await context.route('**/*', route => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
   const page = await context.newPage();
   page.setDefaultTimeout(15000);
@@ -235,8 +234,6 @@ try {
     assert.equal(receipt.result.rows.length, net.count);
     const seq = receipt.result.columns.findIndex(c => c.name === 'experiment_seq');
     assert.ok(seq >= 0);
-    // A run result is the typed result wire: an integer cell is a decimal
-    // string under its `integer` column, read the way verifyRows reads one.
     const seqColumn = receipt.result.columns[seq];
     assert.deepEqual(receipt.result.rows.map(row => integerCell(seqColumn, row[seq])), corpus.slice(0, net.count).map(e => BigInt(e.experiment_seq)));
     report.receipts.push(safeReceipt({ ...receipt, net_id: net.id, net_name: net.name }));

@@ -2,15 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Search and Send keep the same rows for an OR search.
-//!
-//! Search runs [`effective_query`]: the chips and the absolute range merged
-//! into the text. Send runs [`capture_parts`]: the range-free text, with the
-//! window spliced back by trawld as a global `earliest=`/`latest=` prefix.
-//! Both texts are parsed and emitted by trawl-core and executed by `DuckDB`
-//! over the same events, and must keep the same events: the chips and the
-//! range narrow every OR group, not only the first.
-
 use chrono::{DateTime, Utc};
 use duckdb::Connection;
 
@@ -23,8 +14,6 @@ use trawl_search_url::query_merge::{
 const FROM: &str = "2026-09-15T12:00:00Z";
 const TO: &str = "2026-09-15T12:30:00Z";
 
-/// One web event inside the range, one db event a day before it, and one
-/// db event inside it on another host.
 const EVENTS: &str = "SELECT * FROM (VALUES \
     (1, TIMESTAMP '2026-09-15 12:10:00', 'web', 'a'), \
     (2, TIMESTAMP '2026-09-14 12:10:00', 'db', 'a'), \

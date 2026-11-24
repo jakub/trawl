@@ -65,8 +65,6 @@ def pinned_runtime(source, target):
 def prepare(source, target, output, cache=None, deps=None):
     started = time.time()
     manifest, archive, checksum = pinned_runtime(source, target)
-    # Cargo profiles share a content-addressed archive cache. Release callers
-    # keep the ZIP alongside their prepared runtime as before.
     archive_dir = cache / checksum if cache is not None else output
     archive_dir.mkdir(parents=True, exist_ok=True)
     downloaded = archive_dir / archive

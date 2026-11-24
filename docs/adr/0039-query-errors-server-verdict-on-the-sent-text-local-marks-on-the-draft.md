@@ -1,6 +1,6 @@
 # A query error shows the server's verdict on the text it received; the local parser marks the draft
 
-status: accepted (2026-09-22) — prep ruling record for #233; amended (2026-11-08), see the Amendment; amended twice (2026-11-09): every terminal sink shows sender text through the sanitize rule, and terminal text is measured by grapheme
+status: accepted (2026-09-22) — prep ruling record for #233; amended (2026-11-08), see the Amendment; amended twice (2026-11-09): every terminal sink shows sender text through the sanitize rule, and terminal text is measured by grapheme; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The Search page sends the server the effective query, which is the
 executed query with the structured state merged in: filter clauses and
@@ -126,3 +126,12 @@ Considered, not adopted:
 
 - **Keep the whole-string measure and fix only the sites that count bytes.** The overrun above stays.
 - **The larger of the two cheap measures as an upper bound.** It is not one.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Search shows a query error notice only for a failure from the latest request.** The resource keeps an older failure in state after a newer request starts. `query_notice` in `pages/search.rs` hides the notice while a request is loading, then compares the failure's intent and generation with the latest request's, not whether a failure exists. An older failure describes text that did not run last, even when a Haul sends the same text again.
+- **The query error notice renders every string as a text node, and its caret line is hidden from assistive technology.** The strings are server messages and quotes of the sent text, so none of them is ever parsed as markup. The caret line in `components/query_error_notice.rs` carries `aria-hidden`, because the message beside it already says what the carets point at.
+- **A field name taken from a query needs no sanitizing, but a rendered expression does.** The backtick-quoted name parser in `parser/primitives.rs` refuses a name that holds an `is_unsafe_display_char`, so a message that echoes a query field name is safe as it stands. A string literal admits those characters, so `projection::render_agg` sanitizes the aggregate it prints, because that message is a 400 body that reaches a terminal, the TUI, and a browser.
+- **A parse reports at most `MAX_REPORTED_ERRORS` (8) diagnostics: the first seven and the last, with a note on the last of how many were left out.** One query can carry any number of independent violations, so the cap bounds the 400 body. The grammar appends the failure that ended the parse last, so a plain cut would drop the one error the query cannot succeed without fixing, such as an unknown command after a long list of bad values. `report_errors` applies the cap before it renders the grammar's diagnostics and their hints. `regex_compile_errors` renders every regex diagnostic first and then keeps the first seven and the last in the same way.

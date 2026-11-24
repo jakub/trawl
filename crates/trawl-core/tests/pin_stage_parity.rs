@@ -7,11 +7,6 @@
 //! pipeline lanes (the `| where` SQL the emitter renders, executed
 //! against `DuckDB`, and the pin-aware streaming evaluator) by at least
 //! one matrix cell, and the two lanes must agree on every cell.
-//!
-//! The matrix accumulates which variant each cell resolved to and asserts
-//! full coverage at the end, so a new `CompareForm`/`PatternForm` variant
-//! fails this test until the matrix names a cell that reaches it in both
-//! lanes.
 
 use std::collections::BTreeSet;
 use std::io::Write as _;
@@ -29,8 +24,6 @@ use trawl_core::pin_scope::PinScope;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_core::stream::{StageResult, StreamPlan, compile_stream_plan};
 
-/// [`trawl_core::stream::apply_stage`] over a compiled plan, which
-/// prepares every pattern its stages read.
 fn apply_stage(
     stage: &mut trawl_core::stream::CompiledStage,
     event: &mut trawl_core::row::Row,
@@ -40,8 +33,6 @@ fn apply_stage(
         .expect("a compiled plan prepares every pattern")
 }
 
-/// [`trawl_core::eval::eval_expr_with_pins`] over the patterns a compiled
-/// `where` prepares for `condition`.
 fn eval_expr_with_pins(
     condition: &trawl_core::ast::Spanned<trawl_core::ast::Expr>,
     event: &trawl_core::row::Row,
@@ -95,7 +86,6 @@ fn pattern_name(form: PatternForm) -> &'static str {
     }
 }
 
-/// Run one `| where` cell through both lanes and assert agreement.
 /// Returns the agreed boolean answer (`None` = UNKNOWN / filtered).
 fn run_cell(
     conn: &Connection,
@@ -162,10 +152,9 @@ fn run_cell(
     eval_result
 }
 
-/// Run a whole pipeline through both lanes and assert the event either
-/// survives in both or in neither. Unlike [`run_cell`], which evaluates
-/// the `where` condition alone at root scope, this applies every earlier
-/// stage, so a stage that renames the row's keys is exercised.
+/// Unlike [`run_cell`], which evaluates the `where` condition alone at root
+/// scope, this applies every earlier stage, so a stage that renames the
+/// row's keys is exercised.
 fn run_pipeline_cell(
     conn: &Connection,
     dsl: &str,
@@ -231,8 +220,6 @@ fn run_pipeline_cell(
     batch_result
 }
 
-/// Run one `| let` pipeline through both lanes and assert the named
-/// output columns carry the same value.
 fn run_let_cell(
     conn: &Connection,
     dsl: &str,
@@ -242,7 +229,6 @@ fn run_let_cell(
 ) {
     let query = parser::parse(dsl).expect("dsl parses");
 
-    // live lane: compile the plan under the catalog root and apply it.
     let plan =
         compile_stream_plan(&query.pipeline, &PinScope::root(ft), None).expect("plan compiles");
     let StreamPlan::PassThrough(mut stages) = plan else {
@@ -261,7 +247,6 @@ fn run_let_cell(
         );
     }
 
-    // batch lane: emit the SQL and read the single row back as JSON.
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
         .tempfile()
@@ -303,8 +288,6 @@ fn event_with(field: &str, value: Value) -> Map<String, Value> {
     m
 }
 
-/// Every `CompareForm` variant reaches both lanes through some `| where`
-/// comparison cell, and every cell agrees.
 #[test]
 fn compare_form_coverage_in_both_pipeline_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -320,8 +303,6 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
         LiteralValue,
         Value,
     )] = &[
-        // VARCHAR: TextOrNumeric (eq + numeric), Text (eq + word),
-        // NumericOnText (ordered + numeric), Native (ordered + word).
         (
             CanonicalType::Varchar,
             "* | where f == 200",
@@ -350,7 +331,6 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
             LiteralValue::String("alpha".into()),
             Value::from("beta"),
         ),
-        // Typed pins: Conformed, one per pin.
         (
             CanonicalType::BigInt,
             "* | where f > 400",
@@ -372,8 +352,6 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
             LiteralValue::Bool(true),
             Value::from(true),
         ),
-        // SEVERITY (ADR-0013): the band form for an equality-class token,
-        // the exact form for an ordered one.
         (
             CanonicalType::Severity,
             "* | where f == \"error\"",
@@ -417,8 +395,6 @@ fn compare_form_coverage_in_both_pipeline_lanes() {
     );
 }
 
-/// Every `PatternForm` variant reaches both lanes through some pattern
-/// operator (`matches`/LIKE/ILIKE) cell, and every cell agrees.
 #[test]
 fn pattern_form_coverage_in_both_pipeline_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -463,7 +439,6 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
         assert_eq!(got, Some(true), "{dsl} must match its canonical text");
     }
 
-    // TIMESTAMP: over a real TIMESTAMP column, wire value with an offset.
     {
         seen.insert(pattern_name(compare::pattern_form(Some(
             CanonicalType::Timestamp,
@@ -530,21 +505,12 @@ fn pattern_form_coverage_in_both_pipeline_lanes() {
     );
 }
 
-/// A pipeline float literal above 2^53 binds the digits the user wrote, in
-/// both lanes, and answers the same whether or not it was quoted.
-///
-/// `f64` cannot name `9007199254740993`: it parses as the adjacent
-/// `…992`. Binding the re-rendered double would make the unquoted literal
-/// match the neighbouring identifier while the quoted spelling — carried
-/// verbatim as a string — matched the right one, contradicting the
-/// quote-insensitivity the bound door promises (ADR-0011 ruling #6).
 #[test]
 fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let mut ft = FieldTypes::new();
     ft.insert("f", CanonicalType::Varchar);
 
-    // The premise: the two literals below are one f64.
     assert_eq!(
         "9007199254740993.0".parse::<f64>().unwrap().to_bits(),
         "9007199254740992.0".parse::<f64>().unwrap().to_bits(),
@@ -552,11 +518,9 @@ fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
     );
 
     let stored = event_with("f", Value::from("9007199254740993"));
-    // (dsl, expected answer) — quoted and unquoted spellings of each.
     let cells: &[(&str, bool)] = &[
         ("* | where f == 9007199254740993.0", true),
         ("* | where f == \"9007199254740993.0\"", true),
-        // The adjacent identifier is a different number, not a rounding.
         ("* | where f == 9007199254740992.0", false),
         ("* | where f == \"9007199254740992.0\"", false),
         ("* | where f > 9007199254740992.0", true),
@@ -573,15 +537,6 @@ fn float_literal_above_2_53_binds_its_source_token_in_both_lanes() {
     }
 }
 
-/// A negative numeric literal binds pin-aware in both lanes, and answers
-/// the same whether or not it was quoted.
-///
-/// The parser hands `-400` over as `Unary{Neg, Literal(Int)}`, never as a
-/// signed literal, so a door that only took `Expr::Literal` would leave
-/// the whole negative class on the pin-blind path: against a VARCHAR pin
-/// that is a `DuckDB` binder error (`VARCHAR` vs `BIGINT`) or a
-/// conversion error on the first non-numeric row, while the quoted
-/// spelling of the same number binds pin-aware and answers.
 #[test]
 fn negative_literals_bind_pin_aware_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -589,20 +544,17 @@ fn negative_literals_bind_pin_aware_in_both_lanes() {
     ft.insert("f", CanonicalType::Varchar);
 
     let stored = event_with("f", Value::from("-200"));
-    // (dsl, expected answer) — quoted and unquoted spellings of each.
     let cells: &[(&str, bool)] = &[
         ("* | where f > -400", true),
         ("* | where f > \"-400\"", true),
         ("* | where f < -400", false),
         ("* | where f < \"-400\"", false),
-        // A VARCHAR pin's `=` reads the number, not the spelling.
         ("* | where f == -200", true),
         ("* | where f == \"-200.0\"", true),
         ("* | where f == -200.0", true),
         ("* | where f != -200", false),
         ("* | where f in (-400, -200)", true),
         ("* | where f in (-400, 200)", false),
-        // Ordered against a negative float literal, both spellings.
         ("* | where f > -200.5", true),
         ("* | where f > \"-200.5\"", true),
         ("* | where f < -199.5", true),
@@ -615,9 +567,6 @@ fn negative_literals_bind_pin_aware_in_both_lanes() {
         );
     }
 
-    // A row the pin-blind path could not even read: the ordered form is
-    // UNKNOWN (no numeric reading) rather than a conversion error, and
-    // equality still answers through the text half.
     let unreadable = event_with("f", Value::from("accepted"));
     assert_eq!(
         run_cell(&conn, "* | where f > -400", &unreadable, &ft),
@@ -629,16 +578,6 @@ fn negative_literals_bind_pin_aware_in_both_lanes() {
     );
 }
 
-/// `| let` resolves a sibling reference column-then-alias in both lanes:
-/// an input column wins (so an overwrite never feeds the assignment
-/// beside it), and only a name resolving to no column binds the lateral
-/// column alias the sibling just defined.
-///
-/// The batch lane has no choice, since the stage desugars to one
-/// projection (`COLUMNS(c -> c NOT IN (targets)), (expr) AS tgt, …`) and
-/// `DuckDB` binds the names in it, so the live lane is the one that must
-/// not drift. `PinScope::advance` stays strictly parallel on top of this:
-/// an alias-bound sibling is unpinned in both lanes.
 #[test]
 fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -647,13 +586,8 @@ fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
 
     let event = event_with("a", Value::from(5));
 
-    // The row carries `a`: the input column wins over the alias, so the
-    // sibling reads the original `a`.
     run_let_cell(&conn, "* | let a = 1, b = a", &event, &ft, &["a", "b"]);
-    // An overwrite does not feed the assignment beside it either.
     run_let_cell(&conn, "* | let a = a + 1, b = a", &event, &ft, &["a", "b"]);
-    // The row carries no `ms`: the alias binds, in both lanes. This is
-    // the ordinary shape — `let` targets are usually new names.
     run_let_cell(
         &conn,
         "* | let ms = 1000, total = ms * 2",
@@ -661,7 +595,6 @@ fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
         &ft,
         &["ms", "total"],
     );
-    // Same, chained through a bare alias of a real column.
     run_let_cell(&conn, "* | let x = a, y = x", &event, &ft, &["x", "y"]);
     // "Carries the column" is DuckDB's own case-insensitive binding, not
     // an exact key match: `A` names the row's `a`, so the target shadows
@@ -671,18 +604,8 @@ fn let_sibling_references_bind_column_then_alias_in_both_lanes() {
     // disambiguates the alias to `A_1`, so the lanes project different
     // column names while agreeing on the value this rule is about.
     run_let_cell(&conn, "* | let A = 1, b = A", &event, &ft, &["b"]);
-    // The residual is the row-vs-relation gap, not the alias: a column
-    // the corpus carries but this row leaves absent reads NULL in batch
-    // while the live lane, seeing no key, binds the alias.
 }
 
-/// A pinned comparison reads the row under the spelling the row uses.
-///
-/// Ingest ASCII-folds every key it writes, so `where Status>400` over a
-/// stored `status` needs the fold. The pipeline lanes carry user-chosen
-/// names verbatim (`rename status as St` keys the live event `St` and
-/// names the SQL result column `"St"`), so a mixed-case alias must not be
-/// folded away into a lookup that misses and drops the row.
 #[test]
 fn mixed_case_aliases_resolve_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -691,7 +614,6 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
 
     let event = event_with("status", Value::from("404"));
 
-    // The ingest-written key needs the fold.
     assert!(run_pipeline_cell(
         &conn,
         "* | where Status > 400",
@@ -704,7 +626,6 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
-    // A pipeline alias is verbatim, and the pin rides along with it.
     assert!(run_pipeline_cell(
         &conn,
         "* | rename status as St | where St > 400",
@@ -729,7 +650,6 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
-    // Same through the IN-list and pattern arms.
     assert!(run_pipeline_cell(
         &conn,
         "* | rename status as St | where St in (404)",
@@ -742,8 +662,6 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         &event,
         &ft
     ));
-    // ...and through plain equality against a string literal — the shape a
-    // `rename`/`let` of an envelope pin is most often read back with.
     assert!(run_pipeline_cell(
         &conn,
         "* | rename status as St | where St == \"404\"",
@@ -770,8 +688,6 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
         "* | rename status as St | where st > 400",
         "* | rename status as St | where sT > 400",
         "* | let S2 = status | where s2 > 400",
-        // The source of a rename binds case-insensitively too: `Status`
-        // is the ingest-folded `status` column in both lanes.
         "* | rename Status as st | where st > 400",
     ] {
         assert!(run_pipeline_cell(&conn, dsl, &event, &ft), "{dsl}");
@@ -784,21 +700,12 @@ fn mixed_case_aliases_resolve_in_both_lanes() {
     ));
 }
 
-// ── sev(): the pin-declaring subject (ADR-0013 ruling 9) ─────────────
-
-/// `sev(<field>)` is a comparison subject with a function-declared pin,
-/// so it binds through the SEVERITY rule table in both lanes, over an
-/// empty catalog: the declaration is the function's, and embedded
-/// `--data` over foreign parquet must answer identically.
 #[test]
 fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let unpinned = FieldTypes::new();
 
-    // (dsl, event level value, expected answer)
     let cells: &[(&str, Value, Option<bool>)] = &[
-        // Equality takes the band, the whole reason sev() declares
-        // SEVERITY rather than plain BIGINT: `error2` is an error.
         (
             r#"* | where sev(level) == "error""#,
             Value::String("error2".into()),
@@ -809,7 +716,6 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("warn".into()),
             Some(false),
         ),
-        // An ordered operator takes the token's exact number (17).
         (
             r#"* | where sev(level) >= "error""#,
             Value::String("error2".into()),
@@ -820,13 +726,11 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("warning".into()),
             Some(false),
         ),
-        // Both operand orders: `"error" <= sev(level)` is `>= "error"`.
         (
             r#"* | where "error" <= sev(level)"#,
             Value::String("fatal".into()),
             Some(true),
         ),
-        // An exact OTel short name is exactly that number.
         (
             r#"* | where sev(level) == "error2""#,
             Value::String("error2".into()),
@@ -837,13 +741,11 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("error".into()),
             Some(false),
         ),
-        // Integers bind unclamped.
         (
             "* | where sev(level) > 0",
             Value::String("info".into()),
             Some(true),
         ),
-        // A value with no reading is NULL — UNKNOWN, both operators.
         (
             r#"* | where sev(level) == "error""#,
             Value::String("gold".into()),
@@ -854,13 +756,11 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("gold".into()),
             None,
         ),
-        // …and the pipeline's `!=` stays strict (no null widening).
         (
             r#"* | where sev(level) != "error""#,
             Value::String("warn".into()),
             Some(true),
         ),
-        // IN routes each element through the equality rule (bands).
         (
             r#"* | where sev(level) in ("warn", "fatal")"#,
             Value::String("fatal2".into()),
@@ -871,8 +771,6 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("error".into()),
             Some(false),
         ),
-        // Patterns match the pin's canonical token text, not the stored
-        // word: a `warning` reads 13 and renders `warn`.
         (
             r#"* | where sev(level) matches "^warn$""#,
             Value::String("warning".into()),
@@ -883,13 +781,11 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
             Value::String("error3".into()),
             Some(true),
         ),
-        // A numeric column reads as a ladder position…
         (
             r#"* | where sev(level) == "error""#,
             Value::Number(18.into()),
             Some(true),
         ),
-        // …and a JSON shape with no reading is UNKNOWN in both lanes.
         (
             r#"* | where sev(level) == "error""#,
             Value::Bool(true),
@@ -907,25 +803,12 @@ fn sev_subject_binds_through_the_severity_rules_in_both_lanes() {
     }
 }
 
-/// Collapsing the out-of-ladder points to one representative is a
-/// rendering equivalence, so both lanes must still agree cell for cell.
-///
-/// A `SEVERITY` subject is 1-24 or NULL, so every point outside the
-/// ladder is unmatchable and interchangeable. The cells that matter are
-/// the NULL-producing ones: dropping the points instead of keeping a
-/// representative would turn UNKNOWN into false and diverge from the live
-/// matcher under `not`.
 #[test]
 fn sev_out_of_ladder_points_agree_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let unpinned = FieldTypes::new();
 
-    // (dsl, event level value, expected answer)
     let cells: &[(&str, Value, Option<bool>)] = &[
-        // An all-out-of-ladder set renders one representative point. It
-        // must still answer false for a real reading and UNKNOWN for a
-        // value with none: dropping the points instead of keeping a
-        // representative would lose the second.
         (
             "* | where sev(level) in (99, 101, 250)",
             Value::String("error".into()),
@@ -946,8 +829,6 @@ fn sev_out_of_ladder_points_agree_in_both_lanes() {
             Value::String("gold".into()),
             None,
         ),
-        // Mixed: the in-ladder band still decides, the representative
-        // contributes nothing but its NULL propagation.
         (
             r#"* | where sev(level) in ("error", 99, 101, 250)"#,
             Value::String("error3".into()),
@@ -963,7 +844,6 @@ fn sev_out_of_ladder_points_agree_in_both_lanes() {
             Value::String("gold".into()),
             None,
         ),
-        // A scalar out-of-ladder point, both polarities.
         (
             "* | where sev(level) != 99",
             Value::String("error".into()),
@@ -986,23 +866,12 @@ fn sev_out_of_ladder_points_agree_in_both_lanes() {
     }
 }
 
-/// The SEVERITY set collapse must not change what matches.
-///
-/// A whole IN list renders as one membership test over the union of its
-/// bands' ladder points, so a list naming a band twice, a band beside a
-/// point inside it, or an out-of-ladder integer has to answer exactly as
-/// a per-element disjunction would, in both lanes. Reversed scalar
-/// operands ride along: the subject is still the call, so the band still
-/// applies.
 #[test]
 fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
     let unpinned = FieldTypes::new();
 
-    // (dsl, event level value, expected answer)
     let cells: &[(&str, Value, Option<bool>)] = &[
-        // …and a list that names the same band twice, or a band and a
-        // point inside it, is still exactly that set.
         (
             r#"* | where sev(level) in ("error", "err", "error2")"#,
             Value::String("error4".into()),
@@ -1013,8 +882,6 @@ fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
             Value::String("warn".into()),
             Some(false),
         ),
-        // A mixed token/integer list, with the integer inside a named
-        // band: `warn` covers 13-16, so the 17 is the only addition.
         (
             r#"* | where sev(level) in ("warn", 17)"#,
             Value::String("warn3".into()),
@@ -1030,8 +897,6 @@ fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
             Value::String("error2".into()),
             Some(false),
         ),
-        // An integer outside the ladder joins the set unclamped and
-        // simply matches nothing, in both lanes.
         (
             r#"* | where sev(level) in ("warn", 99)"#,
             Value::String("warn".into()),
@@ -1042,14 +907,11 @@ fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
             Value::String("fatal".into()),
             Some(false),
         ),
-        // A NULL-producing value under a list is UNKNOWN, not false.
         (
             r#"* | where sev(level) in ("warn", "error")"#,
             Value::String("gold".into()),
             None,
         ),
-        // Reversed scalar operands over the equality class: the subject
-        // is still the call, so the band still applies.
         (
             r#"* | where "error" == sev(level)"#,
             Value::String("error3".into()),
@@ -1070,8 +932,6 @@ fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
             Value::String("error".into()),
             Some(false),
         ),
-        // The pipeline `!=` stays strict over a value with no reading:
-        // the complement of a set is still UNKNOWN for a NULL.
         (
             r#"* | where "error" != sev(level)"#,
             Value::String("gold".into()),
@@ -1089,8 +949,6 @@ fn sev_subject_sets_and_reversed_operands_agree_in_both_lanes() {
     }
 }
 
-/// The dialect argument travels with the subject: a syslog numeral
-/// inverts in both lanes, and its words are unaffected.
 #[test]
 fn sev_subject_carries_its_dialect_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1127,8 +985,6 @@ fn sev_subject_carries_its_dialect_in_both_lanes() {
     }
 }
 
-/// Cross-lane guard for the whole case-variant projection class. Each
-/// projection writes one folded column and each reader names either spelling.
 #[test]
 fn case_variant_projections_agree_across_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1238,8 +1094,6 @@ fn live_rows(
 ) -> Vec<Map<String, Value>> {
     let plan = compile_stream_plan(&query.pipeline, &PinScope::root(field_types), None)
         .unwrap_or_else(|error| panic!("{dsl}: plan must compile: {error}"));
-    // One anchor for the whole lane comparison (ADR-0017 §3): these
-    // cases are about pins, so the clock is held still.
     let anchor = trawl_core::context::EvalContext::capture();
     let feed = |stages: &mut [trawl_core::stream::CompiledStage],
                 event: &mut trawl_core::row::Row| {
@@ -1299,9 +1153,6 @@ fn comparable(rows: &[Map<String, Value>]) -> BTreeSet<Vec<(String, String)>> {
         .collect()
 }
 
-/// A `let` target adopts the declared pin, so the comparison downstream
-/// is the same comparison, and the value the two lanes project is the
-/// same number.
 #[test]
 fn sev_let_target_adopts_the_declared_pin_in_both_lanes() {
     let conn = Connection::open_in_memory().unwrap();
@@ -1317,8 +1168,6 @@ fn sev_let_target_adopts_the_declared_pin_in_both_lanes() {
         &["s"],
     );
 
-    // The adopted pin types the downstream comparison: the band under
-    // `==`, which a plain BIGINT pin would miss.
     assert!(run_pipeline_cell(
         &conn,
         r#"* | let s = sev(level) | where s == "error""#,
@@ -1339,9 +1188,6 @@ fn sev_let_target_adopts_the_declared_pin_in_both_lanes() {
     ));
 }
 
-/// An unknown severity token is the same refusal in both lanes, the
-/// emitter's error and the stream compiler's plan error, because the
-/// subject classifier and the rule table are shared.
 #[test]
 fn sev_subject_refuses_an_unknown_token_in_both_lanes() {
     let unpinned = FieldTypes::new();

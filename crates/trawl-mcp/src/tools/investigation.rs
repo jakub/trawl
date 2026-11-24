@@ -9,31 +9,6 @@
 //! actions that read it. A field the action does not read, a missing one
 //! and one past its trawl-api bound are refused by name before any
 //! request, so a malformed call costs no request against the key's rate.
-//!
-//! - `create` sends `PUT /api/v1/investigations/{id}`, create if absent.
-//!   Without an `id` the server here mints one from 16 random bytes as 32
-//!   lowercase hex digits, the way trawld mints result ids, and the reply
-//!   prints it first; the model never invents one. The same `id` and
-//!   fields again return the same investigation, which is how a create
-//!   whose answer was lost is recovered, and a failed create prints the id
-//!   it sent for that reason.
-//! - `read` sends `GET …?since=&limit=` and prints the board
-//!   ([`crate::render::activity`]), sharing its renderer with `read`'s
-//!   `action: investigation`.
-//! - `list` sends `GET /api/v1/investigations`.
-//! - `note`, `finding` and `keep` send `POST …/entries` with the session's
-//!   `seen_seq` ([`crate::session`]); the reply prints the entry written
-//!   and the activity other keys wrote since, each entry once per session.
-//! - `finding_status` sends `PUT …/findings/{seq}/status` and `status`
-//!   sends `PATCH …` with `status` alone, the one field per request trawld
-//!   takes; both carry `expected_seq`, and a stale one prints trawld's
-//!   expected and current sequence. Both carry the session's `seen_seq`
-//!   too, and the reply prints the activity as an append's does.
-//!
-//! Changing the title or question, deleting an investigation and
-//! extending its evidence are not actions here: deletion and extension
-//! need `server_manage`, an operator's permission. Nothing here retries a
-//! refused call.
 
 use rmcp::model::CallToolResult;
 use trawl_api::investigations::{
@@ -60,12 +35,8 @@ use crate::session::{Seen, SeenGuard};
 
 /// The most entries one board read asks trawld for: as many as trawld's
 /// activity allowance, so a board page and an activity block print alike.
-/// The response budget usually prints fewer, and the continuation reads
-/// on from the last one printed.
 pub const BOARD_PAGE_ENTRIES: u64 = 50;
 
-/// Run `investigation` against `backend`, keeping this session's
-/// bookkeeping in `seen`.
 pub async fn run<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -87,9 +58,6 @@ pub async fn run<B: Backend>(
     }
 }
 
-// -- input checks ---------------------------------------------------------------
-
-/// The action's wire word.
 fn action_word(action: InvestigationAction) -> &'static str {
     match action {
         InvestigationAction::Create => "create",
@@ -140,7 +108,6 @@ fn takes(action: InvestigationAction) -> (&'static [&'static str], &'static [&'s
     }
 }
 
-/// The optional fields the call gave, by name.
 fn given(input: &InvestigationInput) -> Vec<&'static str> {
     [
         ("id", input.id.is_some()),
@@ -165,8 +132,6 @@ fn given(input: &InvestigationInput) -> Vec<&'static str> {
     .collect()
 }
 
-/// Refuse a call whose fields do not fit its action, or whose values are
-/// out of their bounds, before any request.
 fn check(input: &InvestigationInput) -> Result<(), CallToolResult> {
     let action = action_word(input.action);
     let (allowed, needed) = takes(input.action);
@@ -267,7 +232,6 @@ fn check(input: &InvestigationInput) -> Result<(), CallToolResult> {
     Ok(())
 }
 
-/// A finding's status, for a word that names one.
 fn finding_status_of(word: StatusWord) -> Option<FindingStatus> {
     match word {
         StatusWord::Hypothesis => Some(FindingStatus::Hypothesis),
@@ -278,7 +242,6 @@ fn finding_status_of(word: StatusWord) -> Option<FindingStatus> {
     }
 }
 
-/// An investigation's status, for a word that names one.
 fn investigation_status(word: StatusWord) -> Option<InvestigationStatus> {
     match word {
         StatusWord::Open => Some(InvestigationStatus::Open),
@@ -297,8 +260,6 @@ fn id_of(input: &InvestigationInput) -> InvestigationId {
         .unwrap_or_else(mint)
 }
 
-/// A fresh investigation id: 128 random bits as 32 lowercase hex digits,
-/// the way trawld mints result ids.
 #[must_use]
 pub fn mint() -> InvestigationId {
     use std::fmt::Write as _;
@@ -322,9 +283,6 @@ fn refs(rows: Option<&Vec<RowRef>>) -> Vec<EvidenceRef> {
     .unwrap_or_default()
 }
 
-// -- refusals -------------------------------------------------------------------
-
-/// The permissions `action` needs, in words.
 fn needs(action: InvestigationAction) -> &'static str {
     match action {
         InvestigationAction::Read | InvestigationAction::List => "query and investigation_read",
@@ -332,9 +290,6 @@ fn needs(action: InvestigationAction) -> &'static str {
     }
 }
 
-/// The error a refused or failed call answers: trawld's code and message,
-/// then what it means for this action and the call that is the way back.
-/// It retries nothing.
 pub(crate) fn refused(
     action: InvestigationAction,
     id: Option<&InvestigationId>,
@@ -413,9 +368,6 @@ pub(crate) fn advice(
     advice
 }
 
-// -- actions --------------------------------------------------------------------
-
-/// `create`.
 async fn create<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -496,8 +448,6 @@ fn acknowledged(
     })
 }
 
-/// `result`, a failed create's error, with the line that recovers it: a
-/// create whose answer was lost may have created the investigation.
 fn with_recovery(result: &CallToolResult, id: &InvestigationId) -> CallToolResult {
     let text = result
         .content
@@ -513,9 +463,6 @@ fn with_recovery(result: &CallToolResult, id: &InvestigationId) -> CallToolResul
     ))
 }
 
-/// The board of investigation `id` after `since`, read for `tool`, and the
-/// investigation, with the guard that will record what the reply prints;
-/// or the error to answer.
 pub(crate) async fn board<'a, B: Backend>(
     backend: &B,
     seen: &'a Seen,
@@ -544,7 +491,6 @@ pub(crate) async fn board<'a, B: Backend>(
     ))
 }
 
-/// `read`.
 async fn read<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -583,7 +529,6 @@ async fn read<B: Backend>(
     result
 }
 
-/// `list`.
 async fn list<B: Backend>(backend: &B, budget: Budget) -> CallToolResult {
     let list = match backend.list_investigations().await {
         Ok(list) => list,
@@ -617,7 +562,6 @@ async fn list<B: Backend>(backend: &B, budget: Budget) -> CallToolResult {
     activity::fit_entries(reply, budget, INVESTIGATION)
 }
 
-/// The append `input` asks for, carrying `seen_seq`.
 fn append_entry(input: &InvestigationInput, seen_seq: Option<u64>) -> AppendEntry {
     match input.action {
         InvestigationAction::Keep => AppendEntry::Keep {
@@ -644,7 +588,6 @@ fn append_entry(input: &InvestigationInput, seen_seq: Option<u64>) -> AppendEntr
     }
 }
 
-/// The note when this session first touches an investigation at `seq`.
 fn first_touch(id: &InvestigationId, seq: u64) -> String {
     format!(
         "this session starts following this investigation at #{seq}; what other keys wrote \
@@ -653,10 +596,6 @@ fn first_touch(id: &InvestigationId, seq: u64) -> String {
     )
 }
 
-/// What a write's reply prints for the activity: with no `seen_seq` sent,
-/// no activity and the note that the session starts at `written`, the
-/// entry the write wrote; with one, the activity trawld answered, or a
-/// note that it sent none.
 fn written_activity(
     id: &InvestigationId,
     seen_seq: Option<u64>,
@@ -693,7 +632,6 @@ fn record_written(
     }
 }
 
-/// `note`, `finding` and `keep`.
 async fn append<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -738,7 +676,6 @@ async fn append<B: Backend>(
     result
 }
 
-/// `finding_status`.
 async fn finding_status<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -801,7 +738,6 @@ fn word_of(status: FindingStatus) -> &'static str {
     }
 }
 
-/// `status`: close or reopen, the one field this `PATCH` sends.
 async fn status<B: Backend>(
     backend: &B,
     seen: &Seen,

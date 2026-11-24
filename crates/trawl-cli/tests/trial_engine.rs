@@ -8,22 +8,6 @@
 //! `docker` on `PATH` is a stub for an empty engine whose id the test
 //! chooses, and `DOCKER_HOST` names a socket the test binds, because
 //! preflight trusts only a real socket.
-//!
-//! `down`, `stop`, and `status` act only on the engine the trial was
-//! created on. The trial state records engine `engine-a`. On the wrong
-//! engine, `down --yes` would find nothing of the trial's, delete the
-//! state directory, and report success while the trial's containers and
-//! volumes stay on `engine-a`. `down` and `stop` must refuse, name both
-//! engines, and leave the state and the engine alone; `status` must not
-//! list the wrong engine's containers as the trial's.
-//!
-//! A first `up` writes its state before it creates the engine claim, and
-//! deletes that state again only when its own inspect finds another
-//! trial's claim.
-//!
-//! A `down` that stops part way leaves its teardown marker. `up` then
-//! refuses before it changes anything, and the next `down` finishes the
-//! teardown. A resume refuses when the trial's volumes are gone.
 
 use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::PathBuf;
@@ -31,8 +15,6 @@ use std::process::{Command, Output, Stdio};
 
 const TRIAL_ID: &str = "0123456789abcdef0123456789abcdef";
 
-/// A stub engine: the `docker` program and the socket `DOCKER_HOST`
-/// names.
 struct Engine {
     _tmp: tempfile::TempDir,
     stub: PathBuf,
@@ -157,7 +139,6 @@ esac
         self.trial_with(engine, |_| {})
     }
 
-    /// [`Self::trial_on`], with `edit` applied to the state first.
     fn trial_with(&self, engine: &str, edit: impl FnOnce(&mut serde_json::Value)) -> PathBuf {
         let dir = self.state_home.join("trawl/trial");
         std::fs::DirBuilder::new()
@@ -205,7 +186,6 @@ esac
         self.trawl_with(verb, &[])
     }
 
-    /// [`Self::trawl`] with `env` set on top.
     fn trawl_with(&self, verb: &[&str], env: &[(&str, &str)]) -> Output {
         let path = std::env::join_paths(std::iter::once(self.stub.clone()).chain(
             std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
@@ -237,8 +217,6 @@ esac
     }
 }
 
-/// Run `verb` against a trial created on `engine-a` while `engine-b`
-/// answers, and check it refused without touching either side.
 fn refuses_another_engine(verb: &[&str]) {
     let engine = Engine::new("engine-b");
     let dir = engine.trial_on("engine-a");
@@ -284,10 +262,6 @@ fn down_proceeds_on_its_own_engine() {
     assert_eq!(engine.calls(), "");
 }
 
-/// An interrupted command left a one-off container that never started.
-/// Without a terminal and without `--yes`, `down` deletes nothing, not
-/// even that one-off: it lists it with the rest, then refuses. With
-/// `--yes` it deletes it with everything else.
 #[test]
 fn down_deletes_nothing_before_it_is_confirmed() {
     let engine = Engine::new("engine-a");
@@ -313,7 +287,6 @@ fn down_deletes_nothing_before_it_is_confirmed() {
     assert!(!dir.exists(), "{stderr}");
 }
 
-/// `status` lists containers only from the trial's own engine.
 #[test]
 fn status_lists_containers_only_on_its_own_engine() {
     let containers = |engine_id: &str| {
@@ -339,9 +312,6 @@ fn status_lists_containers_only_on_its_own_engine() {
     );
 }
 
-/// `status` warns about a connection variable only when it changes where
-/// commands go, and reads `TRAWL_INSECURE` and `TRAWL_PROFILE` as the
-/// argument parser does.
 #[test]
 fn status_warns_only_about_variables_that_move_commands() {
     let engine = Engine::new("engine-a");
@@ -382,11 +352,9 @@ fn status_warns_only_about_variables_that_move_commands() {
 /// port to a bind to port 0 or to an outgoing connection, which is what
 /// every other test on a busy machine asks for.
 ///
-/// Residual exposure: between that drop and the child's own bind, a
-/// process that asks for one of these ports by number can still take it:
-/// a service with a fixed port, or another call of this helper that draws
-/// the same number. The child must bind the port itself, so no test can
-/// hold it across the spawn.
+/// Between that drop and the child's own bind, a process that asks for one
+/// of these ports by number can still take it. The child must bind the
+/// port itself, so no test can hold it across the spawn.
 fn free_ports<const N: usize>() -> [u16; N] {
     use rand::Rng as _;
 
@@ -405,7 +373,6 @@ fn free_ports<const N: usize>() -> [u16; N] {
     listeners.map(|listener| listener.local_addr().unwrap().port())
 }
 
-/// Another trial's id.
 const THEIRS: &str = "fedcba9876543210fedcba9876543210";
 
 /// How the Docker CLI reports a request the engine carried out and an
@@ -426,7 +393,6 @@ impl Engine {
         std::fs::remove_file(self.stub.join(name)).unwrap();
     }
 
-    /// The trial id the engine's claim carries.
     fn claim(&self) -> Option<String> {
         std::fs::read_to_string(self.stub.join("claim.id"))
             .ok()
@@ -437,7 +403,6 @@ impl Engine {
         self.state_home.join("trawl/trial")
     }
 
-    /// The trial id the state records, when there is a state.
     fn state(&self) -> Option<String> {
         let bytes = std::fs::read(self.dir().join("state.json")).ok()?;
         let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
@@ -445,7 +410,6 @@ impl Engine {
         Some(state["trial_id"].as_str().unwrap().to_owned())
     }
 
-    /// How many claim creates `up` ran.
     fn creates(&self) -> usize {
         self.calls()
             .lines()
@@ -457,8 +421,6 @@ impl Engine {
             .count()
     }
 
-    /// `up`, which the stub always fails; returns its stderr. The first
-    /// `up` picks free ports, and a rerun resumes on the recorded ones.
     fn up(&self) -> String {
         let out = if self.state().is_some() {
             self.trawl(&["up", "--no-sample-data"])
@@ -481,10 +443,8 @@ impl Engine {
     }
 }
 
-/// Port 0 names no port: its bind test passes on an ephemeral port, and
-/// the trial would record 0 and print addresses nothing listens on. The
-/// argument parser refuses it, naming the flag, before anything is
-/// created.
+/// Port 0 names no port: its bind check would pass on an ephemeral port,
+/// and the trial would record 0 and print addresses nothing listens on.
 #[test]
 fn up_refuses_port_zero() {
     for (zero, other) in [("--api-port", "--web-port"), ("--web-port", "--api-port")] {
@@ -503,9 +463,9 @@ fn up_refuses_port_zero() {
     }
 }
 
-/// (a) The engine made the claim and the response to the create was
-/// denied. Our inspect finds the claim with our id, so `up` goes on,
-/// and so does a rerun.
+/// The engine made the claim and the response to the create was denied.
+/// Our inspect finds the claim with our id, so `up` goes on, and so does a
+/// rerun.
 #[test]
 fn a_denied_create_response_goes_on_when_the_claim_is_ours() {
     let engine = Engine::new("engine-a");
@@ -522,9 +482,8 @@ fn a_denied_create_response_goes_on_when_the_claim_is_ours() {
     assert_eq!(engine.claim().as_deref(), Some(id.as_str()));
 }
 
-/// (b) The engine made the claim, the response to the create was denied,
-/// and the inspect failed too. Nothing proves the claim is not ours, so
-/// the state stays, and a rerun finds the claim with its own id instead
+/// The engine made the claim, the response to the create was denied, and
+/// the inspect failed too. A rerun finds the claim with its own id instead
 /// of refusing it as an orphan.
 #[test]
 fn a_denied_create_response_and_a_failed_inspect_keep_the_state() {
@@ -546,9 +505,7 @@ fn a_denied_create_response_and_a_failed_inspect_keep_the_state() {
     assert_eq!(engine.state().as_deref(), Some(id.as_str()));
 }
 
-/// (c) Another trial took the claim after `up` listed the engine. Our
-/// inspect shows its id, so nothing of ours was created: `up` refuses,
-/// and the state it wrote goes.
+/// Another trial took the claim after `up` listed the engine.
 #[test]
 fn a_foreign_claim_removes_the_new_state() {
     let engine = Engine::new("engine-a");
@@ -562,8 +519,6 @@ fn a_foreign_claim_removes_the_new_state() {
     assert_eq!(engine.claim().as_deref(), Some(THEIRS));
 }
 
-/// (d) The engine refused the create and holds no claim. The state stays,
-/// and a rerun creates the claim with the recorded id.
 #[test]
 fn a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim() {
     let engine = Engine::new("engine-a");
@@ -583,8 +538,6 @@ fn a_refused_create_keeps_the_state_and_a_rerun_creates_the_claim() {
     assert_eq!(engine.creates(), 2);
 }
 
-/// The create may have reached the engine before the connection dropped;
-/// the state stays for the same reason.
 #[test]
 fn a_dropped_create_keeps_the_state() {
     let engine = Engine::new("engine-a");
@@ -597,7 +550,6 @@ fn a_dropped_create_keeps_the_state() {
     assert!(engine.state().is_some(), "{stderr}");
 }
 
-/// (e) `down` deletes a kept state that owns nothing on the engine.
 #[test]
 fn down_removes_a_kept_state_that_owns_nothing() {
     let engine = Engine::new("engine-a");
@@ -636,10 +588,6 @@ impl Engine {
     }
 }
 
-/// A trial directory without a state still holds files, and the engine
-/// holds nothing of a trial's. Without a terminal and without `--yes`,
-/// `down` lists what the directory holds, deletes nothing, and exits
-/// non-zero. With `--yes` it deletes the directory.
 #[test]
 fn down_asks_before_it_deletes_a_directory_without_state() {
     let engine = Engine::new("engine-a");
@@ -669,9 +617,6 @@ fn down_asks_before_it_deletes_a_directory_without_state() {
     assert_eq!(engine.calls(), "");
 }
 
-/// (c) over a trial directory that already held files but no state: the
-/// foreign claim removes only the state this `up` wrote, and the files
-/// and the directory stay.
 #[test]
 fn a_foreign_claim_keeps_files_the_new_state_did_not_write() {
     let engine = Engine::new("engine-a");
@@ -692,10 +637,6 @@ fn a_foreign_claim_keeps_files_the_new_state_did_not_write() {
     );
 }
 
-/// An empty trial directory without a state is a deletion like any
-/// other: `down` lists it, and without a terminal and without `--yes` it
-/// exits non-zero and leaves it. With `--yes` it removes it, and a second
-/// `down`, with no trial directory left, exits 0.
 #[test]
 fn down_asks_before_it_removes_an_empty_directory() {
     let engine = Engine::new("engine-a");
@@ -724,11 +665,9 @@ fn down_asks_before_it_removes_an_empty_directory() {
     assert_eq!(engine.calls(), "");
 }
 
-/// What `up` says while a teardown marker exists.
 const TEARDOWN_INCOMPLETE: &str = "trial teardown is incomplete. run `trawl trial down` to \
      finish deleting it, then `trawl trial up` to create a new trial.";
 
-/// The trial's volumes, as Docker names them.
 const VOLUMES: [&str; 3] = [
     "trawl-trial_postgres",
     "trawl-trial_trawld",
@@ -736,7 +675,6 @@ const VOLUMES: [&str; 3] = [
 ];
 
 impl Engine {
-    /// List `names` as volumes of trial `trial`.
     fn volumes(&self, trial: &str, names: &[&str]) {
         let mut listing = String::new();
         for name in names {
@@ -751,7 +689,6 @@ impl Engine {
         self.put("volumes", &listing);
     }
 
-    /// The names of the volumes the engine still lists.
     fn volumes_left(&self) -> Vec<String> {
         std::fs::read_to_string(self.stub.join("volumes"))
             .unwrap_or_default()
@@ -767,8 +704,6 @@ impl Engine {
         self.state_home.join("trawl/trial.teardown")
     }
 
-    /// Write a teardown marker for trial `trial` created on `engine`, at
-    /// 0600, as `down` writes it.
     fn put_marker(&self, trial: &str, engine: &str) {
         use std::io::Write as _;
         std::fs::DirBuilder::new()
@@ -787,8 +722,6 @@ impl Engine {
             .unwrap();
     }
 
-    /// A trial on `engine-a` that resumes on this engine: free ports, the
-    /// images the stub answers with, the claim, and the phases `phases`.
     fn resumable(&self, phases: &serde_json::Value) -> PathBuf {
         self.put("claim.id", TRIAL_ID);
         // Two distinct ports from one call. They are written into the state
@@ -857,8 +790,6 @@ fn interrupt_down(
     assert_ne!(id, TRIAL_ID, "{fault:?}: up resumed the deleted trial");
 }
 
-/// Each way a `down` stops part way leaves a marker that `up` refuses,
-/// and the next `down` finishes.
 #[test]
 fn trial_teardown_interruptions() {
     // A partial `volume rm`: Docker removed the volumes it could.
@@ -898,10 +829,6 @@ fn trial_teardown_interruptions() {
     );
 }
 
-/// A resume needs all three volumes once the state records a step: each
-/// one missing is refused before `up` changes anything. A state that
-/// records no step starts without them, and a listing that fails is
-/// reported as itself, never as a missing volume.
 #[test]
 fn trial_resume_storage_matrix() {
     let database = serde_json::json!({
@@ -921,7 +848,6 @@ fn trial_resume_storage_matrix() {
         assert_eq!(engine.calls(), "", "{gone}: refused after setup began");
     }
 
-    // The control: with all three, the resume goes past the claim.
     let engine = Engine::new("engine-a");
     engine.resumable(&database);
     engine.volumes(TRIAL_ID, &VOLUMES);
@@ -940,7 +866,6 @@ fn trial_resume_storage_matrix() {
     let stderr = engine.up();
     assert!(stderr.contains(PAST_THE_CLAIM), "{stderr}");
 
-    // The volume listing fails: its own error, not a missing volume.
     let engine = Engine::new("engine-a");
     engine.resumable(&database);
     engine.volumes(TRIAL_ID, &VOLUMES);
@@ -970,10 +895,6 @@ fn up_on_another_engine_names_the_engines_before_the_volumes() {
     assert_eq!(engine.calls(), "");
 }
 
-/// A `down` killed after the directory went and before the marker did:
-/// the next `down` says it is finishing the teardown, removes the
-/// marker, and exits 0 without asking. On another engine it refuses and
-/// keeps the marker.
 #[test]
 fn marker_without_dir_cleared_by_down() {
     let engine = Engine::new("engine-a");
@@ -1034,9 +955,6 @@ fn marker_without_dir_cleared_by_down() {
     assert!(elsewhere.marker().is_file(), "{stderr}");
 }
 
-/// `down` reads only the trial id and engine from a state of any schema,
-/// and the state's id wins over a marker naming another trial: the
-/// marker is rewritten with the state's id before the first deletion.
 #[test]
 fn trial_down_any_schema() {
     let engine = Engine::new("engine-a");
@@ -1068,8 +986,6 @@ fn trial_down_any_schema() {
     assert!(!dir.exists() && !engine.marker().exists(), "{stderr}");
 }
 
-/// `status` reports a teardown marker in place of the trial, and exits 0
-/// without reading the state; `stop` ignores the marker.
 #[test]
 fn status_reports_and_stop_ignores_a_teardown_marker() {
     let engine = Engine::new("engine-a");

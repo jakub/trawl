@@ -3,22 +3,13 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! App-side mapping of trawl's domain vocabularies onto fleet-ui's
-//! generic tone enums. Pure (no `leptos`/`web_sys`), so it lives ungated
-//! and its contract is exercised by native `cargo test` — mirroring the
-//! sibling helper module (`facets`) and fleet-ui's own
-//! `status_dot::tone`. Keeping the string→tone mapping app-side is
-//! deliberate (ADR-0002): the status/color vocabularies are trawl's, only
-//! the rendered dot/badge is generic.
+//! generic tone enums (ADR-0002).
 //!
 //! Only the wasm32 build consumes these mappers — on native they exist
-//! purely so their tests run under plain `cargo test`. Matches the
-//! `facets.rs` / `offset.rs` pattern.
+//! purely so their tests run under plain `cargo test`.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
-/// Map a saved-query run status string (trawl-api vocabulary) onto the
-/// fleet-ui status-dot tone. App-side because the status vocabulary is
-/// trawl's; only the dot is generic.
 pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     match status {
         "success" => fleet_ui::StatusTone::Success,
@@ -30,7 +21,6 @@ pub(crate) fn run_status_tone(status: &str) -> fleet_ui::StatusTone {
     }
 }
 
-/// Human-readable execution outcome. Unknown server states stay visible verbatim.
 pub(crate) fn run_status_label(status: &str) -> &str {
     match status {
         "running" => "Running",
@@ -41,10 +31,6 @@ pub(crate) fn run_status_label(status: &str) -> &str {
     }
 }
 
-/// The marker a run's history row carries for how the run started, or
-/// `None` for no marker. Only a manual run is marked: a scheduled run is
-/// the ordinary case, and a run recorded before origins were has none to
-/// show. Unknown server origins stay visible verbatim.
 pub(crate) fn run_origin_label(origin: Option<&str>) -> Option<&str> {
     match origin? {
         "manual" => Some("Manual"),
@@ -53,7 +39,6 @@ pub(crate) fn run_origin_label(origin: Option<&str>) -> Option<&str> {
     }
 }
 
-/// Badge counterpart of the shared execution status-dot vocabulary.
 pub(crate) fn run_badge_tone(status: &str) -> fleet_ui::Tone {
     match run_status_tone(status) {
         fleet_ui::StatusTone::Success => fleet_ui::Tone::Success,
@@ -63,7 +48,6 @@ pub(crate) fn run_badge_tone(status: &str) -> fleet_ui::Tone {
     }
 }
 
-/// Repin refusal and blocking are distinct from execution failure.
 /// Callers sanitize the returned text before displaying unknown wire values.
 pub(crate) fn repin_status_label(status: &str) -> &str {
     match status {
@@ -86,9 +70,6 @@ mod tests {
     fn run_status_tone_maps_every_arm() {
         assert_eq!(run_status_tone("success"), fleet_ui::StatusTone::Success);
         assert_eq!(run_status_tone("error"), fleet_ui::StatusTone::Error);
-        // Load-bearing: `timeout` is a failed execution and must share the
-        // red `Error` tone rather than a soft-warning one. A future edit
-        // moving it elsewhere has to turn this assertion red.
         assert_eq!(run_status_tone("timeout"), fleet_ui::StatusTone::Error);
         assert_eq!(run_status_tone("running"), fleet_ui::StatusTone::Running);
     }

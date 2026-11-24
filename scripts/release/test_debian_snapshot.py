@@ -47,8 +47,6 @@ class DebianSnapshot(unittest.TestCase):
         self.assertEqual(len(identity["snapshot_sha256"]), 64)
         self.assertFalse((self.copy / ".git").exists())
         self.assertEqual((self.copy / "relative link").read_text(), "required asset\n")
-        # Model the packager's critical section: append its actual variant
-        # header, acknowledge the write, then die before any restoration.
         child = subprocess.Popen([sys.executable, "-c",
             "from pathlib import Path; import sys; "
             "p = Path(sys.argv[1]); p.write_text(p.read_text() + "

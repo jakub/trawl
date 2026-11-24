@@ -1,6 +1,6 @@
 # Ingest is admitted against hot-buffer capacity; nothing admitted is evicted
 
-status: accepted (2026-09-24), prep record for #253
+status: accepted (2026-09-24), prep record for #253; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 When the hot buffer reaches its caps, it evicts its oldest batches. Those events were acknowledged and are safe in the WAL, but no query can see them until compaction publishes them. Searches answer 200 with rows missing. ADR-0041 recorded this as a known limit and rejected refusing reads, because the pressure should fall on the sender, who can retry. This record replaces eviction with **admission**: a producer reserves hot-buffer space before it writes the WAL, and a batch that cannot reserve space is refused without writing anything.
 
@@ -56,3 +56,27 @@ ADR-0022's trade ("a stalled compactor stops WAL drain until the hot buffer evic
 ## Amendment: a full request count is a different 503, 2026-10-08
 
 ADR-0054 adds `request_limit_reached`, a second server-wide 503 on the ingest route. It is not `hot_buffer_full`. trawld answers it before it reads the body or checks the key, when the server-wide count of requests in progress is full. `hot_buffer_full` comes after the body is read and before it is decompressed. Only `hot_buffer_full` carries `Retry-After`, because only its recovery follows a known interval, the compaction interval. Admission and the request count are separate limits, and neither stands in for the other.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**Health and HTTP.**
+
+- **The `ingest_capacity` health check reads `ok` or `refusing`, never `error`.** A refusal is back-pressure on senders, not a failed subsystem, so a probe that matches `error` on the other checks must not count it as one (`ingest_capacity_check` in `handlers.rs`).
+- **A WAL failure in one (environment, service) group answers a redacted 500, but the groups that did write are still published and counted first.** Those groups are durable and compaction merges them, so the 500 is not an atomic rollback, and a sender that retries the request can duplicate them. The failed groups' share of the reservation is released.
+
+**Self-telemetry.**
+
+- **A refused telemetry flush is not a write failure.** No write was attempted, so it leaves no write-failure count, no stderr line and no trace. The ledger's refusal counter records it, and the unit is retried on the next tick.
+- **A telemetry event larger than the full caps on its own is dropped as a `buffer_cap` loss.** It can never be admitted, and leaving it at the front of the queue would block every event behind it (`WalLayerInner::fit_front`).
+- **`telemetry_buffer_max_bytes` is one budget over the estimated memory of the active buffer, the retry queue and the batch in flight, checked when an event is recorded.** A cap applied only to the queue would not bound memory while a stuck WAL write holds a batch, because recording would keep appending to the active buffer. Recording sheds the oldest queued batches first, because current operational state is worth more than history. The batch in flight cannot be shed. When shedding cannot free enough, recording drops the incoming event instead of exempting it. The check and the append take the active-buffer lock separately, so events recorded at the same time can each pass the check and together exceed the budget (`WalLayerInner::admit`, `WalLayer::on_event`).
+- **`telemetry_buffer_max_bytes` has a floor, `MIN_TELEMETRY_BUFFER_MAX_BYTES` (64 KiB), and 0 does not turn it off.** Other caps in `trawl-config` read 0 as off, but an unbounded telemetry buffer grows without limit behind a wedged WAL write. Self-telemetry has its own off switch, `internal_telemetry = false`, so a zero budget has no meaning, and `validate_telemetry_buffer_max_bytes` refuses it.
+- **A telemetry write that fails and leaves its file visible releases its batch instead of retrying it.** Compaction may merge that file, so a retry could write the same events twice.
+- **After the first successful write in a cycle, queued telemetry batches are joined into drain units of up to 4 MiB (`MAX_DRAIN_UNIT_BYTES`).** A long WAL outage queues one batch per flush tick, and writing each to its own fsynced WAL file would make recovery cost one write per tick instead of a few writes for the queued bytes. Batches are not joined while writes still fail, so shedding keeps its per-tick granularity.
+
+**Compaction keeps draining.** Compaction is the only thing that frees hot-buffer space, so a fault that stops it refuses all ingest.
+
+- **A WAL environment directory that cannot be read is skipped for that pass and counted, not propagated** (`scan_env_wal_files` in `compaction.rs`). Propagating the error would stop the WAL drain of every other environment and the daily rollup for as long as the one directory stays unreadable.
+- **A WAL root that cannot be read fails the pass, but a missing root is an empty cold start.** Reading an unreadable root as empty would report a clean pass while the WAL never drains. A root entry that the scan cannot inspect lets the listed environments drain, but it counts as a persistent failure, because the entry may be an environment that never drains.
+- **One batch's catalog bookkeeping, retries included, has a 2 s wall-clock budget (`BOOKKEEPING_BUDGET`).** During a postgres outage each write blocks for the pool's acquire timeout instead of failing fast. Bookkeeping runs inline while `compact_once` walks every chunk in sequence, so an attempt count alone would let an outage stall the compactor. Fast failures, such as a full pool, still get every attempt.

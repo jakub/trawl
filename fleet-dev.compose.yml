@@ -1,5 +1,3 @@
-# Persistent, loopback-only interactive development database.
-#
 # This is intentionally separate from docker-compose.dev.yml, whose tmpfs
 # clusters are disposable test infrastructure. Reset only with the documented
 # explicit command:

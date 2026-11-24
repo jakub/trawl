@@ -13,13 +13,9 @@ import { test as base, expect } from '@playwright/test';
 
 type PageErrors = { errors: Error[] };
 
-// How long a stub server may take to snapshot the dist and bind. Matches
-// the webServer default the suite used before servers became per worker.
 const STUB_START_TIMEOUT_MS = 60_000;
 
-/** Start `harness/server.mjs` for one worker and resolve with its origin.
- *
- * Readiness is the server's own "listening" line, not a health probe
+/** Readiness is the server's own "listening" line, not a health probe
  * alone: that line is printed from its `listen` callback, so only a
  * process that bound the port itself can print it. A stray server left on
  * the port by another worktree would answer `/__ctl/health` just as well
@@ -81,8 +77,6 @@ async function startStub(port: number): Promise<{ origin: string; stop: () => Pr
     );
   }
 
-  // Startup output has served its purpose; from here on, whatever the
-  // server says (a crash stack, say) goes to the worker's own streams.
   child.stdout.off('data', collect);
   child.stderr.off('data', collect);
   child.stdout.pipe(process.stdout, { end: false });
@@ -90,24 +84,10 @@ async function startStub(port: number): Promise<{ origin: string; stop: () => Pr
   return { origin, stop };
 }
 
-// The reset / network-guard / pageerror / unstubbed contract rides an
-// AUTO FIXTURE, not `test.beforeEach`. This module is loaded once per
-// worker (ESM module cache), so a `test.beforeEach` written here is
-// registered against whichever spec file imported it FIRST and silently
-// does not run for any other file — which is exactly what happened:
-// every spec but the first was running with no scenario reset, no
-// homelab-independence guard and no pageerror check. An auto fixture is
-// attached to the `test` object itself, so it runs for every test that
-// imports it, whatever the file.
-//
-// The stub server is per WORKER. harness/server.mjs holds one mutable
-// "current scenario" (see its `/__ctl/reset` contract), so two tests may
-// never share a server; a worker runs one test at a time, so one server
-// per worker is exactly enough. Worker N listens on E2E_PORT + N (its
-// `parallelIndex`), and `baseURL` points `page` and `request` at it. A
-// worker that Playwright replaces after a failure reuses the index, and
-// the runner waits for the old worker's teardown, so the old server has
-// released the port before the new one binds it.
+// Those checks ride an AUTO FIXTURE, not `test.beforeEach`. This module
+// is loaded once per worker (ESM module cache), so a `test.beforeEach`
+// written here is registered against whichever spec file imported it
+// FIRST and silently does not run for any other file.
 export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { stubOrigin: string }>({
   stubOrigin: [
     async ({}, use, workerInfo) => {
@@ -136,15 +116,9 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
     async ({ page, request, pageErrors, stubOrigin }, use, testInfo) => {
       // Default scenario; a spec that needs a different one calls
       // `resetScenario(request, name)` itself at the top of the test
-      // body — simpler than threading it through a hook, since
-      // Playwright runs fixtures before the test body even sees its own
-      // annotations.
+      // body.
       await request.post('/__ctl/reset', { data: { scenario: 'default' } });
 
-      // Homelab-independence contract: abort any request whose origin
-      // isn't this worker's own stub server — the same origin `baseURL`
-      // carries, so the guard can never disagree with where the stub is.
-      // `data:`/`blob:` are allowed (inline fonts, blob-backed workers).
       await page.context().route('**/*', (route) => {
         const url = new URL(route.request().url());
         const ok =
@@ -164,10 +138,7 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
       // option (off in playwright.config.ts). Playwright takes that one while
       // closing the context, and a closing context no longer dispatches
       // routes, so every request the page starts then hangs on the guard
-      // above. The screenshot waits for web fonts, so a test that ended
-      // while a new document was loading paid a flat 5 s timeout, and every
-      // passing test paid for a screenshot that was thrown away. Here the
-      // routes still answer, and only a failure pays.
+      // above.
       let failed = testInfo.status !== testInfo.expectedStatus;
       try {
         // console.error is deliberately NOT checked — headless-GL / wasm
@@ -180,12 +151,10 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
         expect(state.unstubbed, `unstubbed /api/* calls: ${JSON.stringify(state.unstubbed)}`).toEqual(
           [],
         );
-        // The same claim one level down. Under `corpus` a pipeline with no
-        // fixture is answered with a 500 and recorded here, and the page
-        // renders that as an ordinary query error — which no assertion in
-        // any spec would notice. Recording it and never reading it made
-        // the record decoration. A hit here is a fixture gap: add the
-        // shape to harness/server.mjs, never loosen this.
+        // Under `corpus` a pipeline with no fixture is answered with a 500,
+        // which the page renders as an ordinary query error. A hit here is
+        // a fixture gap: add the shape to harness/server.mjs, never loosen
+        // this.
         expect(
           state.unhandledQueries ?? [],
           `corpus queries with no fixture: ${JSON.stringify(state.unhandledQueries)}`,
@@ -195,10 +164,6 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
         throw error;
       } finally {
         if (failed) {
-          // Every open page, as Playwright's own option did (a test may leave
-          // a second tab open when it fails), with its file names, in the
-          // test's output directory, which CI uploads on failure. A page that
-          // closes meanwhile has nothing to capture.
           let index = 0;
           for (const open of page.context().pages()) {
             const path = testInfo.outputPath(`test-failed-${++index}.png`);
@@ -215,53 +180,36 @@ export const test = base.extend<{ pageErrors: PageErrors; contract: void }, { st
 
 export { expect };
 
-/** What the `populated` scenario's corpus is called. The bodies live in
- * `harness/wire/saved-queries.json` and
- * `harness/wire/service-schema-populated.json`, and
- * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins these
- * exact values there — a spec navigating to `?svc=nginx` against a
- * fixture that renamed the service would silently render no drawer. */
+/** `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins these
+ * exact values in `harness/wire/` — a spec navigating to `?svc=nginx`
+ * against a fixture that renamed the service would silently render no
+ * drawer. */
 export const POPULATED = {
-  /** The one service `?svc=` opens the service drawer on. */
   service: 'nginx',
-  /** The one net's id, for `?net=<id>&ntab=`. */
   netId: 1,
 } as const;
 
-/** What the `corpus` scenario's data is, by CONTENT.
- *
- * `corpus` is `populated` plus rows: the same one service and one net,
- * with `/api/v1/query`, `/api/v1/history` and the runs routes answering
- * with fixtures instead of empty bodies. A spec reads a row by the value
- * in it, so every value it can assert on lives here and is pinned in
+/** Every value here is pinned in
  * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` against the
  * `harness/wire/` files.
  */
 export const CORPUS = {
-  /** Same service and net as `populated` — `corpus` only adds data. */
   service: POPULATED.service,
   netId: POPULATED.netId,
-  /** The net's name, as the runs page prints it. */
   netName: 'errors by host',
   /** Rows in `wire/query-rows.json`. */
   rowCount: 8,
   /** Fixed metadata in every query wire fixture. Pagination adds offset seconds/ms. */
   execution: { startedAt: '2026-09-15T12:34:56Z', durationMs: 125 },
-  /** Its columns, in wire order. */
   columns: ['_time', 'host', 'status', 'message'] as const,
-  /** `host`'s distinct values, most frequent first, then alphabetical —
-   * the order the facet rail computes. Six of them, one past the five a
-   * group shows, so the group offers "Show 1 more listed value". */
+  /** Most frequent first, then alphabetical. Six of them, one past the
+   * five a group shows. */
   hosts: ['web-01', 'cache-01', 'db-01', 'edge-01', 'web-02', 'web-03'] as const,
-  /** How many values the `host` facet hides behind its more control. */
   hostsHidden: 1,
-  /** The first `host` cell in wire order, and the last host
-   * alphabetically: enough to tell one sort order from the other. */
   firstHost: 'web-01',
   hostLastAlphabetically: 'web-03',
   /** The two `wire/history.json` entries, newest first. */
   history: {
-    /** The rerunnable one. */
     query: 'service=nginx _severity>=error last=1h',
     /** The one the navigator refuses: 32769 ASCII bytes, one over
      * `MAX_SEARCH_BYTES` (`crates/trawl-search-url/src/search_url.rs`). Its text is
@@ -270,72 +218,46 @@ export const CORPUS = {
     overBoundPrefix: 'host=aaaa',
     overBoundBytes: 32769,
   },
-  /** The service column `wire/service-schema-corpus.json` names in the
-   * service's `degraded_fields`, which is the only thing that renders a
-   * field row's degraded badge. `populated` has no such column, so a
-   * badge spec has to be on `corpus`. The name is also
-   * `wire/catalog-field.json`'s field, so the case file the badge opens
-   * is about the field the badge sits on. */
+  /** The column `wire/service-schema-corpus.json` lists in
+   * `degraded_fields`, the only thing that renders a field row's degraded
+   * badge; `populated` lists none. Also `wire/catalog-field.json`'s field. */
   degradedField: 'duration',
-  /** The service's columns at the ends of a name sort, from
-   * `wire/service-schema-corpus.json`: `_time`, `duration`, `status`
-   * ascending. Enough to tell the drawer's default direction from its
-   * opposite after the field headers moved onto the shared helper. */
   fieldFirstAlphabetically: '_time',
   fieldLastAlphabetically: 'status',
-  /** The field the service drawer's overview lists first under "Top
-   * fields by cardinality": the highest count in
-   * `wire/query-cardinality.json`. The drawer reads that answer BY
-   * POSITION, so this is the service column the fixture's first cell
-   * stands for, not a name the fixture carries. */
+  /** The drawer reads `wire/query-cardinality.json` BY POSITION, so this
+   * is the service column the fixture's first cell stands for, not a name
+   * the fixture carries. */
   topCardinalityField: '_time',
-  /** Runs of the net, newest first (`wire/net-runs.json`). */
+  /** Newest first. */
   runIds: [501, 502] as const,
-  /** The run whose expansion has a result body. It is also the newest
-   * row of the global runs list (`wire/runs-all.json`). */
+  /** This run is also the newest row of `wire/runs-all.json`. */
   runWithResult: 501,
-  /** That row's recorded rows and query, as the global list carries
-   * them — what the runs page's execution receipt has to print when the
-   * run's stored result is gone and the read carries no summary. */
   runWithResultRows: 3,
   runWithResultQuery: '_severity>=error last=1h | stats count() by host',
 } as const;
 
-/** What the `schedule` scenario's two nets are.
- *
- * `schedule` exists so the drawer's schedule form has both cases on one
- * page: a net with no schedule at all and a net whose schedule tiles.
- * The bodies live in `harness/wire/saved-queries-windowed.json`,
- * `harness/wire/schedule-net-runs.json` and
- * `harness/wire/run-result-paged.json`, and
- * `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins every
- * value below against them.
+/** `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs` pins every
+ * value below against `harness/wire/`.
  */
 export const SCHEDULE = {
-  /** The net with no schedule: the `populated` net, verbatim. Its query
-   * carries `last=1h`, which is the clause a window conflicts with. */
+  /** This net's query carries `last=1h`, the clause a window conflicts
+   * with. */
   plainNetId: 1,
-  /** The net whose schedule tiles. */
   windowedNetId: 2,
-  /** The net with a fixed-span schedule. */
   fixedNetId: 3,
   /** The net with a paused query-mode schedule: no window, not enabled. */
   queryModeNetId: 4,
-  /** Its name, as the drawer titles itself. */
   windowedNetName: 'tiled error digest',
-  /** Its saved window and lag, which the form opens showing. */
   window: 'since_last',
   lag: '5m',
-  /** The run whose stored result is longer than one preview page. */
   pagedRunId: 503,
-  /** How many rows that result carries, and the page the preview cuts
-   * them into (`PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`). */
   pagedRunRows: 45,
+  /** `PREVIEW_PAGE_SIZE` in `src/components/net_drawer.rs`. */
   previewPageSize: 20,
 } as const;
 
 /**
- * The `schedule-spent` scenario (issue #351): `harness/wire/saved-queries-spent.json`,
+ * `harness/wire/saved-queries-spent.json`,
  * pinned by `crates/trawl-web-ui/tests/e2e_wire_fixture_contract.rs`.
  */
 export const SPENT = {
@@ -352,16 +274,12 @@ export const SPENT = {
   zeroLabel: 'spent 0/0',
 } as const;
 
-/** Re-point the stub server at a non-default scenario for this test. Call
- * at the top of the test body — `beforeEach` above already reset to
- * 'default' by the time the body runs. */
 export async function resetScenario(request: import('@playwright/test').APIRequestContext, name: string) {
   const response = await request.post('/__ctl/reset', { data: { scenario: name } });
   expect(response.ok(), `reset ${name}: HTTP ${response.status()}`).toBe(true);
   expect(await response.json()).toMatchObject({ ok: true, scenario: name });
 }
 
-/** Saved-query request bodies captured since the last scenario reset. */
 export async function capturedSavedRequests(request: Ctl): Promise<Array<{ name: string; query: string }>> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.savedRequests;
@@ -369,10 +287,8 @@ export async function capturedSavedRequests(request: Ctl): Promise<Array<{ name:
 
 type Ctl = import('@playwright/test').APIRequestContext;
 
-/** Schedule PUT bodies captured since the last scenario reset, oldest
- * first. Each entry is `{ savedId, body }`, and `body` is exactly what
- * arrived: a dropped `window` is an ABSENT key, not a null, which is the
- * distinction the schedule spec is built on. */
+/** `body` is exactly what arrived: a dropped `window` is an ABSENT key,
+ * not a null. */
 export async function capturedScheduleRequests(
   request: Ctl,
 ): Promise<Array<{ savedId: number; body: Record<string, unknown> }>> {
@@ -380,16 +296,13 @@ export async function capturedScheduleRequests(
   return state.scheduleRequests;
 }
 
-/** How many run-result reads the stub has served since the last reset. */
 export async function runDetailReadCount(request: Ctl): Promise<number> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.runDetailReads.length;
 }
 
-/** Point the run-detail route at a run whose stored result file is gone,
- * so `GET .../runs/{id}` answers the server's 409 envelope for it — what
- * trawld does once `data_dir` is repointed out from under a recorded run
- * (issue #227). Every read of that run answers the same way. */
+/** Make `GET .../runs/{runId}` answer the server's 409 envelope for a run
+ * whose stored result file is gone, on every read, not just the next. */
 export async function armRunUnavailable(request: Ctl, runId: number): Promise<void> {
   const response = await request.post(`/__ctl/run-unavailable/${runId}`);
   expect(response.ok(), `arm run ${runId} unavailable: HTTP ${response.status()}`).toBe(true);
@@ -402,8 +315,6 @@ export async function armScheduleRefusal(request: Ctl, kind: 'refuse' | 'fail'):
   expect(response.ok(), `arm ${kind}: HTTP ${response.status()}`).toBe(true);
 }
 
-/** Saved ids `POST /api/v1/saved/{id}/run` (Run now) was sent for since
- * the last scenario reset, oldest first. */
 export async function capturedRunRequests(request: Ctl): Promise<number[]> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.runRequests;
@@ -416,18 +327,12 @@ export async function armRunRefusal(request: Ctl): Promise<void> {
   expect(response.ok(), `arm run refusal: HTTP ${response.status()}`).toBe(true);
 }
 
-/** How many `POST /api/v1/query` bodies the stub has captured since the
- * last reset. A spec that asserts a URL does NOT run reads this before
- * and after a bounded quiet wait. */
 export async function capturedQueryCount(request: Ctl): Promise<number> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.queries.length;
 }
 
-/** The last captured query body, once exactly `expectedCount` have
- * arrived. Polls rather than sleeping, and throws with the bodies it did
- * see — a spec must never read a stale `at(-1)` as this navigation's
- * query. */
+/** A spec must never read a stale `at(-1)` as this navigation's query. */
 export async function lastCapturedQuery(request: Ctl, expectedCount: number, timeoutMs = 5_000) {
   const deadline = Date.now() + timeoutMs;
   let queries: any[] = [];
@@ -444,16 +349,11 @@ export async function lastCapturedQuery(request: Ctl, expectedCount: number, tim
   }
 }
 
-/** How many `POST /api/v1/export` bodies the stub has captured since the
- * last reset. An export is the request that mattered most in ADR-0027's
- * review: the server reads an empty query as every row, so a link the
- * page refused must not be exportable. */
 export async function capturedExportCount(request: Ctl): Promise<number> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.exports.length;
 }
 
-/** Every captured query's DSL, oldest first. */
 export async function capturedQueries(request: Ctl): Promise<string[]> {
   const state = await (await request.get('/__ctl/state')).json();
   return state.queries.map((q: { query: string }) => q.query);
@@ -461,20 +361,14 @@ export async function capturedQueries(request: Ctl): Promise<string[]> {
 
 type Pg = import('@playwright/test').Page;
 
-/** Count `setInterval` timers the page currently holds, bucketed by
- * delay.
- *
- * This is the only oracle for a LEAKED timer. A leaked `gloo_timers`
+/** This is the only oracle for a LEAKED timer. A leaked `gloo_timers`
  * `Interval` whose body runs a disposed leptos callback is network-
  * silent: the callback no-ops, so the leak issues no HTTP read and
- * throws no `pageerror`. Nothing the server or the DOM can see
- * distinguishes it from a cancelled one — only the browser's own timer
- * table does.
+ * throws no `pageerror`.
  *
  * Must be called BEFORE `page.goto`: `addInitScript` runs ahead of the
  * page's own scripts, which is what keeps the app from capturing the
- * native `setInterval` before the wrapper is in place. Native signatures
- * and return values are preserved, so the app cannot tell the difference.
+ * native `setInterval` before the wrapper is in place.
  */
 export async function trackIntervals(page: Pg): Promise<void> {
   await page.addInitScript(() => {
@@ -489,8 +383,6 @@ export async function trackIntervals(page: Pg): Promise<void> {
     (window as any).__e2eIntervalCount = (delay: number) => counts.get(delay) ?? 0;
     window.setInterval = ((handler: TimerHandler, delay?: number, ...args: any[]) => {
       const id = start(handler, delay, ...args);
-      // An omitted delay is 0 to the platform; bucket it as the platform
-      // sees it rather than as a distinct "no delay" case.
       const key = delay ?? 0;
       delays.set(id, key);
       counts.set(key, (counts.get(key) ?? 0) + 1);
@@ -508,7 +400,6 @@ export async function trackIntervals(page: Pg): Promise<void> {
   });
 }
 
-/** How many live `setInterval` timers the page holds at `delay` ms. */
 export async function intervalCount(page: Pg, delay: number): Promise<number> {
   return page.evaluate((ms) => {
     const read = (window as any).__e2eIntervalCount;
@@ -519,13 +410,8 @@ export async function intervalCount(page: Pg, delay: number): Promise<number> {
   }, delay);
 }
 
-/** Count every toast that was ever ADDED to the document, cumulatively.
- *
- * Cumulative rather than a DOM query at assert time, because a toast
- * dismisses itself after 4.5s (`fleet-ui/src/toast/runtime.rs`): a spec
- * that waits out a 3s poll period and then counts `.toast` elements is
- * racing that timer, and would report "no toast was raised" for a toast
- * that came and went. This counts arrivals, so a toast cannot outrun it.
+/** Cumulative rather than a DOM query at assert time, because a toast
+ * dismisses itself after 4.5s (`fleet-ui/src/toast/runtime.rs`).
  *
  * Must be called BEFORE `page.goto`, same as `trackIntervals`.
  */
@@ -558,7 +444,6 @@ export async function trackToasts(page: Pg): Promise<void> {
   });
 }
 
-/** How many toasts have been raised since the page loaded. */
 export async function toastCount(page: Pg): Promise<number> {
   return page.evaluate(() => {
     const read = (window as any).__e2eToastCount;
@@ -569,18 +454,13 @@ export async function toastCount(page: Pg): Promise<number> {
   });
 }
 
-/** Arm the stub's scripted repin status sequence for one field.
- *
- * The reset is the ONE door that arms it (see `harness/server.mjs`), so
- * this wraps that reset rather than adding a second control route. With
- * the script disarmed, which is every other spec, the status route
- * answers `{ job: null }`.
+/** The reset is the ONE door that arms the scripted repin status
+ * sequence (see `harness/server.mjs`).
  */
 export async function scriptRepinStatus(request: Ctl, field: string): Promise<void> {
   await request.post('/__ctl/reset', { data: { scenario: 'default', repinField: field } });
 }
 
-/** Requests to the global Runs endpoint, including the requested order. */
 export async function capturedRunListRequests(request: Ctl): Promise<Array<{
   path: string; offset: number; limit: number; sort: string; dir: string;
 }>> {

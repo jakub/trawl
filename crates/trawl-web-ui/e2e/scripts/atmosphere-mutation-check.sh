@@ -2,8 +2,6 @@
 # This Source Code Form is subject to the terms of the Mozilla Public
 # License, v. 2.0. If a copy of the MPL was not distributed with this
 # file, You can obtain one at https://mozilla.org/MPL/2.0/.
-#
-# Mutation 21 removes only the terminal latch. Speed zero and hiding survive.
 set -euo pipefail
 root=$(git rev-parse --show-toplevel)
 cd_path="$root/crates/trawl-web-ui/e2e"
@@ -42,7 +40,7 @@ trap restore EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 # Run the exact target against the baseline too. A broken test cannot count as
-# a killed mutant, even if another CI job previously passed the whole suite.
+# a killed mutant.
 (cd "$cd_path" && npx playwright test atmosphere-fallback.spec.ts --grep 'live shader stays stopped' --output="$root/e2e-artifacts/test-results/atmosphere-baseline" --reporter=json) > "$backup/baseline.json"
 node - "$backup/baseline.json" <<'NODE'
 const fs = require('node:fs');

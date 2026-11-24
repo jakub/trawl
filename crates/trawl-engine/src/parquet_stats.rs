@@ -37,25 +37,17 @@ const MAX_SAMPLE_LEN: usize = 256;
 /// starved (UTF-8 is at most 4 bytes/char), keeping the rendered sample intact.
 const MAX_SAMPLE_BYTES: usize = MAX_SAMPLE_LEN * 4;
 
-/// Error reading a parquet file's footer. Carries the offending path so callers
-/// can quarantine and log exactly which file failed.
 #[derive(Debug, thiserror::Error)]
 pub enum ParquetStatsError {
-    /// The file could not be opened.
     #[error("opening parquet file {}: {source}", path.display())]
     Open {
-        /// The file that failed to open.
         path: PathBuf,
-        /// The underlying I/O error.
         #[source]
         source: std::io::Error,
     },
-    /// The footer could not be parsed (corrupt, truncated, or not parquet).
     #[error("reading parquet footer from {}: {source}", path.display())]
     Footer {
-        /// The file whose footer failed to parse.
         path: PathBuf,
-        /// The underlying parquet error.
         #[source]
         source: parquet::errors::ParquetError,
     },
@@ -67,35 +59,24 @@ pub enum ParquetStatsError {
          trawl writes only flat schemas",
         path.display()
     )]
-    NonScalarColumn {
-        /// The file carrying the nested element.
-        path: PathBuf,
-        /// The offending top-level schema element's name.
-        field: String,
-    },
+    NonScalarColumn { path: PathBuf, field: String },
 }
 
-/// Footer-derived statistics for a single parquet file.
 #[derive(Debug)]
 pub struct FileStats {
-    /// Rows in the file (`FileMetaData::num_rows`).
     pub num_rows: u64,
-    /// Per-column stats, summed across the file's row groups.
     pub columns: Vec<FileColumnStat>,
 }
 
-/// One column's footer stats within a single file.
 #[derive(Debug)]
 pub struct FileColumnStat {
     /// Dotted column path (the parquet `path_in_schema`).
     pub name: String,
-    /// Total values across the file's row groups.
     pub num_values: u64,
     /// Null values across the file's row groups (0 if stats are absent).
     pub null_count: u64,
     /// Total compressed size of this column's chunks, in bytes.
     pub compressed_bytes: u64,
-    /// Min/max value samples, folded across the file's row groups.
     pub samples: SampleBounds,
 }
 
@@ -103,16 +84,12 @@ pub struct FileColumnStat {
 /// INT64's ticks make one second.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimestampUnit {
-    /// Milliseconds since the epoch.
     Millis,
-    /// Microseconds since the epoch.
     Micros,
-    /// Nanoseconds since the epoch.
     Nanos,
 }
 
 impl TimestampUnit {
-    /// Ticks per second.
     const fn per_second(self) -> i64 {
         match self {
             Self::Millis => 1_000,
@@ -150,8 +127,6 @@ enum SampleKind {
 }
 
 impl SampleKind {
-    /// The kind a column descriptor declares.
-    ///
     /// An `INT64` is a timestamp when its logical type says so, or, for a
     /// file written without logical types, when its legacy converted type
     /// is `TIMESTAMP_MILLIS`/`TIMESTAMP_MICROS` — which the parquet spec
@@ -189,7 +164,6 @@ impl SampleKind {
         Some(Self::Timestamp { unit, utc })
     }
 
-    /// Whether samples of the two kinds order against each other.
     fn comparable(self, other: Self) -> bool {
         match (self, other) {
             (Self::Timestamp { utc: a, .. }, Self::Timestamp { utc: b, .. }) => a == b,
@@ -203,20 +177,14 @@ impl SampleKind {
 /// bytes would mis-order integers and floats.
 #[derive(Debug, Clone)]
 pub enum StatVal {
-    /// A boolean stat.
     Bool(bool),
-    /// An integer stat (`INT32`/`INT64`, widened to `i64`).
     Int(i64),
-    /// A floating-point stat (`FLOAT`/`DOUBLE`, widened to `f64`).
     Float(f64),
-    /// A byte-array stat (string/binary), kept as raw bytes until display.
     Bytes(Vec<u8>),
     /// An `INT64` the column declares a timestamp: `raw` ticks of `unit`
     /// since the epoch, UTC-adjusted or local as the file says.
     Timestamp {
-        /// The stored integer.
         raw: i64,
-        /// What one tick of `raw` is.
         unit: TimestampUnit,
         /// The file marks the column adjusted to UTC.
         utc: bool,
@@ -245,8 +213,6 @@ impl StatVal {
             }
             Statistics::Double(_) => take::<8>(bytes).map(|a| Self::Float(f64::from_le_bytes(a))),
             Statistics::ByteArray(_) | Statistics::FixedLenByteArray(_) => {
-                // Cap the retained sample so a pathological multi-MB stat value
-                // can't bloat the accumulator (it's only ever a display sample).
                 let end = bytes.len().min(MAX_SAMPLE_BYTES);
                 Some(Self::Bytes(bytes[..end].to_vec()))
             }
@@ -259,13 +225,6 @@ impl StatVal {
     /// Whether `self` orders strictly before `other`, or `None` when the two are
     /// different kinds and so can't be compared. Timestamps order as instants
     /// across units; a UTC-adjusted and a local timestamp are different kinds.
-    ///
-    /// `Bytes` are compared as unsigned byte-lexical order, which matches
-    /// parquet's modern UNSIGNED sort order for `BYTE_ARRAY` stats. Legacy files
-    /// that wrote SIGNED byte-array min/max could in principle mis-order a
-    /// high-bit-set value, but these are display-only samples, so the impact is
-    /// cosmetic. (Samples are also truncated to `MAX_SAMPLE_BYTES`, so two values
-    /// sharing that prefix compare equal — again, sample-only.)
     fn precedes(&self, other: &Self) -> Option<bool> {
         match (self, other) {
             (Self::Bool(a), Self::Bool(b)) => Some(a < b),
@@ -293,7 +252,6 @@ impl StatVal {
         }
     }
 
-    /// Render the sample as a display string (truncated to [`MAX_SAMPLE_LEN`]).
     fn display(&self) -> String {
         match self {
             Self::Bool(v) => v.to_string(),
@@ -352,7 +310,6 @@ fn render_timestamp(raw: i64, unit: TimestampUnit, utc: bool) -> String {
     )
 }
 
-/// Read the first `N` bytes of `bytes` as a fixed array, or `None` if short.
 fn take<const N: usize>(bytes: &[u8]) -> Option<[u8; N]> {
     bytes.get(..N)?.try_into().ok()
 }
@@ -403,8 +360,6 @@ impl SampleBounds {
         }
     }
 
-    /// Fold in one observation of a column of `kind`, with the min/max it
-    /// carries, if any.
     fn observe(&mut self, kind: SampleKind, min: Option<StatVal>, max: Option<StatVal>) {
         match &mut self.0 {
             Bounds::Mixed => {}
@@ -424,7 +379,6 @@ impl SampleBounds {
         }
     }
 
-    /// Fold another fold (one file's) into this one.
     fn absorb(&mut self, other: Self) {
         match other.0 {
             Bounds::Unseen => {}
@@ -459,22 +413,12 @@ fn merge(acc: &mut Option<StatVal>, candidate: Option<StatVal>, is_min: bool) ->
 ///
 /// The reader works on duplicates of `file`'s descriptor, which share its
 /// offset: the caller seeks before reading `file` again.
-///
-/// # Errors
-/// The parquet error when the footer cannot be read or parsed.
 pub fn check_footer(file: &File) -> Result<(), parquet::errors::ParquetError> {
     ParquetMetaDataReader::new()
         .parse_and_finish(file)
         .map(drop)
 }
 
-/// Read a single parquet file's footer statistics. Pure Rust — never invokes
-/// `DuckDB`. A corrupt, truncated, or non-parquet file yields an [`Err`], not a
-/// crash.
-///
-/// # Errors
-/// Returns [`ParquetStatsError::Open`] if the file cannot be opened and
-/// [`ParquetStatsError::Footer`] if its footer cannot be parsed.
 pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
     let file = File::open(path).map_err(|source| ParquetStatsError::Open {
         path: path.to_path_buf(),
@@ -487,7 +431,6 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
     let meta = reader.metadata();
     let num_rows = u64::try_from(meta.file_metadata().num_rows()).unwrap_or(0);
 
-    // Sum each column's chunks across the file's row groups, keyed by name.
     let mut cols: BTreeMap<String, FileColumnStat> = BTreeMap::new();
     for rg in meta.row_groups() {
         for cc in rg.columns() {
@@ -540,10 +483,6 @@ pub fn read_file_stats(path: &Path) -> Result<FileStats, ParquetStatsError> {
 /// `FIXED_LEN_BYTE_ARRAY`), because their statistics are truncated samples,
 /// not bounds: a shortened max sorts before the true max, so it cannot back
 /// a decision about every row.
-///
-/// # Errors
-/// Returns [`ParquetStatsError::Open`] if the file cannot be opened and
-/// [`ParquetStatsError::Footer`] if its footer cannot be parsed.
 pub fn read_row_group_bounds(
     path: &Path,
     column: &str,
@@ -606,12 +545,6 @@ pub fn read_row_group_bounds(
 /// Names are returned exactly as the file spells them. Folding to a catalog
 /// key is the server's job ([`trawl_core::schema::catalog_key`]) — this
 /// crate has no opinion about catalog identity.
-///
-/// # Errors
-/// [`ParquetStatsError::Open`] if the file cannot be opened,
-/// [`ParquetStatsError::Footer`] if its footer cannot be parsed, and
-/// [`ParquetStatsError::NonScalarColumn`] for a nested or repeated
-/// top-level element.
 pub fn read_column_names(path: &Path) -> Result<Vec<String>, ParquetStatsError> {
     let file = File::open(path).map_err(|source| ParquetStatsError::Open {
         path: path.to_path_buf(),
@@ -639,8 +572,7 @@ pub fn read_column_names(path: &Path) -> Result<Vec<String>, ParquetStatsError> 
 }
 
 /// Accumulates [`FileStats`] from many files into per-column
-/// [`ParquetColumnStats`] plus a total row count — the footer-based replacement
-/// for `DuckDB`'s `parquet_metadata()` aggregation.
+/// [`ParquetColumnStats`] plus a total row count.
 #[derive(Debug, Default)]
 pub struct StatsAccumulator {
     total_rows: u64,
@@ -656,7 +588,6 @@ struct ColAccum {
 }
 
 impl StatsAccumulator {
-    /// Fold one file's footer stats into the running totals.
     pub fn add_file(&mut self, file: FileStats) {
         self.total_rows += file.num_rows;
         for c in file.columns {
@@ -668,12 +599,10 @@ impl StatsAccumulator {
         }
     }
 
-    /// Total rows seen across all added files.
     pub fn total_rows(&self) -> u64 {
         self.total_rows
     }
 
-    /// Finalize into per-column stats, sorted by column name.
     pub fn finish(self) -> Vec<ParquetColumnStats> {
         self.cols
             .into_iter()
@@ -707,9 +636,6 @@ pub mod fixture {
     /// statistics of `column`'s chunk in row group `row_group`, as a writer
     /// that keeps none for it would. The data pages stay byte for byte, so
     /// a reader still reads every row of that chunk.
-    ///
-    /// # Panics
-    /// When the file is not parquet or has no such row group or column.
     pub fn drop_statistics(path: &Path, row_group: usize, column: &str) {
         let reader = SerializedFileReader::new(File::open(path).expect("open the parquet file"))
             .expect("a parquet footer");
@@ -817,7 +743,6 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("svc.parquet");
         let conn = duckdb::Connection::open_in_memory().unwrap();
-        // 3 rows; one null in `msg`; integer `status`; string min/max.
         write_parquet(
             &conn,
             &path,
@@ -882,13 +807,11 @@ mod tests {
         let raw = vec![b'x'; 5000];
         let decoded = StatVal::decode(SampleKind::Bytes, &stats, &raw).unwrap();
 
-        // Decode caps the retained bytes at MAX_SAMPLE_BYTES.
         match &decoded {
             StatVal::Bytes(b) => assert_eq!(b.len(), MAX_SAMPLE_BYTES),
             other => panic!("expected Bytes, got {other:?}"),
         }
 
-        // display() caps at MAX_SAMPLE_LEN chars then appends one ellipsis.
         let sample = decoded.display();
         assert_eq!(sample.chars().count(), MAX_SAMPLE_LEN + 1);
         assert!(sample.ends_with('…'));
@@ -982,8 +905,6 @@ mod tests {
             Err(ParquetStatsError::Footer { .. })
         ));
 
-        // A real file cut short: the magic and the footer length survive at
-        // the head, the metadata thrift does not.
         let whole = dir.path().join("whole.parquet");
         write_parquet(&conn, &whole, "SELECT 1 AS n");
         let bytes = std::fs::read(&whole).unwrap();
@@ -997,7 +918,6 @@ mod tests {
         ));
     }
 
-    /// Fold `paths` in order and return `column`'s rendered `(min, max)`.
     fn samples_of(paths: &[&Path], column: &str) -> (Option<String>, Option<String>) {
         let mut acc = StatsAccumulator::default();
         for path in paths {
@@ -1310,7 +1230,6 @@ mod tests {
         ));
     }
 
-    /// The raw ticks of each row group's bounds, for readable asserts.
     fn ticks(bounds: &[(StatVal, StatVal)]) -> Vec<(i64, i64)> {
         bounds
             .iter()
@@ -1360,9 +1279,6 @@ mod tests {
         );
     }
 
-    /// A byte-array column's statistics are samples, truncated and so not
-    /// bounds; the reader answers no bounds for it, whatever the footer
-    /// carries, while a timestamp column of the same file keeps its pairs.
     #[test]
     fn row_group_bounds_are_absent_for_byte_array_columns() {
         let dir = tempfile::tempdir().unwrap();

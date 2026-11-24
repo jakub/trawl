@@ -4,29 +4,9 @@
 
 //! Shared harness for trawld's pg-backed end-to-end tests.
 //!
-//! A full-server fixture owns every resource it hands the server (ADR-0021
-//! rulings 1-3). It mints BOTH databases itself — fleet keystore and trawl
-//! app state — from `DATABASE_URL`, builds one sized pool on each, and
-//! passes those pools in through `AppState::from_parts`. Nothing here runs
-//! under `#[sqlx::test]`: that macro's teardown closes the pool under a
-//! 10-second timeout and then drops the database regardless, while the
-//! server's detached tasks (collector, scheduler, compaction) still hold
-//! connections. `#[sqlx::test]` survives only where the handed pool is the
-//! sole connection holder — the store-level suites.
-//!
-//! The app database is still migrated by trawld's REAL boot path
-//! (`StorageState::from_pool`: advisory lock → migrate), so every server
-//! test exercises boot-time migration; the fixture runs
-//! `fleet_auth::MIGRATOR` on the fleet database itself.
-//!
 //! The two schemas must live in two databases: sqlx hardwires one
 //! `_sqlx_migrations` table per database and both migration sets would
 //! collide in it. Two databases also match the production shape.
-//!
-//! Sibling databases are best-effort leftovers: nextest is process-per-test
-//! and the server's pools stay open until process exit, so we don't drop
-//! them (a throwaway CI container makes leaks acceptable; local dev reuses
-//! names prefixed `trawl_app_test_` for easy bulk cleanup).
 
 #![allow(dead_code)] // each test binary uses a subset of these items
 
@@ -38,7 +18,6 @@ use std::path::PathBuf;
 use fleet_auth::{KeyStore, PrincipalKind, RolePermission};
 use sqlx::{Connection as _, Executor as _, PgPool, postgres::PgConnection};
 
-/// Build a `trawl`-namespace [`RolePermission`] list from permission strings.
 pub fn trawl_perms(perms: &[&str]) -> Vec<RolePermission> {
     perms
         .iter()
@@ -123,7 +102,6 @@ pub async fn seed_trawl_roles(store: &KeyStore) {
         .expect("seed coastwatch-viewer");
 }
 
-/// Helper: a single-role name list for `create_key`.
 pub fn roles(names: &[&str]) -> Vec<String> {
     names.iter().map(|s| (*s).to_owned()).collect()
 }
@@ -176,22 +154,6 @@ pub async fn bookkeeping_timeouts(url: &str) -> std::collections::BTreeMap<Strin
     counts
 }
 
-/// Assert that no catalog bookkeeping write was abandoned during the window
-/// the two scrapes bracket.
-///
-/// A test that reads conflict rows or per-service observations is reading
-/// what compaction's phase-4 bookkeeping wrote, and that write is
-/// best-effort under a two-second budget. When postgres is slow enough on a
-/// loaded machine, the budget expires, the evidence never lands, and the
-/// test fails on a value assertion that says nothing about the code under
-/// test. This turns that into a sentence naming the cause.
-///
-/// The recorder is process-global, so under plain `cargo test` (which runs
-/// tests as threads of one process) a SIBLING test's timeout inside this
-/// window trips the assertion too. That is deliberate slack, not a defect:
-/// either way the failure names bookkeeping starvation rather than a
-/// mystery value, and nextest (the repo's runner everywhere) isolates
-/// per-process, where the window can only see its own test.
 pub fn assert_bookkeeping_quiet(
     before: &std::collections::BTreeMap<String, f64>,
     after: &std::collections::BTreeMap<String, f64>,
@@ -210,18 +172,10 @@ pub fn assert_bookkeeping_quiet(
     }
 }
 
-/// Create a `PrometheusHandle` for test contexts.
-///
 /// The prometheus recorder is process-global: `metrics::counter!` always
 /// records into whichever recorder was installed first, regardless of
-/// which handle a given server renders `/metrics` from. Under nextest
-/// (process-per-test) that is always the test's own; under plain
-/// `cargo test` every test in the binary shares one process, so a second
-/// server's freshly-built recorder would never see the counters the
-/// handlers emit — its `/metrics` renders empty and any assertion on it
-/// fails only under `cargo test`. Every harness server in the process
-/// therefore renders the same handle: the first call installs the global
-/// recorder and caches its handle, and every later call clones it.
+/// which handle a given server renders `/metrics` from. Every harness
+/// server in the process therefore renders the same handle.
 pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
     static HANDLE: std::sync::OnceLock<metrics_exporter_prometheus::PrometheusHandle> =
         std::sync::OnceLock::new();
@@ -237,13 +191,6 @@ pub fn test_metrics_handle() -> metrics_exporter_prometheus::PrometheusHandle {
         .clone()
 }
 
-/// The base admin DSN every fixture database is minted from.
-///
-/// Read straight from the environment, because the full-server fixture no
-/// longer runs under `#[sqlx::test]` and so has no harness reading it on
-/// the fixture's behalf. An unset variable panics loudly and fails the
-/// test: a pg-backed suite that silently skips is a suite that passes
-/// while proving nothing.
 pub fn admin_database_url() -> String {
     std::env::var("DATABASE_URL").expect(
         "DATABASE_URL must be set for the pg-backed suites \
@@ -252,7 +199,6 @@ pub fn admin_database_url() -> String {
     )
 }
 
-/// Replace the database path of a postgres URL, preserving any query string.
 pub fn swap_database(url: &str, db: &str) -> String {
     let (base, query) = url
         .split_once('?')
@@ -287,38 +233,25 @@ pub fn fleet_database_url(pool: &PgPool) -> String {
     swap_database(&admin_database_url(), db)
 }
 
-/// Prefix of the app-state databases this fixture mints.
 const APP_DB_PREFIX: &str = "trawl_app_test";
 
-/// Prefix of the fleet-keystore databases this fixture mints (ADR-0021
-/// ruling 2: a full-server fixture outlives `#[sqlx::test]`'s teardown, so
-/// it mints the fleet database itself instead of borrowing the harness's).
 const FLEET_DB_PREFIX: &str = "trawl_fleet_test";
 
 /// Every prefix the sweeper is allowed to drop. A prefix that mints must
 /// appear here or its leftovers accumulate forever.
 const SWEPT_PREFIXES: [&str; 2] = [APP_DB_PREFIX, FLEET_DB_PREFIX];
 
-/// The most databases one sweep drops.
-///
 /// The sweep runs inside a test's setup, and every `DROP DATABASE` forces a
-/// checkpoint and waits for it: a fraction of a second on an idle cluster,
-/// seconds on a loaded one. A full trawl-server run leaves hundreds of
-/// databases behind, so a setup that dropped them all ran past nextest's
-/// 300 s timeout. Every mint adds one database and sweeps, and a sweep that
-/// wins the lock drops up to this many, so a backlog shrinks whenever more
-/// than one mint in four wins it.
+/// checkpoint and waits for it. Every mint adds one database and sweeps,
+/// and a sweep that wins the lock drops up to this many, so a backlog
+/// shrinks whenever more than one mint in four wins it.
 const SWEEP_MAX_DROPS: usize = 4;
 
-/// Fleet-keystore pool size for one fixture server.
 pub const FLEET_POOL_MAX: u32 = 3;
 
-/// Fleet-keystore pool size for a fixture whose test parks bearer
-/// verifications in Postgres (`request_limit`'s junk-token case).
-///
 /// Four requests wait inside `verify_key`'s prefix lookup behind a table
 /// lock, each holding a connection, and one more is free for health's
-/// keystore ping. Every other fixture keeps [`FLEET_POOL_MAX`].
+/// keystore ping.
 pub const PARKED_AUTH_FLEET_POOL_MAX: u32 = 5;
 
 /// How long that pool waits for a free connection: longer than the
@@ -331,19 +264,12 @@ pub const PARKED_AUTH_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration
 /// lock. It is not taken from any pool.
 pub const TABLE_LOCK_CONNECTIONS: u32 = 1;
 
-/// App-store pool size for one fixture server.
 pub const APP_POOL_MAX: u32 = 3;
 
-/// Ceiling of the pool `#[sqlx::test]` hands a test.
-///
-/// Not ours to choose: sqlx builds it at `max_connections(5)`
-/// (`sqlx-postgres/src/testing/mod.rs`). It is charged in full to every
-/// shape that keeps the macro, because a test is free to drive five
-/// queries at once through it.
+/// Not ours to choose: sqlx builds the `#[sqlx::test]` pool at
+/// `max_connections(5)` (`sqlx-postgres/src/testing/mod.rs`).
 pub const SQLX_TEST_POOL_MAX: u32 = 5;
 
-/// The advisory-lock session one `StorageState` holds for its lifetime.
-///
 /// Charged on top of the app pool's own ceiling: the store acquires it from
 /// that pool and then detaches it, so the pool refills the slot and the
 /// process holds `APP_POOL_MAX` plus this one.
@@ -354,22 +280,6 @@ pub const LOCK_CONNECTIONS: u32 = 1;
 /// a shape: it exists for one statement, not for the test.
 pub const ADMIN_TRANSIENT: u32 = 1;
 
-// -- per-shape ceilings ----------------------------------------------------
-//
-// A shape is charged what a test HOLDS for its duration: every live pool at
-// its `max_connections`, plus every raw connection it keeps open. The
-// nextest group width is derived from the WORST of them against
-// [`CI_MAX_CONNECTIONS`] (ADR-0021 ruling 4).
-//
-// One shape is deliberately absent: fleet-auth's `connect_and_ping_via_url`
-// builds a PRODUCTION keystore pool (`KeyStore::connect`, ceiling 8) beside
-// its harness pool, which by pool-ceiling arithmetic would be 13. That test
-// is the one place the production constructor itself is under test, it
-// issues one query at a time and closes the pool before returning, so it
-// holds at most three connections. Read it before trusting this note.
-
-/// A full-server fixture: fleet pool + app pool + the app store's
-/// advisory-lock session.
 pub const FULL_SERVER_CONNECTION_CEILING: u32 = FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS;
 
 /// A full-server fixture whose TEST also opens its own pool on the server's
@@ -386,13 +296,9 @@ pub const SQLX_STORE_CONNECTION_CEILING: u32 = SQLX_TEST_POOL_MAX + APP_POOL_MAX
 /// harness pool at all.
 pub const BOOT_CONNECTION_CEILING: u32 = 2 * (APP_POOL_MAX + LOCK_CONNECTIONS);
 
-/// A full-server fixture on a [`PARKED_AUTH_FLEET_POOL_MAX`] fleet pool,
-/// plus the raw connection its test holds a table lock on.
 pub const PARKED_AUTH_CONNECTION_CEILING: u32 =
     PARKED_AUTH_FLEET_POOL_MAX + APP_POOL_MAX + LOCK_CONNECTIONS + TABLE_LOCK_CONNECTIONS;
 
-/// The widest shape in the postgres admission group. `connection_budget`
-/// multiplies THIS by the group width.
 pub const WORST_TEST_CONNECTION_CEILING: u32 = max_u32(
     max_u32(
         max_u32(
@@ -409,17 +315,9 @@ const fn max_u32(a: u32, b: u32) -> u32 {
     if a > b { a } else { b }
 }
 
-/// `max_connections` of the postgres CI runs against.
 pub const CI_MAX_CONNECTIONS: u32 = 100;
 
 /// The one sanctioned pool constructor for test code.
-///
-/// Every fixture pool is built here with an explicit ceiling, so the
-/// per-test connection budget is a property of this file rather than of
-/// whichever test last copied a `PgPoolOptions` chain. The `allow` below
-/// is the single enforcement point: once the pool constructors land in
-/// clippy's `disallowed_methods` for test code, this is the only site
-/// that opts out.
 pub async fn fixture_pool(dsn: &str, max_connections: u32) -> PgPool {
     fixture_pool_with_acquire_timeout(dsn, max_connections, None).await
 }
@@ -443,12 +341,10 @@ pub async fn fixture_pool_with_acquire_timeout(
     pool
 }
 
-/// A fleet-keystore pool sized by [`FLEET_POOL_MAX`].
 pub async fn fleet_pool(dsn: &str) -> PgPool {
     fixture_pool(dsn, FLEET_POOL_MAX).await
 }
 
-/// An app-store pool sized by [`APP_POOL_MAX`].
 pub async fn app_pool(dsn: &str) -> PgPool {
     fixture_pool(dsn, APP_POOL_MAX).await
 }
@@ -476,8 +372,6 @@ async fn create_test_database(prefix: &str) -> String {
     swap_database(&admin_database_url(), &name)
 }
 
-/// Create an EMPTY sibling database for the trawl app-state store and
-/// return its DSN. trawld's real boot path migrates it (AC5).
 pub async fn create_app_database() -> String {
     create_test_database(APP_DB_PREFIX).await
 }
@@ -521,9 +415,6 @@ fn pid_alive(pid: u32) -> bool {
         .map_or(true, |s| s.success())
 }
 
-/// Best-effort sweep of test databases leaked by earlier runs, over every
-/// prefix in [`SWEPT_PREFIXES`].
-///
 /// The server's pools stay open until process exit, so a test cannot drop
 /// its OWN databases; instead each run garbage-collects its predecessors'.
 /// A database is only dropped when BOTH guards agree it is abandoned: (a)
@@ -532,16 +423,13 @@ fn pid_alive(pid: u32) -> bool {
 /// the server's first connection — and (b) the owner pid encoded in its
 /// name is no longer alive. A single advisory lock elects one sweeper at a
 /// time, and DROP without FORCE is a final safety net (live connections
-/// make it error harmlessly). One lock, one pass, one LIKE per prefix, and
-/// at most [`SWEEP_MAX_DROPS`] drops, so the mint that wins the lock never
-/// pays for the whole backlog.
+/// make it error harmlessly).
 async fn sweep_stale_test_databases() {
     use sqlx::Row as _;
 
     let Ok(mut admin) = PgConnection::connect(&admin_database_url()).await else {
         return;
     };
-    // One sweeper at a time, and only if the lock is free right now.
     let Ok(got_lock) = sqlx::query_scalar::<_, bool>("SELECT pg_try_advisory_lock(741_852_963)")
         .fetch_one(&mut admin)
         .await
@@ -580,11 +468,6 @@ async fn sweep_stale_test_databases() {
         .await;
 }
 
-/// The databases one sweep drops, in listing order: the first
-/// [`SWEEP_MAX_DROPS`] `listed` names, each paired with the prefix whose
-/// LIKE matched it, that both guards call abandoned. A name the run
-/// `marker` claims is skipped before `alive` is asked about its pid, and no
-/// pid is asked about once the batch is full.
 fn sweep_batch<'a>(
     listed: &'a [(&'static str, String)],
     marker: &str,
@@ -607,8 +490,7 @@ fn sweep_guards_parse_own_database_name() {
     // The sweeper's abandoned-db detection must round-trip the naming
     // scheme `create_test_database` uses, for EVERY prefix it mints under
     // — a parse mismatch here silently turns the sweeper into a
-    // live-sibling killer (it did once: the guard-bypassing bug behind
-    // transient 'database does not exist' boot failures).
+    // live-sibling killer.
     for prefix in SWEPT_PREFIXES {
         let name = format!(
             "{prefix}_{}_{}_{}",
@@ -635,9 +517,8 @@ fn sweep_guards_parse_own_database_name() {
 #[test]
 fn a_sweep_drops_one_batch_of_a_backlog() {
     // A finished run leaves hundreds of databases behind. Each DROP forces
-    // a checkpoint, and the first sweep of the next run on that cluster
-    // used to drop them all inside one test's setup: past nextest's 300 s
-    // timeout under load. A sweep takes one batch, in listing order.
+    // a checkpoint, and dropping them all inside one test's setup runs past
+    // nextest's 300 s timeout under load. A sweep takes one batch.
     let backlog: Vec<(&'static str, String)> = (0..3 * SWEEP_MAX_DROPS)
         .map(|n| {
             let prefix = SWEPT_PREFIXES[n % SWEPT_PREFIXES.len()];
@@ -659,9 +540,6 @@ fn a_sweep_drops_one_batch_of_a_backlog() {
         "no owner is checked past a full batch"
     );
 
-    // Both guards still hold ahead of the batch: this run's own databases
-    // and those of a live owner are never in it, nor a name of another
-    // scheme.
     let own = format!("{APP_DB_PREFIX}_{}_4194000_abcdefghijkl", run_marker());
     let live = format!("{FLEET_DB_PREFIX}_otherrun_1_abcdefghijkl");
     let abandoned = format!("{APP_DB_PREFIX}_otherrun_4194000_abcdefghijkl");
@@ -684,7 +562,6 @@ fn a_sweep_drops_one_batch_of_a_backlog() {
     );
 }
 
-/// The database name a DSN points at.
 fn database_name(url: &str) -> &str {
     url.rsplit('/')
         .next()
@@ -692,8 +569,6 @@ fn database_name(url: &str) -> &str {
         .expect("database name in url")
 }
 
-/// Forcibly drop a database by DSN, terminating live connections —
-/// simulates a backend dying under a running server.
 pub async fn kill_database(url: &str) {
     let name = database_name(url);
     let mut admin = PgConnection::connect(&admin_database_url())
@@ -707,11 +582,6 @@ pub async fn kill_database(url: &str) {
         .expect("force-drop database");
 }
 
-/// Terminate every backend connected to the database named in `url`,
-/// leaving the database itself intact — simulates the lock-holding session
-/// dying (pg restart, idle-timeout culling, `pg_terminate_backend`) while
-/// the database stays up so a replacement instance can re-acquire the lock.
-///
 /// Kills the dedicated advisory-lock connection *and* the app-state pool's
 /// connections; sqlx transparently reconnects the pool (the split-brain
 /// hazard), but the raw lock connection cannot, so its session-held
@@ -721,8 +591,6 @@ pub async fn terminate_backends(url: &str) {
     let mut admin = PgConnection::connect(&admin_database_url())
         .await
         .expect("connect to admin DB");
-    // `pg_stat_activity`/`pg_terminate_backend` are cluster-wide; the admin
-    // connection sits on a different database, so filter by datname.
     sqlx::query(
         "SELECT pg_terminate_backend(pid) FROM pg_stat_activity \
          WHERE datname = $1 AND pid <> pg_backend_pid()",
@@ -733,35 +601,18 @@ pub async fn terminate_backends(url: &str) {
     .expect("terminate app-database backends");
 }
 
-/// Serializes [`publish_dir_once`] within one test process.
 static PUBLISH_LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
 
-/// Publish a directory exactly once, atomically, for every test process
-/// and every test thread that races to build it.
-///
 /// If `dest` exists, there is nothing to do. Otherwise `build` fills a
 /// sibling staging directory (a sibling so the rename stays on one
 /// filesystem) and one `rename` publishes it whole.
 ///
-/// The old shape published each FILE with its own rename and then decided
-/// "already built?" by testing ONE of them (ADR-0021 ruling 5). A reader
-/// arriving between the two renames saw the cert without the key, or the
-/// nginx parquet without the postgres one, and failed on a fixture that
-/// was merely half-published. One rename per directory removes that
-/// window: a consumer sees either no directory or a complete one.
-///
-/// Two races, two guards. ACROSS processes the rename decides: the loser
-/// gets `EEXIST`/`ENOTEMPTY` and adopts the winner's tree, but only after
-/// checking that every entry it staged is present under `dest`. A rename
-/// that failed for any other reason, or a `dest` that is missing something
-/// we built, is an error, never a silent pass. WITHIN one process (plain
-/// `cargo test` runs many tests per binary in one process, on many
-/// threads) the staging path itself was the hazard: it was named after the
-/// pid alone, so two threads shared it and one deleted the other's
-/// half-built tree. The staging name now carries a per-call nonce, and one
-/// process-wide mutex serializes publication so the second thread finds
-/// `dest` already in place instead of building a rival copy. No caller ever
-/// removes a staging path but its own.
+/// ACROSS processes the rename decides: the loser gets
+/// `EEXIST`/`ENOTEMPTY` and adopts the winner's tree, but only after
+/// checking that every entry it staged is present under `dest`. WITHIN
+/// one process (plain `cargo test` runs many tests per binary in one
+/// process, on many threads) one process-wide mutex serializes
+/// publication so the second thread finds `dest` already in place.
 fn publish_dir_once(
     dest: &std::path::Path,
     build: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
@@ -826,7 +677,6 @@ fn staging_nonce() -> String {
     format!("{}.{n}.{}", std::process::id(), random_db_suffix())
 }
 
-/// Sorted top-level entry names of a directory.
 fn dir_entry_names(dir: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsString>> {
     let mut names = std::fs::read_dir(dir)?
         .map(|e| e.map(|e| e.file_name()))
@@ -835,8 +685,6 @@ fn dir_entry_names(dir: &std::path::Path) -> std::io::Result<Vec<std::ffi::OsStr
     Ok(names)
 }
 
-/// Whether the tree a rival published carries at least everything we
-/// staged. Losing the rename only counts as success when it did.
 fn published_tree_is_complete(dest: &std::path::Path, staged: &[std::ffi::OsString]) -> bool {
     let Ok(published) = dir_entry_names(dest) else {
         return false;
@@ -846,12 +694,6 @@ fn published_tree_is_complete(dest: &std::path::Path, staged: &[std::ffi::OsStri
 
 #[test]
 fn publish_dir_once_has_one_winner_under_thread_contention() {
-    // The regression guard for the same-process race: under plain `cargo
-    // test` many tests share one process, so two threads can reach an
-    // unpublished fixture at the same instant. Exactly one may build, and
-    // every caller must return to a COMPLETE tree. The old pid-only
-    // staging name let the second thread delete the first one's half-built
-    // directory and publish the remains.
     let tmp = tempfile::tempdir().expect("tempdir");
     let dest = tmp.path().join("fixture-v1");
     let builds = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -898,31 +740,22 @@ fn publish_dir_once_has_one_winner_under_thread_contention() {
     );
 }
 
-/// Root of the shared, published fixture directories.
 fn fixture_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
         .join("fixtures")
 }
 
-/// Publish the parquet seed tree once and return its root.
-///
 /// The directory name carries a version. Change the seed data and bump
 /// `-v1`: a stale tree from an older checkout is then simply a directory
 /// nobody looks at, instead of a half-recognised fixture some test has to
 /// detect and delete.
-///
-/// The tree is READ-ONLY to tests. Each test copies it into its own data
-/// root ([`seed_data_root`]), so nothing writes here.
 fn published_parquet_root() -> PathBuf {
     let dest = fixture_root().join("parquet-v1");
     publish_dir_once(&dest, |staging| {
         // The ADR-0009 on-disk layout the query planner prunes over:
         // `{data}/{env}/{date}/{HH}/{service}.parquet`. Fixtures live
-        // there because that is the only shape the server ever writes — a
-        // flat data root is only reachable through a whole-root `**`
-        // glob, which the planner deliberately no longer emits (it would
-        // swallow `scheduled/`).
+        // there because that is the only shape the server ever writes.
         let hour_dir = staging.join("prod").join("2024-01-15").join("10");
         std::fs::create_dir_all(&hour_dir)?;
 
@@ -964,7 +797,6 @@ fn published_parquet_root() -> PathBuf {
     dest
 }
 
-/// Copy a directory tree recursively.
 fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
     std::fs::create_dir_all(dest)?;
     for entry in std::fs::read_dir(src)? {
@@ -979,15 +811,6 @@ fn copy_tree(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<(
     Ok(())
 }
 
-/// Seed a PRIVATE data root under `dir` from the published parquet tree
-/// and return its directory path.
-///
-/// Every test gets its own copy because the data root is WRITABLE: the
-/// scheduler drops report output under `scheduled/`, and repin stages
-/// siblings of it. Sharing one root meant tests deleting each other's
-/// `scheduled/` directory to stay deterministic (ADR-0021 ruling 7).
-/// A private root removes both the wipe and the cross-test coupling.
-///
 /// The seed is COPIED, not hardlinked: `dir` is a tempdir on /tmp, which
 /// is a tmpfs here, so a link across from the repo's filesystem is EXDEV.
 pub fn seed_data_root(dir: &std::path::Path) -> String {
@@ -996,10 +819,6 @@ pub fn seed_data_root(dir: &std::path::Path) -> String {
     data.to_str().unwrap().to_owned()
 }
 
-/// Return a shared self-signed cert/key pair, published on first call.
-///
-/// Both files are staged and published by ONE rename, so a reader never
-/// sees the cert without its key.
 pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
     let dir = fixture_root().join("tls-v1");
     publish_dir_once(&dir, |staging| {
@@ -1014,13 +833,6 @@ pub fn ensure_test_cert() -> (PathBuf, PathBuf) {
     (dir.join("cert.pem"), dir.join("key.pem"))
 }
 
-/// A reqwest builder that trusts the [`ensure_test_cert`] certificate as a
-/// root, with certificate and hostname verification left on.
-///
-/// Every server these suites start serves that pair: the in-process fixture
-/// passes it as `tls_cert_path`, and `startup_pg` writes it into the spawned
-/// trawld's config. Its SANs cover `localhost` and `127.0.0.1`. Callers add
-/// their own timeout and redirect settings before `build()`.
 pub fn harness_client_builder() -> reqwest::ClientBuilder {
     let (cert_path, _) = ensure_test_cert();
     let pem = std::fs::read(&cert_path).expect("read the shared test certificate");
@@ -1029,7 +841,6 @@ pub fn harness_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder().add_root_certificate(certificate)
 }
 
-/// A response read off a [`raw_https_exchange`].
 pub struct RawResponse {
     pub status: u16,
     /// Header names lowercased, in the order the server sent them.
@@ -1038,7 +849,6 @@ pub struct RawResponse {
 }
 
 impl RawResponse {
-    /// The first value of header `name` (any case).
     pub fn header(&self, name: &str) -> Option<&str> {
         let name = name.to_ascii_lowercase();
         self.headers
@@ -1048,9 +858,6 @@ impl RawResponse {
     }
 }
 
-/// Assert `resp` is a body limit's refusal: a 413 carrying the JSON error
-/// envelope with code `request_too_large` and exactly `message`, which
-/// names the setting and the value it enforced.
 pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
     assert_eq!(resp.status, 413, "{what}: status");
     assert_eq!(
@@ -1068,11 +875,6 @@ pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
     assert_eq!(body["error"]["message"], message, "{what}: message");
 }
 
-/// Write `request` verbatim to the fixture server at `url`
-/// (`https://host:port`) over one TLS connection that trusts the
-/// [`ensure_test_cert`] certificate, then read one HTTP/1.1 response,
-/// whose head must carry `Content-Length`.
-///
 /// For requests reqwest cannot send without a race: a body the server
 /// refuses before reading all of it. reqwest writes the whole body before
 /// it reads, so a server that answers early and closes leaves it with a
@@ -1081,9 +883,6 @@ pub fn assert_request_too_large(resp: &RawResponse, message: &str, what: &str) {
 /// than it sends, or a chunk with no terminator), and nothing is written
 /// after the response starts, so no write can fail and no unread byte is
 /// left to turn the server's close into a reset.
-///
-/// The whole exchange is bounded, so a server that never answers fails the
-/// test with a message instead of hanging it until the runner's timeout.
 pub async fn raw_https_exchange(url: &str, request: &[u8]) -> RawResponse {
     raw_https_exchange_within(url, request, std::time::Duration::from_secs(30))
         .await
@@ -1186,23 +985,14 @@ async fn raw_https_exchange_unbounded(url: &str, request: &[u8]) -> RawResponse 
     }
 }
 
-/// What a failing test needs to know about its own fixture (ADR-0021
-/// ruling 8): which two databases it minted, which port it bound, and the
-/// connection ceilings it was sized against.
-///
 /// Names and numbers ONLY. There is no DSN and no token in this struct,
-/// so no print of it can leak one. The admin DSN the activity snapshot
-/// connects with is read from the environment at print time and never
-/// echoed.
+/// so no print of it can leak one.
 /// Private on purpose: the panic path is the only consumer, and a `pub`
 /// field here is a field a test could overwrite with a DSN, which is
 /// exactly the leak the struct exists to avoid.
 struct FixtureFacts {
-    /// Name (not DSN) of the app-state database.
     app_db: String,
-    /// Name (not DSN) of the fleet-keystore database.
     fleet_db: String,
-    /// `host:port` the server bound.
     bound_addr: String,
     fleet_pool_max: u32,
     app_pool_max: u32,
@@ -1221,8 +1011,6 @@ impl FixtureFacts {
         }
     }
 
-    /// Print the facts, then whatever postgres is willing to say about
-    /// the backends on those two databases.
     fn report(&self) {
         eprintln!("--- fixture facts ---");
         eprintln!("  app database:   {}", self.app_db);
@@ -1236,14 +1024,6 @@ impl FixtureFacts {
     }
 }
 
-/// Print a `pg_stat_activity` census of this test's two databases.
-///
-/// Grouped counts only: datname, `backend_type`, state and the wait
-/// event. No `usename`, `client_addr`, `application_name` or `query`: a
-/// diagnostic that dumps SQL text or connection identities into CI logs
-/// is a leak, and the grouped counts are what distinguish "pool
-/// exhausted" from "everyone is waiting on one lock".
-///
 /// `Drop` cannot await, and `Handle::block_on` panics when called from a
 /// runtime worker thread, so the work happens on a fresh std thread with
 /// its own current-thread runtime. The join is capped at 2 seconds: a
@@ -1310,7 +1090,6 @@ async fn collect_pg_activity(databases: &[String]) -> Result<Vec<String>, &'stat
         .collect())
 }
 
-/// Test server handle with analyst, admin, and ingest tokens.
 pub struct TestServer {
     pub url: String,
     pub analyst_token: String,
@@ -1319,17 +1098,12 @@ pub struct TestServer {
     pub ingest_token: String,
     pub schema_admin_token: String,
     /// The schema-admin key's stable prefix — the identity the repin
-    /// cancel audit events name beside the display name (#109).
+    /// cancel audit events name beside the display name.
     pub schema_admin_prefix: String,
     pub coastwatch_only_token: String,
-    /// Pool on the per-test fleet database (mint/revoke keys mid-test).
     pub fleet_pool: PgPool,
-    /// DSN of the fleet database (kill it to simulate auth-backend loss).
     pub fleet_db_url: String,
-    /// DSN of the sibling trawl app-state database.
     pub app_db_url: String,
-    /// The server's shared state — e.g. to reach the hot buffer when a test
-    /// drives compaction directly against the server's WAL/data dirs.
     pub state: AppState,
     /// The clock captured results' lifecycle reads, fixed at the instant the
     /// fixture was built. `set` moves it for the server too: it is the
@@ -1344,14 +1118,9 @@ pub struct TestServer {
     server_config: ServerConfig,
     http_config: trawl_server::state::HttpConfig,
     state_dir: PathBuf,
-    /// Printed by the drop guard when the test panics.
     facts: FixtureFacts,
 }
 
-/// On a PANICKING unwind only, print the fixture's facts and a census of
-/// its postgres backends. A passing test prints nothing: the guard exists
-/// so a CI failure carries the state that explains it, not so every run
-/// grows a diagnostics tail.
 impl Drop for TestServer {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -1361,10 +1130,6 @@ impl Drop for TestServer {
 }
 
 impl TestServer {
-    /// Boot a SECOND server over this fixture's state and TLS material, on
-    /// an ephemeral port of its own, driven by a shutdown channel the
-    /// caller owns.
-    ///
     /// The fixture's own server is already parked in `accept()` by the time
     /// a test body runs, so it cannot answer what a signal does when it
     /// lands BEFORE the accept loop first polls. Here the caller decides:
@@ -1392,12 +1157,6 @@ impl TestServer {
         })
     }
 
-    /// Boot a SECOND server over this fixture's state and TLS material, on
-    /// an ephemeral port of its own, holding connections to `timeouts`
-    /// instead of the production deadlines and reporting the accept
-    /// loop's bookkeeping through `probe`
-    /// (`serve_with_listener_and_timeouts`). Driven by `shutdown` when
-    /// given, else by its own signal listener. Waits until it answers.
     pub async fn spawn_server_with_timeouts(
         &self,
         timeouts: trawl_server::transport::http::ConnectionTimeouts,
@@ -1432,12 +1191,9 @@ impl TestServer {
         (format!("https://{addr}"), task)
     }
 
-    /// The production router over this fixture's state, with the fixture's
-    /// HTTP config as `f` leaves it.
-    ///
-    /// For in-process requests through `oneshot`. Such a request must carry
-    /// a `SocketAddr` extension where a route reads the peer (ingest does),
-    /// as the accept loop inserts one for every real connection.
+    /// For in-process `oneshot` requests, which must carry a `SocketAddr`
+    /// extension where a route reads the peer (ingest does): only the accept
+    /// loop inserts one, for every real connection.
     pub fn router_with(
         &self,
         f: impl FnOnce(&mut trawl_server::state::HttpConfig),
@@ -1445,9 +1201,6 @@ impl TestServer {
         self.router_over(self.state.clone(), f)
     }
 
-    /// [`Self::router_with`] over `state` instead of the fixture's own: a
-    /// clone of [`Self::state`] with a field replaced, for a setting that
-    /// lives in the state rather than the HTTP config (the stream caps).
     pub fn router_over(
         &self,
         state: AppState,
@@ -1458,14 +1211,6 @@ impl TestServer {
         http::router(state, &http_config)
     }
 
-    /// Boot a SECOND server over this fixture's state and TLS material, on
-    /// an ephemeral port of its own, with the fixture's HTTP config as `f`
-    /// leaves it, and wait until it answers. Answers its base URL and the
-    /// serve task.
-    ///
-    /// `faults` are errors its first `accept()` calls answer, in order,
-    /// before any real accept (`serve_with_listener_failing_accepts`).
-    /// Empty, it serves through `serve_with_listener`, as the fixture does.
     pub async fn spawn_server_with(
         &self,
         f: impl FnOnce(&mut trawl_server::state::HttpConfig),
@@ -1511,11 +1256,6 @@ impl TestServer {
         (format!("https://{addr}"), task)
     }
 
-    /// Boot a SECOND server over this fixture's state and TLS material, on
-    /// an ephemeral port of its own, through the test-only listener that
-    /// negotiates HTTP/2 (`serve_with_listener_h2_for_tests`), and wait
-    /// until it answers. Answers its base URL and the serve task.
-    ///
     /// trawld serves HTTP/1.1 only (ADR-0054). This listener proves the
     /// router and a client under HTTP/2, not the production edge.
     pub async fn spawn_server_h2_for_tests(&self) -> (String, tokio::task::JoinHandle<()>) {
@@ -1545,20 +1285,16 @@ impl TestServer {
         (format!("https://{addr}"), task)
     }
 
-    /// Force-drop the fleet keystore database under the running server.
     pub async fn kill_fleet_database(&self) {
         kill_database(&self.fleet_db_url).await;
     }
 
-    /// Force-drop the app-state database under the running server.
     pub async fn kill_app_database(&self) {
         kill_database(&self.app_db_url).await;
     }
 }
 
-/// Create the standard role keys in the fleet keystore (roles must already
-/// be seeded via [`seed_trawl_roles`]).
-/// Returns (analyst, admin, reader, ingest) plaintext tokens.
+/// Roles must already be seeded via [`seed_trawl_roles`].
 pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String) {
     let analyst = store
         .create_key(
@@ -1604,19 +1340,13 @@ pub async fn mint_role_keys(store: &KeyStore) -> (String, String, String, String
     )
 }
 
-/// A key minted mid-test on a role of its own.
 pub struct MintedKey {
-    /// The plaintext bearer token.
     pub token: String,
     /// The key's stable prefix, the identity the wire attributes writes to.
     pub prefix: String,
-    /// The key's name.
     pub name: String,
 }
 
-/// Mint a service key named `name` on a new role `role-<name>` holding
-/// exactly the trawl permissions `perms`: the two-principal suites give
-/// each principal its own permission set.
 pub async fn mint_key(fleet_pool: &PgPool, name: &str, perms: &[&str]) -> MintedKey {
     let store = KeyStore::from_pool(fleet_pool.clone());
     let role = format!("role-{name}");
@@ -1635,10 +1365,6 @@ pub async fn mint_key(fleet_pool: &PgPool, name: &str, perms: &[&str]) -> Minted
     }
 }
 
-/// Migrate a bare database with the FLEET schema, seed the converted-shape
-/// roles, and return a keystore on it. Both callers hand it an empty
-/// database: the fixture its own mint, the store-level suites their
-/// `#[sqlx::test(migrations = false)]` one.
 pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     fleet_auth::MIGRATOR
         .run(pool)
@@ -1649,26 +1375,12 @@ pub async fn fleet_keystore(pool: &PgPool) -> KeyStore {
     store
 }
 
-/// Poll the health endpoint until the server answers, under ONE overall
-/// deadline.
-///
-/// Three properties the pre-listener fixture did not need. First, the
-/// fixture binds the socket before the serve task runs, so a connection
-/// nothing is accepting yet sits in the kernel backlog instead of being
-/// refused: an attempt that hangs must be cut off, or the poll never
-/// advances. Second, a serve task that has already finished means the
-/// server will never answer (TLS setup failed, or the accept loop
-/// returned), so report that instead of spending the whole budget and then
-/// blaming readiness. Third, the budget is the WALL CLOCK, not a count of
-/// attempts: 100 attempts of up to 500ms each plus sleeps is 51 seconds of
-/// worst case behind a doc comment that says "1s".
-///
 /// [`READY_TIMEOUT`] is the hang guard
 /// ([`trawl_server::test_timing::HANG_GUARD`]) because this fixture boots a
 /// real trawld: two migrations and the boot conformance pass run before
 /// `serve_with_listener` accepts anything, and on a loaded machine that
 /// can take far longer than on an idle one. It is a ceiling on a hang, not
-/// a target; a healthy fixture answers on the first or second attempt.
+/// a target.
 const READY_TIMEOUT: std::time::Duration = trawl_server::test_timing::HANG_GUARD;
 
 /// How long the poll waits on its pending attempts before it starts one
@@ -1700,10 +1412,7 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
             );
         };
         match tokio::time::timeout(remaining.min(patience), pending.join_next()).await {
-            // An attempt answered: the server is up.
             Ok(Some(Ok(Ok(_)))) => return,
-            // An attempt finished with an error (refused, reset): retry it,
-            // unless the server can never answer.
             Ok(Some(_) | None) => {
                 assert!(
                     !serve_task.is_finished(),
@@ -1712,8 +1421,6 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 start_attempt(&mut pending);
             }
-            // Nothing finished in time: keep every pending attempt and start
-            // one more beside them.
             Err(_) => {
                 patience = patience.saturating_mul(2);
                 start_attempt(&mut pending);
@@ -1722,29 +1429,17 @@ pub async fn wait_for_ready(addr: &str, serve_task: &tokio::task::JoinHandle<()>
     }
 }
 
-/// Set up a test server with custom rate limiting for rate limit tests.
 pub async fn setup_with_rate_limit(rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_in_dir(tmp.path(), rate_limit).await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// Set up a test server whose WAL and data root both live under the given
-/// directory (which must outlive the server). The data root is this
-/// test's own copy of the published parquet seed. Scheduled report
-/// output and repin staging therefore land where no other test can see
-/// them.
 pub async fn setup_in_dir(dir: &std::path::Path, rate_limit: RateLimitConfig) -> TestServer {
     setup_in_dir_with_data(dir, seed_data_root(dir), rate_limit).await
 }
 
-/// The derivation policy, resolved the way `main` resolves it.
-///
-/// Production resolves it before the tracing subscriber (the telemetry
-/// layer needs the same policy) and hands it to `AppState::from_config`;
-/// the harness resolves the same config the same way, boot-fatally.
 fn resolve_derivation(
     config: &Config,
 ) -> std::sync::Arc<trawl_server::ingest::producer::Derivation> {
@@ -1754,10 +1449,7 @@ fn resolve_derivation(
     )
 }
 
-/// Like [`setup_in_dir`], but with an explicit cold-data directory — for tests
-/// that compact into a per-test data directory instead of the shared
-/// fixtures.
-#[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
+#[allow(clippy::too_many_lines)]
 pub async fn setup_in_dir_with_data(
     dir: &std::path::Path,
     data_path: String,
@@ -1766,21 +1458,12 @@ pub async fn setup_in_dir_with_data(
     setup_in_dir_with_data_and_timeout(dir, data_path, rate_limit, DEFAULT_TEST_TIMEOUT_SECS).await
 }
 
-/// The query timeout every fixture uses unless a test needs to reach it.
-///
 /// The hang guard, because the deadline is real time and covers a kept
 /// result's fsync, which a loaded disk can stall for seconds: a shorter
-/// bound would fail a correct build with a 504. A test that reaches the
-/// deadline sets its own.
+/// bound would fail a correct build with a 504.
 pub const DEFAULT_TEST_TIMEOUT_SECS: u64 = trawl_server::test_timing::HANG_GUARD.as_secs();
 
-/// A fixture whose query timeout a test can shorten.
-///
-/// Reaching the timeout is the only way to observe a retained permit end
-/// to end: the request has to stop waiting while the work is still
-/// running (ADR-0024), and ten seconds of it per test is not a bill worth
-/// paying.
-#[allow(clippy::too_many_lines)] // linear assembly: two databases, two pools, one config
+#[allow(clippy::too_many_lines)]
 pub async fn setup_in_dir_with_data_and_timeout(
     dir: &std::path::Path,
     data_path: String,
@@ -1807,8 +1490,6 @@ pub async fn setup_in_dir_with_data_and_timeout(
     .await
 }
 
-/// The query pool and the query database's budgets a fixture runs with
-/// (ADR-0056).
 #[derive(Debug, Clone, Copy)]
 pub struct QueryKnobs {
     pub max_concurrent_queries: usize,
@@ -1818,7 +1499,6 @@ pub struct QueryKnobs {
 }
 
 impl QueryKnobs {
-    /// Two permits under the shipped budgets.
     pub const DEFAULT: Self = Self {
         max_concurrent_queries: 2,
         spill_max_bytes: trawl_server::config::DEFAULT_QUERY_SPILL_MAX_BYTES,
@@ -1827,8 +1507,6 @@ impl QueryKnobs {
     };
 }
 
-/// A fixture over a caller-owned `dir` and data root whose query pool and
-/// budgets are `query` and whose queries time out after `timeout_secs`.
 pub async fn setup_with_query_knobs(
     dir: &std::path::Path,
     data_path: String,
@@ -1855,7 +1533,6 @@ pub async fn setup_with_query_knobs(
     .await
 }
 
-/// How a fixture's fleet-keystore pool is built.
 #[derive(Debug, Clone, Copy)]
 pub struct FleetPoolSize {
     pub max_connections: u32,
@@ -1864,23 +1541,17 @@ pub struct FleetPoolSize {
 }
 
 impl FleetPoolSize {
-    /// The pool every fixture uses unless a test parks bearer
-    /// verifications in Postgres.
     pub const DEFAULT: Self = Self {
         max_connections: FLEET_POOL_MAX,
         acquire_timeout: None,
     };
 
-    /// The pool for a test that parks bearer verifications in Postgres:
-    /// [`PARKED_AUTH_FLEET_POOL_MAX`] connections and
-    /// [`PARKED_AUTH_ACQUIRE_TIMEOUT`].
     pub const PARKED_AUTH: Self = Self {
         max_connections: PARKED_AUTH_FLEET_POOL_MAX,
         acquire_timeout: Some(PARKED_AUTH_ACQUIRE_TIMEOUT),
     };
 }
 
-/// The `[server]` row caps a fixture boots with.
 #[derive(Debug, Clone, Copy)]
 pub struct RowCaps {
     pub max_result_rows: usize,
@@ -1888,15 +1559,12 @@ pub struct RowCaps {
 }
 
 impl RowCaps {
-    /// The caps every fixture uses unless a test needs to reach one.
     pub const DEFAULT: Self = Self {
         max_result_rows: 100_000,
         max_export_rows: 1_000_000,
     };
 }
 
-/// A fixture with its own row caps, for tests that must cross one with a
-/// handful of events rather than a hundred thousand.
 pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
@@ -1917,14 +1585,10 @@ pub async fn setup_with_row_caps(caps: RowCaps) -> TestServer {
         trawl_config::InvestigationConfig::default(),
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// The two body limits a fixture boots with: `[server]
-/// max_request_body_bytes` on the interactive router and `[ingest]
-/// max_body_bytes` on the ingest router.
 #[derive(Debug, Clone, Copy)]
 pub struct BodyLimits {
     pub max_request_body_bytes: usize,
@@ -1932,8 +1596,6 @@ pub struct BodyLimits {
 }
 
 impl BodyLimits {
-    /// The limits every fixture uses unless a test needs to reach one: a
-    /// 128 KiB interactive limit and the shipped ingest default.
     pub const DEFAULT: Self = Self {
         max_request_body_bytes: 128 * 1024,
         ingest_max_body_bytes: trawl_server::config::DEFAULT_INGEST_MAX_BODY_BYTES,
@@ -1947,7 +1609,6 @@ pub async fn setup_with_body_limits(limits: BodyLimits) -> TestServer {
     setup_with_limits(limits, RateLimitConfig::default()).await
 }
 
-/// [`setup_with_body_limits`] with its own rate limits too.
 pub async fn setup_with_limits(limits: BodyLimits, rate_limit: RateLimitConfig) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
@@ -1968,13 +1629,10 @@ pub async fn setup_with_limits(limits: BodyLimits, rate_limit: RateLimitConfig) 
         trawl_config::InvestigationConfig::default(),
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// Exercise configured WAL presence through real `AppState` construction, without
-/// replacing the writer or preconstructing dashboard metadata in the test.
 pub async fn setup_in_dir_with_ingest(dir: &std::path::Path, enabled: bool) -> TestServer {
     setup_with_ingest_config(
         dir,
@@ -2019,14 +1677,10 @@ pub async fn setup_with_scheduler(scheduler: SchedulerConfig) -> TestServer {
         trawl_config::InvestigationConfig::default(),
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// A fixture whose `[ingest] trusted_relays` holds `cidrs`, for tests of
-/// what a host-less event from a relay becomes. The tempdir holding its WAL
-/// is leaked so it outlives the server.
 pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
@@ -2047,7 +1701,6 @@ pub async fn setup_with_trusted_relays(cidrs: &[&str]) -> TestServer {
         trawl_config::InvestigationConfig::default(),
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
@@ -2064,12 +1717,9 @@ pub struct HotBufferKnobs {
     pub compaction_interval_secs: u64,
 }
 
-/// A fixture with its own hot-buffer caps and compaction interval. The
-/// tempdir holding its WAL is leaked so it outlives the server.
 pub async fn setup_with_hot_buffer(knobs: HotBufferKnobs) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_hot_buffer_in(tmp.path(), knobs).await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
@@ -2098,11 +1748,6 @@ pub async fn setup_with_hot_buffer_in(dir: &std::path::Path, knobs: HotBufferKno
     .await
 }
 
-/// A fixture over a caller-owned `dir` (WAL in `dir/wal`) and data root
-/// that hands the built state to `before_boot` before
-/// `boot::prepare_corpus` runs, for tests of the boot itself: plant WAL or
-/// markers first, observe the state before the boot (subscribe to the
-/// event bus, read the gate), then what the boot did.
 pub async fn setup_observing_boot(
     dir: &std::path::Path,
     data_path: String,
@@ -2154,9 +1799,6 @@ async fn setup_with_ingest_config(
     );
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Both databases are the fixture's own (ADR-0021 ruling 2): the server's
-    // detached tasks outlive any test-macro teardown, so nothing may drop a
-    // database out from under them mid-test.
     let fleet_db_url = create_fleet_database().await;
     let app_db_url = create_app_database().await;
 
@@ -2191,9 +1833,6 @@ async fn setup_with_ingest_config(
         .unwrap();
 
     let (cert_path, key_path) = ensure_test_cert();
-    // ADR-0021 ruling 1: the port is owned from bind to serve. The fixture
-    // holds this listener until `serve_with_listener` adopts it, so nothing
-    // can take the port in between.
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind an ephemeral port for the server");
     let addr = listener
         .local_addr()
@@ -2262,9 +1901,6 @@ async fn setup_with_ingest_config(
         investigation,
     };
 
-    // ADR-0021 ruling 3: the server receives pools the fixture built and
-    // sized; only production connects for itself. The app store still boots
-    // through the real path (advisory lock, then migrate).
     let auth = trawl_server::state::AuthState::from_key_store(KeyStore::from_pool(fleet.clone()));
     let storage = trawl_server::store::StorageState::from_pool(app_pool(&app_db_url).await)
         .await
@@ -2293,8 +1929,6 @@ async fn setup_with_ingest_config(
     }
     prepare_corpus(&state, &config).await;
 
-    // Snapshot collector: makes GET /api/v1/dashboard live in tests, same
-    // as trawld's `main()` does in production.
     let _collector = trawl_server::monitor::spawn_snapshot_collector(
         state.clone(),
         addr.clone(),
@@ -2332,8 +1966,6 @@ async fn setup_with_ingest_config(
     }
 }
 
-/// Spawn the HTTPS server task over the fixture's listener and wait for it
-/// to answer on `addr`. Returns the task handle so the caller can keep it.
 async fn serve_and_wait(
     listener: TcpListener,
     state: &AppState,
@@ -2371,18 +2003,14 @@ async fn serve_and_wait(
     task
 }
 
-/// The boot steps trawld's `main()` runs between state construction and
-/// the listener (`boot::prepare_corpus`): on an ingest node, rollup-marker
-/// recovery, boot conformance and WAL hydration; on a query-only node, the
-/// archive identity gate. The fixture never spawns compaction, so overhang
-/// the boot leaves stays until the test drives compaction itself.
+/// The fixture never spawns compaction, so overhang the boot leaves stays
+/// until the test drives compaction itself.
 async fn prepare_corpus(state: &AppState, config: &Config) {
     trawl_server::boot::prepare_corpus(state, config)
         .await
         .expect("the boot corpus preparation must succeed");
 }
 
-/// Set up a test server whose queries time out after `timeout_secs`.
 pub async fn setup_with_query_timeout(
     rate_limit: RateLimitConfig,
     timeout_secs: u64,
@@ -2395,7 +2023,6 @@ pub async fn setup_with_query_timeout(
         timeout_secs,
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
@@ -2404,8 +2031,7 @@ pub async fn setup_with_query_timeout(
 /// parks bearer verifications in Postgres and still needs a free
 /// connection beside them. With [`FleetPoolSize::PARKED_AUTH`] and the
 /// test's table-lock connection, the shape is
-/// [`PARKED_AUTH_CONNECTION_CEILING`]. The tempdir is leaked so it
-/// outlives the server.
+/// [`PARKED_AUTH_CONNECTION_CEILING`].
 pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
     let tmp = tempfile::tempdir().expect("failed to create temp dir");
     let server = setup_with_ingest_config(
@@ -2426,14 +2052,12 @@ pub async fn setup_with_fleet_pool(size: FleetPoolSize) -> TestServer {
         trawl_config::InvestigationConfig::default(),
     )
     .await;
-    // Leak the tempdir so it survives the test (cleaned up by OS).
     std::mem::forget(tmp);
     server
 }
 
-/// A fixture over `data_path` whose `[capture]` limits are `capture`
-/// (ADR-0057), for the captured-results suites. `dir` holds the WAL and
-/// stays the caller's, so a test can seed the data root before boot.
+/// `dir` holds the WAL and stays the caller's, so a test can seed the data
+/// root before boot.
 pub async fn setup_with_capture(
     dir: &std::path::Path,
     data_path: String,
@@ -2450,8 +2074,6 @@ pub async fn setup_with_capture(
     .await
 }
 
-/// [`setup_with_capture`] whose queries time out after `timeout_secs`, for
-/// a capture that must outlast the fixture's default query timeout.
 pub async fn setup_with_capture_timeout(
     dir: &std::path::Path,
     data_path: String,
@@ -2470,8 +2092,6 @@ pub async fn setup_with_capture_timeout(
     .await
 }
 
-/// [`setup_with_capture_timeout`] whose `[investigation]` settings are
-/// `investigation` (ADR-0059): the evidence budgets and clocks.
 pub async fn setup_with_evidence(
     dir: &std::path::Path,
     data_path: String,
@@ -2500,9 +2120,7 @@ pub async fn setup_with_evidence(
     .await
 }
 
-/// Captured results through the fixture's HTTPS listener (ADR-0057): the
-/// requests, a corpus with known times, and the check that a refused
-/// capture took nothing.
+/// Captured results through the fixture's HTTPS listener (ADR-0057).
 pub mod captured {
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -2514,7 +2132,6 @@ pub mod captured {
 
     use super::TestServer;
 
-    /// One answer: its status, its headers and its JSON body.
     pub type Answer = (StatusCode, HeaderMap, serde_json::Value);
 
     fn client() -> reqwest::Client {
@@ -2531,7 +2148,6 @@ pub mod captured {
         (status, headers, body)
     }
 
-    /// `POST /api/v1/results` with `body`, as `token`.
     pub async fn capture(server: &TestServer, token: &str, body: &serde_json::Value) -> Answer {
         answer(
             client()
@@ -2542,7 +2158,6 @@ pub mod captured {
         .await
     }
 
-    /// A capture that must answer 200, decoded through the wire type.
     pub async fn captured(
         server: &TestServer,
         token: &str,
@@ -2553,7 +2168,6 @@ pub mod captured {
         serde_json::from_value(answer).expect("a capture response")
     }
 
-    /// `GET /api/v1{path}`, as `token`.
     pub async fn get(server: &TestServer, token: &str, path: &str) -> Answer {
         answer(
             client()
@@ -2563,13 +2177,10 @@ pub mod captured {
         .await
     }
 
-    /// A page of capture `id`; `query` is the query string, `""` or
-    /// `"?offset=..."`.
     pub async fn page(server: &TestServer, token: &str, id: &str, query: &str) -> Answer {
         get(server, token, &format!("/results/{id}{query}")).await
     }
 
-    /// A byte range of one cell of capture `id`.
     pub async fn cell(
         server: &TestServer,
         token: &str,
@@ -2586,9 +2197,6 @@ pub mod captured {
         .await
     }
 
-    /// Capture `result` with column `position` displayed as `name`, read
-    /// back through a page as `token`.
-    ///
     /// Display names are not unique (ADR-0057), but no query makes two
     /// columns of one name: `table` and `fields` list a repeated name once,
     /// `pivot` gets `host_1` from `DuckDB` for a value that matches a row
@@ -2626,14 +2234,6 @@ pub mod captured {
         page.result
     }
 
-    /// Assert that capture `result`, whose columns at two or more
-    /// positions share `name`, answers each shared position's own cell,
-    /// in a page of every column and in one selecting `name`. `stored` is
-    /// a page of the same capture read before [`rename_column`] shared
-    /// the name, while every column had a name of its own. The shared
-    /// positions hold different cells in every stored row where one of
-    /// them holds a value, and there is such a row, so a reader that
-    /// answered one position's cell for both fails.
     pub async fn assert_own_cells(
         server: &TestServer,
         token: &str,
@@ -2694,7 +2294,6 @@ pub mod captured {
         }
     }
 
-    /// The ids `GET /api/v1/results` lists for `token`, in its order.
     pub async fn listed(server: &TestServer, token: &str) -> Vec<String> {
         let (status, _, body) = get(server, token, "/results").await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -2703,18 +2302,12 @@ pub mod captured {
         list.results.into_iter().map(|r| r.id).collect()
     }
 
-    /// One event of a seeded corpus. Its `_ingested` is ten seconds after
-    /// its `_time`.
     pub struct Event {
         pub time: DateTime<Utc>,
         pub host: String,
         pub message: String,
     }
 
-    /// Write `events` as `{data}/prod/{date}/{HH}/{service}.parquet`, the
-    /// layout the planner prunes over, with the shared fixture's columns.
-    /// Every event must fall in the first event's hour. Seed before the
-    /// fixture boots, as the shared tree is.
     pub fn seed_hour(data: &str, service: &str, events: &[Event]) -> PathBuf {
         let first = events.first().expect("a corpus has events").time;
         let hour = first.format("%Y-%m-%d/%H").to_string();
@@ -2727,11 +2320,9 @@ pub mod captured {
         seed_partition(data, &format!("prod/{hour}"), service, events)
     }
 
-    /// Write `events` as `{data}/{partition}/{service}.parquet` with the
-    /// shared fixture's columns, whatever their times. Compaction names a
-    /// partition by when it wrote it, not by the events' `_time`, so this
-    /// is the file a sender whose clock was off leaves behind. Seed before
-    /// the fixture boots.
+    /// Writes `events` whatever their times: compaction names a partition by
+    /// when it wrote it, not by `_time`, so this is the file a sender whose
+    /// clock was off leaves behind.
     pub fn seed_partition(data: &str, partition: &str, service: &str, events: &[Event]) -> PathBuf {
         let dir = Path::new(data).join(partition);
         std::fs::create_dir_all(&dir).unwrap();
@@ -2779,9 +2370,6 @@ pub mod captured {
         path
     }
 
-    /// One event of a correlation corpus ([`seed_rows`]): every column the
-    /// shared fixture has, `_raw` apart from `message`, and fields of its
-    /// own. Its `_ingested` is `ingested_after` past its `_time`.
     #[derive(Debug, Clone)]
     pub struct Row {
         pub time: DateTime<Utc>,
@@ -2795,8 +2383,8 @@ pub mod captured {
         pub fields: Vec<(String, Cell)>,
     }
 
-    /// The value of a [`Row`]'s extra field. A file's column takes the
-    /// type of the first row that names it.
+    /// An extra field's value. A file's column takes the type of the first
+    /// row that names it.
     #[derive(Debug, Clone, PartialEq)]
     pub enum Cell {
         Text(String),
@@ -2823,8 +2411,6 @@ pub mod captured {
     }
 
     impl Row {
-        /// A row of `service` in `env` at `time` on `host`, `message` in
-        /// both `message` and `_raw`, ingested ten seconds later.
         pub fn new(
             time: DateTime<Utc>,
             env: &str,
@@ -2844,14 +2430,12 @@ pub mod captured {
             }
         }
 
-        /// The row with `_raw` set to `raw`.
         #[must_use]
         pub fn raw(mut self, raw: &str) -> Self {
             raw.clone_into(&mut self.raw);
             self
         }
 
-        /// The row with text field `name` set to `value`.
         #[must_use]
         pub fn field(mut self, name: &str, value: &str) -> Self {
             self.fields
@@ -2859,21 +2443,18 @@ pub mod captured {
             self
         }
 
-        /// The row with boolean field `name` set to `value`.
         #[must_use]
         pub fn boolean_field(mut self, name: &str, value: bool) -> Self {
             self.fields.push((name.to_owned(), Cell::Boolean(value)));
             self
         }
 
-        /// The row with float field `name` set to `value`.
         #[must_use]
         pub fn float_field(mut self, name: &str, value: f64) -> Self {
             self.fields.push((name.to_owned(), Cell::Float(value)));
             self
         }
 
-        /// The row ingested `after` past its `_time`.
         #[must_use]
         pub fn ingested_after(mut self, after: chrono::TimeDelta) -> Self {
             self.ingested_after = after;
@@ -2881,10 +2462,7 @@ pub mod captured {
         }
     }
 
-    /// Write `rows` in the ADR-0009 layout, one file per (env, hour,
-    /// service): `{data}/{env}/{date}/{HH}/{service}.parquet`. A file's
-    /// columns are the shared fixture's and the union of its rows' extra
-    /// fields. Seed before the fixture boots.
+    /// Seed before the fixture boots.
     pub fn seed_rows(data: &str, rows: &[Row]) {
         let mut files: std::collections::BTreeMap<(String, String, String), Vec<&Row>> =
             std::collections::BTreeMap::new();
@@ -2900,9 +2478,6 @@ pub mod captured {
         }
     }
 
-    /// Write `rows` as one file, `{data}/{partition}/{file}.parquet`,
-    /// whatever their envs, services and times: the file a sender's
-    /// mislabelled batch leaves, or many groups in one file.
     pub fn seed_file(data: &str, partition: &str, file: &str, rows: &[Row]) {
         let rows: Vec<&Row> = rows.iter().collect();
         write_rows(data, partition, file, &rows);
@@ -2981,9 +2556,7 @@ pub mod captured {
         .unwrap();
     }
 
-    /// A fixture over the shared seed plus whatever `seed` writes into the
-    /// data root, with `capture`. The tempdir is leaked so it outlives the
-    /// server.
+    /// The tempdir is leaked so it outlives the server.
     pub async fn boot_seeded(
         capture: trawl_config::CaptureConfig,
         seed: impl FnOnce(&str),
@@ -3003,8 +2576,6 @@ pub mod captured {
         server
     }
 
-    /// `POST /api/v1/results/{read}` with `body`, as `token`: one of the
-    /// correlation reads (ADR-0058).
     pub async fn correlate(
         server: &TestServer,
         token: &str,
@@ -3020,8 +2591,6 @@ pub mod captured {
         .await
     }
 
-    /// A correlation read that must answer 200, decoded through the wire
-    /// type.
     pub async fn correlated(
         server: &TestServer,
         token: &str,
@@ -3036,25 +2605,18 @@ pub mod captured {
     /// The service of the [`corpus`] events, which no shared seed row has.
     pub const SERVICE: &str = "capturecorpus";
 
-    /// Events in the [`corpus`].
     pub const ROWS: usize = 20;
 
-    /// The `seq` of the corpus event whose message is multi-byte text.
     pub const WIDE_SEQ: usize = 7;
 
-    /// The multi-byte message: two-, three- and four-byte characters.
     pub const WIDE_MESSAGE: &str = "wide ✓ ünïcødé ☕🐟 end";
 
-    /// An RFC 3339 instant.
     pub fn at(text: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(text)
             .unwrap()
             .with_timezone(&Utc)
     }
 
-    /// [`ROWS`] events of [`SERVICE`], one a second from
-    /// 2024-01-16T10:00:00Z, hosts alternating `web01` and `web02`; event
-    /// [`WIDE_SEQ`] carries [`WIDE_MESSAGE`], the rest `event {seq}`.
     pub fn corpus() -> Vec<Event> {
         let start = at("2024-01-16T10:00:00Z");
         (0..ROWS)
@@ -3087,9 +2649,6 @@ pub mod captured {
     /// slow query's execution, which its control holds to.
     pub const INTO_EXECUTE: Duration = Duration::from_millis(500);
 
-    /// Write [`SLOW_ROWS`] events of [`SLOW_SERVICE`] with 128-character hex
-    /// messages, all distinct, as one Parquet file in the [`corpus`] hour,
-    /// with the shared fixture's columns.
     pub fn slow_corpus(data: &str) {
         let hour = Path::new(data).join("prod/2024-01-16/10");
         std::fs::create_dir_all(&hour).expect("create the corpus hour");
@@ -3108,8 +2667,6 @@ pub mod captured {
         .expect("write the slow corpus");
     }
 
-    /// A fixture over the shared seed plus the [`corpus`], with `capture`
-    /// and `rate_limit`. The tempdir is leaked so it outlives the server.
     pub async fn boot(
         rate_limit: super::RateLimitConfig,
         capture: trawl_config::CaptureConfig,
@@ -3117,7 +2674,6 @@ pub mod captured {
         boot_with_data(rate_limit, capture).await.0
     }
 
-    /// [`boot`], with the data root's path.
     pub async fn boot_with_data(
         rate_limit: super::RateLimitConfig,
         capture: trawl_config::CaptureConfig,
@@ -3147,8 +2703,6 @@ pub mod captured {
         (server, data)
     }
 
-    /// A refused capture took nothing: the pool has the `permits` it had
-    /// before, and a publication writer still acquires.
     pub async fn assert_nothing_held(server: &TestServer, permits: usize, what: &str) {
         let pool = &server.state.query.pool;
         assert_eq!(pool.available_permits(), permits, "{what}: no permit held");
@@ -3159,8 +2713,6 @@ pub mod captured {
         );
     }
 
-    /// The fleet key id `token` authenticates as: the key a capture
-    /// belongs to.
     pub async fn key_id(server: &TestServer, token: &str) -> i64 {
         fleet_auth::KeyStore::from_pool(server.fleet_pool.clone())
             .verify_key(token)
@@ -3169,8 +2721,6 @@ pub mod captured {
             .id
     }
 
-    /// Every name in the server's results root, sorted: published results
-    /// (`<id>.parquet`) and stages (`.stage-*`).
     pub fn root_names(server: &TestServer) -> Vec<String> {
         let mut names: Vec<String> = std::fs::read_dir(server.state.results.root.path())
             .expect("read the results root")
@@ -3195,7 +2745,6 @@ pub mod captured {
     }
 
     impl Disk {
-        /// The WAL directory the fixture's ingest writes.
         pub fn wal(&self) -> PathBuf {
             self.dir.join("wal")
         }
@@ -3236,8 +2785,6 @@ pub mod captured {
         assert_eq!(failures, 0, "the compaction pass lost nothing");
     }
 
-    /// The keys a [`Restartable`] fixture minted once, which every boot
-    /// after the first reuses from the same fleet database.
     struct Keys {
         analyst: String,
         admin: String,
@@ -3259,9 +2806,7 @@ pub mod captured {
     /// them. No captured-results test reads the dashboard.
     pub struct Restartable {
         pub disk: Disk,
-        /// The per-key rates of every boot.
         pub rate_limit: super::RateLimitConfig,
-        /// The capture limits of the next boot.
         pub capture: trawl_config::CaptureConfig,
         /// Whether the next boot is an ingest node (the default). `false`
         /// boots a query-only node: no WAL writer and no hot buffer, and
@@ -3278,9 +2823,7 @@ pub mod captured {
     /// bound but not yet served: nothing has answered a request, so a test
     /// can read what the preparation left before any client can act on it.
     pub struct Unserved {
-        /// The prepared state the listener will serve.
         pub state: trawl_server::state::AppState,
-        /// DSN of the app-state database the state boots over.
         pub app_db_url: String,
         listener: std::net::TcpListener,
         addr: String,
@@ -3296,16 +2839,11 @@ pub mod captured {
     /// already dropped, so the port no longer accepts connections and the
     /// locks the state held are released.
     pub struct RefusedBoot {
-        /// The error `boot::prepare_corpus` returned.
         pub error: String,
-        /// The address the refused boot had bound.
         pub addr: String,
     }
 
     impl Restartable {
-        /// The shared seed plus `seed`'s files in a fresh data root, under
-        /// `rate_limit` and `capture`, booted once. The tempdir is leaked so
-        /// it outlives every boot.
         pub async fn boot(
             rate_limit: super::RateLimitConfig,
             capture: trawl_config::CaptureConfig,
@@ -3370,18 +2908,10 @@ pub mod captured {
             (fixture, server)
         }
 
-        /// Stop `server` and boot again over everything it left, under
-        /// [`Self::capture`], [`Self::ingest_enabled`] and
-        /// [`Self::scheduler`], with the results clock reading what it read,
-        /// then serve. A refused boot fails the test.
         pub async fn restart(&self, server: TestServer) -> TestServer {
             admitted(self.try_reboot(server).await).serve().await
         }
 
-        /// [`Self::restart`] up to and including `boot::prepare_corpus`, and
-        /// no further: the listener is bound but unserved, or the boot was
-        /// refused and its listener and state are gone.
-        ///
         /// The serve task stops and every handle on the old state drops;
         /// the locks it held are released as its connections close, so the
         /// new boot retries each while the old holder lets go. Then the boot
@@ -3547,8 +3077,6 @@ pub mod captured {
     }
 
     impl Unserved {
-        /// Serve the prepared state on the bound listener and wait until it
-        /// answers.
         pub async fn serve(self) -> TestServer {
             let Self {
                 state,
@@ -3593,7 +3121,6 @@ pub mod captured {
         }
     }
 
-    /// The prepared boot, or a failed test naming why the boot was refused.
     fn admitted(boot: Result<Unserved, RefusedBoot>) -> Unserved {
         boot.unwrap_or_else(|refused| {
             panic!(
@@ -3625,20 +3152,12 @@ pub mod captured {
     }
 }
 
-/// Set up a test server with fixtures and return a `TestServer` handle.
-///
-/// The fixture mints both databases; the caller supplies nothing.
 pub async fn setup() -> TestServer {
     setup_with_rate_limit(RateLimitConfig::default()).await
 }
 
 /// The rows of a typed result, each as the plain JSON object a test reads
 /// fields from: column name → cell, so an absent field indexes as null.
-///
-/// Live `data` frames are one-row results and `snapshot` frames carry one,
-/// so a test decodes the frame through the shared codec first; a frame the
-/// wire type refuses then fails the test instead of reading as absent
-/// fields.
 pub fn result_rows(result: &trawl_api::value::QueryResult) -> Vec<serde_json::Value> {
     result
         .rows
@@ -3654,23 +3173,16 @@ pub fn result_rows(result: &trawl_api::value::QueryResult) -> Vec<serde_json::Va
         .collect()
 }
 
-/// A tracing capture layer, for the tests that assert on audit events.
-///
-/// Shared because the events it exists to prove are emitted from several
-/// subsystems (the repin engine, the schema handlers) and asserted from
-/// several test binaries, each of which is its own process.
 pub mod audit_capture {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    /// One captured tracing event's fields, stringified.
     #[derive(Debug, Clone)]
     pub struct Captured {
         pub fields: BTreeMap<String, String>,
     }
 
     impl Captured {
-        /// One field's captured value, or a panic naming the event.
         pub fn field(&self, name: &str) -> String {
             self.fields
                 .get(name)
@@ -3679,7 +3191,6 @@ pub mod audit_capture {
         }
     }
 
-    /// Capture layer recording every event's fields as strings.
     #[derive(Clone, Default)]
     pub struct Capture {
         events: Arc<Mutex<Vec<Captured>>>,
@@ -3690,18 +3201,9 @@ pub mod audit_capture {
             self.events.lock().unwrap().clone()
         }
 
-        /// Every captured event whose `event_type` is `name` and whose
-        /// `key` field carries `value`.
-        ///
-        /// The correlation half is not optional. The subscriber this layer
-        /// installs is GLOBAL, so under `cargo test` — which runs a
-        /// binary's tests as threads in one process, unlike nextest's
-        /// process per test — a sibling test's ack or repin lands in the
-        /// same buffer and an exact-count assertion fails for reasons that
-        /// have nothing to do with the code under test. Every audit event
-        /// worth asserting names its subject (a field, an actor, a job), so
-        /// filtering on the unique name the test chose costs nothing and
-        /// makes the count mean what it says.
+        /// Filtering on `key` is not optional: the subscriber this layer
+        /// installs is GLOBAL, so under `cargo test` a sibling test's ack or
+        /// repin lands in the same buffer.
         ///
         /// Values are captured through `Debug`, so a string field arrives
         /// quoted: the match is `contains`, not equality.
@@ -3752,12 +3254,10 @@ pub mod investigating {
 
     use super::{MintedKey, TestServer};
 
-    /// The `n`th investigation id of a test.
     pub fn id(n: u32) -> String {
         format!("{n:032x}")
     }
 
-    /// `method` on `/api/v1{path}` as `token`, with an optional JSON body.
     /// The answer's body is `null` when it is empty, as a 204's is.
     pub async fn call(
         server: &TestServer,
@@ -3785,17 +3285,14 @@ pub mod investigating {
         (status, body)
     }
 
-    /// The error envelope's code.
     pub fn code(body: &Value) -> &str {
         body["error"]["code"].as_str().unwrap_or_default()
     }
 
-    /// The error envelope's message.
     pub fn message(body: &Value) -> &str {
         body["error"]["message"].as_str().unwrap_or_default()
     }
 
-    /// The create request every test sends.
     pub fn creation() -> Value {
         json!({
             "title": "502s on checkout",
@@ -3803,7 +3300,6 @@ pub mod investigating {
         })
     }
 
-    /// Create investigation `n` as `key`; it must be new.
     pub async fn create(server: &TestServer, key: &MintedKey, n: u32) -> Investigation {
         let (status, body) = call(
             server,
@@ -3817,7 +3313,6 @@ pub mod investigating {
         serde_json::from_value(body).expect("an investigation")
     }
 
-    /// Read investigation `n` as `key` with `query` (`""` or `"?since=…"`).
     pub async fn read(
         server: &TestServer,
         key: &MintedKey,
@@ -3836,8 +3331,6 @@ pub mod investigating {
         serde_json::from_value(body).expect("an investigation read")
     }
 
-    /// The step entries of investigation `n`, read as `key`, in sequence
-    /// order.
     pub async fn steps(server: &TestServer, key: &MintedKey, n: u32) -> Vec<LogEntry> {
         let mut steps: Vec<LogEntry> = read(server, key, n, "")
             .await
@@ -3857,11 +3350,10 @@ pub mod investigating {
         }
     }
 
-    /// Wait, bounded, until step `seq` of investigation `n` exists and has
-    /// an outcome, and answer the step. A step written by a task the test
-    /// no longer awaits, such as an admission whose request went away, may
-    /// land after the test's own write returns, so a step not there yet is
-    /// waited for like one without an outcome.
+    /// A step written by a task the test no longer awaits, such as an
+    /// admission whose request went away, may land after the test's own write
+    /// returns, so a step not there yet is waited for like one without an
+    /// outcome.
     pub async fn settled(server: &TestServer, key: &MintedKey, n: u32, seq: u64) -> LogEntry {
         let give_up = std::time::Instant::now() + std::time::Duration::from_mins(1);
         loop {
@@ -3880,11 +3372,8 @@ pub mod investigating {
         }
     }
 
-    /// The statement a write into an investigation locks it with.
     pub const INVESTIGATION_LOCK: &str = "SELECT status, seq FROM investigations%";
 
-    /// A session of its own holding investigation `n`'s row lock in an open
-    /// transaction, until the test commits it or drops the connection.
     pub async fn hold(server: &TestServer, n: u32) -> sqlx::PgConnection {
         use sqlx::Connection as _;
         let mut held = sqlx::PgConnection::connect(&server.app_db_url)
@@ -3899,12 +3388,8 @@ pub mod investigating {
         held
     }
 
-    /// The statement a promotion locks a cited result with.
     pub const PROMOTION_LOCK: &str = "UPDATE captured_results%SET state = 'kept'%";
 
-    /// A session of its own holding captured result `result`'s row lock in
-    /// an open transaction, until the test commits it or drops the
-    /// connection.
     pub async fn hold_result(server: &TestServer, result: &str) -> sqlx::PgConnection {
         use sqlx::Connection as _;
         let mut held = sqlx::PgConnection::connect(&server.app_db_url)
@@ -3920,8 +3405,6 @@ pub mod investigating {
         held
     }
 
-    /// Wait, bounded, until `count` sessions of the app-state database wait
-    /// on a lock in a statement that starts like `pattern`.
     pub async fn lock_waits(server: &TestServer, pattern: &str, count: i64) {
         let probe = super::fixture_pool(&server.app_db_url, 1).await;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -3934,9 +3417,6 @@ pub mod investigating {
         probe.close().await;
     }
 
-    /// How many sessions of the app-state database wait on a lock in a
-    /// statement that starts like `pattern`, read once: what Postgres
-    /// reports at this moment, for a test that asserts it at a chosen one.
     pub async fn lock_waiters(server: &TestServer, pattern: &str) -> i64 {
         let probe = super::fixture_pool(&server.app_db_url, 1).await;
         let count = waiting(&probe, pattern).await;
@@ -3983,9 +3463,6 @@ pub mod investigating {
         request
     }
 
-    /// Wait, bounded, until `app` admits the investigation list as `token`,
-    /// a regular request that waits on no lock. Until then each attempt
-    /// must be refused at the request count.
     pub async fn until_admitted(app: &axum::Router, token: &str) {
         use tower::ServiceExt as _;
         let give_up = std::time::Instant::now() + std::time::Duration::from_secs(20);
@@ -4012,9 +3489,6 @@ pub mod investigating {
         }
     }
 
-    /// A capture request body of `query` over the last hour, attached to
-    /// investigation `n` with `attach`'s other members (`seen_seq`,
-    /// `purpose`).
     pub fn attached(query: &str, n: u32, attach: &Value) -> Value {
         let mut investigation = json!({ "id": id(n) });
         if let Value::Object(members) = attach {

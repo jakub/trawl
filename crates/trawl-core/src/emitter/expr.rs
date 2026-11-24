@@ -18,7 +18,6 @@ use super::functions::{
 use super::relation::Nullness;
 use super::state::{EmitterState, Use};
 
-/// Recursively translate an expression AST node to a SQL fragment.
 pub(crate) fn emit_expr(
     expr: &Spanned<Expr>,
     state: &mut EmitterState,
@@ -30,8 +29,6 @@ pub(crate) fn emit_expr(
             if let Some(kind) = PatternKind::of_operator(*op) {
                 return emit_pattern_test(lhs, kind, rhs, state);
             }
-            // Bare field-vs-literal comparisons bind through the pin
-            // scope, on the same rule table as the search stage.
             if let Some(clause) = try_pinned_comparison(lhs, *op, rhs, state)? {
                 return Ok(clause);
             }
@@ -48,9 +45,6 @@ pub(crate) fn emit_expr(
             translate_function(name, &translated_args, state)
         }
         Expr::InList { expr: target, list } => {
-            // A pinned bare-field target with an all-literal list routes
-            // each element through the equality rule, mirroring the
-            // search stage's IN list.
             if let Some(clause) = try_pinned_in_list(target, list, state)? {
                 return Ok(clause);
             }
@@ -64,11 +58,6 @@ pub(crate) fn emit_expr(
     }
 }
 
-/// Translate one call's arguments, after [`check_call`] has passed the
-/// call: integer positions inline as literals, closed-vocabulary tokens
-/// that choose the emitted expression reach the translation as text, and
-/// literals read through `to_json` carry their own type.
-///
 /// The one argument walk for every position a call can sit in: the
 /// expression arm above and every aggregation call site
 /// (`emitter::pipeline`'s `stats`/`timechart`/`pivot`/`eventstats`).
@@ -106,30 +95,16 @@ pub(crate) fn emit_call_args(
             } else if json_positions.contains(&i)
                 && let Some(literal) = bare_literal(&a.node)
             {
-                // Read through `to_json` (`sev()`'s subject): a
-                // bare parameter has no type for `DuckDB` to
-                // infer there, so a literal carries the type it
-                // binds as anyway.
                 Ok(typed_literal(&literal, state))
             } else {
                 match absent_argument_type(name, i).map(|ty| (ty, state.nullness(&a.node))) {
-                    // A NULL with no type of its own (an absent field,
-                    // `coalesce` of absent fields) takes the type the call
-                    // reads, so `DuckDB` still has one overload to bind.
-                    // The cast changes no value: the argument has none.
                     Some((ty, Nullness::Untyped)) => {
                         Ok(format!("CAST({} AS {ty})", emit_expr(a, state)?))
                     }
-                    // The data's column or an untyped NULL: a cast could
-                    // convert the data, so the type comes from a typed
-                    // NULL beside it, which keeps a value of that type and
-                    // refuses any other at bind.
                     Some((ty, Nullness::UntypedUnlessMade)) => Ok(format!(
                         "COALESCE({}, CAST(NULL AS {ty}))",
                         emit_expr(a, state)?
                     )),
-                    // Anything that can carry data, or that `DuckDB` types
-                    // itself, is emitted as is.
                     Some((_, Nullness::Typed)) | None => emit_expr(a, state),
                 }
             }
@@ -138,8 +113,6 @@ pub(crate) fn emit_call_args(
     Ok(translated_args)
 }
 
-/// Map a comparison [`BinaryOp`] onto the search stage's [`FilterOp`]
-/// vocabulary; `None` for every non-comparison operator.
 fn comparison_filter_op(op: BinaryOp) -> Option<FilterOp> {
     match op {
         BinaryOp::Eq => Some(FilterOp::Eq),
@@ -152,7 +125,6 @@ fn comparison_filter_op(op: BinaryOp) -> Option<FilterOp> {
     }
 }
 
-/// The operand flip for `400 < status` → `status > 400`.
 fn flip_filter_op(op: FilterOp) -> FilterOp {
     match op {
         FilterOp::Gt => FilterOp::Lt,
@@ -163,18 +135,10 @@ fn flip_filter_op(op: FilterOp) -> FilterOp {
     }
 }
 
-/// A bare literal, as the rule table's door wants it: the AST value, not
-/// a re-rendered one, so a float literal keeps its source token (ADR-0011
-/// ruling #6, [`crate::ast::FloatLiteral`]).
-///
 /// A negative numeric literal leaves the parser as `Unary{Neg, Literal}`,
-/// never as a signed `Literal`, so the sign is folded back in here, into
-/// the `i64` and into the float's source token alike, keeping the DECIMAL
-/// binding exact. Without the fold a bare `> -400` would emit pin-blind
-/// while its quoted spelling `> "-400"` (a plain `Literal`) bound
-/// pin-aware: two spellings of one number disagreeing. Only `Int`/`Float`
-/// fold; `-"400"` and `-true` are arithmetic on a non-number and keep
-/// their generic emission.
+/// never as a signed `Literal`, so the sign is folded back in here. Without
+/// the fold a bare `> -400` would emit pin-blind while its quoted spelling
+/// `> "-400"` bound pin-aware.
 fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     match expr {
         Expr::Literal(lit) => Some(Cow::Borrowed(lit)),
@@ -182,8 +146,6 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
             op: UnaryOp::Neg,
             operand,
         } => match &operand.node {
-            // `i64::MIN`'s magnitude has no `i64` negation to fold into;
-            // it declines, exactly as any other unfoldable shape does.
             Expr::Literal(LiteralValue::Int(n)) => {
                 Some(Cow::Owned(LiteralValue::Int(n.checked_neg()?)))
             }
@@ -196,19 +158,6 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     }
 }
 
-/// Emit `lhs matches rhs`, `lhs like rhs` or `lhs ilike rhs`.
-///
-/// The pattern must be literal text in the query
-/// ([`literal_operand`], ADR-0063): anything else is
-/// [`EmitError::ComputedPattern`], never SQL, whether or not the parser
-/// saw the query first.
-///
-/// Only the left operand is a subject, since the right one is the
-/// pattern rather than a comparison target. A subject that
-/// [`crate::pin_scope::PinScope::subject_pin`] recognizes, under a pin
-/// whose pattern form is not native, matches against its canonical text
-/// ([`pattern_target`], ADR-0011); every other left operand is emitted as
-/// written.
 fn emit_pattern_test(
     lhs: &Spanned<Expr>,
     kind: PatternKind,
@@ -222,8 +171,6 @@ fn emit_pattern_test(
         Some((subject, pin)) if compare::pattern_form(Some(pin)) != PatternForm::Native => {
             pattern_target(&subject_sql(&subject, state)?, Some(pin))
         }
-        // An unpinned subject, or a pin whose column is already text:
-        // the operand as written.
         _ => emit_expr(lhs, state)?,
     };
     Ok(match kind {
@@ -243,24 +190,6 @@ fn emit_pattern_test(
     })
 }
 
-/// Detect a pinned-subject-vs-literal comparison and emit it through the
-/// shared rule table (ADR-0011, ADR-0013 ruling 9).
-///
-/// The subject is whatever [`crate::pin_scope::PinScope::subject_pin`]
-/// recognizes: a bare pinned field, or a pin-declaring call over one
-/// (`sev(level)`). Every other shape returns `None` and falls through to
-/// generic, literal-driven emission, structurally: field-vs-field, an
-/// ordinary function wrapper, arithmetic, `== null`, unpinned fields, and
-/// any form the rule table leaves native.
-///
-/// Both operand orders are accepted (`400 < status` is `status > 400`).
-/// The pattern operators never reach here: [`emit_pattern_test`] owns
-/// them.
-///
-/// NULL policy is [`NullPolicy::Strict`]: plain SQL null propagation,
-/// exactly what a pin-blind `where` answers. The search stage's
-/// `OR field IS NULL` widening for `!=` deliberately does not apply here,
-/// or a repin would change missing-field semantics.
 fn try_pinned_comparison(
     lhs: &Spanned<Expr>,
     op: BinaryOp,
@@ -275,7 +204,6 @@ fn try_pinned_comparison(
         state.pin_scope().subject_pin(rhs),
     ) {
         (Some((subject, pin)), _) => bare_literal(&rhs.node).map(|l| (subject, pin, filter_op, l)),
-        // `400 < status` is `status > 400`, subject on the right.
         (None, Some((subject, pin))) => {
             bare_literal(&lhs.node).map(|l| (subject, pin, flip_filter_op(filter_op), l))
         }
@@ -288,15 +216,11 @@ fn try_pinned_comparison(
         return Ok(None);
     };
     if matches!(form, CompareForm::Native(_)) {
-        // The rule table leaves the shape literal-driven (VARCHAR pin,
-        // ordered non-numeric literal): generic emission is the rule.
         return Ok(None);
     }
     // Subject first, again for parameter order.
     let target = subject_sql(&subject, state)?;
     let clause = comparison_sql(&target, filter_op, form, NullPolicy::Strict, state);
-    // Parenthesize for composition under and/or/not, matching the generic
-    // emitter's style; the two-armed shapes arrive parenthesized already.
     Ok(Some(if clause.starts_with('(') {
         clause
     } else {
@@ -304,9 +228,6 @@ fn try_pinned_comparison(
     }))
 }
 
-/// Detect `field in (literal, …)` over a pinned field and emit each
-/// element through the equality rule, mirroring the search stage's IN
-/// list.
 fn try_pinned_in_list(
     target: &Spanned<Expr>,
     list: &[Spanned<Expr>],
@@ -325,9 +246,7 @@ fn try_pinned_in_list(
         };
         forms.push(form);
     }
-    // Subject first, for parameter order: `in_list_sql` pushes one
-    // parameter per element, except the all-SEVERITY arm, which renders
-    // inlined ladder points and pushes none.
+    // Subject first, for parameter order.
     let subject = subject_sql(&subject, state)?;
     let clause = in_list_sql(&subject, forms, state);
     Ok(Some(if clause.starts_with('(') {
@@ -337,9 +256,6 @@ fn try_pinned_in_list(
     }))
 }
 
-/// The SQL a pinned subject compares as: the column read, or the
-/// translated call.
-///
 /// A pin-declaring call is emitted by the ordinary function path, so it
 /// is the same SQL `| let s = sev(level)` would project and the
 /// comparison and the projection cannot read one value two ways.
@@ -353,14 +269,8 @@ fn subject_sql(
     }
 }
 
-/// A literal bound as a parameter that carries its own type.
-///
-/// For the positions read through `to_json`
-/// ([`super::functions::json_read_positions`]): `DuckDB` infers a
-/// parameter's type from its surroundings, and `to_json(?)` offers none,
-/// so the statement fails to prepare. The cast names exactly the type the
-/// value binds as, so nothing about the reading changes; a NULL takes
-/// VARCHAR, the type every text reading starts from.
+/// `DuckDB` infers a parameter's type from its surroundings, and `to_json(?)`
+/// offers none, so the statement fails to prepare.
 fn typed_literal(lit: &LiteralValue, state: &mut EmitterState) -> String {
     let ty = match lit {
         LiteralValue::String(_) | LiteralValue::Null => "VARCHAR",

@@ -4,7 +4,7 @@
 
 //! Browser evidence server using the production asset handlers and CSP.
 //! Build in release mode after building the SPA so rust-embed captures that
-//! distribution. Run distinct processes for embedded and disk-backed evidence.
+//! distribution.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;

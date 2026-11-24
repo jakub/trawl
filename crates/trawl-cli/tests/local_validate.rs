@@ -5,7 +5,7 @@
 //! Local `trawl validate`, observed on the real `trawl` binary: with no
 //! token it parses the query and then runs the semantic checks both
 //! query lanes share, so a query either lane would refuse is refused
-//! here too, with the same sentence (#457).
+//! here too, with the same sentence.
 //!
 //! Every run strips the inherited `TRAWL_*` environment and reads its own
 //! empty config file, so no saved key sends the query to a server.
@@ -34,8 +34,6 @@ fn empty_config(dir: &Path) -> std::path::PathBuf {
     path
 }
 
-/// A refusal: a non-zero exit, nothing on stdout, and `sentence` on
-/// stderr.
 fn assert_refused(output: &Output, query: &str, sentence: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -64,7 +62,6 @@ fn local_validate_refuses_a_malformed_json_path() {
         query,
         r#"json(): invalid JSON path "$[" in argument 2: expected an array index after ["#,
     );
-    // The hint travels with it, said once.
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert_eq!(
         stderr.matches("a JSON path is $ for the root").count(),
@@ -97,8 +94,6 @@ fn local_validate_refuses_an_invalid_format() {
     );
 }
 
-/// A query that passes every check still prints `valid` and exits 0, and
-/// a parse failure is still refused as before.
 #[test]
 fn local_validate_accepts_a_valid_query_and_refuses_a_parse_error() {
     let dir = tempfile::tempdir().expect("tempdir");

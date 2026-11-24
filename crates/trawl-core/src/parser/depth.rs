@@ -2,9 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The [`MAX_TREE_DEPTH`] check (#447, ADR-0024's amendment of
-//! 2026-11-11), over a query the grammar accepted, and the
-//! [`MAX_SEARCH_PRESCAN`] count that runs before the grammar.
+//! The [`MAX_TREE_DEPTH`] check (ADR-0024) and the [`MAX_SEARCH_PRESCAN`]
+//! count that runs before the grammar.
 //!
 //! Most later walks of a parsed query recurse once a level, and the
 //! grammar builds a flat chain as deep as it is long. This walk is the one
@@ -38,13 +37,6 @@ enum Tree {
     Expression,
 }
 
-/// The refusal of the first tree in `query` deeper than
-/// [`MAX_TREE_DEPTH`], in text order: each top-level search token, then
-/// each stage's expressions in the order they are written.
-///
-/// A search refusal spans the top-level token that holds the deep path.
-/// An expression refusal spans the refused root as the tree holds it: a
-/// `where` condition, a `let` value or one aggregation argument.
 pub(super) fn tree_depth_error(query: &Query) -> Option<ParseError> {
     let Query { search, pipeline } = query;
     let SearchStage {
@@ -54,8 +46,6 @@ pub(super) fn tree_depth_error(query: &Query) -> Option<ParseError> {
         latest: _,
         hoisted: _,
     } = search;
-    // The top-level `OR` between the groups is no level, so each token is
-    // a root of its own.
     if let Some(token) = groups
         .iter()
         .flatten()
@@ -82,8 +72,6 @@ fn refusal(tree: Tree, span: &Range<usize>) -> ParseError {
     }
 }
 
-/// The span of the first root in `stage` deeper than [`MAX_TREE_DEPTH`].
-///
 /// Every stage and every field is named, with no wildcard and no `..`, so
 /// a stage or a field that holds an expression does not compile until it
 /// is counted here.
@@ -164,11 +152,7 @@ fn first_deep<'q>(roots: impl IntoIterator<Item = &'q Spanned<Expr>>) -> Option<
         .map(|root| root.span.clone())
 }
 
-/// Whether some path in `root` passes through more than
-/// [`MAX_TREE_DEPTH`] operators, unaries, calls and `in` lists. Fields
-/// and values add no level.
 fn expr_too_deep(root: &Expr) -> bool {
-    // Each node still to visit, with the levels above it.
     let mut pending = vec![(root, 0_usize)];
     while let Some((node, above)) = pending.pop() {
         let level = above + 1;
@@ -185,7 +169,6 @@ fn expr_too_deep(root: &Expr) -> bool {
                 }
                 pending.push((&operand.node, level));
             }
-            // An empty call is still one level.
             Expr::FunctionCall { name: _, args } => {
                 if level > MAX_TREE_DEPTH {
                     return true;
@@ -205,11 +188,7 @@ fn expr_too_deep(root: &Expr) -> bool {
     false
 }
 
-/// Whether some path in `root` passes through more than
-/// [`MAX_TREE_DEPTH`] search `NOT`s and bracket groups. Filters, words and
-/// time clauses add no level.
 fn search_too_deep(root: &SearchToken) -> bool {
-    // Each token still to visit, with the levels above it.
     let mut pending = vec![(root, 0_usize)];
     while let Some((token, above)) = pending.pop() {
         let level = above + 1;
@@ -237,16 +216,12 @@ fn search_too_deep(root: &SearchToken) -> bool {
     false
 }
 
-/// The refusal of `input` when the search grammar could recurse more than
-/// [`MAX_SEARCH_PRESCAN`] levels deep in it: the search's sentence, over
-/// the bracket or `NOT` at which [`prescan`]'s count passes the bound.
 pub(super) fn prescan_error(input: &str) -> Option<ParseError> {
     prescan(input, MAX_SEARCH_PRESCAN)
         .err()
         .map(|at| refusal(Tree::Search, &at))
 }
 
-/// A level [`prescan`] holds open: a `(` or a `NOT`, at its byte offset.
 struct Level {
     at: usize,
     bracket: bool,
@@ -349,20 +324,16 @@ pub(super) fn prescan(input: &str, limit: usize) -> Result<usize, Range<usize>> 
     Ok(peak)
 }
 
-/// Queries at a chosen tree depth, and trees deeper than the limit built
-/// in code, for the tests across the crate that follow the limit.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use crate::ast::{BinaryOp, Expr, LiteralValue, PipeStage, Query, Spanned, UnaryOp};
 
-    /// Which tree a [`Shape`] makes deep.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Kind {
         Search,
         Expression,
     }
 
-    /// One shape #447's first premise checkpoint names, at some depth.
     #[derive(Debug)]
     pub(crate) struct Shape {
         pub(crate) name: &'static str,
@@ -375,12 +346,10 @@ pub(crate) mod fixtures {
         pub(crate) refused: String,
     }
 
-    /// `n` terms joined by `+`: an operator chain `n - 1` levels deep.
     pub(crate) fn chain(n: usize) -> String {
         vec!["1"; n].join(" + ")
     }
 
-    /// `a == 0 <op> a == 1 …`: `n` comparisons, `n` levels deep.
     pub(crate) fn comparisons(n: usize, op: &str) -> String {
         (0..n)
             .map(|i| format!("a == {i}"))
@@ -388,7 +357,6 @@ pub(crate) mod fixtures {
             .join(&format!(" {op} "))
     }
 
-    /// `body` wrapped in `n` nested calls to `function`.
     fn calls(function: &str, n: usize, body: &str) -> String {
         format!(
             "{}{body}{}",
@@ -397,9 +365,8 @@ pub(crate) mod fixtures {
         )
     }
 
-    /// Every shape of #447's first premise checkpoint, each exactly
-    /// `depth` levels deep. Sixteen of a call shape's levels are nested
-    /// calls, the most the grammar's nesting bound admits.
+    /// Sixteen of a call shape's levels are nested calls, the most the
+    /// grammar's nesting bound admits.
     pub(crate) fn shapes(depth: usize) -> Vec<Shape> {
         assert!(depth > 16, "a call shape spends 16 levels on its calls");
         let d = depth;
@@ -427,7 +394,6 @@ pub(crate) mod fixtures {
             expression("and chain", "* | where ", comparisons(d, "and"), ""),
             Shape {
                 name: "minus run",
-                // `-` repeats with no space between
                 text: format!("* | where {}a < 2", "-".repeat(d - 1)),
                 kind: Kind::Expression,
                 refused: "a < 2".to_owned(),
@@ -492,7 +458,6 @@ pub(crate) mod fixtures {
         Spanned::new(node, 0..0)
     }
 
-    /// The integer literal `n`.
     pub(crate) fn int(n: i64) -> Spanned<Expr> {
         at(Expr::Literal(LiteralValue::Int(n)))
     }
@@ -511,12 +476,10 @@ pub(crate) mod fixtures {
         })
     }
 
-    /// `1+1+…` with `terms` terms.
     pub(crate) fn flat_chain(terms: usize) -> Spanned<Expr> {
         chain_of(std::iter::repeat_with(|| int(1)).take(terms))
     }
 
-    /// `operand` under `n` unary `op`s.
     pub(crate) fn unary_run(op: UnaryOp, n: usize, operand: Spanned<Expr>) -> Spanned<Expr> {
         (0..n).fold(operand, |operand, _| {
             at(Expr::Unary {
@@ -526,12 +489,10 @@ pub(crate) mod fixtures {
         })
     }
 
-    /// The field a [`spliced`] template names where the deep tree goes.
     const MARKER: &str = "DEEP";
 
     /// `template` parsed, with the deep tree in place of the one field
-    /// `DEEP` its last stage names: a tree the parser now refuses, in a
-    /// query that otherwise came from text.
+    /// `DEEP` its last stage names.
     pub(crate) fn spliced(template: &str, deep: Spanned<Expr>) -> Query {
         let mut query = crate::parser::parse(template).expect("the template parses");
         let mut deep = Some(deep);

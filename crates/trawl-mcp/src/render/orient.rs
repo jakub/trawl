@@ -3,29 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The `orient` reply as one text block and its mirror (ADR-0058).
-//!
-//! The text block, top to bottom, each part omitted when it is empty:
-//!
-//! 1. the outcome line;
-//! 2. trawld's version, now in UTC and in the display zone, the key and its
-//!    permissions, and health with its problems;
-//! 3. the inventory: one JSON array per environment, service and host,
-//!    `[env, service, host, events, last_seen]`, or the line saying why it
-//!    is absent;
-//! 4. retention reach per environment, or the line saying why it is
-//!    absent; then the open investigations, one line each, and the line
-//!    saying what that list leaves out or why it is absent;
-//! 5. the degraded fields, the applied limits, and the installed DSL
-//!    stages, functions and reference resources;
-//! 6. at most two proposed next calls;
-//! 7. the DSL essentials block.
-//!
-//! Every value that came from trawld or from stored events (an
-//! environment, a service, a host, a key name, a field name) prints as
-//! JSON. The fitting drops inventory rows from the end first, then the
-//! function list, then the resource list, then the next calls, and says
-//! what it dropped in the inventory note; a reply that does not fit with
-//! all of those gone is an error.
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value as Json, json};
@@ -37,7 +14,6 @@ use super::rows::{as_u64, json_string, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line};
 use crate::reply::{NextAction, OrientReply};
 
-/// The `orient` reply as a tool result fitted under `budget`.
 #[must_use]
 pub fn orient(mut reply: OrientReply, budget: Budget) -> CallToolResult {
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
@@ -55,7 +31,6 @@ pub fn orient(mut reply: OrientReply, budget: Budget) -> CallToolResult {
     }
 }
 
-/// The text block of an `orient` reply, unfitted.
 #[must_use]
 pub fn orient_text(reply: &OrientReply) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -69,7 +44,6 @@ pub fn orient_text(reply: &OrientReply) -> String {
     lines.join("\n")
 }
 
-/// Part 2: the version, now, the key and health.
 fn installation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     if let Some(version) = &reply.server_version {
         lines.push(format!("version: trawld {}", one_line(version)));
@@ -101,7 +75,6 @@ fn installation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
 }
 
-/// Part 3: the inventory rows as JSON arrays, or why there are none.
 fn inventory_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     if !reply.inventory.is_empty() {
         lines.push(
@@ -123,7 +96,6 @@ fn inventory_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
 }
 
-/// Part 4: retention reach per environment, or why it is absent.
 fn retention_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     for reach in &reply.retention {
         let policy = if reach.max_age_days == 0 {
@@ -147,7 +119,6 @@ fn retention_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
 }
 
-/// Part 4, continued: the open investigations.
 fn investigation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     if !reply.open_investigations.is_empty() {
         lines.push("open investigations, most recently changed first:".to_owned());
@@ -158,7 +129,6 @@ fn investigation_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
 }
 
-/// Part 5: degraded fields, limits and the installed DSL.
 fn catalog_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     if let Some(note) = &reply.degraded_note {
         lines.push(format!("degraded fields: {}", one_line(note)));
@@ -194,8 +164,6 @@ fn catalog_lines(reply: &OrientReply, lines: &mut Vec<String>) {
     }
 }
 
-/// The proposed next calls, one line each, as the result layout prints
-/// them.
 pub(crate) fn next_action_lines(actions: &[NextAction], lines: &mut Vec<String>) {
     for action in actions.iter().take(MAX_NEXT_ACTIONS) {
         lines.push(format!(
@@ -207,7 +175,6 @@ pub(crate) fn next_action_lines(actions: &[NextAction], lines: &mut Vec<String>)
     }
 }
 
-/// Words trawld named, comma-separated on one line.
 fn word_list(words: &[String]) -> String {
     words
         .iter()
@@ -216,7 +183,6 @@ fn word_list(words: &[String]) -> String {
         .join(", ")
 }
 
-/// What the fitting gives up, in order.
 #[derive(Debug, Clone, Copy)]
 enum Drop {
     Nothing,
@@ -225,8 +191,6 @@ enum Drop {
     NextActions,
 }
 
-/// `reply` fitted under `budget`, or `None` when it does not fit with
-/// every droppable part gone.
 fn fit(mut reply: OrientReply, budget: Budget) -> Option<(String, Json)> {
     let rows = reply.inventory.len();
     let note = reply.inventory_note.clone();
@@ -249,9 +213,6 @@ fn fit(mut reply: OrientReply, budget: Budget) -> Option<(String, Json)> {
     None
 }
 
-/// The reply with the most of its first `rows` inventory rows that fit,
-/// rendered, its note saying how many were dropped; `None` when not even
-/// zero rows fit.
 fn most_rows(
     reply: &OrientReply,
     rows: usize,

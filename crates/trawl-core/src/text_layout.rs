@@ -4,35 +4,12 @@
 
 //! Terminal text cut, padded and caret-marked in display cells.
 //!
-//! The unit is the display cell: the columns a terminal gives a string.
-//! A string is measured as ratatui-core draws it, one extended grapheme
-//! cluster at a time: `日` takes two cells, `e\u{301}` one, `❤\u{FE0F}`
-//! two, `ｶﾞ` two and `لا` two, one for each letter. The width of a string
-//! is the sum of its clusters' widths. It is not the unicode-width of the
-//! whole string, which gives `لا` one cell where ratatui draws two.
-//!
-//! Text is passed through [`sanitize_display_text`] before it is measured,
-//! segmented or returned, so a control, bidi or zero-width character
-//! prints as U+FFFD and cannot rewrite the line around it.
-//!
-//! [`fit_cells`] returns the sanitized text whole when it fits its budget.
-//! Otherwise it returns the longest run of whole leading clusters that
-//! fits beside one [`MARKER`], then the marker. It never cuts inside a
-//! cluster, so a selector, combining mark or sound mark is never split
-//! from its base.
-//!
 //! The work [`fit_cells`] does is bounded by the budget, not by the input.
 //! It reads at most `8 × (budget + 1)` characters of the input and walks
 //! the clusters of what it read once. A value of any length, a million
 //! combining marks included, costs O(budget). Text longer than that read
 //! window is cut even when its width would fit: ordinary text needs far
-//! fewer than eight characters per cell. The window's last cluster can go
-//! on past the window, so a cut text never keeps it.
-//!
-//! [`locate_span`] resolves a span, a pair of UTF-8 byte offsets into the
-//! text it indexes, to the line holding its start. It refuses a span that
-//! cannot index the text and never clamps one. [`caret_layout`] lays that
-//! line out for a caret line underneath it, whole clusters at a time.
+//! fewer than eight characters per cell.
 
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -48,13 +25,10 @@ pub const MARKER: char = '…';
 /// stays under this. A longer cluster is cut whatever its width.
 const CHARS_PER_CELL: usize = 8;
 
-/// How many input characters [`fit_cells`] reads at `budget`.
 fn scan_cap(budget: usize) -> usize {
     budget.saturating_add(1).saturating_mul(CHARS_PER_CELL)
 }
 
-/// The first [`scan_cap`] characters of `text`, and whether that left any
-/// of it unread. Walks at most that many characters.
 fn scan_window(text: &str, budget: usize) -> (&str, bool) {
     match text.char_indices().nth(scan_cap(budget)) {
         Some((at, _)) => (&text[..at], true),
@@ -62,10 +36,6 @@ fn scan_window(text: &str, budget: usize) -> (&str, bool) {
     }
 }
 
-/// The display cells `s` takes: the sum of [`cluster_cells`] over its
-/// extended grapheme clusters, which is where ratatui puts the next cell
-/// after drawing `s`.
-///
 /// `s` must already be sanitized. Every width in this module goes through
 /// here or through [`cluster_cells`].
 fn measure(s: &str) -> usize {
@@ -91,9 +61,6 @@ fn cluster_cells(cluster: &str) -> usize {
     cluster.width() + sound_marks
 }
 
-/// The display cells `text` takes once sanitized, the sum of its grapheme
-/// clusters' cells.
-///
 /// This reads all of `text`. To size a column from values of any length,
 /// measure each value's [`fit_cells`] at the widest the column may be,
 /// which reads only a bounded prefix.
@@ -102,14 +69,8 @@ pub fn cells(text: &str) -> usize {
     measure(&sanitize_display_text(text))
 }
 
-/// `text` sanitized and cut to at most `budget` display cells.
-///
-/// The sanitized text whole when it fits and [`fit_cells`] read all of it;
-/// otherwise the longest run of its leading grapheme clusters that fits
-/// beside [`MARKER`], then the marker. A budget of 0 returns an empty
-/// string. A budget of 1 returns the marker alone unless the text fits
-/// whole or opens with clusters of no width. See the module documentation
-/// for the bound on the work done.
+/// `text` sanitized and cut to at most `budget` display cells. See the
+/// module documentation for the bound on the work done.
 #[must_use]
 pub fn fit_cells(text: &str, budget: usize) -> String {
     if budget == 0 {
@@ -147,8 +108,6 @@ pub fn fit_cells(text: &str, budget: usize) -> String {
     out
 }
 
-/// [`fit_cells`] of `text`, then spaces to exactly `width` display cells,
-/// measured by grapheme cluster as [`cells`] measures them.
 #[must_use]
 pub fn pad_cells(text: &str, width: usize) -> String {
     let mut out = fit_cells(text, width);
@@ -168,7 +127,6 @@ pub struct SpanLine {
     /// Whether the text holds a `\n`. A client that names the line it
     /// quotes does so only then.
     pub multi_line: bool,
-    /// Where the line starts.
     pub line_start: usize,
     /// Where the line's text ends: before its `\n` or `\r\n`, and before
     /// a lone `\r` that ends the text.
@@ -190,36 +148,24 @@ impl SpanLine {
         &text[self.line_start..self.line_end]
     }
 
-    /// The line before the span.
     #[must_use]
     pub fn before<'t>(&self, text: &'t str) -> &'t str {
         &text[self.line_start..self.start]
     }
 
-    /// The part of the line the span covers.
     #[must_use]
     pub fn covered<'t>(&self, text: &'t str) -> &'t str {
         &text[self.start..self.end]
     }
 
-    /// The line after the span.
     #[must_use]
     pub fn after<'t>(&self, text: &'t str) -> &'t str {
         &text[self.end..self.line_end]
     }
 }
 
-/// Resolve the byte span `start..end` against `text`.
-///
 /// `None` when the span cannot index `text`: reversed, past the end, or
-/// off a character boundary at either end. The caller then shows the
-/// message without an excerpt; a caret under the wrong character is worse
-/// than none.
-///
-/// For a valid span this is the line holding `start`. `\r\n` is one line
-/// ending, and a lone `\r` at the end of the text is dropped like one. A
-/// span that runs past its line is cut there, and a span that starts on
-/// the line ending sits just past the line's text.
+/// off a character boundary at either end.
 #[must_use]
 pub fn locate_span(text: &str, start: usize, end: usize) -> Option<SpanLine> {
     // Every check comes before any slice or arithmetic, so no offset, not
@@ -261,22 +207,13 @@ pub struct CaretLayout {
     /// one that holds its last byte. Empty for an empty span between two
     /// clusters; for an empty span inside a cluster, that cluster.
     pub covered: String,
-    /// The line after `covered`.
     pub after: String,
-    /// The display cells before the first caret: the cells of `before`.
     pub pad: usize,
     /// How many carets mark the span: the cells of `covered`, at least
     /// one, so an empty span still gets a caret where it sits.
     pub carets: usize,
 }
 
-/// Lay out the line `at` names in `text` for a caret line underneath.
-///
-/// The line is sanitized, so a tab or any other character
-/// [`is_unsafe_display_char`](crate::sanitize::is_unsafe_display_char)
-/// names prints as one U+FFFD cell, in the line and in the count alike.
-/// The span's ends then move out to the edges of the sanitized line's
-/// grapheme clusters that hold them.
 #[must_use]
 pub fn caret_layout(text: &str, at: &SpanLine) -> CaretLayout {
     let line = at.line_text(text);
@@ -322,9 +259,7 @@ pub fn caret_layout(text: &str, at: &SpanLine) -> CaretLayout {
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy)]
 pub struct SpanCase {
-    /// What the row checks.
     pub name: &'static str,
-    /// The text the span indexes.
     pub text: &'static str,
     /// The span's start, a byte offset.
     pub start: usize,
@@ -335,7 +270,6 @@ pub struct SpanCase {
     pub expect: Option<SpanExpect>,
 }
 
-/// What a terminal client shows for a [`SpanCase`] that locates.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SpanExpect {
@@ -343,9 +277,7 @@ pub struct SpanExpect {
     pub line: usize,
     /// The line as printed: sanitized, without its line ending.
     pub excerpt: &'static str,
-    /// Display cells before the first caret.
     pub pad: usize,
-    /// How many carets mark the span.
     pub carets: usize,
 }
 
@@ -752,11 +684,6 @@ mod tests {
 
     use super::*;
 
-    /// One piece of a generated string, biased toward the text that has
-    /// broken terminal layouts: accents, CJK, halfwidth katakana and its
-    /// sound marks, combining marks, emoji with their selectors and
-    /// modifiers, ligatures, controls, bidi and zero-width characters, long
-    /// runs of zero-width marks, and anything at all.
     fn piece() -> impl Strategy<Value = String> {
         let pick = |options: &'static [&'static str]| {
             prop::sample::select(options).prop_map(str::to_owned)
@@ -783,7 +710,6 @@ mod tests {
         prop::collection::vec(piece(), 0..48).prop_map(|pieces| pieces.concat())
     }
 
-    /// The `fit_cells` and `pad_cells` contract for one text at one budget.
     fn check_fit(text: &str, budget: usize) -> Result<(), TestCaseError> {
         let out = fit_cells(text, budget);
         let shown = sanitize_display_text(text);
@@ -795,14 +721,12 @@ mod tests {
         if budget == 0 {
             prop_assert_eq!(&out, "");
         } else if out != shown {
-            // Exactly one marker appended to a shorter prefix.
             let kept = out.strip_suffix(MARKER);
             prop_assert!(
                 kept.is_some_and(|kept| kept.len() < shown.len() && shown.starts_with(kept)),
                 "{out:?} is not a cut of {shown:?} at {budget}"
             );
         }
-        // Read whole and fitting: returned whole.
         if budget > 0 && text.chars().count() <= scan_cap(budget) && measure(&shown) <= budget {
             prop_assert_eq!(&out, &shown);
         }
@@ -820,8 +744,6 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]
 
-        /// No panic, never past the budget, and only the sanitized text
-        /// whole or a prefix of it with one marker, at every budget 0..=80.
         #[test]
         fn text_layout_fits_cell_budget(text in generated_text()) {
             for budget in 0..=80 {
@@ -829,7 +751,6 @@ mod tests {
             }
         }
 
-        /// The same over strings drawn from all of Unicode, unbiased.
         #[test]
         fn text_layout_fits_cell_budget_any_string(text in any::<String>()) {
             for budget in 0..=80 {
@@ -838,7 +759,6 @@ mod tests {
         }
     }
 
-    /// Each grapheme cluster takes the cells ratatui draws it in.
     #[test]
     fn text_layout_measures_by_grapheme_cluster() {
         assert_eq!(cells("لا"), 2);
@@ -851,11 +771,8 @@ mod tests {
         assert_eq!(cells(&"لا".repeat(9)), 18);
     }
 
-    /// Each named class at budgets 0 and 1, and the longest run of whole
-    /// clusters that fits beside the marker.
     #[test]
     fn text_layout_fits_cell_budget_fixed_cases() {
-        // `a`, then `b` with a hundred combining accents.
         let ab_marks = format!("ab{}", "\u{301}".repeat(100));
         let cases: &[(&str, &str, usize, &str)] = &[
             ("empty", "", 0, ""),
@@ -910,7 +827,6 @@ mod tests {
             ("bidi", "\u{202E}abc", 2, "\u{FFFD}…"),
             ("bidi", "\u{202E}abc", 4, "\u{FFFD}abc"),
             ("zero-width space", "\u{200B}", 1, "\u{FFFD}"),
-            // A halfwidth sound mark takes a cell of its own.
             ("halfwidth sound mark", "ｶﾞ", 1, "…"),
             ("halfwidth sound mark", "ｶﾞ", 2, "ｶﾞ"),
             ("halfwidth sound mark", "ｶﾞx", 2, "…"),
@@ -929,11 +845,8 @@ mod tests {
         }
     }
 
-    /// Where a selector makes the text narrower, the kept prefix still
-    /// fits and is still a prefix, whichever one the search lands on.
     #[test]
     fn text_layout_fits_cell_budget_where_width_shrinks() {
-        // `⌚` is two cells, `⌚\u{FE0E}` one.
         assert_eq!(cells("⌚"), 2);
         assert_eq!(cells("⌚\u{FE0E}"), 1);
         for budget in 0..=6 {
@@ -942,9 +855,6 @@ mod tests {
         }
     }
 
-    /// unicode-width gives the halfwidth sound marks U+FF9E and U+FF9F no
-    /// width, like the combining marks they are not; a terminal, and
-    /// ratatui, give each a cell. The combining sound marks keep none.
     #[test]
     fn text_layout_counts_halfwidth_sound_marks() {
         assert_eq!(cells("ｶﾞ"), 2);
@@ -961,9 +871,6 @@ mod tests {
         assert_eq!(caret_layout(text, &at).carets, 2);
     }
 
-    /// A million combining marks fit any budget, and `fit_cells` still
-    /// reads only its window: the result is a cut of that window, not the
-    /// whole text. No timing involved.
     #[test]
     fn text_layout_fits_cell_budget_reads_a_bounded_prefix() {
         let text = format!("a{}", "\u{301}".repeat(1_000_000));
@@ -997,8 +904,6 @@ mod tests {
         assert_eq!(pad_cells("\u{202E}", 2), "\u{FFFD} ");
     }
 
-    /// Every row of [`SPAN_CASES`] through `locate_span` and
-    /// `caret_layout`, against its literal expectation.
     #[test]
     fn shared_span_contract() {
         for case in SPAN_CASES {
@@ -1027,8 +932,6 @@ mod tests {
         }
     }
 
-    /// A cluster that holds either end of a span falls whole into the
-    /// covered part, so the three parts can be drawn as separate spans.
     #[test]
     fn caret_layout_cuts_parts_between_clusters() {
         let parts = |text: &str, start: usize, end: usize| {
@@ -1047,7 +950,6 @@ mod tests {
         assert_eq!(parts("\t\u{301}x", 1, 1), owned("", "\u{FFFD}\u{301}", "x"));
     }
 
-    /// The hand-worked offsets in [`SPAN_CASES`] point where the rows say.
     #[test]
     fn shared_span_contract_offsets_are_what_the_rows_say() {
         let issue = "service=\"日本\" | where x ~ /(/";
@@ -1084,10 +986,6 @@ mod tests {
         assert_eq!(&multi[12..20], "| stats ");
     }
 
-    /// `locate_span` is the rule trawl-mcp's `excerpt` and the web UI's
-    /// `locate` each carried: the start's line, a `\r` before its `\n`
-    /// or at the end of the text dropped, the span clipped to the line,
-    /// and `multi_line` whenever the text holds a `\n`.
     #[test]
     fn shared_span_contract_locates_like_mcp_and_web() {
         let line = |line, multi_line, line_start, line_end, start, end| {

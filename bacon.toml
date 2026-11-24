@@ -1,6 +1,3 @@
-# bacon configuration
-# run `bacon` for clippy-on-save, `bacon test` for test-on-save
-
 default_job = "clippy"
 
 [jobs.clippy]
@@ -15,8 +12,6 @@ need_stdout = false
 command = ["cargo", "nextest", "run", "--workspace", "--color", "always"]
 need_stdout = true
 
-# Mirrors CI: tests without default features (catches snapshot drift
-# from version bumps and feature-gated rendering differences).
 [jobs.test-ci]
 command = ["cargo", "nextest", "run", "--workspace", "--no-default-features", "--color", "always"]
 need_stdout = true

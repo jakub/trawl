@@ -4,26 +4,13 @@
 
 //! In-memory event filter compiled from the search stage of a DSL query.
 //!
-//! [`CompiledFilter`] provides semantically equivalent matching to the SQL
-//! WHERE clauses emitted by the search stage emitter. Used for real-time
-//! event filtering in the SSE streaming endpoint.
+//! `filter.matches_at(event, ctx)` must agree with running the emitted SQL
+//! against `DuckDB` for every `(event, search_stage)` pair, under the same
+//! `now()` anchor (ADR-0017 §3).
 //!
-//! Key invariant: `filter.matches_at(event, ctx)` must agree with
-//! running the emitted SQL against `DuckDB` for every
-//! `(event, search_stage)` pair — under the same `now()` anchor, since
-//! `last=` is clock-relative and both lanes read the instant the caller
-//! hands them (ADR-0017 §3).
-//!
-//! Evaluation is therefore three-valued, like the SQL it mirrors: field
-//! matchers answer [`Truth`] (`Some(true)`/`Some(false)`/`None` for UNKNOWN),
-//! UNKNOWN propagates through NOT/AND/OR by SQL's rules, and only a final
-//! `Some(true)` is a match. Text containment is the deliberate two-valued
-//! exception (ADR-0015): a missing `message`/`_raw` does not contain a term.
-//! Collapsing UNKNOWN to `false` at a field-comparison leaf would survive a
-//! top-level filter but invert under `NOT`:
-//! `NOT status>=400` over a VARCHAR-pinned `status="accepted"` is a live
-//! match while `NOT (TRY_CAST(status AS DECIMAL(38,6)) >= …)` stays NULL
-//! and is filtered out — a false-positive live alert.
+//! Evaluation is three-valued, like the SQL it mirrors: collapsing UNKNOWN
+//! to `false` at a field-comparison leaf would invert under `NOT`. Text
+//! containment is the deliberate two-valued exception (ADR-0015).
 
 use std::cell::OnceCell;
 
@@ -42,18 +29,10 @@ use crate::pin_match::{
 use crate::schema::FieldTypes;
 use crate::text::fold_ci;
 
-/// A compiled filter that can match JSON events in memory.
-///
-/// Compiled once from a [`SearchStage`], then called per-event
-/// in the hot path. All regex patterns are pre-compiled.
 pub struct CompiledFilter {
-    /// OR-of-AND groups, mirroring the search stage structure.
     groups: Vec<Vec<TokenMatcher>>,
-    /// Global time filter (hoisted from groups during parsing).
     time_filter: Option<TimeMatcher>,
-    /// Absolute lower bound (`earliest=`), inclusive.
     earliest: Option<compare::Instant>,
-    /// Absolute upper bound (`latest=`), exclusive.
     latest: Option<compare::Instant>,
 }
 
@@ -68,12 +47,8 @@ impl std::fmt::Debug for CompiledFilter {
     }
 }
 
-/// Why a live filter did not compile.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterError {
-    /// What the SQL emitter refuses the same search for, or a pattern this
-    /// lane cannot build: a fault in the query, worded as the emitter
-    /// words it.
     Emit(EmitError),
     /// The query's regex memory does not fit, in its budget or in the
     /// server's reservation (ADR-0063). A capacity refusal, not a fault in
@@ -97,7 +72,6 @@ impl std::fmt::Display for FilterError {
 
 impl std::error::Error for FilterError {}
 
-/// A literal the pin rule table refuses is the emitter's refusal here too.
 impl From<compare::CompareError> for FilterError {
     fn from(e: compare::CompareError) -> Self {
         Self::Emit(e.into())
@@ -121,17 +95,15 @@ struct FieldMatcher {
 }
 
 enum FieldPredicate {
-    /// An exact value under the typed comparison.
-    Compare { op: CompareOp, value: CoercedValue },
-    /// A glob or regex over the pin's canonical pattern text; `negated`
-    /// is `!=` (ADR-0060).
+    Compare {
+        op: CompareOp,
+        value: CoercedValue,
+    },
     Pattern {
         regex: Pattern,
         form: PatternForm,
         negated: bool,
     },
-    /// A comma list: `=` ORs its elements, `!=` ANDs their negations,
-    /// each element mirroring its own SQL term.
     List {
         elements: Vec<ListElement>,
         form: PatternForm,
@@ -145,48 +117,21 @@ enum ListElement {
 }
 
 struct TextMatcher {
-    /// The term under [`fold_ci`], the bundled `DuckDB`'s lowercase fold
-    /// that `ILIKE` applies; the event text is folded the same way and
-    /// substring-matched against it.
     folded_term: String,
-    /// Whether the match is negated (NOT ILIKE).
     negated: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Compilation
-// ---------------------------------------------------------------------------
-
 impl CompiledFilter {
-    /// Compile a filter from a parsed search stage.
-    ///
-    /// `pins` is the field catalog's full pin snapshot (ADR-0011):
-    /// comparisons against pinned fields follow the same rule table the
-    /// SQL emitter's `emit_with_pins` applies — batch/live parity is part
-    /// of the contract. Pass an empty set where no catalog exists
-    /// (embedded mode, plain unit tests); every comparison is then
-    /// literal-driven.
-    ///
-    /// Regex and glob patterns are compiled eagerly, through a ledger of
-    /// the filter's own, so a pattern the search stage repeats is built
-    /// once. [`compile_with`](Self::compile_with) takes the ledger, so the
-    /// filter and a live plan can share one.
+    /// `pins` is the field catalog's full pin snapshot (ADR-0011). Pass an
+    /// empty set where no catalog exists (embedded mode, plain unit tests);
+    /// every comparison is then literal-driven.
     ///
     /// # Errors
     ///
     /// Returns the same error the SQL emitter raises when a `SEVERITY`-pinned
     /// field is compared against a literal outside the ladder vocabulary.
-    /// Such a filter has no in-memory meaning: compiling it to a
-    /// match-nothing predicate would turn a typo into a silently empty
-    /// live stream while the same query errors on `/api/v1/query`.
-    ///
-    /// Also errors when a regex does not compile here. Dropping the token
-    /// instead would change which events match: under `!=` or inside a
-    /// comma list the filter would silently widen. Every glob compiles: a
+    /// Also errors when a regex does not compile here. Every glob compiles: a
     /// malformed one (`a[z-a]*`) matches nothing, as `DuckDB`'s GLOB does.
-    ///
-    /// Each of those is [`FilterError::Emit`]. A pattern whose regex
-    /// memory the ledger refuses is [`FilterError::RegexResources`].
     pub fn compile(search: &SearchStage, pins: &FieldTypes) -> Result<Self, FilterError> {
         Self::compile_with(search, pins, &mut Preparer::new())
     }
@@ -194,12 +139,6 @@ impl CompiledFilter {
     /// [`compile`](Self::compile), building the filter's patterns through
     /// `preparer`. A pattern the ledger already holds, from the filter or
     /// from a plan it prepared, is not built or charged again.
-    ///
-    /// # Errors
-    ///
-    /// As [`compile`](Self::compile), and for a pattern `preparer`
-    /// refuses: its regex budget and the server's reservation among them.
-    /// Once the ledger's stop is requested, [`FilterError::Cancelled`].
     pub fn compile_with(
         search: &SearchStage,
         pins: &FieldTypes,
@@ -209,8 +148,6 @@ impl CompiledFilter {
             duration_secs: tf.node.duration.to_seconds(),
         });
 
-        // The instants the parser read, which the SQL lane binds too
-        // (ADR-0017's amendment of 2026-11-08).
         let earliest = search.earliest.as_ref().map(|b| b.node.instant());
         let latest = search.latest.as_ref().map(|b| b.node.instant());
 
@@ -224,18 +161,6 @@ impl CompiledFilter {
         })
     }
 
-    /// Test whether a JSON event matches this filter, under the
-    /// evaluation context this event is being processed with.
-    ///
-    /// `last=`/`earliest=`/`latest=` are clock-relative, so the filter is
-    /// a `now()` reader like any other and takes its instant from the
-    /// caller's [`EvalContext`] — never from a clock of its own
-    /// (ADR-0017 §3). In the live lane that context is the event's own,
-    /// so the window this filter applies and the `now()` a later
-    /// `| where` reads are one instant; there is no second door that
-    /// samples per batch, because a bus batch is an upstream client's
-    /// POST size and not a boundary a query author can see.
-    ///
     /// # Errors
     ///
     /// [`PatternError::Cancelled`] once the stop of the ledger that built
@@ -246,15 +171,13 @@ impl CompiledFilter {
         event: &serde_json::Map<String, Value>,
         ctx: &EvalContext,
     ) -> Result<bool, PatternError> {
-        // Check time filter first (global, not per-group).
         if let Some(tf) = &self.time_filter
             && !matches_time_filter_at(event, tf, ctx.now_utc())
         {
             return Ok(false);
         }
 
-        // Check absolute time bounds. `Instant`'s order puts both
-        // infinities where the SQL comparison does.
+        // `Instant`'s order puts both infinities where the SQL comparison does.
         if self.earliest.is_some() || self.latest.is_some() {
             if let Some(ts) = extract_event_timestamp(event) {
                 let ts = compare::Instant::At(ts.naive_utc());
@@ -269,23 +192,18 @@ impl CompiledFilter {
                     return Ok(false);
                 }
             } else {
-                // no timestamp → can't match time bounds
                 return Ok(false);
             }
         }
 
-        // Empty groups → match everything.
         if self.groups.is_empty() {
             return Ok(true);
         }
 
-        // OR of AND, in SQL's three-valued logic: only TRUE is a match —
-        // a WHERE clause evaluating to UNKNOWN filters the row out.
         Ok(eval_groups(&self.groups, &EventView::new(event))? == Some(true))
     }
 }
 
-/// Compile OR-of-AND groups, dropping tokens with no in-memory matcher.
 fn compile_groups(
     groups: &[Vec<crate::ast::Spanned<SearchToken>>],
     pins: &FieldTypes,
@@ -310,7 +228,6 @@ fn compile_token(
     Ok(match token {
         SearchToken::FieldFilter(ff) => compile_field_filter(ff, pins, preparer)?,
         SearchToken::TextSearch(ts) => {
-            // Wildcard `*` matches everything — skip.
             if ts.term == "*" {
                 return Ok(None);
             }
@@ -321,10 +238,7 @@ fn compile_token(
         }
         SearchToken::TimeFilter(_)
         | SearchToken::EarliestFilter(_)
-        | SearchToken::LatestFilter(_) => {
-            // Time filters are hoisted — this shouldn't appear in groups.
-            None
-        }
+        | SearchToken::LatestFilter(_) => None,
         SearchToken::QuotedSearch(qs) => Some(TokenMatcher::Text(TextMatcher {
             folded_term: fold_ci(&qs.phrase),
             negated: false,
@@ -342,31 +256,16 @@ fn compile_token(
     })
 }
 
-/// Compiles one field filter, out of line from [`compile_token`].
-///
-/// `compile_token` recurses once per search bracket and per `NOT`, and
-/// #447's 64-level tree depth limit budgets that recursion to a quarter of
-/// a 2 MiB worker stack. Inlined, this arm's locals would sit in every
-/// level's frame; here they cost one frame, at the leaf.
+/// `compile_token` recurses once per search bracket and per `NOT`. Inlined
+/// there, this field-filter arm's locals would sit in every level's frame;
+/// out of line they cost one frame, at the leaf.
 #[inline(never)]
 fn compile_field_filter(
     ff: &FieldFilter,
     pins: &FieldTypes,
     preparer: &mut Preparer,
 ) -> Result<Option<TokenMatcher>, FilterError> {
-    // The catalog pin typing this comparison (ADR-0011); the
-    // lookup folds through `catalog_key`, same as the emitter.
     let pin = pins.pin_for(&ff.field);
-    // Glob/regex match one canonical text per pin, resolved by the
-    // shared rule table: plain stringification mirrors the SQL
-    // side's bare column only where there is no pin to conform to
-    // (unpinned, VARCHAR), and every typed pin renders the value's
-    // own conformed reading — RFC 3339 microseconds for TIMESTAMP,
-    // DuckDB's DOUBLE text for DOUBLE, the conformed integer for
-    // BIGINT, lowercase `true`/`false` for BOOLEAN, the ladder
-    // token for SEVERITY — so a pattern cannot mean one thing live
-    // and another in batch. Each is corroborated by execution
-    // probes in trawl-engine/tests/duckdb_probe.rs, not assumed.
     let form = compare::pattern_form(pin);
     let predicate = match &ff.value {
         FilterValue::Single(Scalar::Exact(v)) => FieldPredicate::Compare {
@@ -407,33 +306,19 @@ fn compile_field_filter(
         }
     };
     Ok(Some(TokenMatcher::Field(FieldMatcher {
-        // The event key is the same `catalog_key` the pin lookup
-        // used: an ASCII fold and nothing else, mirroring DuckDB
-        // binding `"Status"` to the real `status` column. Ingest
-        // folds every incoming field name, so an exact lookup on
-        // the folded spelling is the one that finds the value —
-        // without the fold a mixed-case reference would read every
-        // event as a NULL column, which `!=` reports as a match
-        // (`OR col IS NULL`): live tail would stream everything
-        // while `/query` returned nothing.
+        // The event key folds through `catalog_key`, as the pin lookup and
+        // ingest do. Without the fold a mixed-case reference would read
+        // every event as a NULL column, which `!=` reports as a match.
         field: crate::schema::catalog_key(&ff.field),
         predicate,
     })))
 }
 
-/// The live matcher for one glob or regex element, or the error a
-/// pattern this lane cannot compile raises (see [`CompiledFilter::compile`]).
-///
-/// A refusal names the pattern, then gives the owner's own cause, as the
-/// parser words it. A syntax error, which only a regex can raise since
-/// every glob translates to a regex that parses, gives none:
-/// regex-syntax's text spans several lines. A resource refusal is the query's memory, not this pattern's
-/// fault, so it carries the refusal alone, typed, and names no pattern. A
-/// cancellation is no verdict at all, so it is typed too.
+/// A syntax error's cause is left out of the refusal: regex-syntax's text
+/// spans several lines.
 fn compile_pattern(pattern: &Scalar, preparer: &mut Preparer) -> Result<Pattern, FilterError> {
     let (label, kind, text) = match pattern {
         Scalar::Glob(glob) => ("glob", PatternKind::Glob, glob),
-        // The parser's owner and limit, so a regex it accepted compiles here.
         Scalar::Regex(body) => ("regex", PatternKind::Regex, body),
         Scalar::Exact(_) => unreachable!("an exact value binds through compare_form"),
     };
@@ -460,12 +345,6 @@ fn compile_op(op: FilterOp) -> CompareOp {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Matching
-// ---------------------------------------------------------------------------
-
-/// The event under evaluation, with its text columns folded at most once
-/// however many text tokens read them.
 struct EventView<'a> {
     event: &'a serde_json::Map<String, Value>,
     message: OnceCell<Option<String>>,
@@ -481,14 +360,10 @@ impl<'a> EventView<'a> {
         }
     }
 
-    /// The folded `message` text; `None` when the column is missing or
-    /// not a string.
     fn folded_message(&self) -> Option<&str> {
         self.folded(&self.message, "message")
     }
 
-    /// The folded `_raw` text; `None` when the column is missing or not a
-    /// string.
     fn folded_raw(&self) -> Option<&str> {
         self.folded(&self.raw, "_raw")
     }
@@ -502,7 +377,6 @@ impl<'a> EventView<'a> {
     }
 }
 
-/// SQL `OR` of `AND` groups — the search stage's own shape.
 fn eval_groups(groups: &[Vec<TokenMatcher>], event: &EventView<'_>) -> Result<Truth, PatternError> {
     fallible(
         groups
@@ -533,8 +407,6 @@ impl TokenMatcher {
         Ok(match self {
             Self::Field(fm) => fm.eval(event.event)?,
             Self::Text(tm) => Some(tm.eval(event)),
-            // `NOT UNKNOWN` is UNKNOWN, never a match — the SQL `NOT (...)`
-            // this mirrors stays NULL and the row is filtered out.
             Self::Not(inner) => inner.eval(event)?.map(|b| !b),
             Self::OrGroup(groups) => eval_groups(groups, event)?,
         })
@@ -607,8 +479,6 @@ impl FieldMatcher {
     }
 }
 
-/// One pattern element's answer over the value's canonical pattern text.
-///
 /// No canonical text (a TIMESTAMP pin over a value with no timestamp
 /// reading) is a NULL column in batch, and `strftime(NULL, …) GLOB p` is
 /// NULL: UNKNOWN under `=`, not FALSE. Under `!=` the SQL is
@@ -627,24 +497,6 @@ fn pattern_truth(
 }
 
 impl TextMatcher {
-    /// Bare-word search hits `message` and additionally `_raw` where
-    /// present (ADR-0009). Mirrors the SQL exactly:
-    ///
-    /// - positive: `COALESCE("message" ILIKE p, FALSE) OR
-    ///   COALESCE("_raw" ILIKE p, FALSE)` — a match in either column passes;
-    ///   both missing/null is false.
-    /// - negated: the two-valued complement — every carried column must be
-    ///   term-free, and both missing/null is true.
-    ///
-    /// Searching `_raw` is whole-event search: unless a collector supplied a
-    /// pre-parse line, `_raw` is the server's JSON serialization of the event,
-    /// so a term matches another field's value *and* a field name — and the
-    /// negated form excludes on the same basis (see
-    /// [`crate::emitter`]'s `push_text_search` and the DSL reference).
-    /// A missing/non-string column contributes false to containment. The leaf
-    /// therefore always has a true or false answer, and grammar compositions
-    /// such as `NOT term` inherit totality without a special case.
-    ///
     /// Containment folds case on both sides with [`fold_ci`], the
     /// `DuckDB` lowercase table `ILIKE` applies, so `é` finds `É` and `i`
     /// finds `İ` in both lanes.
@@ -656,11 +508,6 @@ impl TextMatcher {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Time filter
-// ---------------------------------------------------------------------------
-
-/// Extract the event timestamp as a UTC datetime.
 fn extract_event_timestamp(
     event: &serde_json::Map<String, Value>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -712,36 +559,25 @@ fn matches_time_filter_at(
     event_time >= cutoff
 }
 
-/// Parse a timestamp string in common formats.
-///
-/// Covers the most common log timestamp formats. Tried in order
-/// of decreasing specificity to avoid ambiguous matches.
 fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
-    // RFC 3339 (most common for JSON): 2026-02-15T12:00:00Z, 2026-02-15T12:00:00.123Z
     if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&chrono::Utc));
     }
-    // ISO 8601 with timezone offset: 2026-02-15T12:00:00+05:30
     if let Ok(dt) = chrono::DateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%:z") {
         return Some(dt.with_timezone(&chrono::Utc));
     }
-    // ISO 8601 with fractional seconds, no timezone (assume UTC).
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f") {
         return Some(naive.and_utc());
     }
-    // ISO 8601, no fractional seconds, no timezone (assume UTC).
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S") {
         return Some(naive.and_utc());
     }
-    // Space-separated: 2026-02-15 12:00:00
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S") {
         return Some(naive.and_utc());
     }
-    // Space-separated with fractional seconds: 2026-02-15 12:00:00.123456
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f") {
         return Some(naive.and_utc());
     }
-    // Epoch-seconds or epoch-millis as string.
     if let Ok(n) = s.parse::<i64>() {
         return parse_epoch_i64(n);
     }
@@ -751,9 +587,6 @@ fn parse_timestamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     None
 }
 
-/// Parse an epoch timestamp from an i64.
-///
-/// Heuristic: values < 1e12 are epoch-seconds, >= 1e12 are epoch-millis.
 fn parse_epoch_i64(val: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     if val.abs() < 1_000_000_000_000 {
         chrono::DateTime::from_timestamp(val, 0)
@@ -765,7 +598,6 @@ fn parse_epoch_i64(val: i64) -> Option<chrono::DateTime<chrono::Utc>> {
     }
 }
 
-/// Parse an epoch timestamp from an f64 (fractional seconds).
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
@@ -777,28 +609,17 @@ fn parse_epoch_f64(val: f64) -> Option<chrono::DateTime<chrono::Utc>> {
     chrono::DateTime::from_timestamp(secs, nanos)
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::parser;
 
-    /// The fixed instant these tests evaluate at.
-    ///
-    /// Nothing here samples a clock: a filter's window is measured
-    /// against the context it is handed (ADR-0017 §3), so a test that
-    /// read `Utc::now()` would be racing the wall clock between event
-    /// construction and evaluation for no gain.
     fn fixed_now() -> chrono::DateTime<chrono::Utc> {
         chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
             .expect("literal is RFC 3339")
             .with_timezone(&chrono::Utc)
     }
 
-    /// Helper: parse DSL, compile filter, test against event.
     fn matches_event(dsl: &str, event_json: &str) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
@@ -810,7 +631,6 @@ mod tests {
             .expect("a never stop never cancels")
     }
 
-    /// Helper: like `matches_event`, with catalog pins (ADR-0011).
     fn matches_event_pinned(
         dsl: &str,
         event_json: &str,
@@ -829,9 +649,6 @@ mod tests {
             .expect("a never stop never cancels")
     }
 
-    /// Helper: like `matches_event`, with an explicit `now`. Time-window
-    /// tests use this to name the instant the window is measured from,
-    /// rather than inheriting the file-wide fixture.
     fn matches_event_at(dsl: &str, event_json: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
         let query = parser::parse(dsl).expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
@@ -842,8 +659,6 @@ mod tests {
             .matches_at(&event, &EvalContext::at(now))
             .expect("a never stop never cancels")
     }
-
-    // ── field filters ─────────────────────────────────────────────────
 
     #[test]
     fn field_eq_string() {
@@ -859,12 +674,10 @@ mod tests {
 
     #[test]
     fn field_eq_numeric() {
-        // Numeric filter against numeric JSON value.
         assert!(matches_event(
             "status=200",
             r#"{"status": 200, "message": "ok"}"#
         ));
-        // Numeric filter against string JSON value (implicit cast).
         assert!(matches_event(
             "status=200",
             r#"{"status": "200", "message": "ok"}"#
@@ -945,7 +758,6 @@ mod tests {
 
     #[test]
     fn field_glob() {
-        // Parser auto-detects glob from `*` in value.
         assert!(matches_event(
             "path=/api/*",
             r#"{"path": "/api/users", "message": "ok"}"#
@@ -958,7 +770,6 @@ mod tests {
 
     #[test]
     fn field_glob_question_mark() {
-        // Parser auto-detects glob from `?` in value.
         assert!(matches_event(
             "host=web-?",
             r#"{"host": "web-1", "message": "ok"}"#
@@ -972,7 +783,6 @@ mod tests {
     #[test]
     fn field_glob_with_character_class() {
         // `[` alone doesn't trigger glob auto-detection, so include `*`.
-        // Character class semantics are covered by glob_conversion_* tests.
         assert!(matches_event(
             "host=web-[123]*",
             r#"{"host": "web-2-prod", "message": "ok"}"#
@@ -983,9 +793,6 @@ mod tests {
         ));
     }
 
-    /// A malformed glob compiles and matches no event, as `DuckDB`'s GLOB
-    /// matches none, so its `!=` matches every event, one without the
-    /// field among them. `NOT` over an absent field stays unknown.
     #[test]
     fn a_malformed_glob_matches_nothing() {
         let carried = [
@@ -1006,8 +813,6 @@ mod tests {
         assert!(!matches_event("host=x,a[z-a]*", r#"{"host": "a"}"#));
     }
 
-    /// What the live lane says when it refuses `body` as the regex of a
-    /// search filter that no parser checked.
     fn live_regex_refusal(body: &str) -> String {
         let mut query = parser::parse("msg=/x/").expect("parses");
         let crate::ast::SearchToken::FieldFilter(filter) = &mut query.search.groups[0][0].node
@@ -1020,10 +825,6 @@ mod tests {
             .to_string()
     }
 
-    /// The live lane builds a regex through the parser's owner, so the
-    /// compiled-size limit draws one line in both: a regex that parses
-    /// compiles here, and one the parser refuses as too large is refused
-    /// here too.
     #[test]
     fn the_live_lane_shares_the_parsers_regex_size_limit() {
         assert!(matches_event(r"msg=/\w{10}/", r#"{"msg": "abcdefghij"}"#));
@@ -1039,10 +840,6 @@ mod tests {
         );
     }
 
-    /// A live refusal says why, in the words the parser uses for the same
-    /// body: nested classes and class set operators, and a program over
-    /// the batch engine's cap, each carry their own message after the
-    /// pattern.
     #[test]
     fn a_live_regex_refusal_carries_its_own_message() {
         for (body, cause) in [
@@ -1060,7 +857,6 @@ mod tests {
         }
     }
 
-    /// `*` and `?` cross a newline, as `DuckDB`'s GLOB does.
     #[test]
     fn a_glob_matches_across_newlines() {
         let event = r#"{"message": "a\nb"}"#;
@@ -1089,8 +885,6 @@ mod tests {
         ));
     }
 
-    // ── pin-aware comparisons (ADR-0011) ─────────────────────────────
-
     use crate::schema::CanonicalType as CT;
 
     const VARCHAR_STATUS: &[(&str, CT)] = &[("status", CT::Varchar)];
@@ -1098,7 +892,6 @@ mod tests {
 
     #[test]
     fn pinned_varchar_eq_numeric_compares_as_text_or_reading() {
-        // String-stored "200" matches on the text arm.
         assert!(matches_event_pinned(
             "status=200",
             r#"{"status": "200"}"#,
@@ -1119,7 +912,6 @@ mod tests {
             r#"{"status": 200.0}"#,
             VARCHAR_STATUS
         ));
-        // Other spellings of the same number share its decimal reading.
         assert!(matches_event_pinned(
             "status=200",
             r#"{"status": "0200"}"#,
@@ -1135,7 +927,6 @@ mod tests {
             r#"{"status": "404"}"#,
             VARCHAR_STATUS
         ));
-        // A non-numeric literal keeps the pure text arm.
         assert!(matches_event_pinned(
             "status=accepted",
             r#"{"status": "accepted"}"#,
@@ -1143,10 +934,6 @@ mod tests {
         ));
     }
 
-    /// `!=` is the complement of `=` over non-null values, including for
-    /// the values with no numeric reading that motivate a VARCHAR pin:
-    /// `status!=200` must still return `"accepted"`, not drop it into
-    /// UNKNOWN. Mirrors the SQL's `COALESCE(…, TRUE)`.
     #[test]
     fn pinned_varchar_ne_numeric_keeps_unreadable_values() {
         for value in [r#""accepted""#, r#""n/a""#, r#""404""#, "404"] {
@@ -1177,9 +964,6 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // SQL emits `(status != '200' OR status IS NULL)` — a JSON null
-        // must match here too, or batch and live disagree on every
-        // repaired event.
         assert!(matches_event_pinned(
             "status!=200",
             r#"{"status": null}"#,
@@ -1187,14 +971,6 @@ mod tests {
         ));
     }
 
-    /// An absent key IS the null case: in batch, a row whose file never
-    /// carried the field reads the column as NULL, so `!=` includes it
-    /// through `OR col IS NULL`. Absent is the dominant shape on the bus
-    /// (the canonicalizer only fills envelope fields), so a divergence
-    /// here would drop every field-less event from live tail while
-    /// `/query` returned them all. Executed against `DuckDB` in
-    /// `tests/filter_parity.rs` (both pinned matrices carry the field-less
-    /// event).
     #[test]
     fn absent_field_matches_ne_like_explicit_null() {
         for dsl in ["status!=200", "status!=accepted"] {
@@ -1232,8 +1008,6 @@ mod tests {
 
     #[test]
     fn pinned_varchar_ordered_numeric_matches_numeric_text() {
-        // "404"/"500" have a DECIMAL(38,6) reading, so both sides compare
-        // numerically.
         assert!(matches_event_pinned(
             "status>=400",
             r#"{"status": "404"}"#,
@@ -1249,8 +1023,6 @@ mod tests {
             r#"{"status": "200"}"#,
             VARCHAR_STATUS
         ));
-        // Values with no reading are NULL — never a match, never an
-        // error.
         assert!(!matches_event_pinned(
             "status>=400",
             r#"{"status": "accepted"}"#,
@@ -1261,7 +1033,6 @@ mod tests {
             r#"{"status": null}"#,
             VARCHAR_STATUS
         ));
-        // The reading is exact, not integral: "1.5" sits between 1 and 2.
         assert!(matches_event_pinned(
             "dur>1",
             r#"{"dur": "1.5"}"#,
@@ -1309,12 +1080,6 @@ mod tests {
 
     #[test]
     fn pinned_lookup_is_case_folded() {
-        // Both halves fold, over an event whose key is spelled the way
-        // ingest actually writes it (lowercase). The event lookup: DuckDB
-        // binds `"Status"` to the real `status` column, so a mixed-case
-        // reference must read the value, not an absent key — and `!=` over
-        // an absent key matches (`OR col IS NULL`), so a fold miss here
-        // streams every event live while `/query` returns none.
         assert!(matches_event_pinned(
             "Status=200",
             r#"{"status": "200"}"#,
@@ -1334,7 +1099,6 @@ mod tests {
             VARCHAR_STATUS
         ));
         assert!(!matches_event("status!=200", r#"{"status": "accepted"}"#));
-        // A JSON null still matches `!=` through the folded key.
         assert!(matches_event_pinned(
             "Status!=200",
             r#"{"status": null}"#,
@@ -1344,16 +1108,11 @@ mod tests {
 
     #[test]
     fn pinned_not_over_unknown_is_never_a_match() {
-        // A TRY_CAST miss is NULL, so `NOT (TRY_CAST(status AS
-        // DECIMAL(38,6)) >= …)` is NULL and the batch query drops the row — the live
-        // stream must not fire on it (executed against DuckDB in
-        // tests/filter_parity.rs::pinned_varchar_matrix_parity).
         assert!(!matches_event_pinned(
             "NOT status>=400",
             r#"{"status": "accepted"}"#,
             VARCHAR_STATUS
         ));
-        // Same for a NULL column, across every predicate class.
         for dsl in [
             "NOT status>=400",
             "NOT status=200",
@@ -1371,14 +1130,11 @@ mod tests {
                 "{dsl} over an absent field must stay UNKNOWN"
             );
         }
-        // `!=` is the total form (`OR col IS NULL`): TRUE on a null, so
-        // NOT genuinely inverts to no-match.
         assert!(!matches_event_pinned(
             "NOT status!=200",
             r#"{"status": null}"#,
             VARCHAR_STATUS
         ));
-        // A real FALSE still inverts — UNKNOWN is not a blanket veto.
         assert!(matches_event_pinned(
             "NOT status>=400",
             r#"{"status": "200"}"#,
@@ -1388,14 +1144,10 @@ mod tests {
 
     #[test]
     fn unpinned_not_over_null_column_is_not_a_match() {
-        // The same rule without a catalog: `NOT (status = 200)` over a
-        // NULL is NULL in SQL, so no live match either.
         assert!(!matches_event("NOT status=200", r#"{"status": null}"#));
         assert!(!matches_event("NOT status=200", r#"{"message": "hi"}"#));
         assert!(matches_event("NOT status=200", r#"{"status": 404}"#));
     }
-
-    // ── text search ───────────────────────────────────────────────────
 
     #[test]
     fn text_search_positive() {
@@ -1423,35 +1175,22 @@ mod tests {
         ));
     }
 
-    /// Whole-event search (ADR-0009): with a server-filled `_raw` — the JSON
-    /// serialization of the event — a bare term reaches another field's value
-    /// and a field name, and the negated form excludes on the same basis.
-    /// Mirrors `bare_word_search_reaches_the_whole_event_through_raw` in the
-    /// engine's execution tests.
     #[test]
     fn text_search_covers_the_whole_event_through_raw() {
         let event = r#"{"message": "started", "service": "nginx", "debug_mode": false,
              "_raw": "{\"service\":\"nginx\",\"debug_mode\":false,\"message\":\"started\"}"}"#;
-        // Another field's value, absent from `message`.
         assert!(matches_event("nginx", event));
-        // A field name, present nowhere else.
         assert!(matches_event("debug", event));
-        // Negation is the exact mirror.
         assert!(!matches_event("-debug", event));
         assert!(matches_event("-absent", event));
     }
 
     #[test]
     fn text_search_missing_message() {
-        // No message field: positive search → no match.
         assert!(!matches_event("error", r#"{"service": "nginx"}"#));
-        // Text containment is total (ADR-0015): absent columns do not contain
-        // the term, so both negation spellings match.
         assert!(matches_event("-debug", r#"{"service": "nginx"}"#));
         assert!(matches_event("NOT debug", r#"{"service": "nginx"}"#));
     }
-
-    // ── quoted search ─────────────────────────────────────────────────
 
     #[test]
     fn quoted_search() {
@@ -1473,28 +1212,21 @@ mod tests {
         ));
     }
 
-    // ── wildcard ──────────────────────────────────────────────────────
-
     #[test]
     fn wildcard_matches_everything() {
         assert!(matches_event("*", r#"{"service": "nginx"}"#));
     }
 
-    // ── OR groups ─────────────────────────────────────────────────────
-
     #[test]
     fn or_groups() {
-        // Matches first group.
         assert!(matches_event(
             "service=nginx OR service=apache",
             r#"{"service": "nginx", "message": "ok"}"#
         ));
-        // Matches second group.
         assert!(matches_event(
             "service=nginx OR service=apache",
             r#"{"service": "apache", "message": "ok"}"#
         ));
-        // Matches neither.
         assert!(!matches_event(
             "service=nginx OR service=apache",
             r#"{"service": "postgres", "message": "ok"}"#
@@ -1508,30 +1240,21 @@ mod tests {
             dsl,
             r#"{"service": "nginx", "status": 500, "message": "ok"}"#
         ));
-        // Matches group 2.
         assert!(matches_event(
             dsl,
             r#"{"service": "apache", "status": 404, "message": "ok"}"#
         ));
-        // Neither group fully matches.
         assert!(!matches_event(
             dsl,
             r#"{"service": "nginx", "status": 404, "message": "ok"}"#
         ));
     }
 
-    // ── empty search ──────────────────────────────────────────────────
-
     #[test]
     fn empty_search_matches_all() {
         assert!(matches_event("", r#"{"service": "nginx"}"#));
     }
 
-    // ── the severity vocabulary rides the pin, not the name ───────────
-
-    /// `level` is ordinary sender vocabulary (ADR-0013 §6): every shape
-    /// compiles in both lanes and matches the sender's own column, with
-    /// no severity meaning attached to the name.
     #[test]
     fn level_is_an_ordinary_field() {
         for dsl in [
@@ -1552,8 +1275,6 @@ mod tests {
         assert!(!matches_event("level=gold", r#"{"severity": 17}"#));
     }
 
-    /// The band vocabulary lives on the SEVERITY pin, where the live
-    /// lane and the SQL agree by construction.
     #[test]
     fn severity_pin_carries_the_band_vocabulary() {
         let mut ft = crate::schema::FieldTypes::new();
@@ -1572,7 +1293,6 @@ mod tests {
         assert!(matches("_severity=error2", r#"{"_severity": 18}"#));
         assert!(!matches("_severity=error2", r#"{"_severity": 17}"#));
 
-        // An unknown value refuses in both lanes, with one sentence.
         let query = parser::parse("_severity=spicy").expect("parse should succeed");
         let emit_error = crate::emitter::emit_with_pins(
             &query,
@@ -1589,8 +1309,6 @@ mod tests {
         assert_eq!(compile_error, emit_error);
     }
 
-    // ── null/missing field ────────────────────────────────────────────
-
     #[test]
     fn null_field_no_match() {
         assert!(!matches_event(
@@ -1598,8 +1316,6 @@ mod tests {
             r#"{"service": null, "message": "ok"}"#
         ));
     }
-
-    // ── timestamp parsing ────────────────────────────────────────────
 
     #[test]
     fn parse_timestamp_rfc3339() {
@@ -1665,7 +1381,6 @@ mod tests {
     fn parse_epoch_i64_millis() {
         let ts = parse_epoch_i64(1_739_620_800_000);
         assert!(ts.is_some());
-        // Should be the same instant as epoch-seconds version.
         let secs_ts = parse_epoch_i64(1_739_620_800).unwrap();
         assert_eq!(ts.unwrap().timestamp(), secs_ts.timestamp());
     }
@@ -1685,9 +1400,6 @@ mod tests {
         assert!(parse_timestamp("").is_none());
     }
 
-    // ── deterministic time filter tests ─────────────────────────────
-
-    /// Helper: create an event with the given RFC 3339 timestamp.
     fn event_with_timestamp(ts: &str) -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();
         m.insert("_time".into(), Value::String(ts.to_string()));
@@ -1695,7 +1407,6 @@ mod tests {
         m
     }
 
-    /// Helper: create an event with an epoch-seconds timestamp.
     fn event_with_epoch_secs(secs: i64) -> serde_json::Map<String, Value> {
         let mut m = serde_json::Map::new();
         m.insert(
@@ -1708,7 +1419,6 @@ mod tests {
 
     #[test]
     fn time_filter_recent_event_matches() {
-        // Event 1 second before `now` → matches last=1h.
         let now = fixed_now();
         let recent = (now - chrono::Duration::seconds(1)).to_rfc3339();
         let event = event_with_timestamp(&recent);
@@ -1721,7 +1431,6 @@ mod tests {
 
     #[test]
     fn time_filter_old_event_excluded() {
-        // Event 2 hours before `now` → does NOT match last=1h.
         let now = fixed_now();
         let old = (now - chrono::Duration::hours(2)).to_rfc3339();
         let event = event_with_timestamp(&old);
@@ -1734,9 +1443,6 @@ mod tests {
 
     #[test]
     fn time_filter_boundary_matches() {
-        // Event at exactly the cutoff (3600 seconds before `now`) → matches:
-        // the window comparison is >=. Injected `now` makes the boundary
-        // exact — the wall-clock variant needed slack and still flaked.
         let now = fixed_now();
         let boundary = (now - chrono::Duration::seconds(3600)).to_rfc3339();
         let event = event_with_timestamp(&boundary);
@@ -1749,7 +1455,6 @@ mod tests {
 
     #[test]
     fn time_filter_just_past_boundary_excluded() {
-        // Event 1 second past the cutoff → does NOT match last=1h.
         let now = fixed_now();
         let past = (now - chrono::Duration::seconds(3601)).to_rfc3339();
         let event = event_with_timestamp(&past);
@@ -1764,12 +1469,10 @@ mod tests {
     fn time_filter_epoch_seconds_event() {
         let now = fixed_now();
 
-        // Epoch-seconds timestamp 1 second before `now` → matches last=1h.
         let event = event_with_epoch_secs(now.timestamp() - 1);
         let json = serde_json::to_string(&event).unwrap();
         assert!(matches_event_at("last=1h", &json, now));
 
-        // Epoch-seconds timestamp 2 hours before `now` → does NOT match.
         let event = event_with_epoch_secs(now.timestamp() - 7200);
         let json = serde_json::to_string(&event).unwrap();
         assert!(!matches_event_at("last=1h", &json, now));
@@ -1777,18 +1480,12 @@ mod tests {
 
     #[test]
     fn time_filter_no_timestamp_excluded() {
-        // Event without a timestamp field → should NOT match.
         let mut event = serde_json::Map::new();
         event.insert("message".into(), Value::String("test".into()));
         let json = serde_json::to_string(&event).unwrap();
         assert!(!matches_event("last=1h", &json));
     }
 
-    // ── a cancelled compile is no verdict on the query ─────────────
-
-    /// A filter whose ledger's stop is requested before its patterns build
-    /// answers the typed cancellation (ADR-0063), not the emitter's
-    /// refusal of an invalid pattern: the work ended, the query is fine.
     #[test]
     fn a_cancelled_compile_is_not_an_invalid_pattern() {
         let query = parser::parse("msg=/time(out)?/ host=web-*").expect("parses");
@@ -1804,20 +1501,16 @@ mod tests {
         assert_eq!(refused, Some(FilterError::Cancelled));
     }
 
-    // ── matches_at reads the context it is handed ───────────────────
-
     #[test]
     fn matches_at_uses_the_contexts_instant() {
         let query = parser::parse("last=1h").expect("parse should succeed");
         let filter = CompiledFilter::compile(&query.search, &crate::schema::FieldTypes::new())
             .expect("filter compiles");
 
-        // Event 30 min ago from "now".
         let now = fixed_now();
         let event_ts = (now - chrono::Duration::minutes(30)).to_rfc3339();
         let event = event_with_timestamp(&event_ts);
 
-        // Under that instant → matches (30 min < 1 hour).
         assert!(
             filter
                 .matches_at(&event, &EvalContext::at(now))
@@ -1833,9 +1526,6 @@ mod tests {
                 .expect("a never stop never cancels")
         );
 
-        // Under an instant 2 hours later the event is >1h old → no
-        // match. Three answers from one filter and one event: the
-        // context is the only input that moved.
         let future_now = now + chrono::Duration::hours(2);
         assert!(
             !filter
@@ -1844,18 +1534,8 @@ mod tests {
         );
     }
 
-    // ── absolute bounds are half-open ───────────────────────────────
-
-    /// The live-lane half of
-    /// `duckdb_probe::the_absolute_time_window_is_half_open_at_the_microsecond`:
-    /// `earliest=` is inclusive, `latest=` is exclusive, and the event
-    /// stamped exactly at the bound is what tells them apart (ADR-0018
-    /// ruling 10). Tiled report windows `[a, b)`, `[b, c)` count the
-    /// event at `b` once, in the second window, and a live tail has to
-    /// agree with the batch query event for event.
     #[test]
     fn absolute_bounds_are_half_open_at_the_microsecond() {
-        // T and its two microsecond neighbours.
         let before = r#"{"_time": "2026-03-14T03:00:00.123455Z"}"#;
         let at = r#"{"_time": "2026-03-14T03:00:00.123456Z"}"#;
         let after = r#"{"_time": "2026-03-14T03:00:00.123457Z"}"#;

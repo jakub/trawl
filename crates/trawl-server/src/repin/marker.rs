@@ -3,55 +3,19 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The repin operation marker and staging-root layout (ADR-0011).
-//!
-//! `data/REPIN` is a small JSON document naming the job, the field, the
-//! two types and the current phase. It is written via the shared
-//! staged-write idiom ([`crate::epoch::publish_marker_staged`]: temp name
-//! → fsync → atomic rename → dir fsync) before any visible change and
-//! removed as the job's final act, so boot recovery reads exactly one
-//! file to know whether — and where — a repin died.
-//!
-//! The shadow and aside roots are siblings of the data root
-//! (`data.repin-next/`, `data.repin-aside/`), the epoch set-aside pattern,
-//! rather than dot-directories inside it: `DuckDB`'s recursive glob
-//! descends into dot-directories (probed by execution in
-//! `trawl-engine/tests/duckdb_probe.rs`), so an in-root shadow would be
-//! unioned into every fallback-glob query as duplicate rows. A sibling is
-//! invisible to every data-root glob and walk by construction and moves
-//! nothing that must not move — `wal/`, `scheduled/`, `EPOCH` and
-//! `CATALOG` never leave the data root.
-//!
-//! Being a sibling puts the staging on the parent's filesystem, which is
-//! the data root's own for the shipped packaging (the volume is mounted
-//! at `/var/lib/trawl`, data at `/var/lib/trawl/data`) but not when an
-//! operator mounts a volume at the data dir (`[data] path = "/mnt/logs"`)
-//! — and then no hardlink and no rename can cross. The root is not the
-//! only place a mount can sit: everything the engine touches lives
-//! arbitrarily deep under it (the shadow build hardlinks
-//! `{env}/{date}/{HH}/{service}.parquet`, the swap renames `{env}`), so a
-//! volume mounted at any env/date/hour subtree — tiered storage, a
-//! plausible archive layout — breaks the same two halves. That is not a
-//! survivable discovery mid-cutover (the swap is forward-only past the
-//! marker, so an `EXDEV`/`EBUSY` there costs the process and every
-//! subsequent boot replays it), so [`check_staging_filesystem`] proves
-//! the whole env subtree is one filesystem before a job is allowed to
-//! build anything.
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-/// Marker filename inside the data root.
 pub const REPIN_MARKER: &str = trawl_config::REPIN_MARKER;
 
 /// Suffix of the shadow (next-generation) sibling root. Config owns the
 /// spelling, because its query scratch check refuses these roots too.
 pub const SHADOW_SUFFIX: &str = trawl_config::REPIN_SHADOW_SUFFIX;
 
-/// Suffix of the aside (previous-generation) sibling root.
 pub const ASIDE_SUFFIX: &str = trawl_config::REPIN_ASIDE_SUFFIX;
 
-/// Where a repin job died, as recorded in the marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepinPhase {
@@ -66,18 +30,8 @@ pub enum RepinPhase {
     Cleanup,
 }
 
-/// The `data/REPIN` document.
-///
-/// Dialect-free by design: a repin to `SEVERITY` may assert that the
-/// corpus's numerals are syslog PRI, but no replay path ever re-runs a
-/// cast — a `building` marker abandons the shadow (the values were never
-/// written), and a `cutover`/`cleanup` marker only completes renames over
-/// files the job already wrote. The dialect lives on the job row, where
-/// the report needs it; putting it here would imply a recovery that could
-/// re-read wire text, which forward-only recovery does not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RepinMarker {
-    /// The `repin_jobs` row this marker belongs to.
     pub job_id: i64,
     /// The repinned field (catalog key, folded).
     pub field: String,
@@ -87,12 +41,10 @@ pub struct RepinMarker {
     /// The target pin (catalog spelling, as written by
     /// `CanonicalType::as_catalog`).
     pub to_type: String,
-    /// Where the job is.
     pub phase: RepinPhase,
 }
 
 impl RepinPhase {
-    /// The phase as the marker spells it, for messages and reports.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -102,10 +54,6 @@ impl RepinPhase {
         }
     }
 
-    /// Whether a query-only node refuses to boot over a marker in this
-    /// phase. A `building` marker leaves the live corpus untouched, so the
-    /// node serves; past it, the corpus may be half-swapped, and only the
-    /// ingest node may finish the job.
     #[must_use]
     pub const fn query_only_refuses(self) -> bool {
         match self {
@@ -116,47 +64,35 @@ impl RepinPhase {
 }
 
 impl RepinMarker {
-    /// The target pin, parsed from its catalog spelling (`from_catalog`,
-    /// matching what the marker writes: the physical parse has no
-    /// `SEVERITY` spelling). `None` for a spelling no canonical type has,
-    /// which recovery of a `cutover` or `cleanup` marker refuses.
     #[must_use]
     pub fn target_type(&self) -> Option<trawl_core::schema::CanonicalType> {
         trawl_core::schema::CanonicalType::from_catalog(&self.to_type)
     }
 }
 
-/// The shadow sibling root for a data root.
 #[must_use]
 pub fn shadow_root(data_dir: &Path) -> PathBuf {
     trawl_config::data_root_sibling(data_dir, SHADOW_SUFFIX)
 }
 
-/// The aside sibling root for a data root.
 #[must_use]
 pub fn aside_root(data_dir: &Path) -> PathBuf {
     trawl_config::data_root_sibling(data_dir, ASIDE_SUFFIX)
 }
 
-/// The marker path inside a data root.
 #[must_use]
 pub fn marker_path(data_dir: &Path) -> PathBuf {
     data_dir.join(REPIN_MARKER)
 }
 
-/// Which piece of repin staging [`staging_evidence`] found first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StagingEvidence {
-    /// The `data/REPIN` marker.
     Marker,
-    /// The shadow sibling root.
     ShadowRoot,
-    /// The aside sibling root.
     AsideRoot,
 }
 
 impl StagingEvidence {
-    /// The evidence named for a log line.
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -167,23 +103,13 @@ impl StagingEvidence {
     }
 }
 
-/// Evidence that a repin job owns this data root right now: the marker, a
-/// shadow root, or an aside root, or `None` when there is none.
-///
-/// The one authority on that question. Retention stands down on it, pin
-/// gc refuses on it, and repin admission refuses to start a job over it.
-/// All three are about not touching a corpus a repin is mid-way through
-/// rearranging, so a second implementation is a second opinion about
-/// whether it is safe to delete something.
+/// The marker, shadow root or aside root showing a repin job owns this
+/// data root now. The one authority on that question: retention stands
+/// down on it, pin gc refuses on it, and repin admission refuses over it.
 ///
 /// Fallible, unlike [`Path::exists`], which folds every I/O error into
-/// `false`. Here `false` means "go ahead", so a data root that cannot be
-/// stat'ed would read as permission to proceed. Callers decide what an
-/// unreadable answer means to them; every one of today's refuses on it.
-///
-/// # Errors
-/// The first `try_exists` error, with the marker checked before the shadow
-/// root and the shadow before the aside.
+/// `false`. `None` means "go ahead", so a data root that cannot be
+/// stat'ed would read as permission to proceed.
 pub fn staging_evidence(data_dir: &Path) -> Result<Option<StagingEvidence>, std::io::Error> {
     for (path, found) in [
         (marker_path(data_dir), StagingEvidence::Marker),
@@ -197,10 +123,6 @@ pub fn staging_evidence(data_dir: &Path) -> Result<Option<StagingEvidence>, std:
     Ok(None)
 }
 
-/// [`staging_evidence`], named for a log line.
-///
-/// # Errors
-/// As [`staging_evidence`].
 pub fn in_flight_evidence(data_dir: &Path) -> Result<Option<&'static str>, std::io::Error> {
     Ok(staging_evidence(data_dir)?.map(StagingEvidence::label))
 }
@@ -237,7 +159,6 @@ pub fn check_staging_filesystem(data_dir: &Path) -> Result<(), String> {
     check_env_subtree_devices(data_dir, root_dev, &|meta| device_of_meta(meta))
 }
 
-/// The refusal for a data root that is itself a mount point.
 fn mount_point_message(data_dir: &Path) -> String {
     format!(
         "the data root ([data] path) is a mount point, so the repin staging \
@@ -251,8 +172,6 @@ fn mount_point_message(data_dir: &Path) -> String {
     )
 }
 
-/// A staging root named by its final component: a sibling of the data
-/// root, never its absolute path.
 fn sibling_name(root: &Path) -> String {
     root.file_name().map_or_else(
         || "a sibling of the data root".to_owned(),
@@ -260,8 +179,6 @@ fn sibling_name(root: &Path) -> String {
     )
 }
 
-/// A pre-flight I/O failure, named by `what` and the error's kind. The
-/// path and the error text go to DEBUG.
 fn io_refusal(what: &str, path: &Path, e: &std::io::Error) -> String {
     tracing::debug!(
         event_type = "repin_staging_preflight_io",
@@ -275,12 +192,8 @@ fn io_refusal(what: &str, path: &Path, e: &std::io::Error) -> String {
     )
 }
 
-/// Walk the env directories the swap moves and the shadow build
-/// hardlinks, refusing the first entry that does not share `root_dev`.
-///
 /// The device function is injected so the walk itself is testable without
-/// a mount (creating one needs privileges the test suite does not have);
-/// production always passes [`device_of_meta`].
+/// a mount (creating one needs privileges the test suite does not have).
 fn check_env_subtree_devices<F>(data_dir: &Path, root_dev: u64, dev_of: &F) -> Result<(), String>
 where
     F: Fn(&std::fs::Metadata) -> u64,
@@ -392,22 +305,15 @@ pub fn read_marker(data_dir: &Path) -> Result<Option<RepinMarker>, String> {
 
 /// Parse a marker's text: the one decoder boot recovery and
 /// `trawld --doctor` share.
-///
-/// # Errors
-/// When the text is not a marker document.
 pub fn parse_marker(raw: &str) -> Result<RepinMarker, serde_json::Error> {
     serde_json::from_str(raw)
 }
 
-/// Write (or rewrite) the marker through the shared staged-write idiom
-/// ([`crate::epoch::publish_marker_staged`]), durable before it is
-/// visible: temp name → fsync → atomic rename → dir fsync.
 pub fn write_marker(data_dir: &Path, marker: &RepinMarker) -> Result<(), String> {
     let body = serde_json::to_string(marker).map_err(|e| format!("marker serialize: {e}"))?;
     crate::epoch::publish_marker_staged(data_dir, REPIN_MARKER, &body)
 }
 
-/// Remove the marker — the job's final act.
 pub fn remove_marker(data_dir: &Path) -> Result<(), String> {
     let path = marker_path(data_dir);
     match std::fs::remove_file(&path) {
@@ -451,7 +357,6 @@ mod tests {
         remove_marker(tmp.path()).expect("idempotent removal");
     }
 
-    /// A phase reads in messages as the marker spells it.
     #[test]
     fn a_phase_reads_as_the_marker_spells_it() {
         for phase in [
@@ -466,8 +371,6 @@ mod tests {
         }
     }
 
-    /// The evidence names the first piece found, marker first, then the
-    /// shadow root, then the aside root, and the labelled form agrees.
     #[test]
     fn staging_evidence_names_the_marker_then_the_shadow_then_the_aside() {
         let tmp = tempfile::tempdir().unwrap();
@@ -494,8 +397,6 @@ mod tests {
         assert_eq!(in_flight_evidence(&data).unwrap(), Some("marker"));
     }
 
-    /// A corrupt marker is a loud error: recovery must never conclude "no
-    /// repin died here" from a file it could not read.
     #[test]
     fn corrupt_marker_errors_rather_than_reading_as_absent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -503,9 +404,6 @@ mod tests {
         read_marker(tmp.path()).expect_err("corruption must surface");
     }
 
-    /// The staging roots are siblings of the data root — outside every
-    /// data-root glob and walk (see the module doc for the probe that
-    /// forced this).
     #[test]
     fn staging_roots_are_siblings_of_the_data_root() {
         let data = Path::new("/var/lib/trawl/data");
@@ -520,9 +418,6 @@ mod tests {
         assert!(!shadow_root(data).starts_with(data));
     }
 
-    /// The shipped shape — a data root that is an ordinary directory
-    /// inside its volume, corpus and all — passes the pre-flight, walk
-    /// included.
     #[test]
     fn a_data_root_inside_its_volume_passes_the_staging_check() {
         let tmp = tempfile::tempdir().unwrap();
@@ -536,13 +431,6 @@ mod tests {
         check_staging_filesystem(&data).expect("one filesystem for the whole corpus");
     }
 
-    /// A volume mounted at an env/date/hour subtree breaks both halves of
-    /// the engine exactly as a mount at the root does — the shadow build
-    /// hardlinks out of it (EXDEV) and the cutover renames the env
-    /// directory containing it (EBUSY, past the point of no return) — so
-    /// the pre-flight walks the whole env subtree, not just the root.
-    /// A mount cannot be created in the test suite, so the device lookup
-    /// is injected; [`check_staging_filesystem`] wires the real one.
     #[cfg(unix)]
     #[test]
     fn a_mount_point_nested_under_the_data_root_is_refused() {
@@ -569,8 +457,6 @@ mod tests {
         assert!(err.contains("EBUSY"), "{err}");
     }
 
-    /// The pre-flight's refusals reach the request and the job row, so
-    /// they carry neither the error's text nor an absolute host path.
     #[test]
     fn staging_refusals_carry_no_host_path_or_io_text() {
         const MARKER: &str = "zz_io_marker_/srv/secret";
@@ -590,7 +476,6 @@ mod tests {
         assert!(msg.contains("(data.repin-next, data.repin-aside)"), "{msg}");
         assert!(msg.contains("Mount the volume one level up"), "{msg}");
 
-        // A data root that is not there: the real stat failure.
         let err = check_staging_filesystem(&data).expect_err("nothing to stat");
         assert!(!err.contains(&abs), "{err}");
         assert!(!err.contains("os error"), "{err}");
@@ -600,8 +485,6 @@ mod tests {
         );
     }
 
-    /// A bind-mounted file is the same defect one level down: the shadow
-    /// build hardlinks it, so a different device is EXDEV all the same.
     #[cfg(unix)]
     #[test]
     fn a_foreign_file_under_an_env_directory_is_refused() {
@@ -627,11 +510,6 @@ mod tests {
         assert!(!err.contains(&tmp.path().display().to_string()), "{err}");
     }
 
-    /// A symlinked env directory is refused before the walk reads it. The
-    /// listing follows the link, so reading on would name the link
-    /// target's children as `prod/...` entries of the data root, and a
-    /// refusal about one of them would carry a name from outside the data
-    /// root. The refusal names the env relative to the data root only.
     #[cfg(unix)]
     #[test]
     fn staging_preflight_refuses_a_symlinked_env_dir() {
@@ -669,9 +547,6 @@ mod tests {
         assert_eq!(err, expected);
     }
 
-    /// Only what the engine moves is in scope: `wal/` and `scheduled/`
-    /// never leave the data root, so a volume mounted there is not this
-    /// job's business and must not refuse it.
     #[cfg(unix)]
     #[test]
     fn a_foreign_filesystem_outside_the_env_dirs_is_not_this_checks_business() {
@@ -705,11 +580,8 @@ mod tests {
         std::os::unix::fs::MetadataExt::ino(meta)
     }
 
-    /// A data root that is itself a mount point is refused before anything
-    /// is built — the shape `[data] path = "/mnt/logs"` creates, and the
-    /// one the forward-only cutover cannot survive. `/proc` is a real
-    /// mount under `/` on every Linux box, so this is a genuine
-    /// cross-device stat rather than a mocked one.
+    /// `/proc` is a real mount under `/` on every Linux box, so this is a
+    /// genuine cross-device stat rather than a mocked one.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_data_root_on_its_own_mount_is_refused() {
@@ -717,7 +589,7 @@ mod tests {
         if !mount.exists()
             || device_of(mount, "/proc").unwrap() == device_of(Path::new("/"), "/").unwrap()
         {
-            return; // no /proc to lean on; nothing to prove here
+            return;
         }
         let err = check_staging_filesystem(mount).expect_err("a mount point must be refused");
         assert!(err.contains("(proc.repin-next, proc.repin-aside)"), "{err}");

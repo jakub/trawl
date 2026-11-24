@@ -2,20 +2,14 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The "Show context" query builder: a ±30s window around one result row.
-//!
-//! Pure and ungated so its tests run natively; the one caller (the results
-//! table's row actions) is wasm32-only. The window names the canonical
-//! `_time` column, because the DSL has no aliases (ADR-0013 §6): naming
-//! `@timestamp` here would filter on an ordinary sender field most events
-//! never carry, and Show context would silently return nothing.
+//! The Show context window filters on the canonical `_time` column, never
+//! `@timestamp`: the DSL has no aliases (ADR-0013 §6).
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::display::value_to_string;
 use trawl_api::value::Value;
 
-/// Index of the first of `names` present in `columns`.
 pub(crate) fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
     for name in names {
         if let Some(i) = columns.iter().position(|c| c == name) {
@@ -25,19 +19,16 @@ pub(crate) fn find_col(columns: &[String], names: &[&str]) -> Option<usize> {
     None
 }
 
-/// Escape a value for embedding in a double-quoted DSL literal.
 pub(crate) fn escape_dq(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// A new snapshot search with an explicit effective window.
 #[derive(Clone, Debug)]
 pub(crate) struct SearchNavigation {
     pub query: String,
     pub range: crate::query_merge::RangeSpec,
 }
 
-/// Build a same-host search and an absolute ±30-second picker range.
 pub(crate) fn build_context_query(row: &[Value], columns: &[String]) -> Option<SearchNavigation> {
     let ti = find_col(columns, &["_time"])?;
     let ts_raw = value_to_string(row.get(ti)?);

@@ -1,7 +1,8 @@
 # Planes, one labelled sidebar, and docked drawers
 
 status: accepted (2026-09-13), ruling record for the UI redesign of
-2026-09-13
+2026-09-13; amended (2026-11-23): rulings moved from code comments, see
+the Amendment
 
 The design study compared two directions against the shipped UI. The
 ruling takes Direction A as the visual base (a small set of surface
@@ -172,3 +173,54 @@ Detailed card facts, dynamic health headings, request generation checks
 and the shell's single dashboard stream remain unchanged. Cancel stays
 an explicit gated button with its confirmation; the query row does not
 become an action target.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where
+they were the only record. They were already in force. None is a new
+decision.
+
+- **A change of `docked` never remounts a drawer's children.** The drawer
+  registers or releases its overlay layer, the wrapper switches between
+  `sd-scrim` and `sd-host`, and the panel toggles `sd-docked`. A resize
+  across the docking width is not an open or a close, so the panes keep
+  their state and their loaded data. The nets detail panes depend on
+  this, as the Runs detail does.
+- **A drawer moves focus only when the focus belongs to it.** On open,
+  only a drawer that mounts undocked with an overlay layer that owns
+  focus takes initial focus. A panel that mounts docked takes none, and
+  a later undock is a resize, so it takes none either. `Drawer` records
+  the opener itself in both presentations, because a docked drawer
+  holds no layer whose restore could run. On close, an undocked drawer
+  restores the opener when its layer owns focus. A docked drawer
+  restores it when focus is inside the closing panel or has fallen to
+  `<body>`. Focus anywhere else, including a modal above the drawer,
+  was put there on purpose and stays.
+- **A collapsed sidebar link keeps its visible label as screen-reader
+  text.** `nav.rail.collapsed` clips `.lb` and `.grp-lb` visually and
+  does not remove them. An icon-only link then keeps its accessible
+  name, and `title` is not its only name.
+- **Every sidebar group renders a `.grp` wrapper, labelled or not.**
+  Only a labelled wrapper carries `role="group"` and `aria-label`. The
+  wrapper lets `nav.rail .grp > a[title]` address every destination,
+  and a `role="group"` with no accessible name is an accessibility
+  defect.
+- **The Runs detail keeps the last list summary of its selected run
+  after paging removes the run from the list.** A run whose stored
+  result file is gone answers 409 with no summary, so the list's record
+  is the only source of its status, duration and row count. The kept
+  summary belongs to the selected identity, the same way the known net
+  name does, so a later selection cannot inherit it.
+- **The Search reading modes, Inspector details and message-first rows,
+  default off and apply only to snapshot raw results.** An Inspector
+  selection is a row index. Once the live ring holds
+  `LIVE_RING_CAPACITY` events, each new event drops the oldest one and
+  shifts every index by one, so a selected index would name a different
+  event. `LiveRawTable` takes neither mode.
+- **A segmented control has one active treatment: the chosen option is
+  raised out of the well track onto the sheet plane.** The stylesheet
+  holds exactly one `.seg-opt.on` rule, and `component_class_contract`
+  counts it. Forced colors reach the chosen option through
+  `aria-pressed="true"` so that the forced-colors rules add no second
+  active rule. This treatment replaces the amber wash that ADR-0003
+  named and keeps that ADR's one-look-per-widget rule.

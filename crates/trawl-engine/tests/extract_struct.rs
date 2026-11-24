@@ -2,23 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! An `extract` stage binds its regex once (ADR-0063, human ruling
-//! 2026-11-04): `DuckDB`'s struct form of `regexp_extract` reads every
-//! named group from one RE2.
-//!
-//! The premise tests pin what the bundled `DuckDB` does with that form,
-//! straight in SQL, prepared and then bound as the engine runs a query:
-//! how it maps names to groups, what a group that takes no part in the
-//! match reads, and when the bound pattern becomes a constant. The
-//! parity tests run what the emitter writes for an `extract` against the
-//! live lane, which reads each group by name.
-//!
-//! The struct form needs a constant pattern at bind. The engine prepares
-//! a statement before it binds the values, and a bound `?` is no constant
-//! then, so `regexp_extract(s, ?, ['g1', ...])` is a binder error at
-//! prepare. With the names list bound as a parameter too,
-//! `regexp_extract(s, ?, ?::VARCHAR[])`, the binder defers the call until
-//! the values are bound, and by then the pattern is a constant.
+//! An `extract` stage binds its regex once (ADR-0063): `DuckDB`'s struct
+//! form of `regexp_extract` reads every named group from one RE2.
 
 use duckdb::Connection;
 use trawl_core::eval::EvalValue;
@@ -26,16 +11,11 @@ use trawl_core::schema::FieldTypes;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::Value;
 
-/// `[g1, ..., gn]`: the struct field names the emitter generates, as the
-/// text the names parameter binds.
 fn names(n: usize) -> String {
     let list: Vec<String> = (1..=n).map(|i| format!("g{i}")).collect();
     format!("[{}]", list.join(", "))
 }
 
-/// Each field of the struct `regexp_extract(subject, pattern, names(n))`
-/// returns, read in order, with the pattern and the names bound as
-/// parameters, as the emitter binds them.
 fn fields(subject: Option<&str>, pattern: &str, n: usize) -> Vec<Option<String>> {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     let reads: Vec<String> = (1..=n).map(|i| format!("x.g{i}")).collect();
@@ -54,9 +34,6 @@ fn some(texts: &[&str]) -> Vec<Option<String>> {
     texts.iter().map(|t| Some((*t).to_owned())).collect()
 }
 
-/// With the names written as a literal list, a bound pattern is refused
-/// at prepare: the struct form wants a constant pattern, and a `?` is
-/// none before its value is bound.
 #[test]
 fn a_literal_names_list_refuses_a_bound_pattern() {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -72,10 +49,8 @@ fn a_literal_names_list_refuses_a_bound_pattern() {
     );
 }
 
-/// With the names bound too, the pattern is a constant by the time the
-/// call binds: an invalid pattern fails at bind over zero rows, before
-/// any row could compile it. (A pattern that only rows compile would
-/// pass over zero rows.)
+/// Over zero rows, so only a bind-time compile can fail: a pattern that
+/// only rows compile would pass.
 #[test]
 fn bound_names_make_the_pattern_a_constant() {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -95,8 +70,6 @@ fn bound_names_make_the_pattern_a_constant() {
     );
 }
 
-/// The struct form takes 40 names, past the scalar form's 0 to 9, and
-/// field k is the k-th capture group's text.
 #[test]
 fn struct_form_reads_forty_groups() {
     let letters: Vec<String> = (0..40)
@@ -117,28 +90,17 @@ fn struct_form_reads_forty_groups() {
     assert_eq!(fields(Some(&subject), &pattern, 40), some(&want));
 }
 
-/// `DuckDB` maps the k-th name to the k-th capture group by position
-/// among every capture group, named or not, never by the group's own
-/// name. So the batch body must make its unnamed groups non-capturing, as
-/// `trawl_core::pattern::batch_extract` does, for the k-th name to read
-/// the k-th named group.
 #[test]
 fn names_map_to_groups_by_position() {
-    // An unnamed group ahead of the named one takes the first name.
     assert_eq!(fields(Some("ab"), "(a)(?P<y>b)", 1), some(&["a"]));
-    // The group's own name plays no part.
     assert_eq!(fields(Some("ab"), "(?P<y>a)(?P<x>b)", 2), some(&["a", "b"]));
-    // Made non-capturing, the unnamed group drops out of the numbering.
     assert_eq!(fields(Some("ab"), "(?:a)(?P<y>b)", 1), some(&["b"]));
-    // Fewer names than groups reads the first groups only.
     assert_eq!(
         fields(Some("abc"), "(?P<x>a)(?P<y>b)(?P<z>c)", 2),
         some(&["a", "b"])
     );
 }
 
-/// More names than capture groups is a bind error, never a silent empty
-/// field.
 #[test]
 fn more_names_than_groups_is_refused() {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
@@ -152,10 +114,6 @@ fn more_names_than_groups_is_refused() {
     );
 }
 
-/// A group that takes no part in the match reads `''`, and so does every
-/// group of a row the pattern does not match, so `nullif(.., '')` reads
-/// NULL for both, as the live lane does. A NULL subject gives a NULL
-/// struct, whose fields read NULL.
 #[test]
 fn unmatched_groups_read_empty() {
     let pattern = "(?:a)(?P<x>b)|(?:c)(?P<y>d)";
@@ -170,12 +128,6 @@ fn unmatched_groups_read_empty() {
     assert_eq!(fields(None, pattern, 2), vec![None, None]);
 }
 
-// ---------------------------------------------------------------------
-// Parity with the live lane
-// ---------------------------------------------------------------------
-
-/// A parquet file of one row a message, with an `id` column to match
-/// rows across lanes by, under `dir`.
 fn fixture(dir: &std::path::Path, messages: &[&str]) -> String {
     let conn = Connection::open_in_memory().expect("in-memory duckdb");
     conn.execute_batch("CREATE TABLE t (_time TIMESTAMP, id BIGINT, message VARCHAR)")
@@ -198,8 +150,6 @@ fn fixture(dir: &std::path::Path, messages: &[&str]) -> String {
     path.display().to_string()
 }
 
-/// What the batch lane answers for `dsl` over `source`: each row's `id`
-/// and the text of each of `names`, `None` for NULL.
 fn batch_rows(dsl: &str, source: &str, names: &[String]) -> Vec<(i64, Vec<Option<String>>)> {
     let result = Executor::new()
         .expect("an executor")
@@ -236,8 +186,6 @@ fn batch_rows(dsl: &str, source: &str, names: &[String]) -> Vec<(i64, Vec<Option
     rows
 }
 
-/// What the live lane answers for `dsl` over the same messages: each
-/// emitted event's `id` and the text of each of `names`.
 fn live_rows(dsl: &str, messages: &[&str], names: &[String]) -> Vec<(i64, Vec<Option<String>>)> {
     let query = trawl_core::parser::parse(dsl).expect("the live query parses");
     let filter = trawl_core::filter::CompiledFilter::compile(&query.search, &FieldTypes::new())
@@ -276,10 +224,6 @@ fn live_rows(dsl: &str, messages: &[&str], names: &[String]) -> Vec<(i64, Vec<Op
     rows
 }
 
-/// Both lanes answer `dsl` over `messages` alike, and the batch lane
-/// writes one `regexp_extract` call for the extract and charges it
-/// `extract_sites` extract sites: what `DuckDB`'s plans hold of it
-/// (`fixed_regex_sites.rs`).
 fn assert_parity(
     dsl: &str,
     messages: &[&str],
@@ -306,12 +250,9 @@ fn assert_parity(
     batch
 }
 
-/// A 40-group extract reads every group alike in both lanes: on a row
-/// that matches with every group taking part, on rows where one branch
-/// of an alternation leaves its group out (NULL), and on a row the
-/// pattern does not match (every group NULL). A capture group is one of
-/// a body's 64 positions, so 18 groups hold a letter, two sit in an
-/// alternation, and 20 are empty, which reads NULL in both lanes.
+/// A capture group is one of a body's 64 positions, so 18 groups hold a
+/// letter, two sit in an alternation, and 20 are empty, which reads NULL in
+/// both lanes.
 #[test]
 fn forty_groups_agree_with_the_live_lane() {
     let letters: Vec<String> = (1..=18u8)
@@ -347,9 +288,6 @@ fn forty_groups_agree_with_the_live_lane() {
     );
 }
 
-/// Unnamed groups between named ones do not shift what a name reads: the
-/// batch body makes them non-capturing, so each named group is the
-/// struct field at its place among the named ones.
 #[test]
 fn unnamed_groups_between_named_ones_agree() {
     let names = vec!["a".to_owned(), "b".to_owned()];
@@ -369,10 +307,6 @@ fn unnamed_groups_between_named_ones_agree() {
     );
 }
 
-/// A `where` on an extracted field reads the field the struct gave it,
-/// in both lanes. The optimizer substitutes the extract into the filter,
-/// so the plan runs three calls of it, and the batch lane charges three
-/// sites.
 #[test]
 fn where_after_extract_agrees() {
     let names = vec!["code".to_owned(), "path".to_owned()];

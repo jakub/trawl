@@ -1,22 +1,8 @@
 //! The capability transitions crash-dump capture depends on (ADR-0023).
 //!
-//! The image stamps `cap_sys_ptrace+p` on `trawld`: permitted, never effective,
-//! so an ordinary exec of the binary still works under a dropped bounding set.
-//! Two processes then move in opposite directions. The monitor raises the bit
-//! into its effective set so it may ptrace a crashed daemon under
-//! `kernel.yama.ptrace_scope=2`. The daemon drops the bit from both sets and
-//! sets `no_new_privs`, which closes the route back to the file capability
-//! through a later exec.
-//!
 //! `libc` 0.2 has the syscall numbers but no `capset` wrapper and no capability
-//! structs, so the three `cap_user_*` types are declared here and both calls go
-//! through `libc::syscall`. This is the only file in the crate that touches
-//! capabilities, and every unsafe block is a single syscall.
-//!
-//! It is also where the crate's other raw-syscall work lives, because this is
-//! the designated unsafe file: [`peer_cred_of_fd`] asks the kernel who is on
-//! the other end of the socket the dump client itself holds, which is how the
-//! parent tells its own monitor from a process that bound the name first.
+//! structs, so the `cap_user_*` types are declared here and both calls go
+//! through `libc::syscall`.
 
 use std::io;
 use std::os::fd::RawFd;
@@ -46,7 +32,6 @@ struct CapData {
     inheritable: u32,
 }
 
-/// Read this process's capability sets.
 fn capget() -> io::Result<[CapData; 2]> {
     let mut header = CapHeader {
         version: CAP_VERSION_3,
@@ -71,7 +56,6 @@ fn capget() -> io::Result<[CapData; 2]> {
     }
 }
 
-/// Write this process's capability sets back.
 fn capset(data: &[CapData; 2]) -> io::Result<()> {
     let mut header = CapHeader {
         version: CAP_VERSION_3,
@@ -79,8 +63,7 @@ fn capset(data: &[CapData; 2]) -> io::Result<()> {
     };
     // SAFETY: `capset(2)` reads the header and exactly two `cap_user_data_t`
     // and writes nothing back. Both pointers are to live, correctly sized
-    // `#[repr(C)]` locals; the data pointer is const-cast only because the
-    // syscall wrapper is variadic.
+    // `#[repr(C)]` locals.
     #[allow(unsafe_code)]
     let rc = unsafe {
         libc::syscall(
@@ -97,9 +80,6 @@ fn capset(data: &[CapData; 2]) -> io::Result<()> {
 }
 
 /// Monitor side: move `CAP_SYS_PTRACE` from permitted to effective.
-///
-/// Every other bit in both words is carried across untouched, because the state
-/// is read first and edited, never synthesized from the one mask we care about.
 pub(crate) fn raise_ptrace_effective() -> io::Result<()> {
     let mut data = capget()?;
     if data[0].permitted & PTRACE_BIT_WORD0 == 0 {
@@ -125,10 +105,7 @@ pub(crate) fn raise_ptrace_effective() -> io::Result<()> {
 /// Clearing permitted also drops the bit from the ambient set, which is how the
 /// deb channel's `AmbientCapabilities=` grant is given back. Both halves are
 /// attempted even when the first fails: a daemon that kept the capability must
-/// at least not be able to re-acquire it, and the other way round. The error
-/// names the step that failed.
-///
-/// Consequence: `trawld` may exec nothing after the monitor is spawned.
+/// at least not be able to re-acquire it, and the other way round.
 pub(crate) fn seal() -> Result<(), (&'static str, io::Error)> {
     let dropped = drop_ptrace_capability();
     let no_new_privs = set_no_new_privs();
@@ -159,11 +136,6 @@ fn set_no_new_privs() -> io::Result<()> {
 }
 
 /// Name the monitor as the one process allowed to ptrace us.
-///
-/// `crash_handler` issues this lazily from inside the signal handler, where a
-/// failure is invisible. Calling it at startup with the return checked is what
-/// makes the yama scope-1 branch of the readiness verdict an observation rather
-/// than an assumption.
 pub(crate) fn set_ptracer(pid: u32) -> io::Result<()> {
     // SAFETY: `prctl(PR_SET_PTRACER, pid)` takes scalars only and touches no
     // memory of ours.
@@ -260,7 +232,6 @@ pub(crate) fn peer_cred_of_fd(fd: RawFd) -> io::Result<libc::ucred> {
     Ok(cred)
 }
 
-/// This process's effective uid, for comparison against a peer's.
 pub(crate) fn effective_uid() -> u32 {
     // SAFETY: `geteuid(2)` takes no arguments, touches no memory of ours and
     // cannot fail.
@@ -305,14 +276,10 @@ mod tests {
 
     /// Names the abstract socket [`abstract_socket_bind_helper`] should bind.
     const HELPER_ENV: &str = "TRAWL_CRASHDUMP_TEST_BIND";
-    /// Selects the middle process of the parent-death-signal test.
     const PDEATHSIG_MIDDLE_ENV: &str = "TRAWL_CRASHDUMP_TEST_PDEATHSIG_MIDDLE";
-    /// Selects the process that arms the signal.
     const PDEATHSIG_CHILD_ENV: &str = "TRAWL_CRASHDUMP_TEST_PDEATHSIG_CHILD";
-    /// Printed by that process once armed, followed by its pid.
     const PDEATHSIG_ARMED: &str = "pdeathsig-armed";
 
-    /// A name no other test, run or process is using.
     fn unique_name(tag: &str) -> String {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -323,10 +290,6 @@ mod tests {
 
     /// The address of an abstract name: a leading NUL byte, then the name, with
     /// the length passed explicitly rather than read up to a terminator.
-    ///
-    /// The production code no longer builds one of these. It reads credentials
-    /// off a descriptor `minidumper` opened, and these tests need a descriptor
-    /// of their own to read.
     // Three casts to fixed-width kernel types, each of a value that provably
     // fits: `AF_UNIX` is 1, a `u8` byte into `c_char` (unsigned on aarch64,
     // signed on x86-64, and only the bit pattern reaches the kernel), and an
@@ -391,7 +354,6 @@ mod tests {
         }
     }
 
-    /// Bind and listen on an abstract name, the way an impostor would.
     fn bind_listen(name: &str) -> OwnedFd {
         let (addr, len) = abstract_addr(name);
         let fd = seqpacket_socket();
@@ -434,7 +396,6 @@ mod tests {
         }
     }
 
-    /// Re-exec this test binary as a process whose only job is to bind `name`.
     fn spawn_bind_helper(name: &str) -> Child {
         Command::new(std::env::current_exe().expect("test binary path"))
             .args([
@@ -475,8 +436,6 @@ mod tests {
         !matches!(tail.split_whitespace().next(), None | Some("Z" | "X"))
     }
 
-    /// Connect to `name` until the peer of the connection is `pid`, and return
-    /// the credentials that proved it.
     fn peer_cred_when_bound_by(name: &str, pid: u32) -> Option<libc::ucred> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -545,10 +504,6 @@ mod tests {
         assert_eq!(cred.gid, status.gid[1], "effective gid");
     }
 
-    /// The ordinary case with a real second process: the pid the kernel reports
-    /// on the connection is the one that BOUND the name, never the one that
-    /// connected. That is what lets `install` tell its own monitor from a
-    /// stranger who won the race for a predictable name.
     #[test]
     fn peer_cred_reports_the_other_process_that_bound_the_name() {
         let name = unique_name("impostor");
@@ -565,15 +520,6 @@ mod tests {
     }
 
     /// The attack the descriptor accounting exists for, played out end to end.
-    ///
-    /// An impostor binds the predictable name first, accepts the connection the
-    /// dump client makes, and then closes only its LISTENER. That frees the
-    /// name, so the real monitor's own bind succeeds a moment later. From then
-    /// on a FRESH connection to the name reaches the real monitor and reports
-    /// its credentials, while the connection the client is actually holding
-    /// still belongs to the impostor. Reading the credentials of a second
-    /// connection would pass this; reading them off the client's own descriptor
-    /// catches it.
     #[test]
     fn peer_cred_separates_the_held_connection_from_a_later_binder() {
         let name = unique_name("interleave");
@@ -607,10 +553,6 @@ mod tests {
         );
     }
 
-    /// Runs only when [`peer_cred_reports_the_other_process_that_bound_the_name`]
-    /// or [`peer_cred_separates_the_held_connection_from_a_later_binder`]
-    /// re-execs the test binary with `--ignored --exact` and the name to bind in
-    /// the environment. Ignored so an ordinary run never pays the sleep.
     #[test]
     #[ignore = "helper process for the peer_cred tests"]
     fn abstract_socket_bind_helper() {
@@ -640,10 +582,6 @@ mod tests {
         );
     }
 
-    /// The mechanism the monitor's lifetime tie rests on, with real processes:
-    /// a process that armed `PR_SET_PDEATHSIG` dies when its parent does, even
-    /// though nothing it holds is closed and nobody signals it directly.
-    ///
     /// Three processes. This test spawns a MIDDLE helper, which spawns a
     /// GRANDCHILD that arms the signal and prints its pid on the stdout it
     /// inherited. Printing after arming is the handshake: without it the test
@@ -684,8 +622,6 @@ mod tests {
         }
     }
 
-    /// The middle process of [`a_child_that_armed_the_signal_dies_with_its_parent`]:
-    /// spawn the grandchild, then do nothing until the test kills us.
     #[test]
     #[ignore = "helper process for the parent-death-signal test"]
     fn pdeathsig_middle_helper() {
@@ -705,8 +641,6 @@ mod tests {
         let _ = grandchild.wait();
     }
 
-    /// The process under test: arm the signal, say so, then wait to be killed
-    /// by the kernel rather than by anyone.
     #[test]
     #[ignore = "helper process for the parent-death-signal test"]
     fn pdeathsig_grandchild_helper() {
@@ -731,9 +665,7 @@ mod tests {
     ///
     /// Both the capability sets and `no_new_privs` are per-THREAD, and this
     /// test body runs on a spawned harness thread while `/proc/self/status`
-    /// reports the main thread. Hence `/proc/thread-self`. In `trawld` the seal
-    /// happens on the main thread before any other exists, which is one more
-    /// reason `init()` is the first statement of `main`.
+    /// reports the main thread. Hence `/proc/thread-self`.
     #[test]
     fn sealing_clears_the_bit_and_forbids_regaining_it() {
         seal().expect("seal an unprivileged process");

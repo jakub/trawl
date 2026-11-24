@@ -75,7 +75,6 @@ class ReleaseSourceTests(unittest.TestCase):
     def test_manual_dispatch_uses_release_source_for_every_consumer(self):
         self.assertNotEqual(self.release_sha, self.workflow_sha)
         outputs = self.assert_resolves("v1.0.0")
-        # The emitted SHA must be usable by fresh, shallow consumer checkouts.
         for consumer in ["linux", "macos", "docker", "helm"]:
             checkout = Path(self.temp.name) / consumer
             checkout.mkdir()
@@ -94,8 +93,6 @@ class ReleaseSourceTests(unittest.TestCase):
             cwd=self.checkout, env=self.env, capture_output=True,
         )
         self.assertNotEqual(absent.returncode, 0)
-        # Execute the workflow's actual loading commands. The fixture models
-        # gh-pages as a separate destination checkout without product source.
         pages = Path(self.temp.name) / "pages"
         pages.mkdir()
         self.git(pages, "init")
@@ -127,8 +124,6 @@ class ReleaseSourceTests(unittest.TestCase):
         self.assertIn("ref: ${{ github.sha }}", step)
         self.assertIn("path: .release-tooling", step)
         self.assertIn("persist-credentials: false", step)
-        # Model the independent checkout action at the selected tooling SHA.
-        # Product source deliberately lacks the helper and remains untouched.
         tooling = self.checkout / ".release-tooling"
         self.git(self.checkout, "clone", "--no-tags", str(self.remote), str(tooling))
         self.git(tooling, "checkout", "--detach", self.workflow_sha)
@@ -151,7 +146,6 @@ class ReleaseSourceTests(unittest.TestCase):
                 checkout = Path(self.temp.name) / tag
                 self.git(checkout.parent, "clone", "--no-tags", str(self.remote), str(checkout))
                 self.git(checkout, "checkout", "--detach", self.release_sha)
-                # A local edit must not replace the committed announcement.
                 (checkout / "docs/releases/v1.0.0.md").write_text("Uncommitted journal\n")
                 result = subprocess.run(['bash', '-e', '-c', commands], cwd=checkout,
                                         env=dict(self.env, SOURCE_SHA=self.release_sha, RELEASE_TAG=tag),

@@ -9,11 +9,7 @@
 //! here splices that text: each builder assembles an [`ast::Query`] whose
 //! values sit in quoted positions, and renders it through
 //! [`format::checked_format_query`], which parses the text back and
-//! returns it only when it has the same canonical form
-//! ([`canonical_form::same_query`]); [`Composed::verify`] runs that proof
-//! again. A value holding `"`, `\`, `|`, `#`, `//` or a wildcard therefore
-//! stays one quoted value and cannot add a pipe stage, open a comment or
-//! turn an exact match into a glob.
+//! returns it only when it has the same canonical form.
 //!
 //! No composed text carries a time clause. The capture's bounds resolver
 //! splices the bounds and, for an event-shaped read, the imposed order and
@@ -21,7 +17,6 @@
 //!
 //! [`ast::Query`]: crate::ast::Query
 //! [`format::checked_format_query`]: crate::format::checked_format_query
-//! [`canonical_form::same_query`]: crate::canonical_form::same_query
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -41,40 +36,25 @@ use crate::parser::{MAX_QUERY_LEN, parse_cancellable, parse_unbuilt};
 use crate::sanitize::{ERROR_EXCERPT_BYTES, excerpt};
 use crate::schema::{MAX_FIELD_NAME_BYTES, catalog_key};
 
-/// The longest literal `sightings` accepts, in bytes.
 pub const MAX_LITERAL_BYTES: usize = 1024;
 
-/// The most group fields `compare` accepts.
 pub const MAX_COMPARE_GROUPS: usize = 2;
 
-/// The column `sightings` writes the per-group match count into.
 pub const SIGHTING_COUNT: &str = "sighting_count";
-/// The column `sightings` writes the per-group first `_time` into.
 pub const SIGHTING_FIRST: &str = "sighting_first";
-/// The column `sightings` writes the per-group last `_time` into.
 pub const SIGHTING_LAST: &str = "sighting_last";
-/// The fields `sightings` groups its counts by, in `by` order.
 pub const SIGHTING_GROUPS: [&str; 2] = ["service", "env"];
 
-/// The label column `compare` assigns each event's window membership to.
 const COMPARE_SIDE: &str = "compare_side";
 const COMPARE_FG: &str = "compare_fg";
 const COMPARE_BL: &str = "compare_bl";
-/// The per-group foreground event count column of a `compare` result.
 pub const FOREGROUND_COUNT: &str = "compare_foreground_count";
-/// The per-group baseline event count column of a `compare` result.
 pub const BASELINE_COUNT: &str = "compare_baseline_count";
-/// The per-group foreground events-per-minute column.
 pub const FOREGROUND_RATE: &str = "compare_foreground_rate";
-/// The per-group baseline events-per-minute column.
 pub const BASELINE_RATE: &str = "compare_baseline_rate";
-/// `compare_foreground_rate - compare_baseline_rate`.
 pub const RATE_CHANGE: &str = "compare_rate_change";
-/// `abs(compare_rate_change)`, the ranking key.
 pub const ABS_RATE_CHANGE: &str = "compare_abs_rate_change";
-/// `compare_rate_change / compare_baseline_rate`, null where the baseline count is zero.
 pub const RELATIVE_CHANGE: &str = "compare_relative_change";
-/// `new_in_foreground`, `vanished` or `both`.
 pub const COMPARE_STATUS: &str = "compare_status";
 
 /// Every column the `compare` pipeline assigns. A group field of one of
@@ -94,84 +74,51 @@ pub const COMPARE_COLUMNS: [&str; 11] = [
     COMPARE_STATUS,
 ];
 
-/// Microseconds in the minute the `compare` rates are per.
 const MINUTE_US: i64 = 60_000_000;
 
-/// Why a correlation query could not be built.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildError {
-    /// `context` was given neither an env nor a host to constrain.
     EmptyScope,
-    /// The `sightings` literal is empty.
     EmptyLiteral,
-    /// A value carries a NUL character, which no stored query text holds.
     Nul {
-        /// What the value is: `literal`, `env`, `host` or `filter`.
         what: &'static str,
     },
-    /// The `sightings` literal is longer than [`MAX_LITERAL_BYTES`].
     LiteralTooLong {
-        /// The literal's length in bytes.
         bytes: usize,
     },
-    /// The `compare` filter does not parse.
     FilterParse {
         /// The parser's first message, as [`excerpt`] quotes at most
         /// [`ERROR_EXCERPT_BYTES`] of it: the parser may echo the filter
         /// whole.
         message: String,
     },
-    /// The `compare` filter is not search tokens only.
     FilterShape {
-        /// What the filter carries that it may not.
         reason: String,
     },
     /// A group field name is longer than [`MAX_FIELD_NAME_BYTES`]; the
     /// refusal names its length, never the name.
     FieldTooLong {
-        /// The name's length in bytes.
         bytes: usize,
     },
-    /// A group field name is refused.
     Field {
-        /// The refused name.
         name: String,
-        /// Why it is refused.
         reason: &'static str,
     },
-    /// More than [`MAX_COMPARE_GROUPS`] group fields.
     TooManyGroups {
-        /// How many were given.
         count: usize,
     },
-    /// `min_count` is above the largest DSL integer.
     MinCount,
-    /// A window has a non-positive duration or an instant the DSL cannot
-    /// write.
     Window {
-        /// `foreground` or `baseline`.
         which: &'static str,
-        /// Why it is refused.
         reason: &'static str,
     },
-    /// The foreground and baseline windows overlap.
     WindowsOverlap,
-    /// The composed text, compact layout included, is longer than
-    /// [`MAX_QUERY_LEN`]: a `compare` filter the parser admits can leave
-    /// no room for the statement around it.
     TooLong {
-        /// The composed text's length in bytes.
         bytes: usize,
     },
     /// The rendered text does not parse back to the query that was built,
-    /// so the read is refused instead of run. Every value a builder takes
-    /// sits in a quoted position or is a filter that already parsed, so
-    /// this is a formatter or builder defect, which the checked renderer
-    /// logs.
+    /// so the read is refused instead of run.
     Reparse,
-    /// The work that asked for the query was cancelled while it was being
-    /// built (ADR-0063). It says nothing about the input: the query was
-    /// not judged.
     Cancelled,
 }
 
@@ -225,7 +172,6 @@ impl From<Cancelled> for BuildError {
     }
 }
 
-/// A composed query: the AST a builder assembled and its canonical text.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Composed {
     query: Query,
@@ -233,35 +179,25 @@ pub struct Composed {
 }
 
 impl Composed {
-    /// Render `query` through the checked renderer, which proves the
-    /// rendering before it returns it.
     fn new(query: Query) -> Result<Self, BuildError> {
         let text = checked_format_query(&query).map_err(|error| refused_rendering(&error))?;
         Ok(Self { query, text })
     }
 
-    /// The query as built.
     #[must_use]
     pub fn query(&self) -> &Query {
         &self.query
     }
 
-    /// The canonical DSL text of [`Self::query`].
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
     /// The reparse proof: [`Self::text`] parses to the canonical form of
-    /// the AST that was built ([`same_query`]). Every builder's text passed
-    /// it when it was rendered; a caller that carries a `Composed` across
-    /// a boundary can run it again. Like the renderer's proof it builds no
-    /// pattern: whether one compiles is not part of what the text means.
-    ///
-    /// # Errors
-    ///
-    /// [`BuildError::Reparse`] when the text does not parse or parses to a
-    /// different query.
+    /// the AST that was built ([`same_query`]). Like the renderer's proof
+    /// it builds no pattern: whether one compiles is not part of what the
+    /// text means.
     pub fn verify(&self) -> Result<(), BuildError> {
         let reparsed = parse_unbuilt(&self.text).map_err(|_| BuildError::Reparse)?;
         if same_query(&reparsed, &self.query) {
@@ -272,7 +208,6 @@ impl Composed {
     }
 }
 
-/// The builder error for a rendering the checked renderer refused.
 fn refused_rendering(error: &FormatError) -> BuildError {
     match *error {
         FormatError::TooLong { bytes } => BuildError::TooLong { bytes },
@@ -288,23 +223,15 @@ pub struct Window {
 }
 
 impl Window {
-    /// The window's length in microseconds; positive for a valid window.
     #[must_use]
     pub fn duration_us(self) -> i64 {
         self.end_us.saturating_sub(self.start_us)
     }
 }
 
-/// The `context` search: `env="…" host="…"`, each given key as a quoted
-/// equality. Under a VARCHAR pin an equality on a numeric-looking value
-/// also matches the values whose decimal reading agrees (`"007"` matches
-/// `7`), and the DSL has no text-only form, so the server's context read
-/// keeps only the rows holding the exact text.
-///
-/// # Errors
-///
-/// [`BuildError::EmptyScope`] when neither is given,
-/// [`BuildError::Nul`] when a value carries NUL.
+/// Under a VARCHAR pin an equality on a numeric-looking value also matches
+/// the values whose decimal reading agrees (`"007"` matches `7`), so the
+/// server's context read keeps only the rows holding the exact text.
 pub fn context_query(env: Option<&str>, host: Option<&str>) -> Result<Composed, BuildError> {
     let mut group = Vec::new();
     for (what, value) in [("env", env), ("host", host)] {
@@ -322,21 +249,8 @@ pub fn context_query(env: Option<&str>, host: Option<&str>) -> Result<Composed, 
     })
 }
 
-/// The `sightings` statement: the literal as one quoted text search, then
-/// per-(service, env) count, first and last `_time` over every match.
-///
-/// ```text
-/// "<literal>"
-/// | eventstats count() as sighting_count, min(_time) as sighting_first, max(_time) as sighting_last by service, env
-/// ```
-///
 /// No sort and no head: the capture imposes the order and the cut, after
 /// the window functions have seen every match.
-///
-/// # Errors
-///
-/// [`BuildError::EmptyLiteral`], [`BuildError::Nul`] or
-/// [`BuildError::LiteralTooLong`].
 pub fn sightings_query(literal: &str) -> Result<Composed, BuildError> {
     check_literal(literal)?;
     let eventstats = EventStatsStage {
@@ -353,28 +267,6 @@ pub fn sightings_query(literal: &str) -> Result<Composed, BuildError> {
     })
 }
 
-/// The `compare` statement: one scan over the filter, each event labelled
-/// with the window it falls in, counted per group for both windows at
-/// once, then rates per minute, change and status, ranked.
-///
-/// `filter` is DSL search tokens with no pipe stage and no time clause
-/// (one parses only at the top level, ADR-0061 ruling 2);
-/// `groups` are 0 to [`MAX_COMPARE_GROUPS`] distinct field names. The
-/// windows are half-open and may touch but not overlap. A statement the
-/// checked renderer cannot write within [`MAX_QUERY_LEN`] is refused with
-/// [`BuildError::TooLong`], and one whose text would read back differently
-/// with [`BuildError::Reparse`], rather than run as something else. Rates are per
-/// minute: a window of whole minutes divides by its minutes, any other by
-/// `count * 60000000 / <microseconds>`, so the divisor is always exact.
-///
-/// # Errors
-///
-/// [`BuildError::FilterParse`], [`BuildError::FilterShape`],
-/// [`BuildError::FieldTooLong`], [`BuildError::Field`],
-/// [`BuildError::TooManyGroups`],
-/// [`BuildError::MinCount`], [`BuildError::Window`],
-/// [`BuildError::WindowsOverlap`], [`BuildError::TooLong`] or
-/// [`BuildError::Reparse`].
 pub fn compare_query(
     filter: &str,
     foreground: Window,
@@ -392,16 +284,7 @@ pub fn compare_query(
     )
 }
 
-/// [`compare_query`], reading `stop` (ADR-0063): the filter's parse reads
-/// it between its pattern builds ([`parse_cancellable`]), and the builder
-/// reads it once more before rendering the statement, whose reparse proof
-/// builds nothing. A requested stop ends the build there, so a preparation
-/// job whose caller left stops at its next check.
-///
-/// # Errors
-///
-/// As [`compare_query`], and [`BuildError::Cancelled`] once `stop` is
-/// requested.
+/// [`compare_query`], reading `stop` (ADR-0063).
 pub fn compare_query_with(
     filter: &str,
     foreground: Window,
@@ -481,8 +364,6 @@ pub fn compare_query_with(
     Composed::new(Query { search, pipeline })
 }
 
-/// The `compare` stage after the counts: rates per minute, their change,
-/// the relative change where the baseline is not zero, and the status.
 fn rates_stage(foreground: Window, baseline: Window) -> Spanned<PipeStage> {
     let_stage(vec![
         (FOREGROUND_RATE, per_minute(FOREGROUND_COUNT, foreground)),
@@ -523,12 +404,6 @@ fn rates_stage(foreground: Window, baseline: Window) -> Spanned<PipeStage> {
     ])
 }
 
-/// At most two next queries for a `sightings` answer: the literal on the
-/// busiest service, and the literal's hourly volume by service. The
-/// caller runs them over the same bounds.
-///
-/// A literal [`sightings_query`] refuses proposes nothing, and a busiest
-/// service carrying NUL drops the first proposal.
 #[must_use]
 pub fn follow_ups(literal: &str, busiest_service: Option<&str>) -> Vec<Composed> {
     if check_literal(literal).is_err() {
@@ -565,10 +440,6 @@ pub fn follow_ups(literal: &str, busiest_service: Option<&str>) -> Vec<Composed>
 /// standing for the text search's `ILIKE` containment.
 pub use crate::text::contains_ci;
 
-// ---------------------------------------------------------------------------
-// Validation
-// ---------------------------------------------------------------------------
-
 fn refuse_nul(what: &'static str, value: &str) -> Result<(), BuildError> {
     if value.contains('\0') {
         Err(BuildError::Nul { what })
@@ -590,10 +461,8 @@ fn check_literal(literal: &str) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// The caller's filter as a search stage: parsed by the DSL parser, and
-/// refused unless it is search tokens alone. Its spans point into
-/// `filter`, not the composed text; nothing reads them, and the reparse
-/// proof ignores them. A cancelled parse is [`BuildError::Cancelled`].
+/// The returned stage's spans point into `filter`, not the composed text;
+/// nothing reads them, and the reparse proof ignores them.
 fn filter_search(filter: &str, stop: &Stop) -> Result<SearchStage, BuildError> {
     let parsed = parse_cancellable(filter, stop)?.map_err(|errors| BuildError::FilterParse {
         message: excerpt(
@@ -619,11 +488,6 @@ fn filter_search(filter: &str, stop: &Stop) -> Result<SearchStage, BuildError> {
     Ok(parsed.search)
 }
 
-/// Refuse group names the statement cannot carry. Names compare under the
-/// DSL's own field fold ([`catalog_key`]): `Compare_Side` is the column
-/// `compare_side` and `Host` and `host` are one column, so the reserved
-/// and duplicate tests fold, while the emitted text and every error keep
-/// the caller's spelling.
 fn check_groups(groups: &[String]) -> Result<(), BuildError> {
     if groups.len() > MAX_COMPARE_GROUPS {
         return Err(BuildError::TooManyGroups {
@@ -658,8 +522,6 @@ fn check_groups(groups: &[String]) -> Result<(), BuildError> {
     Ok(())
 }
 
-/// A window's bounds as DSL timestamp literals, UTC with `Z` and
-/// microseconds.
 fn window_literals(which: &'static str, window: Window) -> Result<(String, String), BuildError> {
     if window.end_us <= window.start_us {
         return Err(BuildError::Window {
@@ -677,10 +539,6 @@ fn window_literals(which: &'static str, window: Window) -> Result<(String, Strin
     };
     Ok((text(window.start_us)?, text(window.end_us)?))
 }
-
-// ---------------------------------------------------------------------------
-// AST construction
-// ---------------------------------------------------------------------------
 
 fn spanned<T>(node: T) -> Spanned<T> {
     Spanned::new(node, 0..0)
@@ -704,7 +562,6 @@ fn search(groups: Vec<Vec<Spanned<SearchToken>>>) -> SearchStage {
     }
 }
 
-/// `"<literal>"`, optionally followed by `service="<service>"`.
 fn literal_search(literal: &str, service: Option<&str>) -> SearchStage {
     let mut group = vec![token(SearchToken::QuotedSearch(QuotedSearch {
         phrase: literal.to_owned(),
@@ -788,9 +645,6 @@ fn sort_key(name: &str, direction: SortDirection) -> SortField {
     }
 }
 
-/// `<count> / <minutes>` for a window of whole minutes, else
-/// `<count> * 60000000 / <microseconds>`: events per minute with an exact
-/// divisor either way.
 fn per_minute(count: &str, window: Window) -> Expr {
     let us = window.duration_us();
     if us % MINUTE_US == 0 {
@@ -1001,9 +855,6 @@ mod tests {
             compare_query("a\0", fg, bl, &[], 1),
             Err(BuildError::Nul { what: "filter" })
         );
-        // A bare value that opens with `"` does not parse under any
-        // operator (#321, ADR-0061 ruling 3): as a glob on the value `"*`
-        // it had no spelling.
         for filter in [r#"host="*"#, r#"host<"*"#] {
             assert!(
                 matches!(
@@ -1021,8 +872,6 @@ mod tests {
         );
     }
 
-    /// The parser's message can echo the filter whole, so the refusal
-    /// quotes an excerpt of it and its length; a short one is still named.
     #[test]
     fn compare_filter_parse_refusal_excerpts_the_parser_message() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1045,10 +894,6 @@ mod tests {
         assert!(short.to_string().contains("zz"), "{short}");
     }
 
-    /// A time clause anywhere in a filter is refused. At the top level the
-    /// filter check names it; inside parentheses or under `NOT` it does
-    /// not parse (ADR-0061 ruling 2). A quoted pipe is a phrase, not a
-    /// stage.
     #[test]
     fn compare_filter_refuses_a_time_clause_at_any_depth() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1131,8 +976,6 @@ mod tests {
                 "{names:?}"
             );
         }
-        // Every column the statement assigns is `compare_`-prefixed, so a
-        // user field of an unprefixed name groups.
         assert!(COMPARE_COLUMNS.iter().all(|c| c.starts_with("compare_")));
         assert!(compare_query("", fg, bl, &groups(&["status", "foreground_count"]), 1).is_ok());
         let long = "h".repeat(MAX_FIELD_NAME_BYTES + 1);
@@ -1213,9 +1056,6 @@ mod tests {
         assert_eq!(composed.verify(), Err(BuildError::Reparse));
     }
 
-    /// A filter on a field whose first dot segment is a separator keyword
-    /// composes, and its text keeps the backticks the field needs: bare,
-    /// `OR.a=""` reads as `OR` and a text search, and the filter is lost.
     #[test]
     fn compare_composes_a_keyword_prefixed_filter() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1235,9 +1075,6 @@ mod tests {
         }
     }
 
-    /// `verify` is the shared canonical form: a text that differs from the
-    /// built query in layout and comments alone passes, and one predicate
-    /// changed, on a keyword-prefixed field too, fails.
     #[test]
     fn composed_verify_uses_the_shared_canonical_form() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1261,9 +1098,6 @@ mod tests {
         }
     }
 
-    /// A filter the parser admits can compose into a statement longer than
-    /// the query limit. That is the caller's input, refused by its size,
-    /// and never the reparse proof's defect.
     #[test]
     fn composed_too_long_is_not_a_reparse_defect() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1284,8 +1118,6 @@ mod tests {
         );
     }
 
-    /// A compare whose stop is requested before it starts builds no
-    /// pattern and refuses as cancelled, never as a refused filter.
     #[test]
     fn a_cancelled_compare_composition_builds_nothing_more() {
         let (fg, bl) = (window(T0, T0 + HOUR_US), window(T0 - HOUR_US, T0));
@@ -1307,10 +1139,6 @@ mod tests {
         assert_eq!(crate::pattern::thread_builds(), before, "nothing built");
     }
 
-    /// The checked renderer's refusals map by cause: a text over the limit
-    /// is the input's size, and an unfaithful one is the reparse proof
-    /// failing. Mapped directly, so no test here fires the renderer's
-    /// error log.
     #[test]
     fn a_format_refusal_maps_by_cause() {
         assert_eq!(

@@ -8,34 +8,11 @@
 //!
 //! A profile bypasses nothing: the ASCII fold, the sealed `_`-prefix strip,
 //! the field-name length drop, the `_raw` cap and the `_producer` stamp
-//! belong to the door and apply to every one of them. That claim is exactly
-//! the kind a per-door unit test proves only where someone thought to look,
-//! so this walks a hostile corpus through each door and asserts the
-//! invariants as a set:
+//! belong to the door and apply to every one of them.
 //!
-//! - no key in the output is in trawl's `_` namespace unless it is one of
-//!   the envelope's own slots (a payload `_producer` must have become a
-//!   bare `producer`, so the column is unforgeable);
-//! - `_raw` is present, a string, and at most [`MAX_RAW_CHARS`];
-//! - every key is at most [`MAX_FIELD_NAME_BYTES`] and carries no ASCII
-//!   uppercase (the two rules the catalog and `DuckDB` respectively need);
-//! - `_producer` equals the profile that admitted the event;
-//! - what a profile asserts is what the event carries;
-//! - the `trawld` profile never rejects, because there is nobody for
-//!   trawld to reject to.
-//!
-//! Deterministic and bounded: one fixed [`SEED`], a few thousand events
-//! per profile, seconds in the ordinary `cargo nextest` run. **To
-//! reproduce a failure**, every assertion names its profile, its round
-//! index and the seed; feed those back into [`Rng::new`] (or change
-//! [`SEED`] locally to widen the search).
-//!
-//! The wire-corpus generator in `xtask/src/ingest_fuzz.rs` is deliberately
-//! independent of this file: that one emits NDJSON to replay against a
-//! live server (`--profile http|syslog|trawld`), this one drives the
-//! function. Neither can stand in for the other, and sharing a generator
-//! across the crate boundary would mean a dev-dependency on the task
-//! runner.
+//! The wire-corpus generator in `xtask/src/ingest_fuzz.rs` is independent of
+//! this file: sharing a generator across the crate boundary would mean a
+//! dev-dependency on the task runner.
 
 use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
@@ -48,14 +25,8 @@ use trawl_server::ingest::envelope::{
 use trawl_server::ingest::producer::{Asserted, Derivation, Producer, ProducerKind};
 use trawl_server::syslog::convert::SyslogDoor;
 
-/// The one seed. Fixed so a failure is reproducible from the transcript
-/// alone; change it locally to widen the search.
 const SEED: u64 = 0x5157_1075_0000_0075;
 
-/// Events per profile. Large enough that every cadence in
-/// [`hostile_payload`] fires many times over, small enough that the whole
-/// file is well under a second — this is the bounded CI run, so it lives
-/// in the default suite rather than behind `#[ignore]`.
 const ROUNDS: u64 = 1_500;
 
 const ENV: &str = "prod";
@@ -84,10 +55,8 @@ impl Rng {
     }
 }
 
-/// Field names a hostile sender — or an honest one with unlucky
-/// vocabulary — can put in front of a door. Deliberately excludes the
-/// identity slots: those are planted explicitly, so a reject stays
-/// attributable.
+/// Deliberately excludes the identity slots: those are planted explicitly,
+/// so a reject stays attributable.
 fn hostile_names() -> Vec<String> {
     [
         "_severity",
@@ -125,8 +94,6 @@ fn hostile_names() -> Vec<String> {
     .collect()
 }
 
-/// Values covering every JSON shape a door has to survive, including the
-/// one that overruns `_raw` on its own.
 fn hostile_value(seed: u64) -> Value {
     match seed % 12 {
         0 => Value::Null,
@@ -144,8 +111,6 @@ fn hostile_value(seed: u64) -> Value {
     }
 }
 
-/// Four hostile keys, drawn deterministically. Identity slots are never
-/// planted here — each profile decides what it asserts.
 fn hostile_payload(rng: &mut Rng, names: &[String]) -> Map<String, Value> {
     let mut payload = Map::new();
     for _ in 0..4 {
@@ -162,10 +127,6 @@ fn is_envelope_slot(name: &str) -> bool {
         .any(|(field, _)| *field == name)
 }
 
-/// The gates every door applies, asserted on one accepted event.
-///
-/// `origin` is the reproduction handle — profile, round and seed — so a
-/// failing assertion is a complete bug report on its own.
 fn assert_universal_gates(obj: &Map<String, Value>, kind: ProducerKind, origin: &str) {
     for key in obj.keys() {
         assert!(
@@ -204,8 +165,6 @@ fn assert_universal_gates(obj: &Map<String, Value>, kind: ProducerKind, origin: 
     }
 }
 
-/// What a profile asserted is what the event carries, checked on every
-/// accepted event rather than on one example.
 fn assert_profile_assertions(canonical: &Canonical, asserted: &Asserted<'_>, origin: &str) {
     assert_eq!(canonical.env, asserted.env, "{origin}: env assertion lost");
     assert_eq!(
@@ -228,8 +187,6 @@ fn assert_profile_assertions(canonical: &Canonical, asserted: &Asserted<'_>, ori
             json!(host),
             "{origin}: host assertion lost"
         ),
-        // Absence IS the assertion: a payload key must not supply what
-        // the profile denied.
         None => assert!(
             !canonical.obj.contains_key(schema::HOST),
             "{origin}: a payload key supplied a host the profile denied"
@@ -244,16 +201,12 @@ fn assert_profile_assertions(canonical: &Canonical, asserted: &Asserted<'_>, ori
     }
 }
 
-/// Accumulate the repair codes an accepted event confessed.
 fn collect_repairs(obj: &Map<String, Value>, seen: &mut BTreeSet<String>) {
     if let Some(codes) = obj.get(schema::REPAIRS).and_then(Value::as_str) {
         seen.extend(codes.split(',').map(str::to_owned));
     }
 }
 
-/// The anti-vacuity half: a corpus that never provoked a gate would pass
-/// every invariant above while proving nothing, so each profile states
-/// the branches it must actually have reached.
 fn assert_reached(seen: &BTreeSet<String>, required: &[&str], profile: &str) {
     for code in required {
         assert!(
@@ -270,10 +223,6 @@ fn arrival() -> (chrono::DateTime<chrono::Utc>, String) {
     (instant, text)
 }
 
-/// The HTTP door: a sender owns its own identity, so this is the only
-/// profile that can reject — and the corpus plants the bad identities
-/// deliberately, so "rejected iff planted" is an exact assertion rather
-/// than a tolerance.
 #[test]
 fn the_http_profile_survives_a_hostile_corpus() {
     let derivation = Derivation::defaults();
@@ -287,7 +236,6 @@ fn the_http_profile_survives_a_hostile_corpus() {
     for round in 0..ROUNDS {
         let origin = format!("http round {round} (seed {SEED:#018x})");
         let mut payload = hostile_payload(&mut rng, &names);
-        // Every sixteenth event carries an identity no server can honour.
         let hostile_identity = round % 16 == 0;
         if hostile_identity {
             payload.insert(
@@ -343,8 +291,6 @@ fn the_http_profile_survives_a_hostile_corpus() {
         }
     }
 
-    // Vacuity guards: an all-rejecting corpus would satisfy every
-    // invariant above without proving a thing.
     assert_eq!(accepted + rejected, ROUNDS);
     assert!(accepted > ROUNDS / 2, "{accepted} accepted of {ROUNDS}");
     assert!(rejected > 0, "the reject path was never exercised");
@@ -363,14 +309,8 @@ fn the_http_profile_survives_a_hostile_corpus() {
     );
 }
 
-/// The syslog door, both halves of it.
-///
-/// Frames go through [`SyslogDoor::admit`] — the real transport path,
-/// parser included — because that is where hostile PRI/timestamp/hostname
-/// shapes live. Payload maps go straight at the door under
-/// `Producer::Syslog`, because a wire frame cannot spell a `_HOSTNAME`
-/// key and the sealed-namespace gate has to be proven for this profile
-/// too.
+/// Payload maps go straight at the door under `Producer::Syslog`, because a
+/// wire frame cannot spell a `_HOSTNAME` key.
 #[test]
 fn the_syslog_profile_survives_hostile_frames_and_payloads() {
     let derivation = Arc::new(Derivation::defaults());
@@ -411,9 +351,6 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
     assert_reached(
         &seen,
         &[
-            // Each one is provoked by the corpus: an oversized datagram, a
-            // frame the profile has to salvage a service for, a frame
-            // carrying no timestamp, and one carrying no hostname.
             "field.truncated",
             "service.from_profile",
             "time.from_ingest",
@@ -422,7 +359,6 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
         "syslog frame",
     );
 
-    // The payload half: the same hostile keys every other door sees.
     let names = hostile_names();
     let mut rng = Rng::new(SEED ^ 0x5359_534c_4f47_0000);
     let mut seen = BTreeSet::new();
@@ -466,9 +402,6 @@ fn the_syslog_profile_survives_hostile_frames_and_payloads() {
     );
 }
 
-/// Frames a hostile or broken appliance can put on the wire: no PRI, no
-/// timestamp, no hostname, an oversized datagram, structured data with
-/// mixed-case and over-long keys, and plain RFC 3164 junk.
 fn hostile_frame(rng: &mut Rng, round: u64) -> String {
     let pri = rng.bits() % 200;
     let sd = format!(
@@ -481,25 +414,20 @@ fn hostile_frame(rng: &mut Rng, round: u64) -> String {
         1 => format!("<{pri}>1 2026-02-15T12:00:00Z - - - - - body {round}"),
         // No PRI at all — `syslog_severity` must be omitted, not defaulted.
         2 => format!("plain line with no framing at all, round {round}"),
-        // An APP-NAME that fails the service charset.
         3 => format!("<{pri}>1 2026-02-15T12:00:00Z host bad/app - - - body"),
         // A body past the 64 KiB `_raw` cap, which has to bite here.
         4 => format!(
             "<{pri}>1 2026-02-15T12:00:00Z host app - - - {}",
             "A".repeat(70_000)
         ),
-        // RFC 3164, the shape most appliances actually emit.
         5 => format!("<{pri}>Feb 15 12:00:00 host-{round} app[{round}]: body"),
-        // Empty-ish and control-bearing bodies.
         6 => format!("<{pri}>1 2026-02-15T12:00:00Z host app - - - \u{0}\t"),
         _ => format!("<{pri}>1 - host-{round} app - - - body without a timestamp"),
     }
 }
 
-/// The `trawld` profile is rejection-free by construction: every identity
-/// it asserts is boot-validated and there is nobody to reject to, so a
-/// refusal here is a server bug. The fuzz corpus is how that claim stops
-/// being an argument.
+/// Every identity the `trawld` profile asserts is boot-validated and there is
+/// nobody to reject to, so a refusal here is a server bug.
 #[test]
 fn the_trawld_profile_never_rejects_a_hostile_payload() {
     let derivation = Derivation::defaults();
@@ -529,7 +457,6 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
         let asserted = Asserted {
             env: ENV,
             service: "trawld",
-            // Alternate the resolved-hostname and failed-lookup shapes.
             host: (round % 2 == 0).then_some("box"),
             message: None,
             repairs: &[],
@@ -568,8 +495,6 @@ fn the_trawld_profile_never_rejects_a_hostile_payload() {
             "field.reserved_prefix",
             "field.name_empty",
             "field.stamp_claimed",
-            // A tracing field name past the catalog's key bound: it has to
-            // be dropped at the door, never carried into compaction.
             "field.name_too_long",
             "host.omitted",
         ],

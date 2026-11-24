@@ -3,19 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The pool holds what a request's schema probe needs (ADR-0062).
-//!
-//! The probe describes the request's cold reader once, before the
-//! statement it shapes binds. It runs inside the pool's slot: under the
-//! request's permit, executor and deadline, and under the publication read
-//! guard the slot takes before source selection and releases only when the
-//! work ends. These are the pool twins of the engine tests of the same
-//! names in `trawl-engine/tests/schema_probe.rs`, which pin the lane's half:
-//! the engine has no permit, no deadline and no publication guard of its
-//! own.
-//!
-//! Both tests park the probe inside `DuckDB` with the engine's test hook
-//! ([`schema_probe::park_when`]), keyed by the corpus directory so no other
-//! test's probe parks.
 
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
@@ -34,10 +21,8 @@ use trawl_server::ingest::wal::WalWriter;
 use trawl_server::pool::{ExecutorPool, WorkContext, WorkKind, seam::Seam};
 use trawl_server::test_timing::HANG_GUARD;
 
-/// The value of `f` on every event the late batch carries.
 const LATE_F: &str = "late";
 
-/// One `nginx` event; `f` only when given.
 fn event(message: &str, f: Option<&str>) -> Map<String, Json> {
     let mut event = json!({
         "_time": "2026-02-15T12:00:00Z",
@@ -55,7 +40,6 @@ fn event(message: &str, f: Option<&str>) -> Map<String, Json> {
     event
 }
 
-/// A WAL, a corpus directory and a hot buffer, as the server lays them out.
 struct Corpus {
     _root: tempfile::TempDir,
     wal: std::path::PathBuf,
@@ -84,8 +68,6 @@ impl Corpus {
         self.data.to_str().expect("utf-8 corpus path").to_owned()
     }
 
-    /// Accept `events` as the ingest handler does: a WAL file and the same
-    /// batch in the hot buffer.
     fn accept(&self, events: Vec<Map<String, Json>>) {
         let mut ndjson = Vec::new();
         for event in &events {
@@ -103,8 +85,6 @@ impl Corpus {
         }));
     }
 
-    /// One compaction pass: the WAL into cold parquet, the hot batches
-    /// drained under the publication write guard.
     async fn compact(wal: std::path::PathBuf, data: std::path::PathBuf, hot: Arc<HotBuffer>) {
         let errors = compact_once(
             &wal,
@@ -121,7 +101,6 @@ impl Corpus {
         assert_eq!(errors, 0, "compaction publishes every batch");
     }
 
-    /// Compact what was accepted, now.
     async fn compact_now(&self) {
         Self::compact(self.wal.clone(), self.data.clone(), Arc::clone(&self.hot)).await;
     }
@@ -140,7 +119,6 @@ impl Corpus {
     }
 }
 
-/// The next probe over a corpus, parked inside `DuckDB` until released.
 struct Park {
     parked: mpsc::Receiver<Instant>,
     release: mpsc::Sender<()>,
@@ -148,8 +126,6 @@ struct Park {
 }
 
 impl Park {
-    /// Park every probe whose `DESCRIBE` names `corpus`. The hook reports
-    /// when the probe parked.
     fn probes_over(corpus: &str) -> Self {
         let (parked_tx, parked) = mpsc::channel();
         let (release, release_rx) = mpsc::channel::<()>();
@@ -171,7 +147,6 @@ impl Park {
         }
     }
 
-    /// The instant the probe parked. The bound only names a hang.
     fn wait(&self) -> Instant {
         tokio::task::block_in_place(|| {
             self.parked
@@ -185,7 +160,6 @@ impl Park {
     }
 }
 
-/// Poll `ready` until it holds. The bound only names a hang.
 async fn until(what: &str, ready: impl Fn() -> bool) {
     tokio::time::timeout(HANG_GUARD, async {
         while !ready() {
@@ -196,7 +170,6 @@ async fn until(what: &str, ready: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("{what}: never happened"));
 }
 
-/// `(message, f)` for every row of an answer that projects both.
 fn message_and_f(result: &QueryResult) -> Vec<(String, Option<String>)> {
     let column = |name: &str| {
         result
@@ -223,7 +196,6 @@ fn message_and_f(result: &QueryResult) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
-/// The late batch's rows in an answer, by their `f`.
 fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
     rows.iter()
         .filter(|(message, _)| message.starts_with("late"))
@@ -231,13 +203,6 @@ fn late_rows(rows: &[(String, Option<String>)]) -> Vec<Option<&str>> {
         .collect()
 }
 
-/// A probe parked past the request's deadline releases nothing early. The
-/// request answers 504 on the budget it was stamped with, while the probe
-/// is still parked: the probe runs on that budget and never refreshes it.
-/// The work keeps its permit, its executor and its publication guard until
-/// it stops, and gives them all back once the probe is released and the
-/// lane, cancelled at the deadline, returns.
-///
 /// The worker is held before source selection for half the budget, so the
 /// probe parks late: a deadline refreshed when the probe began could not
 /// have run out before `parked_at + BUDGET`.
@@ -300,7 +265,6 @@ async fn parked_probe_keeps_its_permit() {
         answered_at - parked_at
     );
 
-    // The probe is still parked, so nothing has been given back.
     assert_eq!(released.arrivals(), 0, "the work has not ended");
     assert_eq!(
         pool.available_permits(),
@@ -331,16 +295,6 @@ async fn parked_probe_keeps_its_permit() {
         .expect("the publication guard is back");
 }
 
-/// Compaction's publish waits on the publication write guard while a
-/// request holding the read guard is parked in its probe. After the
-/// request ends, the publish lands; the request's answer read the late
-/// batch from the hot buffer, with its real `f`, and excluded the file
-/// that later carried it. The next request reads that file's real `f`.
-///
-/// Without the guard the probe could describe the cold files before the
-/// file arrived and the statement read them after: the late rows would
-/// then come back twice, once from the hot snapshot and once from the
-/// file, the file's copy with `f` as NULL.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[allow(clippy::too_many_lines)] // one controlled publication, checked from both sides
 async fn probe_respects_the_publication_guard() {
@@ -402,7 +356,6 @@ async fn probe_respects_the_publication_guard() {
         .expect("the request task")
         .result
         .expect("the request succeeds");
-    // The publish lands after the request ends.
     tokio::task::block_in_place(|| published.recv_timeout(HANG_GUARD))
         .expect("the publish lands once the request released its guard");
     release_publication

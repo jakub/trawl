@@ -12,12 +12,8 @@ use super::validate::batch_extract;
 use super::{EmitError, SqlValue};
 use crate::schema::catalog_key;
 
-/// A direct output column keeping the read's name ([`Use::Column`]).
 const COLUMN: Use<'static> = Use::Column { alias: None };
 
-/// `DuckDB` SQL that ASCII-folds the `COLUMNS` lambda's column name `c` —
-/// the Rust-side [`catalog_key`] rendered as an expression.
-///
 /// `translate` maps character by character and leaves everything outside
 /// `A-Z` alone, so it reproduces `DuckDB`'s own identifier folding exactly
 /// (`CAFÉ` → `cafÉ`), which `lower()` does not.
@@ -64,27 +60,15 @@ fn process_stats(
 ) -> Result<(), EmitError> {
     // A pending ORDER BY or LIMIT belongs to the aggregation's input, and
     // SQL would apply both to its output, so they move into the CTE first,
-    // whether or not anything else modified the state. Placement is a
-    // property of the stage, never of what its arguments happen to bind:
-    // keying it off the parameter guard below would make
-    // `head 2 | stats count() as c` and
-    // `head 2 | stats count() as c, max(now()) as n` answer differently.
+    // whether or not anything else modified the state.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
-    // The aggregation expressions first, through the ordering guard: they
-    // are the only part of this stage that can push a parameter, and a
-    // parameter in the SELECT list must not jump ahead of one the rendered
-    // statement puts after it (see [`EmitterState::emit_ordered_select`]).
-    // The group-by items are field reads that push no parameter, so
-    // emitting them second changes no SQL text, and they have to come
-    // second because the guard may flush to a CTE, which clears
-    // `group_by`.
+    // The aggregation expressions first, through the ordering guard (see
+    // [`EmitterState::emit_ordered_select`]). The group-by items have to come
+    // second because the guard may flush to a CTE, which clears `group_by`.
     let agg_items = ctx.emit_ordered_select(|ctx| {
         let mut items = Vec::with_capacity(agg_stage.aggregations.len());
         for agg in &agg_stage.aggregations {
-            // The same argument walk the expression lane uses: an
-            // aggregation position is still a call, and its per-position
-            // literal rules (`sev()`'s dialect) apply there too.
             let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
             let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
@@ -101,9 +85,6 @@ fn process_stats(
 
     let mut select_items = Vec::new();
 
-    // group-by fields go first in SELECT and GROUP BY. An absent key is a
-    // NULL column in the SELECT and the same constant in the GROUP BY, so
-    // an empty input still has no group.
     for field in &agg_stage.group_by {
         select_items.push(ctx.read_field(field, COLUMN)?);
         let key = ctx.read_field(field, Use::Operand)?;
@@ -153,9 +134,6 @@ fn process_limit(limit_stage: &crate::ast::LimitStage, ctx: &mut EmitterState) {
     ctx.limit = Some(limit_stage.count);
 }
 
-/// `table`/`fields` list every requested name in order: an absent one is
-/// an all-null column (ADR-0062). A repeated name is listed once, at its
-/// first position ([`first_of_each`]).
 fn process_table(
     table_stage: &crate::ast::TableStage,
     ctx: &mut EmitterState,
@@ -171,17 +149,14 @@ fn process_table(
     Ok(())
 }
 
-/// Desugar `top N field` → stats `count()` by field | sort -count | limit N.
 fn process_top(top: &crate::ast::TopStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     process_frequency(top.count, &top.field, &top.by, "DESC", ctx)
 }
 
-/// Desugar `rare N field` → stats `count()` by field | sort count | limit N.
 fn process_rare(rare: &crate::ast::RareStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     process_frequency(rare.count, &rare.field, &rare.by, "ASC", ctx)
 }
 
-/// Shared logic for `top` and `rare` — frequency analysis desugaring.
 fn process_frequency(
     count: u64,
     field: &str,
@@ -190,11 +165,7 @@ fn process_frequency(
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
     // `top`/`rare` desugar to an aggregation, so they take the same
-    // placement rule `stats`/`timechart` do: a pending ORDER BY or LIMIT
-    // belongs to the input being counted, and leaving either here would
-    // absorb it into the aggregation's own SELECT, making
-    // `head 2 | top 3 host` count all six matching rows and then keep two
-    // groups, which is a different question from the one the pipeline asks.
+    // placement rule `stats`/`timechart` do.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let mut select_items = Vec::with_capacity(by.len() + 2);
@@ -217,12 +188,6 @@ fn process_frequency(
     Ok(())
 }
 
-/// `drop` keeps every incoming column but the named ones.
-///
-/// A field no incoming column carries drops nothing, as the live tail
-/// ignores it ([`crate::stream`], ADR-0001), so the stage excludes
-/// through [`columns_excluding`] and not `* EXCLUDE`, which refuses a
-/// name the input lacks.
 fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
     ctx.flush_if(FlushCondition::IfModified);
 
@@ -230,29 +195,14 @@ fn process_drop(drop_stage: &crate::ast::DropStage, ctx: &mut EmitterState) {
     ctx.has_projection = true;
 }
 
-/// The wildcard half of an OVERWRITING projection: every incoming column
-/// except the ones the stage is about to project under its own aliases,
-/// and the whole of a `drop`.
-///
 /// Unlike `* EXCLUDE (...)` the lambda tolerates a name no incoming
-/// column carries, which `let a = expr` needs when `a` is brand new, and
-/// `drop` needs for a field no event carries.
-/// It folds both sides because `DuckDB` binds identifiers
+/// column carries. It folds both sides because `DuckDB` binds identifiers
 /// case-insensitively and [`crate::projection::check_projection`] folds
 /// every output name: a raw `c NOT IN ('Host')` would leave an incoming
-/// `host` in place beside the new `Host` and hand back two columns of one
-/// folded name.
-///
-/// The fold is ASCII-only on both sides ([`ASCII_FOLD_SQL`] on the column
-/// name, [`catalog_key`] on the literal), because that is the fold
-/// `DuckDB`'s identifier equality performs. `lower()` folds Unicode too,
-/// so over a corpus carrying `ü` the backtickable target `` `Ü` `` would
-/// delete the `ü` column the query never named, while `DuckDB` itself
-/// keeps the two apart.
+/// `host` in place beside the new `Host`.
 fn columns_excluding(names: &[String]) -> String {
     let list = names
         .iter()
-        // Escape single quotes for the COLUMNS lambda string comparison.
         .map(|n| format!("'{}'", catalog_key(n).replace('\'', "''")))
         .collect::<Vec<_>>()
         .join(", ");
@@ -264,9 +214,6 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     // which must not interleave with WHERE params from prior stages
     ctx.flush_if(FlushCondition::Always);
 
-    // Each assignment reads the input first, then the assignments before
-    // it in this stage, as `DuckDB` binds a lateral alias only when the
-    // name is no input column (ADR-0062).
     ctx.begin_let(
         let_stage
             .assignments
@@ -292,9 +239,6 @@ fn process_let(let_stage: &crate::ast::LetStage, ctx: &mut EmitterState) -> Resu
     Ok(())
 }
 
-/// The column an `extract` stage's inner select holds its struct in. A
-/// name under `_` is trawl's own, so no input column and no query name
-/// takes it (ADR-0013).
 const EXTRACT_STRUCT: &str = "\"_extract\"";
 
 fn process_extract(
@@ -315,13 +259,6 @@ fn process_extract(
 
     match &extract.mode {
         ExtractMode::Regex(pattern) => {
-            // One struct-form regexp_extract binds the body once, so the
-            // stage is one RE2 a thread whatever its group count
-            // (ADR-0063). The struct's k-th field is the k-th capture
-            // group, so the body binds with its unnamed groups made
-            // non-capturing, and the named group at place k among the
-            // named ones ([`batch_extract`]) is field `gk`. The
-            // live lane, reading by name, finds the same text.
             let batch = batch_extract(pattern)?;
 
             // DuckDB's struct form wants its pattern constant at bind, and
@@ -335,8 +272,6 @@ fn process_extract(
                 .collect();
             let names = ctx.push_param(SqlValue::String(format!("[{}]", fields.join(", "))));
 
-            // A projection write owns its folded name. Exclude any input
-            // spelling of every capture before adding the capture aliases.
             let owned: Vec<String> = batch.captures.iter().map(|c| c.name.clone()).collect();
             ctx.select = vec![
                 columns_excluding(&owned),
@@ -363,10 +298,6 @@ fn process_extract(
             ctx.has_projection = true;
         }
         ExtractMode::KeyValue { .. } => {
-            // kv extraction can't be expressed as SQL (dynamic columns).
-            // The emitter splits the pipeline at this point — this branch
-            // should never be reached because emit_from_state collects kv
-            // and all subsequent stages into rust_stages.
             return Err(EmitError::UnsupportedOperation {
                 message: "extract kv reached SQL emitter (should have been split to rust_stages)"
                     .to_string(),
@@ -381,11 +312,9 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) -> Resu
     ctx.flush_if(FlushCondition::Always);
 
     if dedup.fields.is_empty() {
-        // bare `dedup` — exact row deduplication
         ctx.select = vec!["DISTINCT *".to_string()];
         ctx.has_projection = true;
     } else {
-        // `dedup field, ...` — keep most recent row per unique field combination
         let partition_fields: Vec<String> = dedup
             .fields
             .iter()
@@ -405,7 +334,6 @@ fn process_dedup(dedup: &crate::ast::DedupStage, ctx: &mut EmitterState) -> Resu
 
         ctx.flush_to_cte();
 
-        // filter to keep only the first row per partition, drop _rn
         ctx.push_where("\"_rn\" = 1".to_string());
         ctx.select = vec!["* EXCLUDE (\"_rn\")".to_string()];
         ctx.has_projection = true;
@@ -417,18 +345,10 @@ fn process_timechart(
     tc: &crate::ast::TimechartStage,
     ctx: &mut EmitterState,
 ) -> Result<(), EmitError> {
-    // Same placement rule as `stats` above.
     ctx.flush_if(FlushCondition::IfModifiedOrderedOrLimited);
 
     let interval = crate::timechart::resolve_span(tc.span, ctx.time_filter).to_interval_string();
 
-    // What the buckets are cut from. The default — and an explicit
-    // `on _time`, however it is spelled — is the envelope timestamp,
-    // which carries the unconditional `TRY_CAST` every `_time` read does
-    // (ADR-0008). Any other column is bucketed as stored: no cast, so
-    // nothing here can coerce a column that is not a timestamp into one
-    // empty bucket. What that column IS gets asked separately, by the
-    // probe captured below.
     let bucket_source = match tc.on.as_deref() {
         Some(col) if !crate::schema::is_event_time(col) => {
             // Read first, so the probe asks about the column this stage
@@ -436,10 +356,7 @@ fn process_timechart(
             // field types as no timestamp and the probe refuses.
             let column = ctx.read_field(col, Use::Operand)?;
             // Taken here, and only here: the relation this stage reads
-            // is the state as it stands at this moment, and the stage
-            // about to be emitted is what replaces it. Appended, never
-            // replaced — each timechart in the pipeline contributes its
-            // own probe, in the order the reader wrote them.
+            // is the state as it stands at this moment.
             let probe = crate::emitter::TimechartInputCheck {
                 column: col.to_string(),
                 sql: ctx.stage_input_probe(&column),
@@ -448,8 +365,6 @@ fn process_timechart(
             ctx.timechart_input_checks.push(probe);
             column
         }
-        // No clause, or the envelope timestamp named explicitly in any
-        // spelling.
         None | Some(_) => format!(
             "TRY_CAST({} AS TIMESTAMP)",
             ctx.read_field(crate::schema::TIME, Use::Operand)?
@@ -464,16 +379,11 @@ fn process_timechart(
     let bucket = format!("time_bucket(INTERVAL '{interval}', {bucket_source})");
 
     // Same ordering guard as `stats`, for the same reason: the
-    // aggregations are the only parameter-pushing part of this stage,
-    // and the bucket/group items that surround them are pure text — so
-    // they are assembled after the guard has had its chance to flush
-    // (which would otherwise clear `group_by` and `order_by`).
+    // bucket/group items are assembled after the guard has had its chance
+    // to flush (which would otherwise clear `group_by` and `order_by`).
     let agg_items = ctx.emit_ordered_select(|ctx| {
         let mut items = Vec::with_capacity(tc.aggregations.len());
         for agg in &tc.aggregations {
-            // The same argument walk the expression lane uses: an
-            // aggregation position is still a call, and its per-position
-            // literal rules (`sev()`'s dialect) apply there too.
             let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
 
             let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
@@ -509,9 +419,6 @@ fn process_timechart(
 fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) -> Result<(), EmitError> {
     ctx.flush_if(FlushCondition::IfModifiedOrLimited);
 
-    // if no explicit sort exists, default to _time DESC so "tail"
-    // means "last N chronologically". otherwise, respect the existing
-    // sort order and just limit.
     if ctx.order_by.is_empty() {
         let time = ctx.read_field(crate::schema::TIME, Use::Sort)?;
         ctx.order_by.push(format!("{time} DESC"));
@@ -520,8 +427,6 @@ fn process_tail(tail: &crate::ast::TailStage, ctx: &mut EmitterState) -> Result<
     Ok(())
 }
 
-/// `rename` writes every target, NULL when its source is absent, and
-/// overwrites a stale target (ADR-0062).
 fn process_rename(
     rename: &crate::ast::RenameStage,
     ctx: &mut EmitterState,
@@ -624,14 +529,8 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
             });
         }
 
-        // The same argument walk the expression lane uses: an
-        // aggregation position is still a call, and its per-position
-        // literal rules (`sev()`'s dialect) apply there too.
         let arg_strings = emit_call_args(&agg.function, &agg.args, ctx)?;
         let sql_func = translate_function(&agg.function, &arg_strings, ctx)?;
-        // `eventstats` demands an explicit `as` (ADR-0013 ruling 8,
-        // checked in `projection::check_projection`); the alias-less
-        // name is defensive for a hand-built AST that skipped validation.
         let name = crate::projection::agg_output_name(agg);
         computed.push(format!(
             "{sql_func} OVER ({partition}) AS {}",
@@ -640,9 +539,6 @@ fn process_eventstats(stage: &EventStatsStage, ctx: &mut EmitterState) -> Result
         targets.push(name);
     }
 
-    // An alias naming an incoming column overwrites it, `let`-like, so the
-    // wildcard must not also emit the original: same case-folding lambda
-    // `let` uses.
     let mut items = if targets.is_empty() {
         vec!["*".to_string()]
     } else {

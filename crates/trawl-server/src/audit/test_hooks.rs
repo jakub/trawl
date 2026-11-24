@@ -19,11 +19,9 @@ use super::Phase;
 /// Where in a fetch or a wait the task can be held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Point {
-    /// Before `list_keys`, the first read of a fetch.
     BeforeListKeys,
     /// After `list_keys` succeeded, before `list_roles`.
     BeforeListRoles,
-    /// Before the interval sleep.
     BeforeWait,
 }
 

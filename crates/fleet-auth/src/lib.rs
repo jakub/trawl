@@ -3,13 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Shared auth substrate for fleet apps (ADR-0030).
-//!
-//! Provides the canonical app-agnostic auth types (`PrincipalKind`, `Role`,
-//! `RolePermission`, `VerifiedKey`, `ApiKeyInfo`, `CreatedKey`) and, behind
-//! the `keystore` default feature, a Postgres-backed `KeyStore` plus the
-//! `flt_*` token module and embedded sqlx migrations. Roles are data-defined
-//! cross-app permission bundles (ADR-0006): keys hold any number of roles
-//! and effective permissions are the union.
 
 pub mod error;
 pub mod types;
@@ -42,6 +35,8 @@ pub use migrations::{MIGRATOR, SchemaError, migrate, validate_schema, validate_s
 pub use store::KeyStore;
 
 #[cfg(feature = "session")]
+pub use cookie::SameSite;
+#[cfg(feature = "session")]
 pub use origin::{
     MAX_ORIGIN_HEADER_BYTES, Origin, OriginParseError, OriginScheme, PublicOrigins,
     PublicOriginsError, REASON_MULTIPLE_HEADERS, REASON_NON_UTF8, rejection_log_fields,
@@ -55,10 +50,6 @@ pub use session::{
     SessionRuntimeOverrides, build_clear_cookie_header, build_session_cookie_header, check_origin,
     decrypt, encrypt, is_expired, origin_allowed,
 };
-// Re-export `cookie::SameSite` so consumers don't need to add `cookie` as a
-// direct dep just to populate `SessionConfig.same_site`.
-#[cfg(feature = "session")]
-pub use cookie::SameSite;
 
 #[cfg(feature = "axum")]
 pub use handlers::{LoginRequest, LoginResponse, login, logout};

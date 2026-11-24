@@ -4,25 +4,11 @@
 
 //! The live driver: one per SSE stream (ADR-0063).
 //!
-//! A live stream evaluates every event it receives, and that evaluation
-//! runs regexes. The driver keeps it off the reactor. It awaits the bus,
-//! and for an aggregate plan the snapshot timer, on the reactor, and hands
-//! the events to the blocking pool in bounded chunks, one job at a time.
-//!
 //! The stream's evaluation state ([`LiveState`]) is one owned value that
 //! moves into each job and comes back with the job's frames. While a job
 //! runs the driver receives nothing, so the bus's broadcast ring is the
 //! bounded queue between ingest and the stream, and a stream that falls
 //! behind it gets the ring's `lagged` frame.
-//!
-//! A chunk bounds a job's input, and [`LIVE_JOB_FRAME_BYTES`] its output:
-//! a job takes no event once its frames reach that, and hands the rest of
-//! its chunk back. They run next, before anything else is received.
-//!
-//! A stream that goes away mid-job requests its run's stop, and the job
-//! ends at its next event or regex call. Its state then drops inside the
-//! job, which keeps the stream's SSE slot and its regex reservation until
-//! it exits and releases each once.
 
 use std::convert::Infallible;
 use std::ops::Range;
@@ -43,26 +29,12 @@ use trawl_core::stream::{
 
 use crate::bus::{EventSubscriber, IngestBatch, RecvError};
 
-/// The most string payload one chunk carries, in bytes. A chunk closes
-/// before an event that would take it past this, and an event larger than
-/// this runs alone.
 const LIVE_CHUNK_STRING_BYTES: usize = 256 * 1024;
 
-/// The most frame data one job buffers, in bytes: four input caps. A
-/// stage can make an event's frames far larger than the event, so the
-/// input caps do not bound them. A job takes no event once its frames
-/// reach this and hands the rest back to the driver, so it holds at most
-/// this and one event's frames, or one snapshot's. Its first event always
-/// runs, so an event whose own frames are over this runs alone.
 const LIVE_JOB_FRAME_BYTES: usize = 4 * LIVE_CHUNK_STRING_BYTES;
 
-/// How often an aggregate stream takes a snapshot, when an event fed its
-/// aggregation since the last one. [`trawl_core::stream::SNAPSHOT_EVENT_THRESHOLD`]
-/// events at the end of a bus batch take one sooner.
 const SNAPSHOT_INTERVAL: Duration = Duration::from_millis(500);
 
-/// What one live stream evaluates with. It moves into each job and back
-/// out with the job's output, so a stream has one job at a time.
 #[derive(Debug)]
 pub(crate) struct LiveState {
     run: LiveRun,
@@ -72,8 +44,6 @@ pub(crate) struct LiveState {
     _permit: OwnedSemaphorePermit,
 }
 
-/// A live stream ready to drive: its state, the stop its patterns were
-/// prepared under, and whether its plan aggregates.
 #[derive(Debug)]
 pub(crate) struct Live {
     state: LiveState,
@@ -82,8 +52,6 @@ pub(crate) struct Live {
 }
 
 impl Live {
-    /// A stream of `filter` and `plan`, whose patterns were prepared under
-    /// `stop`, typing its rows under `output_pins` and holding `permit`.
     pub(crate) fn new(
         filter: CompiledFilter,
         plan: StreamPlan,
@@ -104,9 +72,7 @@ impl Live {
     }
 }
 
-/// The SSE frames of `live` over the batches `subscriber` receives. Each
-/// event samples its own instant when its job evaluates it (ADR-0017 §3).
-/// `query_id` names the stream in its logs.
+/// Each event samples its own instant when its job evaluates it (ADR-0017 §3).
 pub(crate) fn frames<S: EventSubscriber>(
     subscriber: S,
     live: Live,
@@ -120,8 +86,7 @@ pub(crate) fn frames<S: EventSubscriber>(
     )
 }
 
-/// [`frames`], its jobs run as `jobs` says.
-#[allow(clippy::too_many_lines)] // the driver's one loop, its steps in order
+#[allow(clippy::too_many_lines)]
 fn drive<S, C>(
     mut subscriber: S,
     live: Live,
@@ -138,7 +103,6 @@ where
         aggregate,
     } = live;
     async_stream::stream! {
-        // Dropped with the stream, mid-job included, it stops the run.
         let _stop = StopOnDrop(stop);
         let mut timer = aggregate.then(|| {
             let mut timer = tokio::time::interval_at(
@@ -156,8 +120,6 @@ where
         // the driver acts on `held` once they have run.
         let mut handed_back: Vec<Piece> = Vec::new();
         let mut held = After::Nothing;
-        // Whether a chunk has evaluated an event since the timer's last
-        // job: with none, the aggregation has nothing new to snapshot.
         let mut evaluated = false;
 
         loop {
@@ -244,12 +206,9 @@ where
     }
 }
 
-/// What each of a stream's jobs runs with, besides its state.
 #[derive(Debug, Clone)]
 struct Jobs<C> {
-    /// Samples each event's and each snapshot's instant.
     clock: C,
-    /// The most events one job evaluates.
     chunk_events: usize,
     #[cfg(any(test, feature = "test-support"))]
     in_flight: seam::InFlight,
@@ -277,10 +236,6 @@ impl<C> Jobs<C> {
 /// Run `work` over `state` as one job on the blocking pool, and answer with
 /// the state and what the job produced. `None` when the job ended without
 /// an answer: it panicked, and its state is gone.
-///
-/// The job owns the state while it runs. Nobody waits for the answer once
-/// the stream has gone away, so the state drops inside the job, which has
-/// stopped by then at its next event or regex call.
 async fn dispatch<C>(state: LiveState, work: Work, jobs: Jobs<C>) -> Option<(LiveState, JobOutput)>
 where
     C: Fn() -> EvalContext + Send + 'static,
@@ -301,7 +256,6 @@ where
             }
             drop(entered);
         }
-        // With no stream waiting, the state and the frames drop here.
         drop(answer.send((state, out)));
     }));
     answered.await.ok()
@@ -365,26 +319,19 @@ fn run_job<C: Fn() -> EvalContext>(state: &mut LiveState, work: Work, clock: &C)
     out
 }
 
-/// One job's work.
 #[derive(Debug)]
 enum Work {
-    /// Evaluate these events, in bus order.
     Chunk(Vec<Piece>),
-    /// The snapshot timer fired.
     Tick,
 }
 
-/// The events of one bus batch that one job evaluates.
 #[derive(Debug)]
 struct Piece {
     batch: Arc<IngestBatch>,
     events: Range<usize>,
-    /// The piece ends with the batch's last event, so its job closes the
-    /// batch after it ([`LiveRun::end_of_batch`]).
     closes_batch: bool,
 }
 
-/// A bus batch whose events from `from` on are still to run.
 #[derive(Debug)]
 struct Carry {
     batch: Arc<IngestBatch>,
@@ -401,18 +348,12 @@ enum After {
     Closed,
 }
 
-/// What one job produced.
 #[derive(Debug, Default)]
 struct JobOutput {
     frames: Vec<Event>,
-    /// The data bytes of `frames`, which [`LIVE_JOB_FRAME_BYTES`] caps.
     bytes: usize,
-    /// The events the job did not take once its frames reached the cap,
-    /// in bus order. They run next.
     handed_back: Vec<Piece>,
-    /// A bus batch's end took a snapshot, so the timer starts over.
     snapshot_taken: bool,
-    /// Why the run ended, if it did.
     end: Option<LiveEnd>,
 }
 
@@ -424,8 +365,6 @@ impl JobOutput {
         }
     }
 
-    /// End the job with `error`. A cancelled run is discarded, and the
-    /// frames it produced with it.
     fn fail(mut self, error: LiveError) -> Self {
         if error == LiveError::Cancelled {
             self.frames.clear();
@@ -436,10 +375,9 @@ impl JobOutput {
     }
 }
 
-/// Gather one chunk from `start`: the events that have already arrived, up
-/// to `chunk_events` and [`LIVE_CHUNK_STRING_BYTES`]. It never waits
-/// for more. A batch the chunk ends inside is left in `carry`, so at most
-/// one partly read batch is held.
+/// Gathers one chunk and never waits for an event that has not arrived. A
+/// batch the chunk ends inside is left in `carry`, so at most one partly
+/// read batch is held.
 fn gather<S: EventSubscriber>(
     subscriber: &mut S,
     start: Carry,
@@ -459,9 +397,6 @@ fn gather<S: EventSubscriber>(
                 break;
             }
             let size = string_payload(event);
-            // The cap bounds batching, not event size: an event cannot be
-            // split, so the first event of a chunk is taken even over the
-            // cap, and runs alone (R14).
             if events > 0 && bytes.saturating_add(size) > LIVE_CHUNK_STRING_BYTES {
                 break;
             }
@@ -537,10 +472,7 @@ fn lagged_frame(query_id: u64, missed: u64) -> Event {
     Event::default().event("lagged").data(payload)
 }
 
-/// Log why a live stream ends early: a stage of its plan has no prepared
-/// pattern for an operand (ADR-0063), which is a broken plan, not a
-/// non-match. The stream protocol has no terminal error event, so the
-/// stream ends the way a spent `limit` ends it, and the cause stays in
+/// The stream protocol has no terminal error event, so the cause stays in
 /// this log. It names the query by id and the cause by the error's fixed
 /// sentence, never by the pattern text.
 fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::PatternError) {
@@ -552,15 +484,10 @@ fn log_missing_prepared_pattern(query_id: u64, error: &trawl_core::pattern::Patt
     );
 }
 
-/// An SSE `data` event for one event a pass-through stream emits: a
-/// one-row typed result.
-///
-/// Each cell is first conformed to the pin `output_pins` holds for its
-/// name ([`trawl_core::eval::conformed_cell`]), the reading a pinned
-/// `| where` takes, so a field the catalog pins BIGINT arrives as the
-/// integer a batch query answers for it, not as the text a sender wrote. A
-/// cell with no reading keeps its own kind, and a field a stage derived
-/// has no pin in the scope, so its own cell types it.
+/// Each cell is first conformed to the pin `output_pins` holds for its name,
+/// so a field the catalog pins BIGINT arrives as the integer a batch query
+/// answers for it, not as the text a sender wrote. A cell with no pin or no
+/// reading keeps its own kind.
 fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<Frame> {
     if !output_pins.is_empty() {
         for (name, cell) in &mut row {
@@ -576,18 +503,8 @@ fn data_frame(mut row: trawl_core::row::Row, output_pins: &PinScope) -> Option<F
     result_frame("data", &result)
 }
 
-/// An SSE snapshot event for an aggregate snapshot, its post-stages
-/// already applied.
-///
-/// The payload is a [`trawl_api::stream::SnapshotFrame`]: the rows as a
-/// typed result, its columns the snapshot's output schema (the
-/// aggregation's declared columns through the post-stages, so they hold
-/// with no row) and typed by the cells the aggregation emitted, plus
-/// `capped`, one `{cap, limit}` per cap that dropped input since the
-/// stream started, on this and every later snapshot, omitted while nothing
-/// has been dropped (ADR-0001). An event dropped at a cap still counts
-/// toward the next snapshot, so the scheduled snapshot discloses a cap
-/// even when no further input arrives.
+/// The columns are the snapshot's output schema (the aggregation's declared
+/// columns through the post-stages, so they hold with no row).
 fn snapshot_frame(snapshot: Snapshot) -> Option<Frame> {
     let schema: Vec<_> = snapshot
         .columns
@@ -601,17 +518,14 @@ fn snapshot_frame(snapshot: Snapshot) -> Option<Frame> {
     result_frame("snapshot", &frame)
 }
 
-/// One frame a job produced, and the bytes of its data.
 #[derive(Debug)]
 struct Frame {
     event: Event,
     bytes: usize,
 }
 
-/// One result frame as an SSE event named `name`. The codec checks every
-/// cell against its column's type, and the builder types columns from
-/// those very cells, so a refusal is a bug: it is logged and the frame
-/// dropped rather than sent half-written.
+/// The codec checks every cell against its column's type, and the builder
+/// types columns from those very cells, so a refusal is a bug.
 fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Frame> {
     match serde_json::to_string(payload) {
         Ok(json) => Some(Frame {
@@ -638,7 +552,6 @@ fn result_frame(name: &'static str, payload: &impl Serialize) -> Option<Frame> {
     }
 }
 
-/// One dropped-input cap as the snapshot wire spells it.
 fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::SnapshotCap {
     use trawl_api::stream::SnapshotCapKind;
     use trawl_core::stream::AggregationCap;
@@ -653,9 +566,6 @@ fn snapshot_cap(cap: trawl_core::stream::AggregationCap) -> trawl_api::stream::S
     }
 }
 
-/// The test seams: each stream's jobs in flight, the frame bytes each job
-/// buffered, and the driver at a chosen chunk size for the chunk
-/// calibration.
 #[cfg(any(test, feature = "test-support"))]
 pub mod seam {
     use std::convert::Infallible;
@@ -675,11 +585,6 @@ pub mod seam {
     use super::{Jobs, Live, drive};
     use crate::bus::EventSubscriber;
 
-    /// The SSE frames of a live stream of `filter` and `plan`, whose
-    /// patterns were prepared under `stop`, driven as [`super::frames`]
-    /// drives them but with at most `chunk_events` events a job. Each
-    /// job's duration goes to `job_times`, and the stream holds `permit`
-    /// as its SSE slot. The chunk calibration of issue #336 runs it.
     pub fn calibration_frames<S: EventSubscriber>(
         subscriber: S,
         filter: CompiledFilter,
@@ -695,7 +600,6 @@ pub mod seam {
         drive(subscriber, live, 0, jobs)
     }
 
-    /// The durations of a stream's jobs, in the order they ended.
     #[derive(Debug, Clone, Default)]
     pub struct JobTimes(Arc<Mutex<Vec<Duration>>>);
 
@@ -707,15 +611,12 @@ pub mod seam {
                 .push(took);
         }
 
-        /// Every duration recorded since the last take.
         #[must_use]
         pub fn take(&self) -> Vec<Duration> {
             std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
         }
     }
 
-    /// The frame data each of a stream's jobs buffered, in bytes, in the
-    /// order the jobs ended.
     #[derive(Debug, Clone, Default)]
     pub struct JobBytes(Arc<Mutex<Vec<usize>>>);
 
@@ -727,30 +628,23 @@ pub mod seam {
                 .push(bytes);
         }
 
-        /// Every job's bytes recorded since the last take.
         #[must_use]
         pub fn take(&self) -> Vec<usize> {
             std::mem::take(&mut *self.0.lock().unwrap_or_else(PoisonError::into_inner))
         }
     }
 
-    /// The most jobs any one stream has had in flight at once.
     static MOST_JOBS_PER_STREAM: AtomicUsize = AtomicUsize::new(0);
 
-    /// The most jobs any one stream of this process has had in flight at
-    /// once. A driver that waits for each job before it starts the next
-    /// keeps this at 1 once a job has run.
     #[must_use]
     pub fn most_jobs_per_stream() -> usize {
         MOST_JOBS_PER_STREAM.load(Ordering::SeqCst)
     }
 
-    /// One stream's jobs in flight.
     #[derive(Debug, Clone, Default)]
     pub(super) struct InFlight(Arc<AtomicUsize>);
 
     impl InFlight {
-        /// Count a job in until the guard drops.
         pub(super) fn enter(&self) -> Entered {
             let now = self.0.fetch_add(1, Ordering::SeqCst) + 1;
             MOST_JOBS_PER_STREAM.fetch_max(now, Ordering::SeqCst);
@@ -758,7 +652,6 @@ pub mod seam {
         }
     }
 
-    /// One job counted in.
     #[derive(Debug)]
     pub(super) struct Entered(Arc<AtomicUsize>);
 
@@ -797,7 +690,6 @@ mod tests {
     };
     use crate::bus::{EventSubscriber, IngestBatch, RecvError};
 
-    /// A subscriber that answers its script in order, then waits forever.
     #[derive(Debug, Default)]
     struct Script(VecDeque<Result<Arc<IngestBatch>, RecvError>>);
 
@@ -826,13 +718,10 @@ mod tests {
         })
     }
 
-    /// Events `request {n}`, for each `n` of `ns`.
     fn requests(ns: Range<usize>) -> Arc<IngestBatch> {
         batch(ns.map(|n| json!({"n": n, "message": format!("request {n}")})))
     }
 
-    /// `dsl` set up for a live stream as its setup prepares it: one ledger
-    /// under one stop, the run's.
     fn live(dsl: &str, permit: OwnedSemaphorePermit) -> Live {
         let stop = Stop::new();
         let query = trawl_core::parser::parse(dsl).expect("the query parses");
@@ -851,8 +740,6 @@ mod tests {
             .expect("a free slot")
     }
 
-    /// Every frame `stream` writes until it ends, as its event name and
-    /// its data, read off the SSE body.
     async fn wire(
         stream: impl Stream<Item = Result<Event, Infallible>> + Send + 'static,
     ) -> Vec<(String, String)> {
@@ -876,7 +763,6 @@ mod tests {
             .collect()
     }
 
-    /// Wait until `reached`, at most 20 s.
     async fn until(label: &str, reached: impl Fn() -> bool) {
         let start = std::time::Instant::now();
         while !reached() {
@@ -888,9 +774,6 @@ mod tests {
         }
     }
 
-    /// A lag the bus reports after k events ends the gather, and its
-    /// `lagged` frame follows the frames of those k events, the rest of a
-    /// split batch included. The events received after it follow it.
     #[tokio::test]
     async fn a_lag_follows_the_frames_of_the_events_before_it() {
         let k = LIVE_CHUNK_EVENTS + 6;
@@ -924,10 +807,6 @@ mod tests {
         }
     }
 
-    /// A stream dropped while its job runs requests the run's stop. The job
-    /// evaluates no event after the one it was in, and keeps the stream's
-    /// SSE slot until it exits. Its state drops there, and the slot comes
-    /// back once.
     #[tokio::test]
     async fn a_stream_dropped_mid_job_stops_and_releases_its_state_once() {
         let k = 2;
@@ -985,11 +864,6 @@ mod tests {
         assert_eq!(slots.available_permits(), 1, "the slot came back once");
     }
 
-    /// A stage that multiplies each event's output cannot make one job
-    /// buffer more than [`LIVE_JOB_FRAME_BYTES`] and one event's frames,
-    /// though one gather takes every event. The stream writes what it
-    /// writes at one event a job, the `lagged` frame after the frames of
-    /// the events before it.
     #[tokio::test]
     async fn a_job_buffers_at_most_its_frame_cap_and_one_event() {
         let copies: Vec<_> = (0..64).map(|i| format!("a{i}=message")).collect();
@@ -1113,9 +987,6 @@ mod tests {
             .collect()
     }
 
-    /// A chunk closes before an event that would take its string payload
-    /// past [`LIVE_CHUNK_STRING_BYTES`], and an event over the cap runs
-    /// alone. The rest of the batch is carried to the next chunk.
     #[test]
     fn a_chunk_closes_before_its_string_payload_would_pass_the_cap() {
         let quarter = "x".repeat(LIVE_CHUNK_STRING_BYTES / 4 - 1);
@@ -1151,9 +1022,6 @@ mod tests {
         );
     }
 
-    /// A chunk takes the batches that have already arrived, up to
-    /// [`LIVE_CHUNK_EVENTS`] events, each closing its batch, and carries
-    /// the rest of the batch it fills inside. A lag ends the gather.
     #[test]
     fn a_chunk_takes_what_has_arrived_up_to_its_event_count() {
         let fill = LIVE_CHUNK_EVENTS - 5;

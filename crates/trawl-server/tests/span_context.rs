@@ -5,13 +5,6 @@
 //! A request's span context reaches both of trawld's sinks, whatever the
 //! same worker thread asked the subscriber before.
 //!
-//! sqlx's statement logger asks `log::log_enabled!(target: "sqlx::query",
-//! Warn)` after every statement slower than its threshold, and the `log`
-//! bridge answers by asking the tracing dispatcher. trawld's filters refuse
-//! that target, so the question is asked and nothing is ever dispatched.
-//! The request span or event that the same thread opens next must still
-//! reach stdout and the WAL, with the span's `request_id`.
-//!
 //! This is its own test binary because `.init()` installs the global
 //! subscriber and the global `log` bridge, exactly as `trawld` does. Every
 //! test here shares that one subscriber and tells its own events apart by
@@ -32,7 +25,6 @@ const ENV: &str = "default";
 const REQUEST_TARGET: &str = "trawl_server::transport::http";
 const HANDLER_TARGET: &str = "trawl_server::handlers";
 
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -61,8 +53,6 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber, built by `telemetry::build_subscriber` under
-/// the default directives and installed once for the whole binary.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -95,7 +85,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// The stdout line that carries `marker`, if one was written.
 fn stdout_line(marker: &str) -> Option<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -105,8 +94,6 @@ fn stdout_line(marker: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// The persisted telemetry record whose `marker` field is `marker`, if one
-/// reached the WAL.
 fn wal_record(marker: &str) -> Option<serde_json::Value> {
     // Tests flush concurrently. Without this lock one test could find the
     // queue already drained by another whose WAL write has not landed yet.
@@ -153,8 +140,6 @@ fn sqlx_slow_statement_probe() {
     }
 }
 
-/// Assert that the event marked `marker` reached stdout and the WAL, and
-/// that both carry the request span's `request_id`.
 fn assert_in_both_sinks_with_request_id(marker: &str, request_id: &str) {
     let mut failures = Vec::new();
     match stdout_line(marker) {
@@ -345,12 +330,9 @@ async fn requeue_now() {
     .await;
 }
 
-/// The same failure end to end: real sqlx connections whose every
-/// statement counts as slow, so sqlx's logger runs the `log_enabled!` probe
-/// after each one, on whichever runtime worker polled it. The request that
-/// worker opens next must keep its span in both sinks. Plain connections,
-/// not a pool: a pool has one owner per process (ADR-0021 ruling 3), and
-/// the probe lives in the connection's statement logger either way.
+/// Plain connections, not a pool: a pool has one owner per process (ADR-0021
+/// ruling 3), and sqlx's `log_enabled!` probe lives in the connection's
+/// statement logger either way.
 #[test]
 fn a_slow_sqlx_statement_does_not_strip_the_next_request_span() {
     use std::str::FromStr as _;

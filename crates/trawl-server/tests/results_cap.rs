@@ -2,17 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A capture over its cap (ADR-0057): an event-shaped result keeps its most
-//! recent rows, newest first, with the exact total; a whole-shaped one is
-//! refused rather than cut.
+//! A capture over its cap (ADR-0057).
 //!
 //! The 20,000-event corpus is two hourly files of 10,000. Events come in
 //! twins that share a `_time` and differ by a millisecond of `_ingested`,
 //! and the twins are offset so the 5000-row cut falls between the two of
 //! one pair: which twin is kept is decided by `_ingested` alone. The test
 //! computes the expected rows from the same formula the seed uses.
-//!
-//! The binary is in the ADR-0021 `postgres` nextest group.
 
 mod common;
 
@@ -31,10 +27,8 @@ use trawl_server::config::RateLimitConfig;
 /// The service of every seeded event here; no shared seed row has it.
 const SERVICE: &str = "capturecap";
 
-/// Events per hourly file.
 const PER_FILE: usize = 10_000;
 
-/// The seeded hours of 2024-01-16.
 const HOURS: [u32; 2] = [10, 11];
 
 /// Distinct hosts across the corpus: more groups than a capture keeps.
@@ -43,13 +37,10 @@ const HOSTS: usize = 6_000;
 /// Distinct severities across the corpus: a whole result that fits.
 const SEVERITIES: usize = 7;
 
-/// The window every capture here covers.
 fn window() -> serde_json::Value {
     json!({ "earliest": "2024-01-16T10:00:00Z", "latest": "2024-01-16T12:00:00Z" })
 }
 
-/// Write `select`, a query over the shared fixture's columns, as
-/// `{data}/prod/2024-01-16/{hour}/{SERVICE}.parquet`.
 fn seed_file(data: &str, hour: u32, select: &str) {
     let dir = Path::new(data).join(format!("prod/2024-01-16/{hour:02}"));
     std::fs::create_dir_all(&dir).unwrap();
@@ -62,9 +53,6 @@ fn seed_file(data: &str, hour: u32, select: &str) {
     .unwrap();
 }
 
-/// Event `i` of the file for `hour`: its `_time` and its `_ingested`.
-/// Twins `2k - 1` and `2k` share a `_time`; the odd one was ingested a
-/// millisecond later.
 fn pair(hour: u32, i: usize) -> (DateTime<Utc>, DateTime<Utc>) {
     let base = at(&format!("2024-01-16T{hour:02}:00:00Z"));
     let twin = i64::try_from(i.div_ceil(2)).unwrap();
@@ -93,7 +81,6 @@ fn corpus_select(hour: u32, first: usize) -> String {
     )
 }
 
-/// The shared seed plus the 20,000-event corpus.
 async fn boot() -> TestServer {
     let tmp = tempfile::tempdir().unwrap();
     let data = common::seed_data_root(tmp.path());
@@ -123,9 +110,6 @@ fn instant(value: &Value) -> DateTime<Utc> {
     }
 }
 
-/// An event capture past the row cap keeps exactly the 5000 most recent
-/// events, ordered `_time DESC, _ingested DESC` on every page and across
-/// every page boundary, with the exact total of the one execution.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_event_capture_keeps_the_most_recent_rows_newest_first() {
     let server = boot().await;
@@ -185,15 +169,12 @@ async fn an_event_capture_keeps_the_most_recent_rows_newest_first() {
     expected.sort_unstable_by(|a, b| b.cmp(a));
     expected.truncate(usize::try_from(max_rows).unwrap());
     assert_eq!(kept.first(), expected.first(), "the newest event leads");
-    // The cut splits a twin pair: the kept twin is the later-ingested one.
     let (last_time, last_ingested) = *expected.last().unwrap();
     let cut_twin = (last_time, last_ingested - TimeDelta::milliseconds(1));
     assert!(!expected.contains(&cut_twin), "the cut splits a pair");
     assert_eq!(kept, expected, "exactly the most recent events, in order");
 }
 
-/// An aggregate with more groups than a capture keeps is refused with
-/// `result_too_large` and the hint, and leaves nothing behind.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_aggregate_over_the_cap_is_refused_with_the_hint() {
     let server = boot().await;
@@ -229,8 +210,6 @@ async fn an_aggregate_over_the_cap_is_refused_with_the_hint() {
     );
 }
 
-/// A whole result within both caps is captured whole: every group, no
-/// imposed order, nothing truncated.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_result_within_the_caps_is_captured_whole() {
     let server = boot().await;
@@ -269,9 +248,6 @@ async fn a_whole_result_within_the_caps_is_captured_whole() {
     assert_eq!(counted, (PER_FILE * HOURS.len()) as u64);
 }
 
-/// Events of 64 KiB cells reach `max_wire_bytes` long before `max_rows`:
-/// the capture keeps the rows before the first that does not fit, and its
-/// `wire_bytes` is the sum of the kept cells as the wire encodes them.
 #[tokio::test(flavor = "multi_thread")]
 async fn wide_cells_reach_the_wire_cap_before_the_row_cap() {
     const EVENTS: usize = 100;
@@ -345,7 +321,6 @@ async fn wide_cells_reach_the_wire_cap_before_the_row_cap() {
         result.wire_bytes + lengths[0] > capture.max_wire_bytes,
         "the next row would not have fit"
     );
-    // Newest first, as for any event capture.
     let times: Vec<DateTime<Utc>> = page.page.rows.iter().map(|row| instant(&row[0])).collect();
     assert_eq!(times[0], at("2024-01-16T10:01:39Z"));
     assert!(times.windows(2).all(|two| two[0] > two[1]));

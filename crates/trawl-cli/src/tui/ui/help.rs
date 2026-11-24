@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Help overlay (F1).
-
 use ratatui::Frame;
 use ratatui::layout::Alignment;
 use ratatui::style::Style;
@@ -12,7 +10,6 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::tui::App;
 
-/// Render the help overlay.
 pub fn render(app: &App, frame: &mut Frame<'_>, scroll: usize) {
     let theme = &app.theme;
     let area = centered_rect(60, 70, frame.area());

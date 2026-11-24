@@ -5,26 +5,9 @@
 //! What one prepared pattern charges against its query's regex budget
 //! (ADR-0063).
 //!
-//! This is the accounting. A pattern's charge is the heap it can hold
-//! while it matches: its program, the caches of its lazy DFAs, the Pike
-//! VM's scratch and its capture slots. The build computes it once, from
-//! integers it reads off the pattern's forward NFA and its program, so a
-//! pattern charges the same bytes on every build: no clock and no hash
-//! order enter it. Its lazy-DFA cache capacity comes from the same
-//! integers ([`Profile::capacity`]).
-//!
 //! The formula follows regex-automata's internals, so the root
 //! `Cargo.toml` pins that crate's exact version. `tests/regex_memory.rs`
-//! checks each term against a counting allocator at that version, and
-//! `pattern::tests::corpus_charges` snapshots what the corpus charges for
-//! its caches and scratch, so a dependency bump or a changed constant
-//! shows as a diff. The program term follows the CPU's choice of
-//! prefilter, so that test holds it under a ceiling instead.
-//!
-//! A query is admitted while the sum of its patterns' charges plus one
-//! [`BUILD_TRANSIENT`] fits [`REGEX_QUERY_BUDGET`]. Capacities never grow
-//! into a budget a query leaves unused: each pattern's capacity follows
-//! from its own minimum, and the budget refuses what does not fit.
+//! checks each term against a counting allocator at that version.
 
 use regex_automata::hybrid;
 use regex_automata::nfa::thompson::{NFA, State};
@@ -33,8 +16,7 @@ const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
 
 /// The most regex memory one query's prepared patterns may charge, with
-/// one [`BUILD_TRANSIENT`], in bytes. A fixed constant with no config key,
-/// like `MAX_LATERAL_EXPANSION`.
+/// one [`BUILD_TRANSIENT`], in bytes.
 ///
 /// At 32 MiB, the whole of [`LOG_REGEXES`] fits one query, and so do six
 /// patterns near the 512 KiB batch compiled-size limit, such as
@@ -43,14 +25,8 @@ const MIB: usize = 1 << 20;
 pub const REGEX_QUERY_BUDGET: usize = 32 * MIB;
 
 /// How far over a pattern's forward lazy-DFA minimum its cache capacity
-/// is set.
-///
-/// A pattern's reverse lazy DFA, and the reverse prefix DFA of the
-/// `ReverseInner` strategy, have minimums of their own, and below any of
-/// them meta turns the lazy DFA off without an error. One capacity serves
-/// all three. Over the corpus and the Unicode table, the largest of those
-/// minimums is at most 5.10 times the forward one, for `\d{20}`, so 6
-/// keeps each of them on (`tests/regex_memory.rs`,
+/// is set. Below any of the reverse minimums, meta turns the lazy DFA off
+/// without an error (`tests/regex_memory.rs`,
 /// `every_lazy_dfa_minimum_fits_k_r`).
 pub const K_R: usize = 6;
 
@@ -60,8 +36,7 @@ pub const K_R: usize = 6;
 pub const CACHE_FLOOR: usize = 16 * KIB;
 
 /// The largest lazy-DFA cache capacity a pattern gets, in bytes: the
-/// `regex` crate's default (regex 1.13.1, `builders.rs:54`), so no
-/// pattern gets a larger cache than it had on that crate.
+/// `regex` crate's default (regex 1.13.1, `builders.rs:54`).
 pub const CACHE_MAX: usize = 2 * MIB;
 
 /// How much heap a lazy DFA can hold for each byte of its capacity.
@@ -69,14 +44,11 @@ pub const CACHE_MAX: usize = 2 * MIB;
 /// A lazy DFA's `memory_usage` counts the length of its vectors, not
 /// their capacity, and a clear frees nothing (regex-automata 0.4.16,
 /// `hybrid/dfa.rs:2021-2038`, `:2355`), so its heap can pass its
-/// capacity. The peak measured is 1.62 times the capacity a direction
-/// (`\w{20}` at 800 000 bytes, `lazy_cache_heap_stays_under_slack`), so
-/// 2 leaves a 23 % margin.
+/// capacity (`lazy_cache_heap_stays_under_slack`).
 pub const CACHE_SLACK: usize = 2;
 
 /// The lazy DFAs one pattern can build: forward, reverse, and the reverse
-/// prefix of the `ReverseInner` strategy (`meta/strategy.rs:1789`). Every
-/// pattern is charged for three, whatever strategy meta picks for it.
+/// prefix of the `ReverseInner` strategy (`meta/strategy.rs:1789`).
 pub const LAZY_DFAS: usize = 3;
 
 /// The heap a built program holds past what its `memory_usage` reports,
@@ -84,17 +56,14 @@ pub const LAZY_DFAS: usize = 3;
 pub const PROGRAM_OVERHEAD: usize = 8 * KIB;
 
 /// The heap one build holds while it runs and frees when it returns, in
-/// bytes: the parse, the profile's NFA and meta's own compile. Charged
-/// once a query, because a ledger builds one pattern at a time. The worst
-/// measured is 2.25 MiB, at the largest bodies the compiled-size limit
-/// admits (`build_transient_fits_t`).
+/// bytes: the parse, the profile's NFA and meta's own compile
+/// (`build_transient_fits_t`).
 pub const BUILD_TRANSIENT: usize = 4 * MIB;
 
 /// The integers a pattern's charge and capacity are computed from, read
 /// off its forward Thompson NFA, the one meta compiles first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Profile {
-    /// The NFA's states.
     pub states: usize,
     /// Its capture slots, two for each group, the whole match included.
     pub slots: usize,
@@ -142,9 +111,7 @@ impl Profile {
         }
     }
 
-    /// The lazy-DFA cache capacity the pattern builds with, in bytes:
-    /// `K_R` times its forward minimum, within [`CACHE_FLOOR`] and
-    /// [`CACHE_MAX`].
+    /// The lazy-DFA cache capacity the pattern builds with, in bytes.
     #[must_use]
     pub fn capacity(&self) -> usize {
         K_R.saturating_mul(self.min_forward)
@@ -172,11 +139,8 @@ pub struct Charge {
     /// The lazy-DFA cache capacity the pattern built with
     /// ([`Profile::capacity`]). It sizes `lazy` and is no term of its own.
     pub capacity: usize,
-    /// The program: its `memory_usage` and [`PROGRAM_OVERHEAD`].
     pub program: usize,
-    /// [`LAZY_DFAS`] caches of `capacity`, each with [`CACHE_SLACK`].
     pub lazy: usize,
-    /// The Pike VM's scratch ([`Profile::pike`]).
     pub pike: usize,
     /// 16 bytes a slot: the one-pass DFA's cache and the `Captures` each
     /// call makes.
@@ -184,8 +148,6 @@ pub struct Charge {
 }
 
 impl Charge {
-    /// The charge of a pattern with `profile` whose program reports
-    /// `program_memory` bytes.
     #[must_use]
     pub fn new(profile: &Profile, program_memory: usize) -> Self {
         let capacity = profile.capacity();
@@ -198,7 +160,6 @@ impl Charge {
         }
     }
 
-    /// The whole charge, in bytes.
     #[must_use]
     pub fn total(&self) -> usize {
         self.program

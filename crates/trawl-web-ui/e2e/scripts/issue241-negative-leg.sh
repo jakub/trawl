@@ -59,15 +59,11 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 
-# build DIST: trunk build into a script-owned directory.
 build() {
   (cd "$WEB_UI_DIR" && env -u NO_COLOR trunk build --dist "$1" >/dev/null 2>&1) \
     || { echo "trunk build failed" >&2; exit 1; }
 }
 
-# run_spec DIST EXPECT (fail|pass): run the spec against DIST, print the
-# reporter summary, and write the verdict (fail, pass or inconclusive) to
-# $WORK/verdict-EXPECT.
 run_spec() {
   local dist="$1" expect="$2" report="$WORK/report-$2.json" out status=0
   out="$(cd "$E2E_DIR" && TRAWL_E2E_DIST="$dist" PLAYWRIGHT_JSON_OUTPUT_NAME="$report" \

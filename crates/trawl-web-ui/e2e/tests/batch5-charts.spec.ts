@@ -10,10 +10,6 @@ import { SEL } from '../selectors';
 
 type Pg = import('@playwright/test').Page;
 
-// The refusal sentences, copied verbatim from `Refusal::message` in
-// crates/trawl-web-ui/src/series.rs (ADR-0038). Every one of them names
-// a fix or the place to look instead, which is the property that makes
-// them worth asserting whole rather than by substring.
 const REFUSES = {
   pivot: 'Pivot results are not drawn as lines. Open Events for the table.',
   top: 'Top results are not drawn as lines. Open Events for the table.',
@@ -24,20 +20,13 @@ const REFUSES = {
   badMetric: 'Visualization draws numeric metrics. Open Events for these values.',
 };
 
-// A snapshot `_time` cell as the server writes it: a `timestamp` cell,
-// RFC 3339 with microseconds at offset zero. The web UI sends `timezone:
-// None` and the server defaults the offset to zero (ADR-0038), and the
-// live lane spells the same instant the same way.
 const snapshotTime = (minute: number) => `2026-09-01T00:0${minute}:00.000000Z`;
 
-// Typed result columns (ADR-0035, amended 2026-10-22): an `integer` cell
+// Typed result columns (ADR-0035): an `integer` cell
 // is a decimal string, a `float` cell a JSON number.
 const TIME = { name: '_time', type: 'timestamp' };
 const col = (name: string, type: string) => ({ name, type });
 const COUNT = col('count', 'integer');
-/** A whole raw result with the histogram trawld would count for it, from
- * `harness/wire/`, where the fixture contract test decodes it and checks
- * the count against its rows. */
 const histogramResult = (name: string) =>
   JSON.parse(readFileSync(path.join(__dirname, `../harness/wire/query-histogram-${name}.json`), 'utf8'));
 
@@ -47,9 +36,6 @@ const countResult = {
   pagination: { limit: 50, offset: 0, returned: 2, total: 2 },
 };
 
-/** A refused chart: the sentence in place of the canvas, nothing drawn,
- * and the Events tab one click away — the alternative every refusal
- * offers (`Refusal::offers_events`). */
 async function refusalOffersEvents(page: Pg, sentence: string) {
   await expect(page.locator('.visualization .results-empty')).toHaveText(sentence);
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(0);
@@ -111,8 +97,6 @@ test('live raw visualization explains its supported query and preserves live con
 });
 
 test('floats and negatives draw, a text metric does not, and metrics draw one series each', async ({ page }) => {
-  // Any number draws: integer, float, negative (ADR-0038). Only a cell
-  // that is not a number at all stops the chart.
   let body: Record<string, unknown> = {
     ...countResult,
     columns: [TIME, col('count', 'float')],
@@ -126,8 +110,6 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '1');
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-chart-type', 'line');
 
-  // A metric column holding text: no magnitude, so nothing to draw, and
-  // the sentence sends the reader to the values themselves.
   body = {
     ...countResult,
     columns: [TIME, col('count', 'string')],
@@ -137,7 +119,6 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await refusalOffersEvents(page, REFUSES.badMetric);
 
-  // An ungrouped timechart draws one series per metric column.
   body = {
     columns: [TIME, COUNT, col('total', 'integer')],
     rows: [[snapshotTime(0), '2', '3'], [snapshotTime(1), '4', '5']],
@@ -154,8 +135,6 @@ test('floats and negatives draw, a text metric does not, and metrics draw one se
 
 test('live aggregation waits, charts in Visualization and shows exact rows in Events', async ({ page, request }) => {
   await resetScenario(request, 'stream-chart');
-  // A live stream asks for no window at all, so there is no coverage to
-  // judge and the chart has nothing to refuse (ADR-0037).
   const streamRequest = page.waitForRequest(/\/api\/v1\/stream\?/);
   await page.goto('/search?q=service%3Dnginx%20%7C%20timechart%20count()&mode=live');
   const streamParams = new URL((await streamRequest).url()).searchParams;
@@ -171,14 +150,10 @@ test('live aggregation waits, charts in Visualization and shows exact rows in Ev
   await page.getByRole('tab', { name: /^Events/ }).click();
   await expect(page.locator('.chart canvas')).toHaveCount(0);
   await expect(page.locator('.results-table tbody tr')).toHaveCount(2);
-  // The grid prints a `timestamp` cell in its short display form.
   await expect(page.locator('.results-table tbody tr').first()).toContainText('2026-09-01 00:00:00');
 });
 
 test('a grouped snapshot draws one series per group on the union of their buckets', async ({ page }) => {
-  // Two hosts over the same two minutes, then the same query with one
-  // host's rows dropped: the second host's series is shorter, which is
-  // exactly what a shared bucket axis exists to align (ADR-0038).
   let rows: string[][] = [
     [snapshotTime(0), 'a', '2'], [snapshotTime(1), 'a', '3'],
     [snapshotTime(0), 'b', '4'], [snapshotTime(1), 'b', '5'],
@@ -194,9 +169,7 @@ test('a grouped snapshot draws one series per group on the union of their bucket
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
   await expect(page.locator(`${SEL.chartHost} .series-key`)).toHaveCount(2);
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
-  // Two minutes, the union of both hosts' buckets.
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '2');
-  // The axis is UTC, and the legend says so where the reader is.
   await expect(page.locator(`${SEL.chartHost} .u-legend`)).toContainText('UTC');
 
   rows = [[snapshotTime(0), 'a', '2'], [snapshotTime(1), 'a', '3'], [snapshotTime(0), 'b', '4']];
@@ -208,9 +181,6 @@ test('a grouped snapshot draws one series per group on the union of their bucket
 });
 
 test('disjoint grouped times keep their own instants and a missing bucket is a gap', async ({ page }) => {
-  // `a` at 00:00 and 00:03, `b` at 00:01. Paired by occurrence these
-  // would be three positions; laid on the minute grid they are four
-  // instants, and `a` has no value at two of them.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
     columns: [TIME, col('host', 'string'), COUNT],
     rows: [[snapshotTime(0), 'a', '1'], [snapshotTime(1), 'b', '10'], [snapshotTime(3), 'a', '2']],
@@ -223,11 +193,7 @@ test('disjoint grouped times keep their own instants and a missing bucket is a g
   // The GRID, not the row count: three rows, four minutes.
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '4');
 
-  // And the gap is a null, not a zero. Over the SECOND instant the live
-  // legend reads 10 for `b` and nothing at all for `a`: one cursor
-  // position, two answers, which is the distinction a zero would erase.
-  // (uPlot's legend prints an empty cell for a null, not a placeholder,
-  // so `b`'s value is what makes the empty one mean "no value here".)
+  // uPlot's legend prints an empty cell for a null, not a placeholder.
   const plot = (await page.locator(`${SEL.chartHost} .u-over`).boundingBox())!;
   await page.mouse.move(plot.x + plot.width / 3, plot.y + plot.height / 2);
   const value = (label: string) => page.locator(`${SEL.chartHost} .u-series`)
@@ -259,7 +225,6 @@ test('supported snapshot chart fits initial narrow viewport and resizes with its
 });
 
 test('subsecond events fall inside their histogram tooltip intervals', async ({ page }) => {
-  // An event at .100 (severity 9) and one at .900 (severity 17).
   const result = histogramResult('subsecond');
   const events: string[][] = result.rows;
   await page.route('**/api/v1/query', route => route.fulfill({ json: result }));
@@ -299,10 +264,6 @@ test('subsecond events fall inside their histogram tooltip intervals', async ({ 
 });
 
 test('histogram tooltip stays inside the strip at both edges', async ({ page }) => {
-  // Two error events at .100 and .900 over the one-second minimum span:
-  // they land in buckets 0 and 38, so bar 0 carries the longest tip text
-  // and bar 47 an empty bucket's shorter one. The clamp is measured per
-  // tip, so each edge is checked with whatever text its bar draws.
   await page.route('**/api/v1/query', route => route.fulfill({ json: histogramResult('two-errors') }));
   await page.goto('/search?q=service%3Dnginx');
   const histo = page.locator('.histo');
@@ -311,8 +272,7 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
 
   // Layout boxes are fractional and the page offers only whole-pixel
   // offsets to measure the tip against, so the two boxes may disagree
-  // by sub-pixel rounding. Half a pixel is less than one device pixel
-  // at DPR 1, so a tip that passes cannot visibly cross the strip edge.
+  // by sub-pixel rounding.
   const ROUNDING = 0.5;
   const inside = async (label: string, index: number) => {
     const tip = bars.nth(index).locator('.tip');
@@ -324,9 +284,6 @@ test('histogram tooltip stays inside the strip at both edges', async ({ page }) 
     expect(t!.x + t!.width, `${label}: right edge`).toBeLessThanOrEqual(h!.x + h!.width + ROUNDING);
   };
 
-  // 320px is the narrowest width the responsive suite checks. There the
-  // strip is narrower than an error bucket's one-line label, so the tip
-  // has to wrap to fit at all.
   for (const viewport of [{ width: 1400, height: 900 }, { width: 800, height: 900 }, { width: 320, height: 900 }]) {
     await page.setViewportSize(viewport);
     for (const index of [0, 47]) {
@@ -355,22 +312,15 @@ test('a shown histogram tooltip is re-placed when the strip resizes', async ({ p
   await page.route('**/api/v1/query', route => route.fulfill({ json: histogramResult('two-errors') }));
   const histo = page.locator('.histo');
   const bars = page.locator('.histo .bar');
-  // Whole-pixel rounding, as in the edge test above.
   const ROUNDING = 0.5;
   const fits = (index: number) => async () => {
     const [t, h] = [await bars.nth(index).locator('.tip').boundingBox(), await histo.boundingBox()];
     return !!t && !!h && t.x >= h.x - ROUNDING && t.x + t.width <= h.x + h.width + ROUNDING;
   };
 
-  // The tip is placed when its bar gains focus. Resizing the window
-  // afterwards moves the bar under a tip that is still shown, and focus
-  // never moves, so nothing but the strip's own resize can re-place it.
-  //
   // Not the edge bars: bar 0 and bar 47 keep their distance from their
   // own strip edge at any width, so a stale shift happens to stay right
-  // for them. Bars 36 and 9 fit centred in the 1400px strip (about 954px)
-  // and overflow the 800px one (about 778px) by roughly 17px on the right
-  // and 24px on the left, so a shift measured at 1400px is wrong at 800px.
+  // for them.
   for (const [index, from, to] of [[36, 1400, 800], [9, 1400, 800]] as const) {
     await page.setViewportSize({ width: from, height: 900 });
     await page.goto('/search?q=service%3Dnginx');
@@ -393,11 +343,6 @@ test('a shown histogram tooltip is re-placed when the strip resizes', async ({ p
 test('a hovered histogram tooltip is re-placed when new bars render under it', async ({ page }) => {
   // The first response has one event at each end; the second adds one
   // in bucket 36's range, so the rerun draws new bars and new labels.
-  // The pointer stays on bar 36 throughout, and the tip of the bar that
-  // replaces it must still fit. This pins the outcome, not the route:
-  // Chromium sends a mouseenter to the new bar under a still pointer,
-  // which places its tip on its own, and the component also places every
-  // tip after the bars render, which does not rely on that.
   let responses = 0;
   await page.route('**/api/v1/query', route => {
     responses += 1;
@@ -427,11 +372,6 @@ test('a hovered histogram tooltip is re-placed when new bars render under it', a
 });
 
 test('the deferred tip placement is skipped once the histogram unmounts', async ({ page, pageErrors }) => {
-  // After the bars render, the histogram places every tip in an
-  // animation frame, and nothing cancels that frame when the strip goes
-  // away. Hold every frame the page asks for, unmount the histogram
-  // while its placement is still queued, then run the queue: the late
-  // callback must find the strip gone and do nothing.
   await page.addInitScript(() => {
     const native = window.requestAnimationFrame.bind(window);
     const cancel = window.cancelAnimationFrame.bind(window);
@@ -466,7 +406,6 @@ test('the deferred tip placement is skipped once the histogram unmounts', async 
   await expect(page.locator('.histo .bar')).toHaveCount(48);
   expect(await page.evaluate(() => (window as any).__heldFrames()), 'the placement is queued').toBeGreaterThan(0);
 
-  // The Visualization tab renders no histogram, so switching disposes it.
   await page.getByRole('tab', { name: 'Visualization' }).click();
   await expect(page.locator('.histo')).toHaveCount(0);
 
@@ -479,8 +418,6 @@ test('the deferred tip placement is skipped once the histogram unmounts', async 
 });
 
 test('numeric group keys are series, labelled by their own digits', async ({ page }) => {
-  // `by status` over 200 and 500: the roles come from the query, so the
-  // numbers in the group column are two series and not two metrics.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
     columns: [TIME, col('status', 'integer'), COUNT],
     rows: [[snapshotTime(0), '200', '1'], [snapshotTime(0), '500', '2']],
@@ -495,8 +432,6 @@ test('numeric group keys are series, labelled by their own digits', async ({ pag
 });
 
 test('a grouped average with a null cell draws the gap', async ({ page }) => {
-  // A null metric cell is "no measurement": a gap in the line, and a
-  // grid instant all the same.
   await page.route('**/api/v1/query', route => route.fulfill({ json: {
     columns: [TIME, col('pod', 'string'), col('avg_latency_ms', 'float')],
     rows: [
@@ -510,8 +445,6 @@ test('a grouped average with a null cell draws the gap', async ({ page }) => {
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '2');
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-points', '3');
-  // The middle instant: `api-1` returned a null there, so its legend
-  // cell is empty while `api-2`'s first bucket still reads 2.
   const plot = (await page.locator(`${SEL.chartHost} .u-over`).boundingBox())!;
   const value = (label: string) => page.locator(`${SEL.chartHost} .u-series`)
     .filter({ has: page.locator('.u-label', { hasText: label }) })
@@ -523,9 +456,6 @@ test('a grouped average with a null cell draws the gap', async ({ page }) => {
 });
 
 test('every unchartable shape refuses with its own sentence and offers Events', async ({ page }) => {
-  // One mock body per shape: what the ladder reads is the QUERY that
-  // produced the rows, so the rows themselves only have to be a
-  // plausible answer to it.
   const cases: { query: string; json: Record<string, unknown>; sentence: string }[] = [
     {
       query: 'service=nginx | pivot count() on status by host',

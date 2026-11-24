@@ -2,14 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// A 401 means one thing on every page: the session ended (ADR-0066,
-// issue #386). A protected read that sees it sends the page to sign-in
-// once, carrying the page's current address as the return destination,
-// but only when the read still owns its page: an answer that arrives
-// after its page was left, or after a newer request replaced it, does
-// nothing. A `login` 401 is a failed sign-in, and a 403 is a permission
-// refusal; neither navigates.
-//
 // Every 401 here is held until the test releases it. The shell's own
 // reads (`/me`, the footer's health probe) are answered normally by the
 // stub, so while the target's answer is held nothing navigates, and the
@@ -27,7 +19,6 @@ const SESSION_GONE: Reply = { status: 401, json: { error: { code: 'auth_error', 
 const component = (value: string) => encodeURIComponent(value).replaceAll("'", '%27');
 const relative = (url: URL) => `${url.pathname}${url.search}${url.hash}`;
 
-/** Count every main-frame document request for the sign-in page. */
 function countSignIns(page: Page) {
   const seen = { count: 0 };
   page.on('request', req => {
@@ -38,8 +29,6 @@ function countSignIns(page: Page) {
   return seen;
 }
 
-/** Hold the first `method` request to `pathname` until `release()`,
- * then answer it with `reply`. Later requests pass to the stub. */
 async function holdFirst(page: Page, pathname: string, reply: Reply = SESSION_GONE, method = 'GET') {
   let open!: () => void;
   const gate = new Promise<void>(resolve => { open = resolve; });
@@ -89,7 +78,6 @@ for (const target of eligible) {
     await page.goto(target.open);
     await expect.poll(() => held.arrived).toBe(true);
     await expect(page.getByRole('main')).toBeVisible();
-    // Held: the shell's own reads have answered, and nothing navigated.
     await quiet(page);
     expect(signIns.count).toBe(0);
     const destination = relative(new URL(page.url()));
@@ -176,7 +164,6 @@ test('a Health 401 for a request a newer read replaced does not navigate', async
   const held = await holdFirst(page, '/api/v1/queries');
   await page.goto('/settings/health');
   await expect.poll(() => held.arrived).toBe(true);
-  // The newer read passes to the stub and lands first.
   await page.locator(SEL.healthQueriesRefresh).click();
   await expect.poll(() => held.later).toBe(1);
   await expect(page.locator(SEL.healthRow)).toHaveCount(4);

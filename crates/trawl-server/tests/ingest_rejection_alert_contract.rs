@@ -4,20 +4,6 @@
 
 //! Which `RejectReason`s `TrawlIngestEventsRejected` alerts on (ADR-0034,
 //! ADR-0053).
-//!
-//! The alert selects `trawl_ingest_events_rejected_total` by excluding the
-//! reasons that have their own signal: `wal_failure` is
-//! `TrawlHttpPersistenceRejection`, and `hot_buffer_full` and
-//! `ingest_batch_too_large` are whole-request 503 and 413 refusals that a
-//! sender sees. Everything else is a per-event refusal inside a request
-//! that answered normally. A new reason alerts without a rule edit, so
-//! adding a variant must make someone decide which side it is on: the
-//! match below has no wildcard arm.
-//!
-//! This test ties that decision to the exclusion matcher in the expected
-//! inventory, the plain rule pack and the chart template. The Python
-//! rendering test proves the packs equal the inventory, and promtool proves
-//! the behaviour.
 
 use std::collections::BTreeSet;
 
@@ -28,7 +14,6 @@ const EXPECTED: &str = include_str!("../../../monitoring/prometheus/tests/expect
 const PLAIN: &str = include_str!("../../../monitoring/prometheus/trawl.rules.yml");
 const CHART: &str = include_str!("../../../chart/trawl/templates/prometheusrule.yaml");
 
-/// Whether `TrawlIngestEventsRejected` alerts on `reason`.
 fn alerted(reason: RejectReason) -> bool {
     match reason {
         RejectReason::MissingService
@@ -41,8 +26,6 @@ fn alerted(reason: RejectReason) -> bool {
         | RejectReason::HostMissingFromRelay
         | RejectReason::NotObject
         | RejectReason::InvalidJson => true,
-        // Own alert (`TrawlHttpPersistenceRejection`), and the whole-request
-        // 503 and 413 refusals.
         RejectReason::WalFailure
         | RejectReason::HotBufferFull
         | RejectReason::IngestBatchTooLarge => false,

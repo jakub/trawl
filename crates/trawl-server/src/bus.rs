@@ -3,38 +3,21 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Event bus for real-time fanout from ingest to subscribers.
-//!
-//! The bus sits between the ingest handler and downstream consumers
-//! (hot buffer, live streaming). It uses `tokio::sync::broadcast` for
-//! lock-free fanout to multiple subscribers.
 
 use std::sync::Arc;
 
 /// A batch of events published to the bus after a successful WAL write.
-///
-/// The `batch_id` is the WAL filename stem (e.g. `nginx_1739000000000_abcd`),
-/// which doubles as the coordination key for hot buffer draining after
-/// compaction.
-///
-/// Always wrapped in `Arc<IngestBatch>` — the event bus publishes `Arc` clones
-/// to all subscribers, the hot buffer stores `Arc` references, and SSE streaming
-/// iterates `&batch.events`. No cloning of the `Vec<Map>` occurs.
 #[derive(Debug)]
 pub struct IngestBatch {
-    /// WAL filename stem — unique identifier for this batch.
     pub batch_id: Arc<str>,
     pub service: Arc<str>,
-    /// Parsed event objects ready for in-memory filtering.
     pub events: Vec<serde_json::Map<String, serde_json::Value>>,
     /// Approximate size in bytes (serialized ndjson byte count).
-    ///
     /// This is the on-wire/on-disk size, not the in-memory representation
-    /// size. The in-memory `Map<String, Value>` uses ~3-5x more memory
-    /// due to allocator overhead, hash table structure, and `String` headers.
+    /// size.
     pub byte_size: usize,
 }
 
-/// Error returned when receiving from a subscriber.
 #[derive(Debug, thiserror::Error)]
 pub enum RecvError {
     /// The subscriber fell behind and missed `n` messages.
@@ -48,27 +31,15 @@ pub enum RecvError {
     Closed,
 }
 
-/// Trait for publishing events to the bus.
-///
-/// Implementors handle fanout to all active subscribers.
 pub trait EventBus: Send + Sync + 'static {
-    /// The subscriber type returned by [`subscribe`](Self::subscribe).
     type Subscriber: EventSubscriber;
 
-    /// Publish a batch of events to all subscribers.
-    ///
-    /// Returns the number of subscribers that received the batch.
-    /// A return of 0 is normal (no active subscribers).
     fn publish(&self, batch: Arc<IngestBatch>) -> usize;
 
-    /// Create a new subscriber that receives future published batches.
     fn subscribe(&self) -> Self::Subscriber;
 }
 
-/// Trait for receiving events from the bus.
 pub trait EventSubscriber: Send + 'static {
-    /// Receive the next batch, waiting if necessary.
-    ///
     /// Returns `Err(RecvError::Lagged(n))` if this subscriber fell behind
     /// and missed `n` messages. The next call will return the oldest
     /// available message.
@@ -81,17 +52,12 @@ pub trait EventSubscriber: Send + 'static {
     fn try_recv(&mut self) -> Option<Result<Arc<IngestBatch>, RecvError>>;
 }
 
-/// In-process event bus backed by `tokio::sync::broadcast`.
 #[derive(Debug)]
 pub struct LocalEventBus {
     tx: tokio::sync::broadcast::Sender<Arc<IngestBatch>>,
 }
 
 impl LocalEventBus {
-    /// Create a new bus with the given channel capacity.
-    ///
-    /// When the channel is full, the oldest message is dropped and slow
-    /// subscribers receive `RecvError::Lagged` on their next recv.
     pub fn new(capacity: usize) -> Self {
         let (tx, _rx) = tokio::sync::broadcast::channel(capacity);
         Self { tx }
@@ -113,7 +79,6 @@ impl EventBus for LocalEventBus {
     }
 }
 
-/// Subscriber for the local in-process event bus.
 #[derive(Debug)]
 pub struct LocalSubscriber {
     rx: tokio::sync::broadcast::Receiver<Arc<IngestBatch>>,
@@ -193,7 +158,6 @@ mod tests {
 
     #[tokio::test]
     async fn lagged_subscriber() {
-        // Channel capacity of 2 — publishing 3 messages should cause lag.
         let bus = LocalEventBus::new(2);
         let mut sub = bus.subscribe();
 
@@ -207,20 +171,16 @@ mod tests {
             bus.publish(batch);
         }
 
-        // First recv should report lag.
         let result = sub.recv().await;
         assert!(
             matches!(result, Err(RecvError::Lagged(_))),
             "expected Lagged, got {result:?}"
         );
 
-        // Subsequent recv should succeed with the oldest available message.
         let batch = sub.recv().await.unwrap();
         assert_eq!(batch.batch_id.as_ref(), "lag_1");
     }
 
-    /// `try_recv` answers what has already arrived, in the order `recv`
-    /// would, a lag included, and `None` without waiting once nothing has.
     #[test]
     fn try_recv_takes_only_what_has_arrived() {
         let bus = LocalEventBus::new(2);
@@ -253,7 +213,6 @@ mod tests {
         let mut sub = {
             let bus = LocalEventBus::new(16);
             bus.subscribe()
-            // bus drops here
         };
 
         let result = sub.recv().await;
@@ -272,7 +231,6 @@ mod tests {
             events: vec![],
             byte_size: 0,
         });
-        // Should not panic, returns 0.
         let receivers = bus.publish(batch);
         assert_eq!(receivers, 0);
     }

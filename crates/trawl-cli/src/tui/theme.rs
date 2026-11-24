@@ -2,117 +2,59 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Semantic theme system for TUI colors.
-//!
-//! Provides a [`Theme`] struct with named color slots covering UI chrome and
-//! DSL syntax highlighting. Built-in themes (`dark`, `light`, `nord`,
-//! `dracula`, `catppuccin`) are defined as plain functions. Custom themes
-//! can be loaded from TOML files in `~/.config/trawl/themes/`.
-
 use std::path::PathBuf;
 
 use ratatui::style::Color;
 use serde::Deserialize;
 
-/// Semantic color theme for the TUI.
-///
-/// All color fields map to ratatui [`Color`] values. Modifiers (bold, dim,
-/// italic) are intentionally *not* themed — they stay hardcoded in render
-/// logic as they're universal across all themes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
-    /// Human-readable theme name (for display in status bar / help).
     pub name: String,
 
-    // -- borders & focus --
-    /// Border color when a pane has focus.
     pub border_focused: Color,
-    /// Border color when a pane is unfocused.
     pub border_unfocused: Color,
 
-    // -- surfaces --
-    /// Panel/popup background color.
     pub surface: Color,
-    /// Highlighted surface (selected row, active element background).
     pub surface_highlight: Color,
 
-    // -- text --
-    /// Primary content text.
     pub text_primary: Color,
-    /// Muted text (hints, metadata, labels, disabled elements).
     pub text_muted: Color,
-    /// Accent text (interactive elements, field names, links).
     pub text_accent: Color,
 
-    // -- status indicators --
-    /// Success state (query complete, high coverage).
     pub status_success: Color,
-    /// Error state (query failed, deletion).
     pub status_error: Color,
-    /// Warning / in-progress state (running query, medium coverage).
     pub status_warning: Color,
-    /// Informational indicator (live mode, special status).
     pub status_info: Color,
-    /// Idle / neutral state.
     pub status_idle: Color,
 
-    // -- search --
-    /// Background for the currently active search match.
     pub search_match_active: Color,
-    /// Background for non-active search matches.
     pub search_match_other: Color,
 
-    // -- tabs --
-    /// Active tab foreground.
     pub tab_active_fg: Color,
-    /// Active tab background.
     pub tab_active_bg: Color,
 
-    // -- table --
-    /// Table column header color.
     pub table_header: Color,
 
-    // -- chart series cycling palette --
-    /// Colors for sparkline/timechart series (cycled in order).
     pub chart_series: [Color; 6],
 
-    // -- syntax highlighting --
-    /// DSL syntax highlighting colors.
     pub syntax: SyntaxColors,
 }
 
-/// Syntax highlighting colors for DSL tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyntaxColors {
-    /// Pipe stages and built-in functions (`stats`, `where`, `count()`).
     pub stage: Color,
-    /// Filter keys in field=value expressions.
     pub filter_key: Color,
-    /// Operators (`|`, `=`, `>=`, `==`).
     pub operator: Color,
-    /// Logical keywords (`AND`, `OR`, `NOT`).
     pub logical: Color,
-    /// Field names recognized from schema.
     pub field_known: Color,
-    /// Field names not found in schema.
     pub field_unknown: Color,
-    /// String literals (`"quoted"`).
     pub string: Color,
-    /// Numeric literals (`42`, `1.5`).
     pub number: Color,
-    /// Regex literals (`/pattern/`).
     pub regex: Color,
-    /// Negated terms (`-word`).
     pub negated: Color,
-    /// Comments (`# ...` to end of line).
     pub comment: Color,
 }
 
-// ---------------------------------------------------------------------------
-// Built-in themes
-// ---------------------------------------------------------------------------
-
-/// Helper to construct an RGB color from a hex value.
 const fn rgb(hex: u32) -> Color {
     Color::Rgb(
         ((hex >> 16) & 0xFF) as u8,
@@ -121,8 +63,8 @@ const fn rgb(hex: u32) -> Color {
     )
 }
 
-/// Dark theme — the default. Built entirely from named ANSI colors, so it
-/// follows the terminal's own palette instead of fixed RGB.
+/// Built entirely from named ANSI colors, so it follows the terminal's own
+/// palette instead of fixed RGB.
 pub fn dark() -> Theme {
     Theme {
         name: "dark".to_owned(),
@@ -167,11 +109,10 @@ pub fn dark() -> Theme {
     }
 }
 
-/// Light theme — inverted surfaces with darker accents for light terminals.
 pub fn light() -> Theme {
     Theme {
         name: "light".to_owned(),
-        border_focused: rgb(0x00_5F_87), // dark cyan
+        border_focused: rgb(0x00_5F_87),
         border_unfocused: rgb(0xAF_AF_AF),
         surface: Color::White,
         surface_highlight: rgb(0xD7_D7_D7),
@@ -212,21 +153,19 @@ pub fn light() -> Theme {
     }
 }
 
-/// Nord theme — based on the Nord color palette (arctic, north-bluish).
 pub fn nord() -> Theme {
-    // Nord palette: https://www.nordtheme.com/docs/colors-and-palettes
-    let polar0 = rgb(0x2E_34_40); // nord0 - background
-    let polar1 = rgb(0x3B_42_52); // nord1 - elevated surface
-    let polar2 = rgb(0x43_4C_5E); // nord2 - selection
-    let polar3 = rgb(0x4C_56_6A); // nord3 - comments/muted
-    let snow0 = rgb(0xD8_DE_E9); // nord4 - primary text
-    let frost1 = rgb(0x88_C0_D0); // nord8 - cyan accent
-    let frost3 = rgb(0x5E_81_AC); // nord10 - dark blue
-    let aurora0 = rgb(0xBF_61_6A); // nord11 - red
-    let aurora1 = rgb(0xD0_87_70); // nord12 - orange
-    let aurora2 = rgb(0xEB_CB_8B); // nord13 - yellow
-    let aurora3 = rgb(0xA3_BE_8C); // nord14 - green
-    let aurora4 = rgb(0xB4_8E_AD); // nord15 - purple
+    let polar0 = rgb(0x2E_34_40);
+    let polar1 = rgb(0x3B_42_52);
+    let polar2 = rgb(0x43_4C_5E);
+    let polar3 = rgb(0x4C_56_6A);
+    let snow0 = rgb(0xD8_DE_E9);
+    let frost1 = rgb(0x88_C0_D0);
+    let frost3 = rgb(0x5E_81_AC);
+    let aurora0 = rgb(0xBF_61_6A);
+    let aurora1 = rgb(0xD0_87_70);
+    let aurora2 = rgb(0xEB_CB_8B);
+    let aurora3 = rgb(0xA3_BE_8C);
+    let aurora4 = rgb(0xB4_8E_AD);
 
     Theme {
         name: "nord".to_owned(),
@@ -264,9 +203,7 @@ pub fn nord() -> Theme {
     }
 }
 
-/// Dracula theme — based on the Dracula color palette.
 pub fn dracula() -> Theme {
-    // Dracula palette: https://draculatheme.com/contribute
     let bg = rgb(0x28_2A_36);
     let current = rgb(0x44_47_5A);
     let fg = rgb(0xF8_F8_F2);
@@ -315,9 +252,7 @@ pub fn dracula() -> Theme {
     }
 }
 
-/// Catppuccin Mocha theme — based on Catppuccin's warmest flavor.
 pub fn catppuccin_mocha() -> Theme {
-    // Catppuccin Mocha: https://catppuccin.com/palette
     let base = rgb(0x1E_1E_2E);
     let surface0 = rgb(0x31_32_44);
     let surface1 = rgb(0x45_47_5A);
@@ -369,18 +304,6 @@ pub fn catppuccin_mocha() -> Theme {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Theme resolution
-// ---------------------------------------------------------------------------
-
-/// Resolve a theme name from config into a [`Theme`].
-///
-/// Resolution order:
-/// 1. `"default"` or `"dark"` → built-in dark theme
-/// 2. Other built-in names (`"light"`, `"nord"`, etc.)
-/// 3. Path containing `/` or ending in `.toml` → load file directly
-/// 4. Bare name → try `~/.config/trawl/themes/{name}.toml`
-/// 5. Not found → warn + fall back to dark
 pub fn resolve(name: &str) -> Theme {
     match name {
         "default" | "dark" => dark(),
@@ -392,7 +315,6 @@ pub fn resolve(name: &str) -> Theme {
     }
 }
 
-/// Attempt to load a custom theme from a TOML file.
 fn resolve_custom(name: &str) -> Theme {
     let path = if name.contains('/')
         || std::path::Path::new(name)
@@ -401,7 +323,6 @@ fn resolve_custom(name: &str) -> Theme {
     {
         PathBuf::from(name)
     } else {
-        // Try ~/.config/trawl/themes/{name}.toml
         let base = shellexpand::tilde("~/.config/trawl/themes");
         PathBuf::from(base.as_ref()).join(format!("{name}.toml"))
     };
@@ -423,21 +344,12 @@ fn resolve_custom(name: &str) -> Theme {
     dark()
 }
 
-/// Load and parse a TOML theme file.
 fn load_theme_file(path: &std::path::Path) -> Result<Theme, String> {
     let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
     let raw: RawTheme = toml::from_str(&content).map_err(|e| e.to_string())?;
     raw.into_theme()
 }
 
-// ---------------------------------------------------------------------------
-// TOML deserialization types
-// ---------------------------------------------------------------------------
-
-/// Intermediate deserialization target for custom theme files.
-///
-/// Colors are strings that accept: named ANSI colors (`"cyan"`, `"dark_gray"`),
-/// hex RGB (`"#268bd2"`), or 256-color index as integer.
 #[derive(Deserialize)]
 struct RawTheme {
     name: Option<String>,
@@ -527,15 +439,9 @@ impl RawTheme {
     }
 }
 
-/// Parse a color string. Accepts:
-/// - Named ANSI: `"black"`, `"red"`, `"green"`, `"yellow"`, `"blue"`,
-///   `"magenta"`, `"cyan"`, `"gray"`, `"dark_gray"`, `"light_red"`, etc.
-/// - Hex RGB: `"#2e3440"` or `"2e3440"`
-/// - 256-color index: `"208"` (pure digits)
 fn parse_color(s: &str) -> Result<Color, String> {
     let s = s.trim();
 
-    // Try named ANSI colors first.
     match s.to_lowercase().as_str() {
         "black" => return Ok(Color::Black),
         "red" => return Ok(Color::Red),
@@ -556,7 +462,6 @@ fn parse_color(s: &str) -> Result<Color, String> {
         _ => {}
     }
 
-    // Try hex RGB (#RRGGBB or RRGGBB).
     let hex = s.strip_prefix('#').unwrap_or(s);
     if hex.len() == 6 && hex.bytes().all(|b| b.is_ascii_hexdigit()) {
         let val =
@@ -564,7 +469,6 @@ fn parse_color(s: &str) -> Result<Color, String> {
         return Ok(rgb(val));
     }
 
-    // Try 256-color index.
     if let Ok(idx) = s.parse::<u8>() {
         return Ok(Color::Indexed(idx));
     }
@@ -598,7 +502,6 @@ mod tests {
 
     #[test]
     fn resolve_unknown_falls_back_to_dark() {
-        // Unknown names fall back to dark (with a warning on stderr).
         let theme = resolve("nonexistent_theme_xyz");
         assert_eq!(theme, dark());
     }

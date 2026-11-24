@@ -1,6 +1,6 @@
 # Tables, nets and analyses share one namespace, revisioned rows and one write rule
 
-status: accepted (2026-09-20) — implementation tracked in [#212](https://github.com/jakub/trawl/issues/212); amended (2026-10-22): the investigation adopts the grant pattern first, the result-wire vocabulary is fixed, and export files are not the wire
+status: accepted (2026-09-20) — implementation tracked in [#212](https://github.com/jakub/trawl/issues/212); amended (2026-10-22): the investigation adopts the grant pattern first, the result-wire vocabulary is fixed, and export files are not the wire; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Trawl 1.1 adds three kinds of named object. A table is editable rows with
 declared, typed columns and an optional key. A net is a saved query with a
@@ -235,3 +235,27 @@ record of what they said and why it changed.
 **The result-wire vocabulary (#214, moved to 1.0).** Every result column carries a required `type` from a closed set: `boolean`, `integer`, `float`, `string`, `timestamp`, `date`, `time`, `list` (with `items`), and `mixed` for a column a Rust-side stage produced whose cells are not of one type. `integer` covers i64 and u64 together: cells are decimal strings, decoded by range into the existing integer variants, and a value outside that range is refused on encode naming the column and refused on decode, so a HUGEINT is narrowed by checked conversion or refused. Floats are JSON numbers, with `NaN`, `Infinity` and `-Infinity` as strings. Timestamps are RFC 3339 with microseconds and an explicit offset. Cells of a `mixed` column are tagged so every cell decodes from its column type and itself, never by guessing at its spelling. Types come from execution, `column_logical_type` for DuckDB results and the emitted cells for Rust-tail and live frames, never from the catalog alone, so zero-row and all-null columns are typed. `severity_columns` stays a presentation hint beside the type. The surfaces are the query response, `from saved` and run results, SSE aggregate snapshots and raw live frames, and the run parquet writer, which writes exact types and a typed empty file for zero rows instead of an inferred schema.
 
 **Export files are not the wire (human ruling, 2026-10-22).** "Every result surface" means API result responses. JSON and NDJSON exports keep JSON numbers, because jq and Vector read them natively and a quoted number becomes a label there; CSV stays text; the parquet export carries exact types.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+**The result wire**
+
+- **`trawl-api` has no `duckdb` dependency, and its result types do not mirror DuckDB's.** The public API stays stable when the `duckdb` crate changes version.
+- **An `integer` cell decodes only from the canonical spelling the encoder writes, `-?(0|[1-9][0-9]*)`.** A sign on a positive value, leading zeros, `-0` and whitespace are refused (`land_decimal`), so hand-written clients cannot drift into spellings that other readers take differently.
+- **Correction.** The parquet export does not carry exact types for a `HUGEINT` column. DuckDB's parquet writer stores it as `DOUBLE`, so a `sum(id)` column that the query answers as `integer` reads back from the export as `float`. The test module `result_types_agree_across_query_saved_and_export` in `crates/trawl-engine/tests/absent_field.rs` pins this. This corrects the sentence "the parquet export carries exact types" in the 2026-10-22 amendment.
+
+**Run result storage**
+
+- **A run's result is a parquet file, a zero-row run included, and a typed blob is kept only when parquet cannot hold the result exactly or the parquet write fails.** Parquet cannot hold a zero-column result or a `mixed` column, because parquet has no union type. `from saved` reads a zero-column blob as an empty source and refuses any other blob with a 409 that names the run.
+- **The stored type of an `integer` column comes from its cells: `BIGINT` when every cell fits `i64` or there is no cell, `UBIGINT` when some cell is above `i64::MAX` and none is negative.** A column that needs both a negative value and a value above `i64::MAX` has no exact stored type, because DuckDB's parquet writer stores `HUGEINT` as `DOUBLE`, which rounds above 2^53. The writer refuses that column (`StoredType::of`), and the run keeps a typed blob. Reading the file maps both stored types back to `integer`. A timestamp is stored as `TIMESTAMP` in UTC, the way the corpus stores `_time`.
+- **A run that names a file answers from that file or not at all.** `get_report_run` never falls back to the blob. A fallback would answer 200 with `result: null` beside a non-zero `row_count`, and every client would then describe a successful run as having no result data.
+- **`run=N` and `run=latest` resolve a run through one function, `source_for_run`, so a run id that names the latest successful run answers exactly as `run=latest` does.** The two selectors differ only in how they find a successful run, never in what a run means. `run=latest` picks the newest run with status `success` (`latest_successful_run`), and `run=N` answers 404 for a run that did not succeed (`resolve_specific`). A run with a typed blob that has columns refuses with a 409, not a 404 or a 500: the run exists and `GET /saved/{id}/runs/{run_id}` serves it. For `run=latest`, the next successful run replaces it.
+- **A read of a recorded run, through `from saved` or a capture of one, reads the run's own result and never the hot buffer (`ReadInput::Recorded`).** The recorded result is self-contained. The hot buffer holds live events, and a union would add them to a result that a past run already answered.
+
+**A missing run result**
+
+- **The server confirms that a run's file is absent before the query reaches DuckDB, and refuses with the named 409.** The executor answers a `read_parquet` that matches no file with an empty relation (`is_no_files_error`), so a missing file would read as "the report found nothing". `guard_vanished_run_result` checks again after execution, for a file deleted between the check and the read.
+- **Every read surface refuses a missing run result with one sentence, `unavailable_run_message`, which names the run, says the run succeeded, and says no older run was substituted.** A caller then knows they were not handed an older window. The sentence carries no filesystem path, because the path is internal to the server (`RunFile::absolute_path`).
+- **Correction.** Retained run results now honour the unavailable-state rule. `get_report_run` and the `from saved` path refuse a confirmed-absent file, a repointed `data_dir` included, with the named 409 from `from_saved::unavailable_run_conflict`. This corrects the decision's sentences "the run reads as a bare failure" and "until then, main violates it".

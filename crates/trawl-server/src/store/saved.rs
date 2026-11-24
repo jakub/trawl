@@ -15,14 +15,12 @@ use super::schedule::{
 };
 use crate::report_window::check_window_compatibility;
 
-/// Normalize the shared saved-query display name before storing it.
 fn validate_name(name: &str) -> Result<&str, StoreError> {
     trawl_core::saved_name::normalize(name).map_err(|_| StoreError::InvalidName {
         name: name.to_owned(),
     })
 }
 
-/// A single saved query entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SavedQuery {
     pub id: i64,
@@ -33,23 +31,18 @@ pub struct SavedQuery {
     pub updated_at: DateTime<Utc>,
 }
 
-/// A saved query enriched with its schedule and latest run — the bulk-join
-/// shape backing `GET /api/v1/saved` (one query, independent of item count).
 #[derive(Debug, Clone)]
 pub struct SavedQueryDetails {
     pub saved: SavedQuery,
     pub schedule: Option<ScheduleWithStats>,
 }
 
-/// A schedule enriched with its latest run. The lifetime run count rides
-/// the schedule itself ([`Schedule::runs_claimed`]).
 #[derive(Debug, Clone)]
 pub struct ScheduleWithStats {
     pub schedule: Schedule,
     pub latest_run: Option<ReportRun>,
 }
 
-/// Decode a [`SavedQuery`] from columns named `{prefix}id`, `{prefix}name`, …
 pub(crate) fn row_to_saved_query_at(row: &PgRow, prefix: &str) -> Result<SavedQuery, sqlx::Error> {
     let col = |name: &str| format!("{prefix}{name}");
     Ok(SavedQuery {
@@ -68,23 +61,16 @@ fn row_to_saved_query(row: &PgRow) -> Result<SavedQuery, sqlx::Error> {
 
 const SAVED_COLS: &str = "id, key_id, name, query, created_at, updated_at";
 
-/// Postgres-backed storage for saved queries. Cheap to clone (shared pool).
 #[derive(Debug, Clone)]
 pub struct SavedQueryStore {
     pool: PgPool,
 }
 
 impl SavedQueryStore {
-    /// Wrap the shared app-state pool.
-    ///
-    /// The pool must point at an already-migrated trawl app-state database
-    /// (production goes through `StorageState::connect`, which migrates;
-    /// tests use `#[sqlx::test]`-migrated pools directly).
     pub fn new(pool: PgPool) -> Self {
         Self { pool }
     }
 
-    /// List all saved queries for a user, sorted by name.
     pub async fn list(&self, key_id: i64) -> Result<Vec<SavedQuery>, StoreError> {
         let rows = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SAVED_COLS} FROM saved_queries WHERE key_id = $1 ORDER BY name ASC"
@@ -98,9 +84,6 @@ impl SavedQueryStore {
             .collect::<Result<Vec<_>, _>>()?)
     }
 
-    /// List saved queries with schedule + latest-run details in a single
-    /// statement: the lateral join keeps it one round trip whatever
-    /// the item count, instead of three follow-up lookups per saved query.
     pub async fn list_with_details(
         &self,
         key_id: i64,
@@ -138,7 +121,6 @@ impl SavedQueryStore {
         Ok(out)
     }
 
-    /// Look up a saved query by id for a specific user.
     pub async fn get(&self, id: i64, key_id: i64) -> Result<Option<SavedQuery>, StoreError> {
         let row = sqlx::query(AssertSqlSafe(format!(
             "SELECT {SAVED_COLS} FROM saved_queries WHERE id = $1 AND key_id = $2"
@@ -150,7 +132,6 @@ impl SavedQueryStore {
         Ok(row.as_ref().map(row_to_saved_query).transpose()?)
     }
 
-    /// Look up a saved query by name for a specific user.
     pub async fn get_by_name(
         &self,
         key_id: i64,
@@ -166,10 +147,6 @@ impl SavedQueryStore {
         Ok(row.as_ref().map(row_to_saved_query).transpose()?)
     }
 
-    /// Create a new saved query.
-    ///
-    /// Returns `InvalidName` for blank names or unsafe display characters and
-    /// `DuplicateName` on the named unique constraint.
     pub async fn create(
         &self,
         key_id: i64,
@@ -212,29 +189,12 @@ impl SavedQueryStore {
     /// text that contradicts the window its schedule already carries
     /// (ADR-0018 rulings 7 and 12).
     ///
-    /// This is the only door onto a saved query's text after creation, and
-    /// the reason it is the only one is the rule it enforces. A schedule
-    /// window and a `last=` in the query both claim to say what a report
-    /// covers, and neither side may be written over the other: an
-    /// unchecked twin of this method would be a way to put a time clause
-    /// under a standing window without ever being told no.
-    ///
-    /// Returns `NotFound` if the query doesn't exist or isn't owned by the
-    /// user, `InvalidName`/`DuplicateName` on name problems, and the
-    /// policy refusal when the new text and the standing window disagree.
-    ///
     /// LOCK ORDER: `saved_queries` FOR UPDATE, then a plain read of the
     /// schedule. The read takes no lock on purpose. Every writer of this
     /// pair — this method and
     /// [`super::ScheduleStore::set_schedule_checked`] — locks the saved
     /// query first, so a window write is either already committed (and this
-    /// read sees it) or is waiting for this transaction to end. Locking the
-    /// schedule as well would add a second level to hold for a value
-    /// nothing can change under us.
-    ///
-    /// A query with no schedule, or a query-mode one, stores its text
-    /// unexamined: [`check_window_compatibility`] returns immediately
-    /// for `None`, and `create` has never parsed DSL either.
+    /// read sees it) or is waiting for this transaction to end.
     pub async fn update_checked(
         &self,
         id: i64,
@@ -315,29 +275,11 @@ impl SavedQueryStore {
     /// Delete a saved query, collecting the parquet result paths of its runs
     /// in the same transaction as the delete.
     ///
-    /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`, the one
-    /// order every multi-row path takes (stated in
-    /// [`super::schedule`]'s module docs). Locking the parent `FOR UPDATE`
-    /// blocks a concurrent run INSERT (which needs a `FOR KEY SHARE` on the
-    /// same row via the FK), so no new run can slip in after we collect
-    /// paths. Locking every run row, not just those with a non-null
-    /// `result_path`, forces a concurrent `finish_run` to either commit its
-    /// path before us (we collect it here) or block until our cascade
-    /// deletes its row (it then updates zero rows and the caller unlinks the
-    /// file it wrote). Filtering on `result_path IS NOT NULL` would skip
-    /// still-running rows and reopen that race, orphaning the parquet file.
-    ///
-    /// The middle level is not decoration. This transaction ends by deleting
-    /// the saved query, and the cascade to `schedules` needs that row, so
-    /// without taking it here the delete reaches for `schedules` while
-    /// holding the run rows. A `since_last` [`super::ScheduleStore::finish_run`]
-    /// goes the other way, `schedules` then `report_runs`, and the pair
-    /// deadlocks: postgres kills one, and if the victim is the finish, this
-    /// delete has already read that run's `result_path` as NULL and nobody
-    /// unlinks the parquet the finish wrote.
-    ///
-    /// Returns the relative parquet paths for the caller to unlink, or
-    /// `NotFound` if the query doesn't exist or isn't owned by the user.
+    /// LOCK ORDER: `saved_queries` -> `schedules` -> `report_runs`
+    /// ([`super::schedule`]'s module docs). The middle level is not
+    /// decoration: the cascade to `schedules` would otherwise reach for it
+    /// while holding the run rows. A `since_last` [`super::ScheduleStore::finish_run`]
+    /// goes `schedules` then `report_runs`, and the pair deadlocks.
     pub async fn delete(&self, id: i64, key_id: i64) -> Result<Vec<String>, StoreError> {
         let mut tx = self.pool.begin().await?;
 
@@ -356,9 +298,6 @@ impl SavedQueryStore {
             });
         }
 
-        // Level 2. A saved query has at most one schedule
-        // (`schedules_saved_query_unique`), but the lock is taken as a set
-        // because that is what the cascade below deletes.
         let _schedules: Vec<i64> =
             sqlx::query_scalar("SELECT id FROM schedules WHERE saved_query_id = $1 FOR UPDATE")
                 .bind(id)

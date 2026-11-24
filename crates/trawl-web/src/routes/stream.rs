@@ -2,16 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! SSE pass-through for `/api/v1/stream` and `/api/v1/dashboard/stream`.
-//!
 //! The generic `/api/v1/*` forwarder buffers request/response bodies,
 //! which is wrong for Server-Sent Events — those are streams of
-//! unbounded size and unpredictable duration. These handlers stream the
-//! upstream response bytes straight to the browser without parsing. The
-//! browser's `EventSource` handles framing on its end; reconnection
-//! after a drop is automatic and rides the same session cookie. A non-2xx
-//! upstream answer is no stream, and is relayed as the generic forwarder
-//! relays it.
+//! unbounded size and unpredictable duration.
 
 use std::time::Duration;
 
@@ -43,8 +36,6 @@ pub async fn forward(
         state.upstream_url().trim_end_matches('/')
     );
 
-    // One client for the request and the whole stream it opens. The head
-    // deadline covers the request only; the stream outlives it.
     let request = state
         .upstream_client()
         .await?
@@ -56,7 +47,6 @@ pub async fn forward(
     forward_sse_response(&state, &auth, upstream_resp)
 }
 
-/// SSE pass-through for the admin dashboard-stats stream. No params —
 /// trawld's `ServerManage` check is the sole authorization gate.
 pub async fn forward_dashboard(
     State(state): State<AppState>,
@@ -67,8 +57,6 @@ pub async fn forward_dashboard(
         state.upstream_url().trim_end_matches('/')
     );
 
-    // One client for the request and the whole stream it opens. The head
-    // deadline covers the request only; the stream outlives it.
     let request = state
         .upstream_client()
         .await?
@@ -79,24 +67,15 @@ pub async fn forward_dashboard(
     forward_sse_response(&state, &auth, upstream_resp)
 }
 
-/// Turn an upstream SSE response into the browser-facing streaming
-/// response: status mirroring, session-expiry cap, SSE headers, and the
-/// proxy-wide cookie rule. Shared by both SSE forwarders.
 fn forward_sse_response(
     state: &AppState,
     auth: &Auth,
     upstream_resp: reqwest::Response,
 ) -> Result<Response, ProxyError> {
-    // Mirror the upstream status verbatim, as `proxy::forward` does.
-    // Routing non-2xx through `ProxyError::Upstream` would collapse
-    // everything but 401/403 into 502, hiding trawld's 400 (invalid DSL)
-    // and 429 (stream-concurrency limit) behind a vague "upstream error".
-    // A 3xx is the exception, for the same reason as there.
+    // Mirror the upstream status verbatim. Routing non-2xx through
+    // `ProxyError::Upstream` would collapse everything but 401/403 into 502.
+    // A 3xx is the exception.
     refuse_redirect(upstream_resp.status())?;
-    // A non-2xx answer is no stream: it goes out through the generic
-    // forwarder's copy, with its own Content-Type, Cache-Control and
-    // request id, so a 503 `request_limit_reached` reaches the browser
-    // unchanged (ADR-0054). Only a stream gets the SSE treatment below.
     if !upstream_resp.status().is_success() {
         return relay_response(upstream_resp, auth);
     }
@@ -105,12 +84,8 @@ fn forward_sse_response(
     let byte_stream = upstream_resp.bytes_stream();
 
     // Cap the stream: a cookie session ends at its `exp`, a bearer client
-    // at the configured session TTL. Without a deadline a browser that
-    // opens `/api/v1/stream` moments before expiry keeps receiving events
-    // long after the cookie stops working for any other request, since the
-    // extractor checks expiry once at handler entry and `Body::from_stream`
-    // has no deadline of its own. Dropping the upstream stream also closes
-    // the TCP connection via reqwest's drop handling.
+    // at the configured session TTL. The extractor checks expiry once at
+    // handler entry and `Body::from_stream` has no deadline of its own.
     let ttl = match auth {
         Auth::Session(s) => remaining_ttl(s.exp(), chrono::Utc::now().timestamp()),
         Auth::Bearer(_) => Duration::from_secs(state.session_ttl_secs()),
@@ -127,10 +102,9 @@ fn forward_sse_response(
         // intermediate proxies when trawl-web is fronted by another one.
         .header("X-Accel-Buffering", "no");
 
-    // The SSE path shares the proxy-wide 401/403 cookie rule; see
-    // `clear_cookie_for_proxied_response`. It never clears, so an
-    // EventSource reconnect keeps 401ing until the SPA's next `/me` poll
-    // drops the dead cookie, which is the permission-aware place to decide.
+    // `clear_cookie_for_proxied_response` never clears, so an EventSource
+    // reconnect keeps 401ing until the SPA's next `/me` poll drops the dead
+    // cookie.
     if let Some(clear) = clear_cookie_for_proxied_response(status, auth) {
         builder = builder.header(header::SET_COOKIE, clear);
     }
@@ -140,13 +114,6 @@ fn forward_sse_response(
         .map_err(|e| ProxyError::Internal(format!("SSE response build: {e}")))
 }
 
-/// Compute the `Duration` between now and the session's expiry.
-///
-/// The session extractor rejects expired sessions before we get here, so
-/// `exp > now` in practice. This function nonetheless clamps to zero for
-/// the edge case where clock skew or a race lets an about-to-expire
-/// session slip through — returning `Duration::ZERO` makes the stream
-/// close immediately via `take_until`, which is the right failure mode.
 #[must_use]
 pub fn remaining_ttl(exp_secs: i64, now_secs: i64) -> Duration {
     let remaining = exp_secs.saturating_sub(now_secs).max(0);
@@ -171,8 +138,6 @@ mod tests {
     fn state_pointing_at(upstream: &TlsUpstream) -> AppState {
         let web = WebConfig {
             allow_insecure_cookies: true,
-            // Required since ADR-0016; these tests send no Origin header,
-            // and a present-only guard lets those through.
             public_origins: vec!["https://trawl.fleet.test".to_owned()],
             ..upstream.web_config()
         };
@@ -296,8 +261,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_upstream_401_with_session_preserves_cookie() {
-        // A stream 401 means the upstream key is dead. The stream proxy still
-        // leaves cookie lifecycle to `auth::me`.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
@@ -354,8 +317,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_preserves_upstream_400_for_bad_query() {
-        // Invalid DSL is a user error, not a proxy error — we must
-        // preserve trawld's 400 so the client can render the real message.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
@@ -379,8 +340,6 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-        // Content-Type from upstream is preserved (not forced to
-        // text/event-stream), so the browser gets a parseable error body.
         assert_eq!(
             resp.headers().get(header::CONTENT_TYPE).unwrap(),
             "application/json"
@@ -391,8 +350,6 @@ mod tests {
 
     #[tokio::test]
     async fn stream_preserves_upstream_429_for_rate_limit() {
-        // Stream concurrency limit is an actionable 429 that the UI
-        // should render with backoff messaging — not a generic 502.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);
@@ -439,17 +396,10 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// trawld's request-limit refusal on a stream route (ADR-0054).
     const REFUSAL: &str = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
 
-    /// The request id trawld put on [`REFUSAL`].
     const REQUEST_ID: &str = "0b5f3c1e-request-limit-id";
 
-    /// Open `uri` through the proxy against an upstream that answers
-    /// `upstream_path` with trawld's 503 `request_limit_reached`, and check
-    /// the browser gets it as trawld sent it: status, body bytes,
-    /// `Content-Type`, `Cache-Control: no-store` and the request id, with no
-    /// SSE header added. The upstream sees exactly one request: no retry.
     async fn assert_stream_relays_request_limit_refusal(uri: &str, upstream_path: &str) {
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
@@ -533,10 +483,6 @@ mod tests {
 
     #[test]
     fn remaining_ttl_zero_when_exp_at_or_past_now() {
-        // Defensive clamp — the extractor rejects expired sessions so
-        // reaching here with exp <= now is a sign of clock skew or a
-        // race. take_until(Duration::ZERO) ends the stream immediately,
-        // which is the correct failure mode.
         assert_eq!(remaining_ttl(1000, 1000), Duration::ZERO);
         assert_eq!(remaining_ttl(999, 1000), Duration::ZERO);
         assert_eq!(remaining_ttl(-1_000_000, 1000), Duration::ZERO);
@@ -544,8 +490,7 @@ mod tests {
 
     #[test]
     fn remaining_ttl_handles_max_exp() {
-        // Far-future session (100 years) must not overflow.
-        let far_future = 1_000 + 3_153_600_000; // ~100y in seconds
+        let far_future = 1_000 + 3_153_600_000;
         assert_eq!(
             remaining_ttl(far_future, 1000),
             Duration::from_hours(100 * 365 * 24)
@@ -554,15 +499,10 @@ mod tests {
 
     #[tokio::test]
     async fn stream_deadline_cuts_long_running_body() {
-        // End-to-end smoke: session with exp ~1s in the future, upstream
-        // returns a body that would otherwise stream indefinitely. The
-        // response body must EOF before ~2s elapse.
         use fleet_auth::{SessionExpiry, SessionPayload, encrypt};
         use zeroize::Zeroizing;
 
         let upstream = TlsUpstream::start().await;
-        // Upstream body can be short; the point is that take_until fires
-        // regardless of whether the body is still arriving.
         Mock::given(method("GET"))
             .and(path("/api/v1/stream"))
             .respond_with(
@@ -576,8 +516,6 @@ mod tests {
         let state = state_pointing_at(&upstream);
         let app = routes::build(state.clone());
 
-        // Hand-craft a session cookie with exp = now + 1 so we skip the
-        // login round-trip and get a deterministic short TTL.
         let now = chrono::Utc::now().timestamp();
         let payload = SessionPayload {
             token: Zeroizing::new("flt_test".to_string()),
@@ -597,7 +535,6 @@ mod tests {
         let start = std::time::Instant::now();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
-        // Fully drain the body — with the cap, this must terminate cleanly.
         let _ = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
         let elapsed = start.elapsed();
         assert!(
@@ -666,8 +603,6 @@ mod tests {
 
     #[tokio::test]
     async fn dashboard_stream_upstream_401_preserves_cookie() {
-        // Model a dead upstream key on the admin stream. The proxy preserves
-        // the shared cookie until `auth::me` performs its `/whoami` check.
         let upstream = TlsUpstream::start().await;
         let state = state_pointing_at(&upstream);
         let app = routes::build(state);

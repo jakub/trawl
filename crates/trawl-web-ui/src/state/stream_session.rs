@@ -6,17 +6,7 @@
 //! snapshot, and lagged indicator — all Leptos signals driven by a
 //! single `EventSource` whose lifetime is bounded by a `StoredValue`.
 //!
-//! The server emits three distinct SSE event names:
-//! - `data`  → one log event, as a one-row typed result
-//! - `snapshot` → the aggregation's whole result so far, typed, with the
-//!   caps that dropped input ([`trawl_api::stream::SnapshotFrame`], ADR-0001)
-//! - `lagged` → `{missed: N}` back-pressure notification
-//!
-//! Both result frames decode through `trawl_api`'s result codec.
-//!
 //! `EventSource` auto-reconnects on network blips (cookie rides along).
-//! Search reports failed connections and malformed snapshots, and clears
-//! stale chart data. A valid event or reopened connection clears the failure.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -38,12 +28,6 @@ pub const STREAM_UNAVAILABLE: &str = "Live stream unavailable. Retry or switch t
 
 /// Which stream session last proved it opened: the connection opened or
 /// the server delivered an event on it.
-///
-/// A refused live query closes before it opens (ADR-0039), so "never
-/// opened" is what lets Search read a closed stream as a possible query
-/// error rather than a dropped connection. The mark only ever moves
-/// forward, so a callback from an older session cannot claim, or
-/// retract, an opening for the current one.
 #[derive(Clone, Copy)]
 pub struct OpenedMark {
     /// The latest session that opened, shared by every session.
@@ -95,35 +79,21 @@ impl Drop for StreamLifecycle {
     }
 }
 
-/// Raw-event buffer shared across the ring, chart-snapshot, and badge
-/// signals. Signals live in the caller — this module only wires events
-/// to them.
 #[derive(Clone, Copy)]
 pub struct LiveSignals {
     pub ring: RwSignal<RingBuffer>,
     pub snapshot: RwSignal<Option<QueryResult>>,
     pub lagged: RwSignal<Option<u64>>,
-    /// Search displays failures; callers without a status view may omit it.
     pub failure: Option<RwSignal<Option<&'static str>>>,
     /// Aggregation frames accepted since the stream opened — the
-    /// footer's `Updates` count. Bumped only for a frame that passed
-    /// validation, so a malformed one raises the failure without
-    /// claiming an update. Callers without a count may omit it.
+    /// footer's `Updates` count.
     pub frames: Option<RwSignal<u64>>,
-    /// Records that this stream opened. Callers that never ask may omit it.
     pub opened: Option<OpenedMark>,
     /// The caps the latest accepted snapshot reported as having dropped
-    /// input (ADR-0001). Set on every accepted snapshot and on nothing
-    /// else: a connection error or a lag notice says nothing about the
-    /// aggregation, so neither clears it. The caller clears it when it
-    /// starts a stream. Callers without a notice may omit it.
+    /// input (ADR-0001). The caller clears it when it starts a stream.
     pub capped: Option<RwSignal<Vec<SnapshotCap>>>,
 }
 
-/// Open an SSE stream for the given query, wiring its three event types
-/// into the provided signals. Returns `None` if the browser doesn't
-/// expose `EventSource` (shouldn't happen in modern browsers) or the
-/// query string is empty.
 pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle> {
     if query.trim().is_empty() {
         return None;
@@ -137,9 +107,6 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
 
     let source = EventSource::new(&url).ok()?;
 
-    // Wire each named SSE event to a dedicated closure. Using `FnMut`
-    // gives the callback a mutable environment without `Cell`-dance on
-    // the hot path.
     let LiveSignals {
         ring,
         snapshot,
@@ -154,9 +121,6 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         }
     };
 
-    // Lagged signal auto-clear: set(Some(n)) then schedule a set(None)
-    // ~3s later so the badge fades from the UI without the user having
-    // to do anything.
     let lagged_clear_guard: Rc<RefCell<Option<gloo_timers::callback::Timeout>>> =
         Rc::new(RefCell::new(None));
 
@@ -223,9 +187,6 @@ pub fn start_stream(query: &str, signals: LiveSignals) -> Option<StreamLifecycle
         }
     });
 
-    // Attach listeners. The `Result` carries only an exception thrown by
-    // the JS call itself, and the event names are compile-time strings,
-    // so there is nothing here to act on.
     let _ = source.add_event_listener_with_callback("data", on_data.as_ref().unchecked_ref());
     let _ =
         source.add_event_listener_with_callback("snapshot", on_snapshot.as_ref().unchecked_ref());

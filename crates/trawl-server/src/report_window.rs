@@ -3,20 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Report-window domain types (ADR-0018 rulings 6-14).
-//!
-//! The window is a property of the SCHEDULE, not of the saved query text: a
-//! schedule either uses query-text timing (no scheduler-owned window, so the DSL
-//! is executed verbatim), tiles `[previous window_end, fire - lag)` under
-//! `window = "since_last"`, or takes a fixed trailing span under
-//! `window = "<duration>"`. This module owns the types, the two spellings
-//! of an instant, and the pure policy over them: [`plan_due_run`] turns a
-//! schedule plus a clock reading into the window a run covers,
-//! [`plan_manual_run`] does the same for a run an operator fires early, and
-//! [`materialize_window`] puts that window onto the saved DSL as absolute
-//! bounds. [`validate_window_compatibility`] is the write-time half: the
-//! one rule both write directions ask before a window and a query text are
-//! attached to each other. The scheduler wiring that persists those
-//! answers lives elsewhere.
 
 use std::fmt;
 
@@ -52,8 +38,6 @@ impl WindowKind {
         }
     }
 
-    /// Read a persisted spelling back. `None` for anything else, so the
-    /// caller decides what an unreadable value means where it is read.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "since_last" => Some(Self::SinceLast),
@@ -69,7 +53,6 @@ impl fmt::Display for WindowKind {
     }
 }
 
-/// The window mode configured on a schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleWindow {
     /// Tile forward from the last successful run's `window_end`.
@@ -82,8 +65,6 @@ pub enum ScheduleWindow {
 }
 
 impl ScheduleWindow {
-    /// The mode alone, which is what `schedules.window_kind` stores and
-    /// what a claimed run records.
     pub fn kind(self) -> WindowKind {
         match self {
             Self::SinceLast => WindowKind::SinceLast,
@@ -91,8 +72,6 @@ impl ScheduleWindow {
         }
     }
 
-    /// The persisted `schedules.window_secs` value: a fixed window carries
-    /// its span, `since_last` carries nothing.
     pub fn secs(self) -> Option<u64> {
         match self {
             Self::SinceLast => None,
@@ -100,12 +79,6 @@ impl ScheduleWindow {
         }
     }
 
-    /// Parse the wire spelling: the literal `since_last`, or a duration in
-    /// the schedule's own grammar.
-    ///
-    /// A fixed window takes the interval's 60s floor. A window shorter than
-    /// the minimum interval would describe a report nothing can be scheduled
-    /// to produce, and the two numbers are the same kind of span.
     pub fn parse(s: &str) -> Result<Self, StoreError> {
         let s = s.trim();
         if s == "since_last" {
@@ -128,20 +101,12 @@ impl fmt::Display for ScheduleWindow {
 }
 
 /// The half-open interval `[start, end)` one run covers (ADR-0018 ruling 10).
-///
-/// `truncated` records that a `since_last` catch-up gap exceeded
-/// `max_catchup_intervals` and the start was clamped forward, so the run
-/// reports the coverage it actually has instead of silently losing the gap.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReportWindow {
-    /// Inclusive lower bound.
     pub start: DateTime<Utc>,
-    /// Exclusive upper bound.
     pub end: DateTime<Utc>,
     /// Whether `start` was clamped forward past an uncovered gap.
     pub truncated: bool,
-    /// The mode this window was planned under, recorded on the run so a
-    /// mid-flight edit to the schedule cannot change what finishing it means.
     pub kind: WindowKind,
 }
 
@@ -166,25 +131,10 @@ pub fn truncate_to_micros(t: DateTime<Utc>) -> DateTime<Utc> {
     t.trunc_subsecs(6)
 }
 
-// ---------------------------------------------------------------------------
-// The due-run planner (ADR-0018 rulings 6, 9, 10, 14)
-// ---------------------------------------------------------------------------
-
-/// Everything one due-run or manual-run decision reads.
-///
-/// The planner never samples a clock and never touches the store: `now`
-/// arrives as a value, and the decision comes back as a value the caller
-/// persists. A tick's answer is therefore reproducible from a schedule row
-/// plus an instant, which is what lets the tiling rules be tested without a
-/// database and keeps the rules in one readable place instead of spread
-/// through the scheduler loop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PlanInput {
     /// The scheduler's clock reading for this tick, or the instant a
-    /// manual claim took its locks. Truncated to microseconds by
-    /// [`plan_due_run`] and [`plan_manual_run`] themselves, so a caller that already
-    /// truncated loses nothing and one that did not cannot leak
-    /// nanoseconds into a stored bound.
+    /// manual claim took its locks.
     pub now: DateTime<Utc>,
     /// The schedule's planned fire instant. Fires are planned from this
     /// cursor rather than from the last run's start, so execution time
@@ -210,10 +160,8 @@ pub struct PlanInput {
 /// A run the scheduler should claim, with the two values it has to write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DueRunPlan {
-    /// The boundary this run stands for. When fires were missed this is
-    /// the LATEST boundary at or before `now`, never the oldest one:
-    /// missed fires coalesce into one run and are never backfilled
-    /// (ruling 9).
+    /// The boundary this run stands for: the LATEST boundary at or before
+    /// `now` (ruling 9).
     pub planned_fire: DateTime<Utc>,
     /// The cursor to store: one interval past `planned_fire`.
     pub next_fire_at: DateTime<Utc>,
@@ -221,10 +169,8 @@ pub struct DueRunPlan {
     pub window: Option<ReportWindow>,
 }
 
-/// What the scheduler should do with one schedule on one tick.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Due {
-    /// Not due yet. Leave the row alone.
     NotYet,
     /// Due, but the window it would cover is already covered. Move the
     /// cursor and run nothing.
@@ -237,26 +183,15 @@ pub enum Due {
         /// The cursor to store.
         next_fire_at: DateTime<Utc>,
     },
-    /// Due. Claim a run for this plan.
     Run(DueRunPlan),
 }
 
-/// Why a schedule could not be planned.
-///
-/// Both variants mean the inputs are wrong, not the operator's request:
-/// the caller fails the tick and leaves the schedule alone rather than
-/// storing a bound it computed from a broken number.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum PlanError {
     /// A fire cursor or window bound left the representable instant
-    /// range. Every add and subtract in the planner is checked, so this
-    /// is what an out-of-range value produces instead of a panic or a
-    /// wrapped instant.
+    /// range.
     #[error("report window arithmetic left the representable instant range")]
     Arithmetic,
-    /// The interval or the catch-up bound is zero. Config refuses both at
-    /// load; the planner refuses them again because this is the one place
-    /// where the numbers actually mean something.
     #[error(
         "a schedule needs an interval of at least one second and max_catchup_intervals of at least 1"
     )]
@@ -265,39 +200,6 @@ pub enum PlanError {
 
 /// Decide what one schedule owes at instant `now` (ADR-0018 rulings 6, 9,
 /// 10 and 14).
-///
-/// The rules, in the order they apply:
-///
-/// - `now < next_fire_at` is [`Due::NotYet`].
-/// - `planned_fire` is the latest planned boundary at or before `now`
-///   (`next_fire_at + floor((now - next_fire_at) / interval) * interval`).
-///   Boundaries missed while the daemon was down are skipped, and the
-///   coverage they would have had is folded into this one window instead
-///   of replayed as N runs (ruling 9).
-/// - `end = planned_fire - lag`. The lag shifts both bounds back so a
-///   straggler event that landed after its own boundary is still inside
-///   the window that covers it (ruling 6).
-/// - No window is query mode: the saved DSL runs verbatim and the run
-///   records no bounds (ruling 6).
-/// - A fixed window is `[end - span, end)`, re-measured from every fire.
-///   It never reads `covered_through`, so a fixed schedule cannot heal a
-///   gap and cannot be truncated either.
-/// - `since_last` with no watermark covers `[end - interval, end)`
-///   (ruling 14). The store seeds that same instant as the watermark when
-///   it creates or re-anchors a `since_last` schedule, so this branch is
-///   the fallback for a row that predates the seed, never the path a fresh
-///   schedule takes. It stays because a schedule with no watermark still
-///   has to answer something, and one interval is what ruling 14 says.
-/// - `since_last` with a watermark starts AT the watermark, so
-///   consecutive windows tile: one run's `end` is the next run's `start`,
-///   and the half-open shape (ruling 10) keeps the shared instant in
-///   exactly one of them. A gap wider than `max_catchup_intervals *
-///   interval` clamps the start forward and sets `truncated`, which is
-///   the run's own admission that it does not cover everything since the
-///   watermark (ruling 9).
-///
-/// Returns [`Due::Advance`] when the window would end at or before the
-/// watermark, which is coverage that already exists.
 pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
     if input.interval_secs == 0 || input.max_catchup_intervals == 0 {
         return Err(PlanError::InvalidConfig);
@@ -323,7 +225,6 @@ pub fn plan_due_run(input: &PlanInput) -> Result<Due, PlanError> {
     })
 }
 
-/// Where an instant sits on a schedule's cadence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FireBoundaries {
     /// The latest planned boundary at or before the instant.
@@ -336,15 +237,8 @@ pub struct FireBoundaries {
 /// Place `now` on the cadence that runs through `next_fire_at` every
 /// `interval_secs`, or `None` when the cursor is still in the future.
 ///
-/// The one spelling of cadence arithmetic. [`plan_due_run`] uses it to pick
-/// the boundary a tick stands for, and a successful manual run's finish uses
-/// it to consume every boundary at or before the instant the manual run
-/// was claimed (ADR-0018 amended 2026-09-23). Both land the cursor on the
-/// same phase, so neither can shift when a schedule fires.
-///
 /// `now` is compared as given; a caller holding a clock reading truncates
-/// it first, as [`plan_due_run`] does. A zero interval is
-/// [`PlanError::InvalidConfig`] rather than a division by zero.
+/// it first, as [`plan_due_run`] does.
 pub fn fire_boundaries(
     next_fire_at: DateTime<Utc>,
     interval_secs: u64,
@@ -390,7 +284,6 @@ pub enum ManualPlan {
     /// A `since_last` window ending at `end` would read nothing the
     /// watermark does not already cover. No run is claimed.
     Covered {
-        /// The schedule's watermark.
         covered_through: DateTime<Utc>,
         /// Where the refused window would have ended: `t - lag`.
         end: DateTime<Utc>,
@@ -399,18 +292,6 @@ pub enum ManualPlan {
 
 /// Decide what a manual run claimed at `input.now` covers: the schedule's
 /// next window, fired early (ADR-0018 amended 2026-09-23).
-///
-/// `input.now` is the instant the claim holds its locks, called `t`. The
-/// window ends at `t - lag` and is otherwise the one a scheduled fire at
-/// `t` would plan: `since_last` starts at the watermark under the same
-/// catch-up clamp and ruling-14 fallback, a fixed span trails the end, and
-/// query mode plans no window. The fire cursor is not read: the run does
-/// not wait for it, and consuming it is the finish's business, on success
-/// only.
-///
-/// A `since_last` window that would end at or before the watermark is
-/// [`ManualPlan::Covered`]. The scheduler answers the same situation by
-/// advancing its cursor; an operator asking for a run is refused instead.
 pub fn plan_manual_run(input: &PlanInput) -> Result<ManualPlan, PlanError> {
     if input.interval_secs == 0 || input.max_catchup_intervals == 0 {
         return Err(PlanError::InvalidConfig);
@@ -435,7 +316,6 @@ enum Coverage {
     Covered { covered_through: DateTime<Utc> },
 }
 
-/// Shift an instant back by the late-arrival allowance.
 fn lagged(instant: DateTime<Utc>, lag_secs: u64) -> Result<DateTime<Utc>, PlanError> {
     instant
         .checked_sub_signed(plan_delta(plan_secs(lag_secs)?)?)
@@ -444,10 +324,6 @@ fn lagged(instant: DateTime<Utc>, lag_secs: u64) -> Result<DateTime<Utc>, PlanEr
 
 /// The window math every run shares, scheduled or manual: given where the
 /// window ends, where does it start (ADR-0018 rulings 6, 9 and 14)?
-///
-/// Reads the mode, the interval, the watermark and the catch-up bound from
-/// `input`, and never its clock or cursor: those only decide `end`, which
-/// is the caller's.
 fn window_ending_at(end: DateTime<Utc>, input: &PlanInput) -> Result<Coverage, PlanError> {
     let Some(window) = input.window else {
         return Ok(Coverage::Window(None));
@@ -499,35 +375,19 @@ fn window_ending_at(end: DateTime<Utc>, input: &PlanInput) -> Result<Coverage, P
     })))
 }
 
-/// A configured second count as the signed number instant arithmetic uses.
 fn plan_secs(secs: u64) -> Result<i64, PlanError> {
     i64::try_from(secs).map_err(|_| PlanError::Arithmetic)
 }
 
-/// A whole-second span, or [`PlanError::Arithmetic`] for a count no span
-/// can hold.
 fn plan_delta(secs: i64) -> Result<TimeDelta, PlanError> {
     TimeDelta::try_seconds(secs).ok_or(PlanError::Arithmetic)
 }
 
-// ---------------------------------------------------------------------------
-// The window materializer (ADR-0018 ruling 11)
-// ---------------------------------------------------------------------------
-
 /// Why a planned window could not be put onto a saved query.
-///
-/// The variants name the check that refused, because the caller's only
-/// sensible move is to fail the run and say which one: every one of these
-/// means the schedule and the query text disagree in a way
-/// [`validate_window_compatibility`] is supposed to have made impossible.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum MaterializeError {
-    /// The saved text does not parse, so there is nothing to splice onto.
     #[error("the saved query does not parse: {message}")]
-    SourceUnparseable {
-        /// The parser's first message.
-        message: String,
-    },
+    SourceUnparseable { message: String },
     /// The saved text owns its own window. Two spellings of one interval
     /// never coexist (ruling 7).
     #[error(
@@ -550,16 +410,8 @@ pub enum MaterializeError {
         /// The parser's first message.
         message: String,
     },
-    /// The spliced text parses, but its bounds are not the planned ones.
     #[error("the spliced query's bounds did not read back as earliest={start} latest={end}")]
-    BoundsNotReadBack {
-        /// The lower bound the splice wrote.
-        start: String,
-        /// The upper bound the splice wrote.
-        end: String,
-    },
-    /// The spliced text parses with the right bounds, but the rest of it
-    /// is no longer the saved query.
+    BoundsNotReadBack { start: String, end: String },
     #[error("splicing the window changed the query itself, not just its bounds")]
     BodyChanged,
 }
@@ -571,23 +423,6 @@ pub enum MaterializeError {
 /// followed by the saved text byte for byte. The three time keywords are
 /// read before anything else in the search stage, so the prefix is valid
 /// ahead of a field filter, a bare word, a comment or a leading `|`.
-///
-/// Rebuilding the text from the AST instead was rejected: the formatter
-/// drops the operator's `#` comments and normalizes spelling, and
-/// `report_runs.query` is an audit artefact a human is meant to paste back
-/// and get the same report from. A prefix keeps the saved text intact.
-///
-/// A splice on text is only as good as its guard, so every result is
-/// checked before it is returned:
-///
-/// 1. the saved text parses, owns no time clause, and carries no
-///    `from saved` stage ANYWHERE in its pipeline (the emitter refuses one
-///    that is not the first stage, but it parses, so a first-stage-only
-///    check would let it through here);
-/// 2. the spliced text parses;
-/// 3. the spliced text's `earliest`/`latest` read back as exactly the two
-///    rendered bounds, with no `last=` beside them;
-/// 4. everything else about the spliced query is the saved query.
 ///
 /// Check 4 compares the two through [`same_query`] rather than by
 /// `PartialEq`: the AST carries source spans and the hoisted clauses'
@@ -634,8 +469,6 @@ fn body_unchanged(mut spliced: Query, original: &Query) -> bool {
     same_query(&spliced, original)
 }
 
-/// Parse DSL, reducing a parse failure to its first message.
-///
 /// Window policy reads what the text means and runs nothing, so the parse
 /// builds no pattern (ADR-0063): the run's admission check builds them.
 ///
@@ -663,10 +496,6 @@ fn carries_from_saved(query: &Query) -> bool {
         .any(|stage| matches!(stage.node, PipeStage::FromSaved(_)))
 }
 
-// ---------------------------------------------------------------------------
-// The write-time compatibility rule (ADR-0018 rulings 7 and 12)
-// ---------------------------------------------------------------------------
-
 /// Why a window and a saved query may not be attached to each other.
 ///
 /// Every message names BOTH sides, because the operator has to remove one
@@ -679,9 +508,7 @@ pub enum WindowPolicyError {
         "schedule window \"{window}\" cannot be attached to a query that does not parse: {message}"
     )]
     Unparseable {
-        /// The window that was being attached.
         window: ScheduleWindow,
-        /// The parser's first message.
         message: String,
     },
     /// The query already spells its own interval (ruling 7).
@@ -690,9 +517,7 @@ pub enum WindowPolicyError {
         .clause.keyword()
     )]
     TimeClause {
-        /// The window that was being attached.
         window: ScheduleWindow,
-        /// The clause the query carries.
         clause: TimeClause,
     },
     /// The query reads stored report rows, not ingest events (ruling 12).
@@ -700,33 +525,15 @@ pub enum WindowPolicyError {
         "schedule window \"{window}\" conflicts with the saved query's \"from saved\" source; \
          stored report rows cannot receive a _time window"
     )]
-    FromSaved {
-        /// The window that was being attached.
-        window: ScheduleWindow,
-    },
+    FromSaved { window: ScheduleWindow },
 }
 
 /// Decide whether a window may be attached to this query text (ADR-0018
 /// rulings 7 and 12).
 ///
-/// This is ONE function for both write directions: putting a window on a
-/// schedule, and editing the DSL of a saved query that already has one.
-/// Two rules that agreed today would drift, and the drift would be a saved
-/// query whose schedule window and whose `last=` both claim to say what
-/// the report covers.
-///
-/// No window is always fine, whatever the text. Query mode executes the
-/// DSL verbatim and never reaches this check, and saved-query creation has
-/// never validated DSL at all, so refusing unparseable text here would be
-/// a new rejection wearing a window's name.
-///
-/// With a window, the text must parse (a window over text nothing can run
-/// is a claim about nothing), must own no `last=`/`earliest=`/`latest=`,
-/// and must carry no `from saved` stage. The time-clause check reads the
-/// parsed AST through [`trawl_core::ast::Query::time_clause`] rather than
-/// scanning the source: a backticked `` `last`=5 `` is an ordinary field
-/// filter and keeps its schedule window, while `service=x OR last=1h`
-/// carries a clause that a per-group text scan would miss.
+/// The time-clause check reads the parsed AST rather than scanning the
+/// source: a backticked `` `last`=5 `` is an ordinary field filter, while
+/// `service=x OR last=1h` carries a clause a per-group text scan would miss.
 pub fn validate_window_compatibility(
     window: Option<ScheduleWindow>,
     dsl: &str,
@@ -747,14 +554,6 @@ pub fn validate_window_compatibility(
 }
 
 /// [`validate_window_compatibility`] on the blocking pool (ADR-0063).
-///
-/// Its callers hold a row lock, so the check takes no preparation slot,
-/// and no lock waits for one. Query mode parses nothing, so it never
-/// leaves the caller's thread.
-///
-/// # Errors
-///
-/// As [`validate_window_compatibility`].
 pub async fn check_window_compatibility(
     window: Option<ScheduleWindow>,
     dsl: &str,
@@ -858,18 +657,12 @@ mod tests {
         assert_eq!(truncate_to_micros(truncated), truncated);
     }
 
-    // -- The due-run planner (ADR-0018 rulings 6, 9, 10, 14) ---------------
-
     const HOUR: u64 = 3600;
 
-    /// 2026-03-14 at the given hour and minute, the fixed clock every
-    /// planner test reads.
     fn at(hour: u32, minute: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 3, 14, hour, minute, 0).unwrap()
     }
 
-    /// An hourly `since_last` schedule with no lag and the default
-    /// catch-up bound, fired exactly on its cursor.
     fn since_last_input(now: DateTime<Utc>, covered: Option<DateTime<Utc>>) -> PlanInput {
         PlanInput {
             now,
@@ -882,8 +675,6 @@ mod tests {
         }
     }
 
-    /// The plan of a schedule that must be due, or a panic naming what
-    /// came back instead.
     fn run(input: &PlanInput) -> DueRunPlan {
         match plan_due_run(input).unwrap() {
             Due::Run(plan) => plan,
@@ -891,23 +682,17 @@ mod tests {
         }
     }
 
-    /// The window of a schedule that must be due AND windowed.
     fn window_of(input: &PlanInput) -> ReportWindow {
         run(input)
             .window
             .expect("a windowed schedule plans a window")
     }
 
-    /// Ruling 10: consecutive `since_last` windows tile. One run's end is
-    /// the next run's start, and because the interval is half-open the
-    /// shared instant belongs to the later window alone.
     #[test]
     fn consecutive_since_last_windows_tile_without_overlap() {
         let first_plan = run(&since_last_input(at(3, 0), None));
         let first = first_plan.window.unwrap();
 
-        // Each fire feeds the next: its window end becomes the watermark,
-        // its next_fire_at becomes the cursor.
         let mut input = since_last_input(at(4, 0), Some(first.end));
         input.next_fire_at = first_plan.next_fire_at;
         let second_plan = run(&input);
@@ -922,15 +707,11 @@ mod tests {
         assert!(first.start < first.end && second.start < second.end);
         assert!(!first.truncated && !second.truncated && !third.truncated);
 
-        // The boundary instant is in the later window and nowhere else.
         let boundary = first.end;
         assert!(boundary >= second.start && boundary < second.end);
         assert!(!(boundary >= first.start && boundary < first.end));
     }
 
-    /// Ruling 9: a failed run leaves the watermark, so the next success
-    /// covers its own interval and the failed one in a single window.
-    /// Nothing is truncated at two intervals of gap.
     #[test]
     fn a_withheld_success_heals_on_the_next_run() {
         let first = window_of(&since_last_input(at(3, 0), None));
@@ -949,9 +730,6 @@ mod tests {
         assert!(!healed.truncated);
     }
 
-    /// Ruling 9: a gap beyond the bound coalesces into ONE run whose start
-    /// is clamped forward and flagged, never N backfilled runs and never a
-    /// silent loss. The bound is exclusive: exactly at it, nothing is cut.
     #[test]
     fn a_long_gap_coalesces_into_one_clamped_and_flagged_run() {
         let now = at(3, 0);
@@ -978,9 +756,6 @@ mod tests {
         assert_eq!(one_over.start, now - TimeDelta::try_hours(24).unwrap());
     }
 
-    /// Ruling 6: a fixed window is re-measured from every fire, so the
-    /// watermark is not read at all, and missed fires are missing runs
-    /// rather than a backlog.
     #[test]
     fn a_fixed_window_ignores_the_watermark_and_skips_missed_fires() {
         let base = PlanInput {
@@ -1015,8 +790,6 @@ mod tests {
         assert_eq!(run(&watermark_past_the_end), plan);
     }
 
-    /// Ruling 14: the first `since_last` run covers
-    /// `[fire - lag - interval, fire - lag)`.
     #[test]
     fn the_first_since_last_run_covers_one_interval_back() {
         let no_lag = window_of(&since_last_input(at(3, 0), None));
@@ -1032,8 +805,6 @@ mod tests {
         assert_eq!(lagged.end, at(2, 55));
     }
 
-    /// The cursor is the due test, and it is inclusive: a tick exactly on
-    /// it runs, one microsecond before it does not.
     #[test]
     fn a_schedule_is_due_at_its_cursor_and_not_before() {
         let mut early = since_last_input(at(3, 0), None);
@@ -1046,9 +817,6 @@ mod tests {
         assert_eq!(plan.next_fire_at, at(4, 0));
     }
 
-    /// A window already covered moves the cursor and runs nothing, so an
-    /// edit that pushed the watermark forward cannot make every poll ask
-    /// the same question again.
     #[test]
     fn an_already_covered_window_advances_the_cursor_instead_of_running() {
         for covered in [at(3, 0), at(9, 0)] {
@@ -1061,8 +829,6 @@ mod tests {
         }
     }
 
-    /// Ruling 6: no window is query mode. The run happens and records no
-    /// bounds.
     #[test]
     fn query_mode_plans_a_run_with_no_window() {
         let mut input = since_last_input(at(3, 0), Some(at(9, 0)));
@@ -1107,10 +873,6 @@ mod tests {
         );
     }
 
-    /// Every add and subtract is checked, so an instant near the end of
-    /// the representable range is an error rather than a panic or a
-    /// wrapped bound. A zero interval or catch-up bound is a config fault
-    /// the planner refuses on its own.
     #[test]
     fn out_of_range_arithmetic_and_zero_config_are_errors_not_panics() {
         let edge = truncate_to_micros(DateTime::<Utc>::MAX_UTC);
@@ -1144,8 +906,6 @@ mod tests {
         assert_eq!(plan_due_run(&no_interval), Err(PlanError::InvalidConfig));
     }
 
-    /// A clock reading finer than a microsecond cannot reach a stored
-    /// bound: the planner truncates `now` before it decides anything.
     #[test]
     fn a_nanosecond_clock_reading_yields_microsecond_bounds() {
         let mut nanos = since_last_input(at(3, 0), None);
@@ -1165,11 +925,6 @@ mod tests {
         }
     }
 
-    // -- Cadence boundaries ------------------------------------------------
-
-    /// The boundary after an instant is strictly after it: an instant ON a
-    /// boundary has already reached it, so the next one is an interval on.
-    /// A cursor still in the future has no boundary to consume.
     #[test]
     fn fire_boundaries_name_the_first_boundary_strictly_after_now() {
         let on = fire_boundaries(at(3, 0), HOUR, at(5, 0)).unwrap().unwrap();
@@ -1189,11 +944,6 @@ mod tests {
         );
     }
 
-    // -- The manual-run planner (ADR-0018 amended 2026-09-23) --------------
-
-    /// A manual `since_last` run is the next window fired early: it starts
-    /// at the watermark and ends at `t - lag`, whatever the fire cursor
-    /// says.
     #[test]
     fn a_manual_since_last_run_covers_from_the_watermark_to_now_minus_lag() {
         let t = at(3, 17) + TimeDelta::nanoseconds(123_456_789);
@@ -1227,8 +977,6 @@ mod tests {
         );
     }
 
-    /// A fixed span is re-measured from `t - lag`, and the watermark is
-    /// not read.
     #[test]
     fn a_manual_fixed_run_covers_the_trailing_span_ending_now_minus_lag() {
         let input = PlanInput {
@@ -1251,7 +999,6 @@ mod tests {
         );
     }
 
-    /// Query mode has no window to plan: the text runs verbatim.
     #[test]
     fn a_manual_query_mode_run_plans_no_window() {
         let mut input = since_last_input(at(3, 17), Some(at(9, 0)));
@@ -1259,8 +1006,6 @@ mod tests {
         assert_eq!(plan_manual_run(&input).unwrap(), ManualPlan::Run(None));
     }
 
-    /// The catch-up clamp and its flag apply to a manual run exactly as to
-    /// a scheduled one.
     #[test]
     fn a_manual_run_past_the_catchup_bound_is_clamped_and_flagged() {
         let mut input = since_last_input(
@@ -1279,8 +1024,6 @@ mod tests {
         );
     }
 
-    /// Ruling 14 holds for a manual run too: no watermark covers one
-    /// interval back from `t - lag`.
     #[test]
     fn a_manual_run_without_a_watermark_covers_one_interval() {
         let mut input = since_last_input(at(3, 17), None);
@@ -1296,9 +1039,6 @@ mod tests {
         );
     }
 
-    /// A window that would end at or before the watermark is coverage
-    /// that already exists. Equality is empty too, down to the microsecond,
-    /// because the window is half-open.
     #[test]
     fn a_manual_run_with_nothing_new_to_read_is_covered() {
         let t = at(3, 17);
@@ -1324,8 +1064,6 @@ mod tests {
         );
     }
 
-    /// The manual planner refuses the same broken numbers the due planner
-    /// does.
     #[test]
     fn a_manual_plan_refuses_zero_config() {
         let no_catchup = PlanInput {
@@ -1340,9 +1078,6 @@ mod tests {
         assert_eq!(plan_manual_run(&no_interval), Err(PlanError::InvalidConfig));
     }
 
-    // -- The window materializer (ADR-0018 ruling 11) ----------------------
-
-    /// The window every materializer test splices: 02:00 to 03:00 UTC.
     fn spliceable_window() -> ReportWindow {
         ReportWindow {
             start: at(2, 0),
@@ -1355,9 +1090,6 @@ mod tests {
     const SPLICED_PREFIX: &str =
         "earliest=\"2026-03-14T02:00:00.000000Z\" latest=\"2026-03-14T03:00:00.000000Z\" ";
 
-    /// The saved text survives the splice byte for byte, including a
-    /// comment the formatter would have dropped, and the result is the
-    /// same query with bounds on it.
     #[test]
     fn materializing_prefixes_the_saved_text_verbatim() {
         let cases = [
@@ -1385,10 +1117,6 @@ mod tests {
         assert!(commented.contains("# nightly rollup, do not touch"));
     }
 
-    /// Check 4 compares canonical forms with only the splice's two bounds
-    /// cleared. Layout and comments are no change; one predicate changed,
-    /// on a keyword-prefixed field too, is. A `last=` beside the bounds
-    /// does not parse, so no splice reaches the check with one.
     #[test]
     fn report_window_proof_detects_body_changes() {
         let parse =
@@ -1432,8 +1160,6 @@ mod tests {
         assert!(trawl_core::parser::parse(&format!("{SPLICED_PREFIX}last=1h a")).is_err());
     }
 
-    /// The bounds the splice writes read back as the instants that were
-    /// planned, not as text that merely looks like them.
     #[test]
     fn spliced_bounds_reparse_to_the_planned_instants() {
         let window = spliceable_window();
@@ -1452,9 +1178,6 @@ mod tests {
         assert_eq!(read(parsed.search.latest.unwrap().node.text()), window.end);
     }
 
-    /// Ruling 7: a query that owns its own window is refused rather than
-    /// given a second one. Write-time policy should have stopped this, so
-    /// the refusal names the clause it found.
     #[test]
     fn materializing_refuses_a_query_that_owns_its_own_window() {
         let cases = [
@@ -1477,8 +1200,6 @@ mod tests {
         }
     }
 
-    /// Ruling 12: stored report rows take no `_time` window, wherever the
-    /// `from saved` stage sits in the pipeline.
     #[test]
     fn materializing_refuses_a_from_saved_query_anywhere_in_the_pipeline() {
         for dsl in [
@@ -1494,8 +1215,6 @@ mod tests {
         }
     }
 
-    /// Text that does not parse is refused before anything is spliced onto
-    /// it, and the parser's own message travels with the refusal.
     #[test]
     fn materializing_refuses_an_unparseable_saved_query() {
         let err = materialize_window("| stats count(", &spliceable_window()).unwrap_err();
@@ -1509,10 +1228,6 @@ mod tests {
         );
     }
 
-    // -- Window/query compatibility (ADR-0018 rulings 7 and 12) ------------
-
-    /// Ruling 7: two spellings of one interval never coexist, and the
-    /// refusal names both so the operator can drop one.
     #[test]
     fn a_window_and_a_time_clause_refuse_each_other_by_name() {
         let window = ScheduleWindow::SinceLast;
@@ -1538,9 +1253,6 @@ mod tests {
         }
     }
 
-    /// Ruling 12: a `from saved` query reads stored report rows, so it can
-    /// never be given a `_time` window. The refusal names the window's own
-    /// spelling and the source it clashes with.
     #[test]
     fn a_window_and_a_from_saved_source_refuse_each_other_by_name() {
         let window = ScheduleWindow::Fixed { secs: 7200 };
@@ -1556,9 +1268,6 @@ mod tests {
         }
     }
 
-    /// A backticked keyword is an ordinary field name, so a query filtering
-    /// a column called `last` keeps its schedule window. This is why the
-    /// check reads the AST instead of scanning the text.
     #[test]
     fn a_backticked_keyword_is_a_field_and_keeps_its_window() {
         assert_eq!(
@@ -1574,8 +1283,6 @@ mod tests {
         );
     }
 
-    /// A hoisted clause is still a clause: `service=x OR last=1h` applies
-    /// its window to both groups, and a per-group text scan would miss it.
     #[test]
     fn a_time_clause_hoisted_out_of_an_or_group_is_still_refused() {
         let window = ScheduleWindow::SinceLast;
@@ -1588,9 +1295,6 @@ mod tests {
         );
     }
 
-    /// No window means no claim about coverage, so the text is not this
-    /// check's business: saved-query creation has never validated DSL and
-    /// this rule does not start.
     #[test]
     fn no_window_accepts_any_text_while_a_window_needs_a_parseable_query() {
         assert_eq!(
@@ -1611,9 +1315,6 @@ mod tests {
         assert!(err.to_string().contains("\"2h\""), "{err}");
     }
 
-    /// The window parses read what the text means and run nothing, so they
-    /// build no pattern (ADR-0063): a store transaction that asks them
-    /// spends no regex compile under its row lock.
     #[test]
     fn window_parses_build_no_pattern() {
         use trawl_core::parser::{ParseKind, ParseLog};

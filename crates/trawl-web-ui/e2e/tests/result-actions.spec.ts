@@ -17,8 +17,6 @@ test('result audit: numeric sorting and only original aggregate group Include', 
   await expect(page.locator('.results-table tbody tr').first()).toContainText('hundred');
   await page.getByRole('button', { name: 'Sort by count', exact: true }).click();
   await expect(page.locator('.results-table tbody tr').first()).toContainText('null');
-  // An aggregate row has no event to reveal, so the exact table offers
-  // no expansion, no raw actions, and a search only on the grouped field.
   await expect(page.getByRole('button', { name: 'Show details for result 1', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Search count = 100', exact: true })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Show context', exact: true })).toHaveCount(0);
@@ -187,9 +185,6 @@ test('result audit: pending query cannot retarget retained aggregate row actions
 });
 
 
-// Derive the response from the native-guarded raw-row fixture. This changes
-// only the fields that the tested let/rename stage changes, and adds a
-// string service field so two untouched facet groups must remain usable.
 function transformedRaw(query: string) {
   const response = structuredClone(raw);
   response.columns.push({ name: 'service', type: 'string' });
@@ -211,7 +206,6 @@ for (const mode of ['snapshot', 'live']) {
       if (mode === 'snapshot') {
         await page.route(routeQuery, route => route.fulfill({ json: response }));
       } else {
-        // One `data` frame per row: a one-row result under the same columns.
         const events = response.rows.map((row: unknown[]) => ({ columns: response.columns, rows: [row] }));
         await page.route('**/api/v1/stream?*', route => route.fulfill({
           contentType: 'text/event-stream',

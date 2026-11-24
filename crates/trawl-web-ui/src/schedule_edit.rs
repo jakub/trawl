@@ -3,41 +3,14 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What a schedule edit carries back, and what it tells the operator.
-//!
-//! `PUT .../schedule` takes the schedule's whole shape, so an omitted
-//! `window` does not mean "leave it alone", it means query mode. The
-//! drawer's form therefore holds a whole [`WindowDraft`] rather than a
-//! set of fields it may or may not send: the draft opens seeded from
-//! what the server reported, and [`WindowDraft::to_request`] decides
-//! from the chosen mode alone which halves travel. What the operator
-//! reads is what the request carries, off the same value.
-//!
-//! Nothing here parses a duration or inspects the DSL. The browser has
-//! no copy of either grammar, and inventing one would let the form
-//! disagree with the server about what it just accepted. The refusals
-//! this module does make ([`ScheduleEditError`]) are the ones a form can
-//! make without a grammar: a chosen span left blank, a max-runs box
-//! holding something that is not a number.
-//!
-//! Run now lives here too: whether a net offers it, what the form says
-//! it will read, and how its toast states the window the server claimed.
-//! The browser never computes that window (ADR-0018 as amended on
-//! 2026-09-23); it only prints the bounds the response carries.
-//!
-//! Pure + ungated so its tests run natively; the callers are
-//! wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
 use trawl_api::{ReportRunSummary, SavedQueryResponse, ScheduleResponse};
 
-/// Which report window a schedule edit is about to send.
-///
 /// The ids are the wire's own: `window` is absent for query mode,
 /// literally `since_last` for tiling, and any other string is a span the
-/// server parses. Nothing here parses a duration — the browser has no
-/// duration grammar and inventing one would let the form disagree with
-/// the server.
+/// server parses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowMode {
     /// The saved text runs as written; the request omits `window`.
@@ -49,8 +22,6 @@ pub enum WindowMode {
 }
 
 impl WindowMode {
-    /// The control's option id, and the value the segmented strip
-    /// round-trips through.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
@@ -60,7 +31,6 @@ impl WindowMode {
         }
     }
 
-    /// The mode an option id names, or `None` for anything else.
     #[must_use]
     pub fn from_id(id: &str) -> Option<Self> {
         match id {
@@ -72,12 +42,8 @@ impl WindowMode {
     }
 }
 
-/// What the form holds for the window half of a schedule edit.
-///
 /// The span and lag buffers survive a mode toggle, so an operator who
-/// looks at query mode and comes back finds their typing intact. Which
-/// of them travels is [`WindowDraft::to_request`]'s decision, taken from
-/// `mode` alone.
+/// looks at query mode and comes back finds their typing intact.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowDraft {
     pub mode: WindowMode,
@@ -85,12 +51,9 @@ pub struct WindowDraft {
     pub lag: String,
 }
 
-/// A refusal the form makes on its own, before any request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScheduleEditError {
-    /// Fixed span was chosen with nothing in the span box.
     BlankFixedSpan,
-    /// Max runs held something that is not a whole number.
     InvalidMaxRuns,
 }
 
@@ -177,8 +140,7 @@ impl WindowDraft {
 /// The max-runs field as a request value.
 ///
 /// Blank is unlimited. Anything that is not a whole number is refused
-/// here rather than silently becoming unlimited, which is what a
-/// discarded parse used to do.
+/// here rather than silently becoming unlimited.
 ///
 /// # Errors
 /// [`ScheduleEditError::InvalidMaxRuns`] when the text is neither blank
@@ -195,11 +157,6 @@ pub fn validate_max_runs(text: &str) -> Result<Option<u64>, ScheduleEditError> {
 
 /// How a net's schedule reads in a list: its cadence, then its window
 /// named as one, in one phrase.
-///
-/// The window half is the wire's own vocabulary said in words — an
-/// absent `window` is query mode, `since_last` is tiling, and anything
-/// else is the span the server parses. Nothing here parses a duration,
-/// so a span is quoted rather than described.
 #[must_use]
 pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
     let Some(schedule) = schedule else {
@@ -217,45 +174,29 @@ pub fn cadence_sentence(schedule: Option<&ScheduleResponse>) -> String {
 /// net drawer header alike.
 pub const RUN_NOW: &str = "Run now";
 
-/// The success toast's link to the started run.
 pub const VIEW_RUN: &str = "View run";
 
 /// The refusal toast's title. Its detail is the server's own message.
 pub const RUN_NOT_STARTED: &str = "Run not started";
 
-/// What Run now reads for a `since_last` schedule, said under the window
-/// choice.
 pub const RUN_NOW_SINCE_LAST_LINE: &str =
     "Run now reads from where the last successful run stopped.";
 
-/// What Run now reads for a fixed-span schedule, said under the window
-/// choice.
 pub const RUN_NOW_FIXED_LINE: &str =
     "Run now reads the span ending now; results can overlap earlier runs.";
 
-/// Whether the session may run a net now and read a run's stored rows.
-/// The server needs `query` beside `saved_query` for both (ADR-0018 as
-/// amended on 2026-11-11), so without either Run now and the run rows
-/// view are absent, not disabled (ADR-0025). The run history stays:
-/// listing runs needs `saved_query` alone. `None` is a session not read
-/// yet, which offers neither until it is.
+/// `None` is a session not read yet: no Run now and no run rows view
+/// until it is.
 #[must_use]
 pub fn may_run_saved(permissions: Option<&[String]>) -> bool {
     permissions.is_some_and(crate::perms::can_run_saved)
 }
 
-/// Whether a net offers Run now: exactly when the session
-/// [may run it](may_run_saved) and its SAVED state has a schedule, in any
-/// mode and enabled or paused. A net with no schedule has nothing to
-/// fire, and the server refuses it with a 400, so the control would not
-/// work (ADR-0025).
 #[must_use]
 pub fn run_now_offered(saved: &SavedQueryResponse, permissions: Option<&[String]>) -> bool {
     may_run_saved(permissions) && saved.schedule.is_some()
 }
 
-/// Why Run now is disabled on a net whose run budget is spent, said
-/// beside the disabled control.
 pub const RUN_NOW_SPENT_REASON: &str = "Run limit reached. Raise it in the schedule to run again.";
 
 /// Whether an offered Run now is disabled because the net's run budget is
@@ -341,16 +282,10 @@ const PRESET_SECS: &[(&str, u64)] = &[
     ("1w", 604_800),
 ];
 
-/// What the form says when a duration it was given is one the browser
-/// cannot read.
 const CUSTOM_NOTE: &str = "The server validates custom durations when you save.";
 
-/// The plain-language reading of a schedule edit: what it will do, an
-/// optional worked example, and an optional note about what could not be
-/// worked out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScheduleSentence {
-    /// One sentence naming the cadence and what each run covers.
     pub headline: String,
     /// A concrete pair of bounds, present only when every duration in
     /// the draft resolved to seconds.
@@ -377,8 +312,6 @@ fn secs_of(text: &str, saved_text: Option<&str>, saved_secs: Option<u64>) -> Opt
     }
 }
 
-/// `secs_of` against both pairs the server reports: the interval and its
-/// seconds, the lag and its seconds.
 fn resolve(text: &str, saved: Option<&ScheduleResponse>) -> Option<u64> {
     secs_of(
         text,
@@ -402,7 +335,6 @@ fn resolve_lag(text: &str, saved: Option<&ScheduleResponse>) -> Option<u64> {
     resolve(text, saved)
 }
 
-/// `HH:MM`, or `HH:MM:SS` when the time carries seconds.
 fn clock(secs: u64) -> String {
     let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
     if s == 0 {
@@ -412,18 +344,10 @@ fn clock(secs: u64) -> String {
     }
 }
 
-/// Whether `text` was offered and could not be read.
 fn unresolved(text: &str, secs: Option<u64>) -> bool {
     secs.is_none() && !text.trim().is_empty()
 }
 
-/// What the schedule form's callout says about the edit in the draft.
-///
-/// The example is computed, never canned: a fixed "11:00 → 12:00" beside
-/// a 5m interval would advertise a window the schedule will not read
-/// (ADR-0025). So it exists only when every duration in the draft
-/// resolves to seconds, and custom text yields the validation note
-/// instead.
 #[must_use]
 pub fn schedule_sentence(
     interval: &str,
@@ -495,10 +419,6 @@ pub fn schedule_sentence(
 
 /// The line a stored run's preview shows when the run stored more rows
 /// than the response carries, or `None` when paging covers everything.
-///
-/// The preview pages the rows it was given; it never re-fetches. Saying
-/// so is the difference between a pager that looks broken and one whose
-/// limits are stated.
 #[must_use]
 pub fn preview_cap(row_count: Option<usize>, fetched: usize) -> Option<String> {
     let n = row_count?;
@@ -511,8 +431,6 @@ pub fn preview_cap(row_count: Option<usize>, fetched: usize) -> Option<String> {
 mod tests {
     use super::*;
 
-    /// A schedule as the server reports it. Only the four fields this
-    /// module reads carry anything.
     fn schedule(window: Option<&str>, lag: Option<(&str, u64)>) -> ScheduleResponse {
         ScheduleResponse {
             id: 1,
@@ -534,7 +452,6 @@ mod tests {
         }
     }
 
-    /// A net as the server lists it, with or without a schedule.
     fn net(schedule: Option<ScheduleResponse>) -> SavedQueryResponse {
         SavedQueryResponse {
             id: 7,
@@ -546,8 +463,6 @@ mod tests {
         }
     }
 
-    /// A manual run as `POST .../run` answers it, with the window the
-    /// server claimed, if any.
     fn started(window: Option<(&str, &str)>) -> ReportRunSummary {
         ReportRunSummary {
             id: 41,
@@ -567,13 +482,10 @@ mod tests {
         }
     }
 
-    /// A session's permissions as `/me` lists them.
     fn permissions(names: &[&str]) -> Vec<String> {
         names.iter().map(|name| (*name).to_owned()).collect()
     }
 
-    /// Run now is offered for every saved schedule, whatever its mode or
-    /// enabled state, and never for a net with no schedule to fire.
     #[test]
     fn run_now_is_offered_exactly_when_a_schedule_is_saved() {
         let runner = permissions(&["query", "saved_query"]);
@@ -587,9 +499,6 @@ mod tests {
         assert!(run_now_offered(&net(Some(paused)), runner));
     }
 
-    /// Without `query` and `saved_query` both, the session offers neither
-    /// Run now nor the run rows view, whatever the net's schedule; a
-    /// session not read yet counts as without. With both, both are there.
     #[test]
     fn run_now_is_absent_without_query() {
         let scheduled = net(Some(schedule(Some("since_last"), None)));
@@ -608,9 +517,6 @@ mod tests {
         assert!(may_run_saved(Some(runner.as_slice())));
     }
 
-    /// Run now stays offered on a spent schedule but is disabled, and the
-    /// label names the spend. Only `exhausted` decides it: a capped
-    /// schedule under its cap runs, and a lowered cap shows N above M.
     #[test]
     fn run_now_is_disabled_for_a_spent_schedule() {
         assert!(!run_now_spent(&net(None)));
@@ -636,8 +542,6 @@ mod tests {
         assert_eq!(run_budget_label(&zero).as_deref(), Some("spent 0/0"));
     }
 
-    /// The toast states the bounds the server claimed, in UTC, to the
-    /// minute when the minute tells them apart.
     #[test]
     fn run_started_toast_names_the_claimed_window() {
         assert_eq!(
@@ -649,14 +553,11 @@ mod tests {
         );
     }
 
-    /// Query mode claims no window, so the toast claims none either.
     #[test]
     fn run_started_toast_in_query_mode_names_no_window() {
         assert_eq!(run_started_toast(&started(None)), "Run started");
     }
 
-    /// Bounds on two days carry their dates, or 23:55–00:10 would read
-    /// as a window running backwards.
     #[test]
     fn run_started_toast_dates_a_window_across_midnight() {
         assert_eq!(
@@ -668,8 +569,6 @@ mod tests {
         );
     }
 
-    /// Two bounds inside one minute print their seconds, or the window
-    /// would read as empty.
     #[test]
     fn run_started_toast_prints_seconds_when_bounds_share_a_minute() {
         assert_eq!(
@@ -681,7 +580,6 @@ mod tests {
         );
     }
 
-    /// Bounds inside one second print the microseconds the wire carries.
     #[test]
     fn run_started_toast_prints_fractions_when_bounds_share_a_second() {
         assert_eq!(
@@ -693,8 +591,6 @@ mod tests {
         );
     }
 
-    /// Bounds the browser cannot read are quoted as the server sent
-    /// them rather than dropped: the window is still the server's claim.
     #[test]
     fn run_started_toast_quotes_bounds_it_cannot_read() {
         assert_eq!(
@@ -703,8 +599,6 @@ mod tests {
         );
     }
 
-    /// One line per windowed mode, and none for query mode, which reads
-    /// the saved text whenever it runs.
     #[test]
     fn run_now_form_line_speaks_only_for_windowed_modes() {
         assert_eq!(run_now_form_line(WindowMode::Query), None);
@@ -718,8 +612,6 @@ mod tests {
         );
     }
 
-    /// Every mode the strip can press is a mode the draft can hold, and
-    /// an unknown id is refused rather than guessed at.
     #[test]
     fn window_mode_ids_round_trip() {
         for mode in [WindowMode::Query, WindowMode::SinceLast, WindowMode::Fixed] {
@@ -728,8 +620,6 @@ mod tests {
         assert_eq!(WindowMode::from_id("tiling"), None);
     }
 
-    /// The form opens showing what the server holds, including the
-    /// silence a zero lag earns.
     #[test]
     fn from_schedule_seeds_the_draft() {
         let none = WindowDraft::from_schedule(None);
@@ -753,8 +643,6 @@ mod tests {
         assert_eq!(fixed.lag, "");
     }
 
-    /// The old pass-through guarantee, now a property of the draft: a
-    /// form nobody touched puts the server's own pair back on the wire.
     #[test]
     fn an_untouched_draft_repeats_the_server_pair() {
         let tiling =
@@ -770,8 +658,6 @@ mod tests {
         );
     }
 
-    /// Query mode drops both fields whatever the buffers still hold, and
-    /// a windowed mode with a blank lag sends the window alone.
     #[test]
     fn query_mode_sends_neither_field() {
         let draft = WindowDraft {
@@ -792,8 +678,6 @@ mod tests {
         );
     }
 
-    /// What the form refuses, it refuses before any request. Zero max
-    /// runs is not one of those: the server owns that judgement.
     #[test]
     fn local_refusals_send_nothing() {
         let blank = WindowDraft {
@@ -812,8 +696,6 @@ mod tests {
         assert_eq!(validate_max_runs(" 3 "), Ok(Some(3)));
     }
 
-    /// The cap line appears only when rows were left behind, so an
-    /// uncapped preview says nothing about fetching at all.
     #[test]
     fn preview_cap_names_the_gap_only_when_capped() {
         assert_eq!(
@@ -824,8 +706,6 @@ mod tests {
         assert_eq!(preview_cap(None, 45), None);
     }
 
-    /// The list's one-line reading of a schedule: no schedule at all,
-    /// and each of the three window shapes.
     #[test]
     fn cadence_sentence_reads_every_window_shape() {
         assert_eq!(cadence_sentence(None), "No schedule");
@@ -843,8 +723,6 @@ mod tests {
         );
     }
 
-    /// A draft in one of the three modes, with whatever span and lag
-    /// text the case is about.
     fn draft(mode: WindowMode, span: &str, lag: &str) -> WindowDraft {
         WindowDraft {
             mode,
@@ -853,7 +731,6 @@ mod tests {
         }
     }
 
-    /// Nothing to say about a cadence that has not been chosen.
     #[test]
     fn schedule_sentence_asks_for_an_interval_first() {
         let said = schedule_sentence("  ", None, &draft(WindowMode::Fixed, "1h", ""));
@@ -862,8 +739,6 @@ mod tests {
         assert_eq!(said.note, None);
     }
 
-    /// Query mode reads the saved text, so the "example" is the absence
-    /// of a bound rather than a pair of timestamps.
     #[test]
     fn schedule_sentence_query_mode_names_no_bound() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::Query, "", "5m"));
@@ -875,8 +750,6 @@ mod tests {
         assert_eq!(said.note, None);
     }
 
-    /// Tiling has one bound to print: the run time, moved back by a lag
-    /// the browser could read.
     #[test]
     fn schedule_sentence_since_last_prints_the_end_bound() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::SinceLast, "", "5m"));
@@ -891,8 +764,6 @@ mod tests {
         assert_eq!(said.note, None);
     }
 
-    /// A lag the browser has no grammar for yields the note instead of a
-    /// guess.
     #[test]
     fn schedule_sentence_since_last_custom_lag_notes_the_server() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::SinceLast, "", "90s"));
@@ -900,7 +771,6 @@ mod tests {
         assert_eq!(said.note, Some(CUSTOM_NOTE));
     }
 
-    /// The common case, both bounds printed: a blank lag is none.
     #[test]
     fn schedule_sentence_fixed_prints_both_bounds() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "1h", ""));
@@ -912,8 +782,6 @@ mod tests {
         assert_eq!(said.note, None);
     }
 
-    /// A lag moves BOTH bounds back, which is the whole reason the
-    /// example is computed rather than canned.
     #[test]
     fn schedule_sentence_fixed_lag_moves_both_bounds() {
         let said = schedule_sentence("15m", None, &draft(WindowMode::Fixed, "15m", "5m"));
@@ -923,8 +791,6 @@ mod tests {
         );
     }
 
-    /// Seconds print only when a bound carries them, and a duration the
-    /// server already parsed is one the browser can read back.
     #[test]
     fn schedule_sentence_fixed_prints_seconds_when_a_bound_has_them() {
         let mut saved = schedule(Some("90s"), None);
@@ -938,8 +804,6 @@ mod tests {
         );
     }
 
-    /// A span not yet chosen is not a refusal, so the callout says what
-    /// the mode means and stops there.
     #[test]
     fn schedule_sentence_fixed_blank_span_says_only_the_shape() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "  ", "5m"));
@@ -948,8 +812,6 @@ mod tests {
         assert_eq!(said.note, None);
     }
 
-    /// Custom span text the browser cannot read: the headline still
-    /// quotes it, the example does not exist, the note says who decides.
     #[test]
     fn schedule_sentence_fixed_custom_span_notes_the_server() {
         let said = schedule_sentence("1h", None, &draft(WindowMode::Fixed, "45m", ""));
@@ -958,8 +820,6 @@ mod tests {
         assert_eq!(said.note, Some(CUSTOM_NOTE));
     }
 
-    /// A span that resolves but runs past the example's own day gets no
-    /// example and no note: nothing failed to be read.
     #[test]
     fn schedule_sentence_fixed_week_span_has_no_worked_example() {
         let said = schedule_sentence("1w", None, &draft(WindowMode::Fixed, "1w", ""));

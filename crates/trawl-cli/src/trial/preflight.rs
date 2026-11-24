@@ -5,15 +5,8 @@
 //! What the trial needs from Docker, checked before anything is created.
 //!
 //! The trial needs Docker Engine on this machine, reached over a local
-//! Unix socket, and the Compose v2 plugin at 2.20 or later. The check is a
-//! pure decision over [`EngineFacts`], so every case is testable without
-//! Docker; [`preflight`] gathers the facts and applies it.
+//! Unix socket, and the Compose v2 plugin at 2.20 or later.
 //!
-//! - `DOCKER_HOST`, when set to anything but a `unix://` address, is
-//!   refused before any subprocess runs, so a remote engine is never
-//!   contacted.
-//! - The active context's endpoint must be `unix://` too; a remote
-//!   context is refused before the engine is asked anything.
 //! - The endpoint is resolved once: `DOCKER_HOST` when it is set, else the
 //!   current context's, read with `docker context inspect`. Every later
 //!   probe, and every call the trial makes after preflight, runs through
@@ -23,12 +16,6 @@
 //!   before the first probe (see [`LocalEndpoint`]): each docker child
 //!   reconnects by path, so a socket another user could swap after this
 //!   check would undo the pin.
-//! - The Compose floor is a comparison, so any later major version passes.
-//!   The legacy `docker-compose` v1 executable is never run.
-//!
-//! There is no OS check and no sniffing for Podman or Docker Desktop: the
-//! trial states the endpoint test it performs, and a trusted local socket
-//! that proxies elsewhere is its owner's business.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt;
@@ -42,7 +29,6 @@ use super::docker::{
 /// 2.20 is the release that introduced `up --wait-timeout`.
 pub const COMPOSE_FLOOR: (u64, u64) = (2, 20);
 
-/// A Compose version's numeric core.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ComposeVersion {
     pub major: u64,
@@ -56,9 +42,6 @@ impl fmt::Display for ComposeVersion {
     }
 }
 
-/// Parse `docker compose version --short`: an optional leading `v`, then
-/// `MAJOR.MINOR[.PATCH]`, then optionally a `-` or `+` suffix such as
-/// `-desktop.1`. Anything else is `None`.
 pub fn parse_compose_version(raw: &str) -> Option<ComposeVersion> {
     let text = raw.trim();
     let text = text.strip_prefix('v').unwrap_or(text);
@@ -87,12 +70,9 @@ pub fn parse_compose_version(raw: &str) -> Option<ComposeVersion> {
     })
 }
 
-/// Everything the preflight decision reads.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EngineFacts {
-    /// The `DOCKER_HOST` value, when set.
     pub docker_host: Option<OsString>,
-    /// Whether the `docker` command could be run at all.
     pub docker_installed: bool,
     /// The endpoint the trial pins: a set `DOCKER_HOST`, else the active
     /// context's (`docker context inspect`), when it could be read.
@@ -105,7 +85,6 @@ pub struct EngineFacts {
     pub engine_id: Option<String>,
 }
 
-/// A usable engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Engine {
     pub compose: ComposeVersion,
@@ -165,7 +144,6 @@ pub enum PreflightError {
     EngineIdUnknown,
 }
 
-/// Refuse a `DOCKER_HOST` that is set and is not a `unix://` address.
 /// An empty value is unset, as Docker itself treats it.
 pub fn check_docker_host(value: Option<&OsStr>) -> Result<(), PreflightError> {
     let Some(value) = value.filter(|v| !v.is_empty()) else {
@@ -182,7 +160,6 @@ pub fn check_docker_host(value: Option<&OsStr>) -> Result<(), PreflightError> {
     }
 }
 
-/// The preflight decision. The first unmet requirement is the error.
 pub fn check(facts: &EngineFacts) -> Result<Engine, PreflightError> {
     check_docker_host(facts.docker_host.as_deref())?;
     if !facts.docker_installed {
@@ -236,11 +213,6 @@ fn scheme(address: &str) -> String {
     }
 }
 
-/// Gather the facts and decide. `docker_host` is this process's
-/// `DOCKER_HOST`; it is checked before any subprocess runs, and gathering
-/// stops at the first unmet requirement, so a remote endpoint is never
-/// contacted.
-///
 /// On success, the driver for the trial directory `dir`, pinned to the
 /// endpoint this check accepted. It is the only way the trial gets one.
 pub async fn preflight(
@@ -257,9 +229,6 @@ pub async fn preflight(
     Ok((engine, docker))
 }
 
-/// The facts, and the driver pinned to the endpoint when it is local. A
-/// local endpoint whose socket fails the trust rule, or does not exist,
-/// is an error before any probe runs.
 async fn gather(
     cli: DockerCli,
     dir: PathBuf,
@@ -318,7 +287,6 @@ async fn gather(
     Ok((facts, Some(docker)))
 }
 
-/// One read-only query through the pinned driver.
 async fn probe(docker: &Docker, argv: &[&str]) -> Result<super::docker::Output, DockerError> {
     docker
         .output(
@@ -330,8 +298,6 @@ async fn probe(docker: &Docker, argv: &[&str]) -> Result<super::docker::Output, 
         .await
 }
 
-/// The Docker endpoint of the first context in `docker context inspect`
-/// output.
 fn context_endpoint(json: &[u8]) -> Option<String> {
     let contexts: serde_json::Value = serde_json::from_slice(json).ok()?;
     contexts
@@ -341,7 +307,6 @@ fn context_endpoint(json: &[u8]) -> Option<String> {
         .map(str::to_owned)
 }
 
-/// Whether `docker version --format json` reported a server.
 fn server_present(json: &[u8]) -> bool {
     serde_json::from_slice::<serde_json::Value>(json)
         .ok()
@@ -358,8 +323,6 @@ mod tests {
     use crate::trial::TrialError;
     use crate::trial::docker::tests::stub_cli;
 
-    /// A listening socket at `dir/name`, owned by the test user, and its
-    /// `unix://` address. The socket file stays while the listener lives.
     fn socket(dir: &Path, name: &str) -> (UnixListener, String) {
         let path = dir.join(name);
         let listener = UnixListener::bind(&path).unwrap();
@@ -580,8 +543,6 @@ mod tests {
         );
     }
 
-    /// Answers the four probes the way Docker 29 with Compose 5.5.1 does,
-    /// with the context at `context`.
     fn healthy(context: &str) -> String {
         format!(
             r#"
@@ -693,8 +654,6 @@ esac"#
         assert_eq!(check(&facts), Err(PreflightError::ComposeMissing));
     }
 
-    /// A stub that logs each call with the endpoint variables it saw, then
-    /// answers as [`healthy`] does, with the context at `context`.
     fn logged(context: &str) -> String {
         format!(
             r#"echo "$* host=${{DOCKER_HOST-unset}} ctx=${{DOCKER_CONTEXT-unset}}" >> "$(dirname "$0")/calls"
@@ -711,7 +670,6 @@ esac"#
             .collect()
     }
 
-    /// The three probes after the endpoint, as [`logged`] records them.
     fn probes(host: &str) -> [String; 3] {
         [
             format!("version --format json host={host} ctx=unset"),
@@ -747,8 +705,6 @@ esac"#
         assert_eq!(calls(&tmp), probes(&host));
     }
 
-    /// The finding: a socket another user could replace after preflight
-    /// is refused before the first probe, from `DOCKER_HOST` or a context.
     #[tokio::test]
     async fn an_untrusted_socket_is_refused_before_any_probe() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -803,12 +759,8 @@ esac"#
     const CHILD_ENDPOINT: &str = "TRAWL_TEST_PINNED_DOCKER_ENDPOINT";
     const BOGUS_CONTEXT: &str = "trawl-test-bogus-context";
 
-    /// On this host's Docker: preflight resolves the real endpoint, then
-    /// this test binary runs [`pinned_driver_under_a_bogus_context`] again
-    /// with `DOCKER_CONTEXT` naming a context that does not exist and no
-    /// `DOCKER_HOST`. The test's own process environment cannot be
-    /// changed (`set_var` is unsafe, and the crate forbids unsafe code),
-    /// hence the child process.
+    /// The test's own process environment cannot be changed (`set_var` is
+    /// unsafe, and the crate forbids unsafe code), hence the child process.
     #[tokio::test]
     async fn a_bogus_parent_context_does_not_move_the_pinned_driver() {
         let dir = tempfile::tempdir().unwrap();

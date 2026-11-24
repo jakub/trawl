@@ -2,20 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! AST type definitions for the trawl query language.
-//!
-//! These types are the contract between the parser and every consumer of a
-//! parsed query: the SQL emitter, the in-memory filter and stream compiler,
-//! and the DSL formatter.
-
 use std::fmt;
 use std::ops::Range;
 
-// ---------------------------------------------------------------------------
-// Span wrapper
-// ---------------------------------------------------------------------------
-
-/// A node annotated with its source location.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Spanned<T> {
     pub node: T,
@@ -28,12 +17,6 @@ impl<T> Spanned<T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Top-level query
-// ---------------------------------------------------------------------------
-
-/// A complete trawl DSL query: an optional search stage followed by zero or
-/// more pipe stages.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Query {
     pub search: SearchStage,
@@ -41,7 +24,6 @@ pub struct Query {
 }
 
 impl Query {
-    /// If the first pipeline stage is `from saved`, return a reference to it.
     #[must_use]
     pub fn from_saved_stage(&self) -> Option<&FromSavedStage> {
         self.pipeline.first().and_then(|s| match &s.node {
@@ -50,27 +32,16 @@ impl Query {
         })
     }
 
-    /// Whether the search stage is empty (no groups, no time filters, no bounds).
     #[must_use]
     pub fn has_empty_search(&self) -> bool {
         self.search.groups.iter().all(Vec::is_empty) && self.time_clause().is_none()
     }
 
-    /// The time clause this query carries, if any. Delegates to
-    /// [`SearchStage::time_clause`], the ONE predicate write policy reads
-    /// (ADR-0018 ruling 7); read it there for why a text scan cannot
-    /// stand in for it.
     #[must_use]
     pub fn time_clause(&self) -> Option<TimeClause> {
         self.search.time_clause()
     }
 
-    /// Whether any pipeline stage emits aggregated rows (stats, timechart,
-    /// top, rare, pivot).
-    ///
-    /// Consumers use this to distinguish "raw event stream" queries from
-    /// "shaped result snapshot" queries — e.g. the live-tail UI renders
-    /// aggregating queries as charts and raw-event queries as tables.
     #[must_use]
     pub fn has_aggregation(&self) -> bool {
         self.pipeline.iter().any(|s| {
@@ -86,24 +57,13 @@ impl Query {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Search stage (everything before the first `|`)
-// ---------------------------------------------------------------------------
-
 /// The implicit search stage — OR-separated groups of AND-joined tokens.
 ///
 /// `a b OR c d` → groups: `[[a, b], [c, d]]`
 /// A query without OR has a single group.
-///
-/// Time filters are hoisted out of groups and applied globally — a query
-/// like `service=nginx last=2h OR service=postgres` applies the time
-/// filter to both groups. A time clause sits only at the top level of the
-/// search stage: inside parentheses or under `NOT` it is a parse error
-/// (ADR-0061 ruling 2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchStage {
     pub groups: Vec<Vec<Spanned<SearchToken>>>,
-    /// Global time filter, hoisted from groups during parsing.
     /// If multiple `last=` tokens appear, last one wins.
     pub time_filter: Option<Spanned<TimeFilter>>,
     /// Absolute lower time bound (`earliest="..."`), hoisted from groups.
@@ -111,22 +71,13 @@ pub struct SearchStage {
     /// Absolute upper time bound (`latest="..."`), hoisted from groups.
     pub latest: Option<Spanned<TimeBound>>,
     /// Every time clause hoisted from groups, with the span of the clause
-    /// token itself.
-    ///
-    /// The three fields above keep the last clause of each kind, and the
-    /// groups no longer hold the others, so this list is the only record
-    /// of where they were: a caller that rewrites the text reads it to cut
-    /// every clause from one parse. Every clause sits at the top level, so
-    /// the list is in text order, and the last entry of each kind is the
-    /// clause its field carries.
+    /// token itself. The three fields above keep the last clause of each
+    /// kind, so this list is the only record of where they were. The list
+    /// is in text order.
     pub hoisted: Vec<Spanned<TimeClause>>,
 }
 
 impl SearchStage {
-    /// All tokens across all groups, flattened.
-    ///
-    /// Convenience for consumers that don't care about OR grouping
-    /// (e.g. extracting time filters, counting tokens in tests).
     pub fn all_tokens(&self) -> impl Iterator<Item = &Spanned<SearchToken>> {
         self.groups.iter().flat_map(|g| g.iter())
     }
@@ -134,18 +85,11 @@ impl SearchStage {
     /// The time clause this search stage carries, if any: the first
     /// present of `last=`, `earliest=`, `latest=`.
     ///
-    /// This is the ONE answer to "does this query own its own window",
-    /// and write policy reads it here (ADR-0018 ruling 7: a schedule
-    /// window and a query time clause may not coexist, in either
-    /// direction). Reading it off the parsed AST is what makes the
-    /// refusal exact. A text scan over the query source
-    /// ([`crate::parser::scan`]) cannot answer the question, in both
-    /// directions. The grammar keywords are also reachable as ordinary
-    /// field names through backticks, so `` `last`=5 `` is a filter on a
-    /// column called `last` and carries no window, while a scanner
-    /// looking for the word would refuse it. And the parser hoists a
-    /// clause out of an OR group, so `service=x OR last=1h` carries a
-    /// window that a per-group reading of the text would miss.
+    /// Write policy reads it here (ADR-0018 ruling 7). A text scan over the
+    /// query source ([`crate::parser::scan`]) cannot answer the question:
+    /// `` `last`=5 `` is a filter on a column called `last`, and the parser
+    /// hoists a clause out of an OR group, so `service=x OR last=1h` carries a
+    /// window.
     ///
     /// Which of the three is reported matters only for the message a
     /// refusal prints. A parsed query never carries `last=` beside an
@@ -181,7 +125,6 @@ pub enum TimeClause {
 }
 
 impl TimeClause {
-    /// The DSL keyword that spells this clause.
     #[must_use]
     pub fn keyword(self) -> &'static str {
         match self {
@@ -194,11 +137,6 @@ impl TimeClause {
 
 /// An `earliest=` or `latest=` bound: the text as written, and the instant
 /// it reads as (ADR-0017's amendment of 2026-11-08).
-///
-/// The formatter and the canonical form read the text, so a query keeps
-/// its source identity. Both lanes execute the instant. [`Self::read`] is
-/// the only constructor, so the two cannot disagree, and clearing the
-/// slot that holds a bound drops both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeBound {
     text: String,
@@ -216,20 +154,17 @@ impl TimeBound {
         })
     }
 
-    /// The bound as the query wrote it.
     #[must_use]
     pub fn text(&self) -> &str {
         &self.text
     }
 
-    /// The instant events are compared with.
     #[must_use]
     pub fn instant(&self) -> crate::compare::Instant {
         self.instant
     }
 }
 
-/// A single token in the search stage.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SearchToken {
     /// `field=value`, `field>=100`, `field=200,301,404`
@@ -251,14 +186,9 @@ pub enum SearchToken {
 }
 
 /// Drops a search tree with an explicit work list, so its depth costs
-/// heap, not stack.
-///
-/// The search grammar builds `NOT` runs and nested brackets as deep as
-/// `MAX_QUERY_LEN` allows, tens of thousands of levels, before the tree
-/// depth check refuses them (#447), and the tree is dropped on every exit
-/// from the parser. Drop glue would recurse once a level and overflow a
-/// tokio worker's 2 MiB stack, so each token hands its children that own
-/// children to the work list before it is freed, as [`Expr`]'s drop does.
+/// heap, not stack. The search grammar builds `NOT` runs and nested
+/// brackets as deep as `MAX_QUERY_LEN` allows before the tree depth check
+/// refuses them, and drop glue would overflow a tokio worker's 2 MiB stack.
 ///
 /// Only the drop has this guarantee: the derived `Clone`, `PartialEq` and
 /// `Debug` still recurse.
@@ -318,7 +248,6 @@ impl SearchToken {
     }
 }
 
-/// A field-value filter with an operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FieldFilter {
     pub field: String,
@@ -326,8 +255,6 @@ pub struct FieldFilter {
     pub value: FilterValue,
 }
 
-/// Comparison operators for field filters.
-///
 /// The operator is the comparison the author typed. Whether the value is a
 /// pattern is a fact about the value ([`Scalar`]), never an operator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -353,7 +280,6 @@ impl fmt::Display for FilterOp {
     }
 }
 
-/// One value of a field filter, with its kind.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     /// Not a pattern. This is not byte equality: an exact value still binds
@@ -366,24 +292,20 @@ pub enum Scalar {
     Regex(String),
 }
 
-/// The right-hand side of a field filter.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FilterValue {
-    /// A single value.
     Single(Scalar),
     /// A comma-separated list. It has at least two elements; the parser
     /// owns that invariant.
     List(Vec<Scalar>),
 }
 
-/// Bare-word text search, optionally negated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TextSearch {
     pub term: String,
     pub negated: bool,
 }
 
-/// Time-range filter (`last=2h`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct TimeFilter {
     pub duration: TrawlDuration,
@@ -438,7 +360,6 @@ impl fmt::Display for TrawlDuration {
     }
 }
 
-/// Time units supported by `last=` filters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeUnit {
     Seconds,
@@ -466,11 +387,6 @@ pub struct QuotedSearch {
     pub phrase: String,
 }
 
-// ---------------------------------------------------------------------------
-// Pipe stages
-// ---------------------------------------------------------------------------
-
-/// A stage in the query pipeline (after `|`).
 #[derive(Debug, Clone, PartialEq)]
 pub enum PipeStage {
     Stats(StatsStage),
@@ -546,7 +462,6 @@ pub struct SortStage {
     pub fields: Vec<SortField>,
 }
 
-/// A single field in a sort clause.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SortField {
     pub field: String,
@@ -570,9 +485,6 @@ impl fmt::Display for SortDirection {
 }
 
 /// `limit 20` — cap the number of results.
-///
-/// Also parsed from `head 20` (SPL alias). The `keyword` field preserves
-/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LimitStage {
     pub count: u64,
@@ -581,9 +493,6 @@ pub struct LimitStage {
 }
 
 /// `table status, avg_duration` — select output columns.
-///
-/// Also parsed from `fields` (SPL alias). The `keyword` field preserves
-/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableStage {
     pub fields: Vec<String>,
@@ -617,9 +526,6 @@ pub struct DropStage {
 ///
 /// Supports comma-separated multi-assignment:
 /// `let a = lower(service), b = length(service)`
-///
-/// Also parsed from `eval` (SPL alias). The `keyword` field preserves
-/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LetStage {
     pub assignments: Vec<(String, Spanned<Expr>)>,
@@ -627,7 +533,6 @@ pub struct LetStage {
     pub keyword: &'static str,
 }
 
-/// The mode of extraction for `extract`.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtractMode {
     /// Named-group regex extraction.
@@ -637,9 +542,6 @@ pub enum ExtractMode {
 }
 
 /// `extract "(?P<ip>\\d+)" from message` — regex-based field extraction.
-///
-/// Also parsed from `rex` (SPL alias). The `keyword` field preserves
-/// which form the user wrote so the formatter can round-trip it.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractStage {
     pub mode: ExtractMode,
@@ -710,7 +612,6 @@ pub struct FromSavedStage {
     pub run: SavedRunSelector,
 }
 
-/// Which run(s) to load for a `from saved` query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SavedRunSelector {
     /// Most recent successful run (default).
@@ -738,7 +639,6 @@ pub struct SampleStage {
     pub mode: SampleMode,
 }
 
-/// Sampling mode: percentage or row count.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SampleMode {
     /// `sample 10%` — bernoulli sampling at given percentage.
@@ -747,11 +647,6 @@ pub enum SampleMode {
     Count(u64),
 }
 
-// ---------------------------------------------------------------------------
-// Expressions (used in where clauses, aggregation args, etc.)
-// ---------------------------------------------------------------------------
-
-/// An expression node in the AST.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     /// Binary operation: `a + b`, `count > 10`, `a and b`
@@ -772,7 +667,6 @@ pub enum Expr {
     },
     /// Field reference: `host`, `host.name`, `@timestamp`
     FieldRef(String),
-    /// Literal value
     Literal(LiteralValue),
     /// `x in (1, 2, 3)`
     InList {
@@ -782,15 +676,9 @@ pub enum Expr {
 }
 
 /// Drops a tree with an explicit work list, so its depth costs heap, not
-/// stack.
-///
-/// `MAX_EXPR_DEPTH` bounds nesting, not a flat chain: `1+1+…` folds into a
-/// left-deep tree as deep as the chain is long, and the longest chain
-/// `MAX_QUERY_LEN` admits is tens of thousands of levels. Drop glue would
-/// recurse once a level and overflow a tokio worker's 2 MiB stack, so each
-/// node hands its children that own children to the work list before it
-/// is freed, and no drop runs below the node being dropped. Leaves and
-/// nodes whose children are all leaves free without allocating.
+/// stack. `MAX_EXPR_DEPTH` bounds nesting, not a flat chain: `1+1+…` folds
+/// into a left-deep tree as deep as the chain is long, and drop glue would
+/// overflow a tokio worker's 2 MiB stack.
 ///
 /// Only the drop has this guarantee: the derived `Clone`, `PartialEq` and
 /// `Debug` still recurse.
@@ -858,23 +746,19 @@ impl Expr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
-    // arithmetic
     Add,
     Sub,
     Mul,
     Div,
     Mod,
-    // comparison
     Eq,
     Ne,
     Gt,
     Gte,
     Lt,
     Lte,
-    // logical
     And,
     Or,
-    // pattern
     Matches,
     Like,
     ILike,
@@ -919,17 +803,9 @@ impl fmt::Display for UnaryOp {
 }
 
 /// A float literal: the parsed value together with the source text it was
-/// written as.
-///
-/// The text is not decoration. A pipeline comparison against a VARCHAR pin
-/// binds the literal's text into `DECIMAL(38,6)` instead of round-tripping
-/// through `f64` (ADR-0011 ruling #6), which is lossy the moment a literal
-/// needs more than 53 bits: `9007199254740993.0` parses as `9007199254740992`,
-/// so rendering the parsed double back would compare against the adjacent
-/// identifier, and the same query written `"9007199254740993.0"` — a string
-/// literal, carried verbatim — would answer differently, contradicting the
-/// quote-insensitivity of pipeline comparisons. Keeping the token means the
-/// pipeline binds exactly what the search stage binds for the same text.
+/// written as. A pipeline comparison against a VARCHAR pin binds the
+/// literal's text into `DECIMAL(38,6)` instead of round-tripping through
+/// `f64` (ADR-0011 ruling #6), which is lossy past 53 bits.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FloatLiteral {
     value: f64,
@@ -937,7 +813,6 @@ pub struct FloatLiteral {
 }
 
 impl FloatLiteral {
-    /// A float literal read from source: the parsed value and its token.
     pub fn new(value: f64, text: impl Into<String>) -> Self {
         Self {
             value,
@@ -961,7 +836,7 @@ impl FloatLiteral {
 impl From<f64> for FloatLiteral {
     /// A literal with no token behind it (a programmatically built AST).
     /// Rust renders the shortest round-tripping decimal, so the text reads
-    /// back as exactly this double — the best a value with no source can do.
+    /// back as exactly this double.
     fn from(value: f64) -> Self {
         Self {
             text: value.to_string(),
@@ -976,7 +851,6 @@ impl fmt::Display for FloatLiteral {
     }
 }
 
-/// Literal values in expressions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum LiteralValue {
     String(String),
@@ -998,10 +872,6 @@ impl fmt::Display for LiteralValue {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1014,10 +884,6 @@ mod tests {
             .time_clause()
     }
 
-    /// Drift guard: the enum and the grammar's keyword set are the same
-    /// three words in the same order. A fourth keyword added to the
-    /// parser fails here until [`TimeClause`] learns it, which is what
-    /// keeps the write-policy predicate total (ADR-0018 ruling 7).
     #[test]
     fn grammar_keywords_and_time_clause_variants_agree() {
         let variants = [TimeClause::Last, TimeClause::Earliest, TimeClause::Latest];
@@ -1038,18 +904,12 @@ mod tests {
         );
     }
 
-    /// The parser hoists a time clause out of an OR group, so the query
-    /// carries a window though the clause sits in one group's token list.
-    /// Under `NOT` a clause does not parse at all (ADR-0061 ruling 2), so
-    /// no query carries a window there.
     #[test]
     fn a_hoisted_clause_still_counts() {
         assert_eq!(clause("service=x OR last=1h"), Some(TimeClause::Last));
         assert!(parser::parse("NOT last=1h").is_err());
     }
 
-    /// A backticked `last` is a field name, not the keyword: the whole
-    /// reason this predicate reads the AST instead of the query text.
     #[test]
     fn a_backticked_keyword_is_a_field_filter_not_a_window() {
         assert_eq!(clause("`last`=5"), None);
@@ -1061,7 +921,6 @@ mod tests {
         assert_eq!(clause("| stats count()"), None);
     }
 
-    /// Runs `work` on a thread with the 2 MiB stack of a tokio worker.
     fn on_worker_stack(case: &str, work: impl FnOnce() + Send + 'static) {
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
         std::thread::Builder::new()
@@ -1073,8 +932,6 @@ mod tests {
             .unwrap_or_else(|_| panic!("{case}: must parse and drop on a 2 MiB stack"));
     }
 
-    /// Parses `dsl` on a 2 MiB stack, where the parser builds the deep
-    /// tree, refuses it for its depth and drops it.
     fn parse_refuse_and_drop(case: &str, dsl: String) {
         assert!(dsl.len() <= parser::MAX_QUERY_LEN, "{case}: {}", dsl.len());
         on_worker_stack(case, move || {
@@ -1084,14 +941,8 @@ mod tests {
         });
     }
 
-    /// A tree as deep as the longest chain any query spells drops on a
-    /// tokio worker's 2 MiB stack in a debug build, whatever variants it
-    /// nests, and so does one a panic unwinds through. A recursive drop
-    /// overflows this stack at about 16 000 levels.
-    ///
-    /// The grammar builds every such tree before the tree depth check
-    /// refuses it, and the refusal drops it inside the parse. A tree that
-    /// outlives a parse, as the unwind case needs, is built in code.
+    /// A recursive drop overflows a tokio worker's 2 MiB stack in a debug
+    /// build at about 16 000 levels.
     #[test]
     fn expression_drop_fits_worker_stack() {
         const TERMS: usize = 32_000;
@@ -1110,8 +961,6 @@ mod tests {
         parse_refuse_and_drop("in subject", format!("{prefix}{} in (1)", chain()));
         parse_refuse_and_drop("in element", format!("{prefix}a in (1, {})", chain()));
 
-        // The parser drops what it built when the text after the chain
-        // fails to parse.
         let broken = format!("{prefix}{} | where", chain());
         on_worker_stack("parse error", move || {
             let query = parser::parse(&broken);
@@ -1162,7 +1011,6 @@ mod tests {
         });
     }
 
-    /// A search leaf: one bare word.
     fn search_leaf() -> Spanned<SearchToken> {
         Spanned::new(
             SearchToken::TextSearch(TextSearch {
@@ -1173,7 +1021,6 @@ mod tests {
         )
     }
 
-    /// `depth` nested brackets around one search word.
     fn nested_groups(depth: usize) -> Spanned<SearchToken> {
         let mut tree = search_leaf();
         for _ in 0..depth {
@@ -1182,11 +1029,7 @@ mod tests {
         tree
     }
 
-    /// A search tree as deep as any text the grammar builds before the
-    /// tree depth check refuses it drops on a tokio worker's 2 MiB stack in
-    /// a debug build, whatever variants it nests, and so does one a panic
-    /// unwinds through. The trees are built in code, as the parser would
-    /// refuse their text.
+    /// The trees are built in code, as the parser would refuse their text.
     #[test]
     fn search_token_drop_fits_worker_stack() {
         const BRACKETS: usize = 30_000;
@@ -1202,8 +1045,6 @@ mod tests {
             drop(tree);
         });
 
-        // Each bracket holds the deeper tree beside a leaf, and a second
-        // OR branch of its own.
         on_worker_stack("mixed", || {
             let mut tree = search_leaf();
             for level in 0..BRACKETS {

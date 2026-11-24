@@ -35,39 +35,24 @@ struct Fixture {
     crash_at: Option<&'static str>,
     /// Enable the syslog listeners (ephemeral ports) and the scheduler.
     producers: bool,
-    /// `[ingest] enabled`; false boots a query-only node.
     ingest: bool,
-    /// The umask the daemon inherits, set in its parent shell alone; the
-    /// test process keeps its own.
     child_umask: Option<u32>,
-    /// Where the daemon's certificate comes from.
     tls: Tls,
-    /// `[server] query_log`.
     query_log: Option<PathBuf>,
-    /// `[ingest] wal_dir`, when not `wal` beside the data root.
     wal_dir: Option<PathBuf>,
-    /// The daemon's `TMPDIR`; unset leaves the system default.
     tmpdir: Option<PathBuf>,
-    /// `[server] query_scratch_dir`; unset leaves the default beside the
-    /// data root ([`Fixture::scratch`]).
     query_scratch_dir: Option<PathBuf>,
-    /// The file the next spawn writes its combined output to, under the
-    /// fixture root.
     daemon_log: &'static str,
 }
 
-/// The certificate a spawned daemon serves.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tls {
-    /// The shared test pair, named in `tls_cert_path` and `tls_key_path`.
     Shared,
     /// Neither path is set, so trawld generates its own pair under the
     /// state directory.
     Generated,
 }
 
-/// The file whose existence releases a boot pass held by
-/// `TRAWL_TEST_HOLD_BOOT_PASS`.
 const BOOT_PASS_RELEASE: &str = "boot-pass.release";
 
 impl Fixture {
@@ -109,14 +94,12 @@ impl Fixture {
         self.storage_root().join("data")
     }
 
-    /// The query scratch directory the daemon uses.
     fn scratch(&self) -> PathBuf {
         self.query_scratch_dir
             .clone()
             .unwrap_or_else(|| self.storage_root().join("data.query-scratch"))
     }
 
-    /// The results root the daemon holds: the default beside the data root.
     fn results(&self) -> PathBuf {
         self.storage_root().join("data.results")
     }
@@ -386,8 +369,6 @@ impl Fixture {
 struct Daemon {
     child: Child,
     log: PathBuf,
-    /// The certificate readiness trusts, when trawld generated its own;
-    /// otherwise the shared test pair's.
     trusted_cert: Option<PathBuf>,
 }
 
@@ -417,7 +398,6 @@ impl Daemon {
             .await;
     }
 
-    /// [`Self::refused`], for a refusal that takes up to `within`.
     async fn refused_within(&mut self, diagnostic: &str, within: Duration) {
         let deadline = Instant::now() + within;
         loop {
@@ -444,8 +424,6 @@ impl Daemon {
         self.serving("ok").await
     }
 
-    /// Wait until the daemon listens and `/api/v1/health` answers with
-    /// `status`; returns its base URL.
     async fn serving(&mut self, status: &str) -> String {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -510,14 +488,10 @@ impl Daemon {
         .await;
     }
 
-    /// Wait up to 30 s for a log line matching `matches`, while the daemon
-    /// runs; returns the log.
     async fn wait_for_log(&mut self, failure: &str, matches: impl Fn(&str) -> bool) -> String {
         self.wait_for_lines(failure, 1, matches).await
     }
 
-    /// Wait up to 30 s for `at_least` log lines matching `matches`, while
-    /// the daemon runs; returns the log.
     async fn wait_for_lines(
         &mut self,
         failure: &str,
@@ -540,8 +514,6 @@ impl Daemon {
         }
     }
 
-    /// Wait until the daemon parks at the test crash point `point`, then
-    /// SIGKILL it and reap it. Returns the log of the killed process.
     async fn kill_at(&mut self, point: &str) -> String {
         let needle = format!("point=\"{point}\"");
         let deadline = Instant::now() + Duration::from_secs(30);
@@ -744,8 +716,6 @@ async fn database_refusal_does_not_initialize_fresh_root() {
         !fixture.wal().exists(),
         "refused startup initialized storage"
     );
-    // The scratch directory and the results root are made and locked before
-    // admission, and are all a refused start leaves, both empty.
     let mut left: Vec<_> = std::fs::read_dir(fixture.storage_root())
         .unwrap()
         .map(|entry| entry.unwrap().path())
@@ -794,11 +764,6 @@ async fn competing_writer_refuses_before_filesystem_recovery() {
     fixture.assert_lock_free().await;
 }
 
-/// A database failure in boot's stale report-run marking (ADR-0018, amended
-/// 2026-11-06) stops trawld before it listens: `main` runs
-/// `boot::prepare_corpus` before the listener binds, so a daemon that cannot
-/// prove its schedules are free never accepts a claim on them. The planted
-/// run stays `running` because the marking rolled back.
 #[tokio::test]
 async fn stale_report_run_recovery_failure_refuses_before_listening() {
     let fixture = Fixture::new().await;
@@ -899,8 +864,6 @@ async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
         !fixture.storage_root().join("wal").exists(),
         "telemetry wrote to WAL before reconciliation completed"
     );
-    // Kill the actual lock-holding PostgreSQL session while reconciliation
-    // is blocked. The startup watcher must terminate without serving.
     let killed: bool = sqlx::query_scalar(
         "SELECT pg_terminate_backend(pid) FROM pg_locks WHERE locktype='advisory'
          AND database=(SELECT oid FROM pg_database WHERE datname=current_database())
@@ -917,7 +880,6 @@ async fn admitted_lock_and_fatal_watcher_cover_store_reconciliation() {
         .await;
     blocker.rollback().await.unwrap();
     fixture.assert_lock_free().await;
-    // The interrupted recovery remains restartable after the lock failure.
     let mut replacement = fixture.spawn();
     replacement.ready().await;
     replacement.stop().await;
@@ -1088,17 +1050,9 @@ async fn fresh_boot_restart_and_interrupted_current_cutover() {
     fixture.assert_lock_free().await;
 }
 
-/// AC8 (#252): publication recovery runs at boot, before the listener and
-/// every producer. One marker records a publish whose output is in place
-/// (canonical identity matches); the other records one that never renamed
-/// (canonical absent, tmp present). After the boot, both markers are gone,
-/// the published WAL is retired, the unpublished WAL is kept and its tmp is
-/// removed, and both outcomes are logged before the first line of boot
-/// conformance, of every producer and background task, and of the
-/// listener. The first compaction pass runs at boot, after recovery, and
-/// publishes the kept WAL once (ADR-0041 slice 2); a long compaction
-/// interval keeps every later tick out of the picture. The restarted
-/// daemon runs internal telemetry, so its activation is ordered too.
+/// The first compaction pass runs at boot, after recovery, and publishes the
+/// unpublished WAL that recovery kept once; a long compaction interval keeps
+/// every later tick out of the picture.
 #[tokio::test]
 async fn boot_recovers_publication_markers_before_serving() {
     use trawl_server::ingest::publication_marker::{ValidatedMarker, identity_of, write_marker};
@@ -1107,8 +1061,6 @@ async fn boot_recovers_publication_markers_before_serving() {
     fixture.current_fleet().await;
     fixture.compaction_interval_secs = Some(3600);
     fixture.producers = true;
-    // A first boot initializes the data root and databases, as a daemon
-    // that later crashed mid-publish would have.
     let mut daemon = fixture.spawn();
     daemon.ready().await;
     daemon.stop().await;
@@ -1294,28 +1246,14 @@ async fn assert_recovery_precedes_boot_steps(daemon: &Daemon) {
     }
 }
 
-// Real-process crash tests for the publication protocol (#252, ADR-0041).
-//
-// Each test ingests uniquely tagged events through authenticated HTTP into a
-// daemon whose `TRAWL_TEST_CRASH_AT` parks it at one publish or recovery
-// point, SIGKILLs it there, checks what the kill left on disk, and restarts
-// it. The daemon then has to publish every acknowledged event exactly once:
-// counted over the parquet files with DuckDB and through the query API,
-// after the restart and after two further completed compaction ticks.
-
 /// The service every crash test ingests into, so every publish of the test
 /// lands in one canonical file and a later tick merges into it.
 const CRASH_SERVICE: &str = "crashsvc";
 /// Events the crash test acknowledges, in one ingest request to one service.
 ///
-/// One request makes one WAL file, renamed into place and acknowledged
-/// before its min-age starts counting down. So the first eligible tick sees
-/// every acknowledged event, and the marker of the killed publish names that
-/// one file. Two requests would let a tick select the first file while the
-/// second is still in flight, and the marker would then cover only part of
-/// the acknowledged events. Retirement order across several consumed WAL
-/// files is covered in-process by the `ac2_*` matrix in
-/// `ingest::publication_marker`.
+/// Two requests would let a tick select the first file while the second is
+/// still in flight, and the marker would then cover only part of the
+/// acknowledged events.
 const CRASH_EVENTS: usize = 100;
 
 /// What boot publication recovery did with a crashed publish, and so where
@@ -1330,7 +1268,6 @@ enum Recovered {
     RolledBack,
 }
 
-/// A daemon killed mid-publish, with what it had acknowledged.
 struct CrashedPublish {
     fixture: Fixture,
     token: String,
@@ -1338,14 +1275,11 @@ struct CrashedPublish {
     time: String,
     tag: String,
     acknowledged: i64,
-    /// The one WAL file the acknowledged request wrote.
     wal_file: PathBuf,
     marker: trawl_server::ingest::publication_marker::ValidatedMarker,
 }
 
 impl CrashedPublish {
-    /// Ingest the tagged events into a daemon that parks at `point` on its
-    /// first publish, and SIGKILL it there.
     async fn at(point: &'static str) -> Self {
         let mut fixture = Fixture::new().await;
         fixture.current_fleet().await;
@@ -1389,16 +1323,6 @@ impl CrashedPublish {
         }
     }
 
-    /// Restart without a crash point, with the boot pass held, and assert
-    /// the first query at readiness counts every acknowledged event exactly
-    /// once from where boot recovery left it ([`Recovered`]). No pass can
-    /// have published anything yet, so when recovery rolled the publish
-    /// back, parquet holds none of the rows and the query counts them from
-    /// the hot buffer the boot hydrated from the kept WAL (ADR-0041 slice
-    /// 2). Then release the boot pass, which publishes that WAL under a
-    /// marker of its own, and assert the count again over the parquet files
-    /// and the query API after two further completed compaction ticks. Ends
-    /// with no marker, no tmp and no WAL.
     async fn restart_exactly_once(&self, recovered: Recovered) {
         let mut daemon = self.fixture.spawn_holding_boot_pass();
         let client = client(&daemon.ready().await, &self.token);
@@ -1471,8 +1395,6 @@ impl CrashedPublish {
         .await;
     }
 
-    /// The kill after the rename: the canonical output carries the marker's
-    /// identity and every WAL file it consumed is still in place.
     fn assert_published_unretired(&self) {
         let data = self.fixture.data();
         let canonical = self.marker.canonical(&data);
@@ -1485,8 +1407,6 @@ impl CrashedPublish {
         self.assert_wal_kept();
     }
 
-    /// The kill before the rename: the tmp carries the marker's identity, no
-    /// canonical output exists, and every consumed WAL file is in place.
     fn assert_staged_unpublished(&self) {
         let data = self.fixture.data();
         assert_eq!(
@@ -1505,8 +1425,6 @@ impl CrashedPublish {
         assert!(self.wal_file.is_file(), "the consumed WAL is kept");
     }
 
-    /// Restart with a recovery crash point; boot recovery parks there and is
-    /// killed before the daemon serves.
     async fn kill_boot_recovery_at(&mut self, point: &'static str) {
         self.fixture.crash_at = Some(point);
         let mut daemon = self.fixture.spawn();
@@ -1523,7 +1441,6 @@ fn client(url: &str, token: &str) -> trawl_client::HttpClient {
     trawl_client::HttpClient::new_insecure(url, token).unwrap()
 }
 
-/// A key allowed to ingest and query, minted in the fixture's keystore.
 async fn writer_token(fixture: &Fixture) -> String {
     let store = fleet_auth::KeyStore::from_pool(fixture.fleet.clone());
     store
@@ -1549,8 +1466,6 @@ fn recent_time() -> String {
         .to_string()
 }
 
-/// Ingest `size` events tagged `tag` in one request; returns the count the
-/// daemon acknowledged, asserting it acknowledged all of them.
 async fn ingest(client: &trawl_client::HttpClient, time: &str, tag: &str, size: usize) -> i64 {
     let records: Vec<serde_json::Value> = (0..size)
         .map(|seq| {
@@ -1575,7 +1490,6 @@ fn marker_path(fixture: &Fixture) -> PathBuf {
         .join(format!("wal/prod/.publish-{CRASH_SERVICE}.json"))
 }
 
-/// Unconsumed WAL files: every `*.ndjson` in the env's WAL directory.
 fn wal_files(fixture: &Fixture) -> Vec<PathBuf> {
     let dir = fixture.storage_root().join("wal/prod");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -1587,8 +1501,6 @@ fn wal_files(fixture: &Fixture) -> Vec<PathBuf> {
     files
 }
 
-/// Exact count of events tagged `tag` over every published parquet file;
-/// 0 when nothing was ever published.
 fn parquet_count(data: &Path, tag: &str) -> i64 {
     fn walk(path: &Path, files: &mut Vec<String>) {
         for entry in std::fs::read_dir(path).unwrap() {
@@ -1620,7 +1532,6 @@ fn parquet_count(data: &Path, tag: &str) -> i64 {
     .unwrap()
 }
 
-/// Exact count of events tagged `tag` through the query API.
 async fn api_count(client: &trawl_client::HttpClient, tag: &str) -> i64 {
     let dsl = format!("crash_tag=\"{tag}\" last=24h | stats count()");
     let result = client.query_paginated(&dsl, None, None).await.unwrap();
@@ -1662,14 +1573,12 @@ async fn assert_api_exactly_once(
     );
 }
 
-/// The value of the field `name` on a formatted log line.
 fn log_field<'a>(line: &'a str, name: &str) -> &'a str {
     line.split_whitespace()
         .find_map(|token| token.strip_prefix(name)?.strip_prefix('='))
         .unwrap_or_else(|| panic!("no {name} field: {line}"))
 }
 
-/// The one `boot_hydration` line in a daemon's log.
 fn boot_hydration(log: &str) -> &str {
     let mut lines = log
         .lines()
@@ -1681,9 +1590,6 @@ fn boot_hydration(log: &str) -> &str {
     line
 }
 
-/// Wait for `ticks` further compaction ticks to complete; returns the number
-/// of probe events published on the way.
-///
 /// Compaction logs no per-tick line, so ticks are observed through WAL
 /// state: each probe is one acknowledged event, ingested only after the
 /// previous probe's WAL was retired and no marker remained. Ticks run one at
@@ -1706,8 +1612,6 @@ async fn complete_ticks(
     probes
 }
 
-/// Wait up to 30 s until compaction has retired every WAL file and left no
-/// publication marker.
 async fn wait_for_drain(fixture: &Fixture, failure: &str) {
     let deadline = Instant::now() + Duration::from_secs(30);
     while !wal_files(fixture).is_empty() || marker_path(fixture).exists() {
@@ -1720,10 +1624,6 @@ async fn wait_for_drain(fixture: &Fixture, failure: &str) {
     }
 }
 
-/// AC1 (#252): a kill after the canonical rename and before WAL retirement
-/// leaves the marker, the published output and its consumed WAL. Boot
-/// recovery completes the publish, retiring that WAL instead of merging it
-/// again.
 #[tokio::test]
 async fn compaction_crash_after_publish_before_retire_is_exactly_once() {
     let crashed = CrashedPublish::at("publish:after_rename").await;
@@ -1732,10 +1632,6 @@ async fn compaction_crash_after_publish_before_retire_is_exactly_once() {
     crashed.restart_exactly_once(Recovered::Published).await;
 }
 
-/// AC3 (#252): a kill after the marker and before the rename leaves the
-/// marker, the staged tmp and the WAL. Recovery removes the tmp and the
-/// marker and keeps the WAL, the boot hydrates it, so the first query
-/// counts it (#265), and the next tick publishes it once.
 #[tokio::test]
 async fn restart_compaction_crash_after_marker_before_rename_is_exactly_once() {
     let crashed = CrashedPublish::at("publish:after_marker").await;
@@ -1744,11 +1640,6 @@ async fn restart_compaction_crash_after_marker_before_rename_is_exactly_once() {
     crashed.restart_exactly_once(Recovered::RolledBack).await;
 }
 
-/// AC2 (#252), real-process complement of the in-process `ac2_*` matrix: a
-/// kill during boot recovery of a published marker, after it retired the
-/// consumed WAL file and before the WAL directory fsync and the marker
-/// removal, reruns to the same end state. The marker names one file here;
-/// the `ac2_*` matrix covers retirement across several.
 #[tokio::test]
 async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
     let mut crashed = CrashedPublish::at("publish:after_rename").await;
@@ -1762,10 +1653,6 @@ async fn publication_recovery_crash_in_published_branch_reruns_exactly_once() {
     crashed.restart_exactly_once(Recovered::Published).await;
 }
 
-/// AC2 (#252), real-process complement: a kill during boot recovery of an
-/// unpublished marker, after the marker is removed and before the tmp is,
-/// reruns without the marker: the WAL is kept, hydrated at boot (#265) and
-/// published once.
 #[tokio::test]
 async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly_once() {
     let mut crashed = CrashedPublish::at("publish:after_marker").await;
@@ -1787,19 +1674,10 @@ async fn restart_publication_recovery_crash_in_unpublished_branch_reruns_exactly
     crashed.restart_exactly_once(Recovered::RolledBack).await;
 }
 
-/// AC1 (#265): events acknowledged before the process stops, and still in
-/// the WAL, are counted exactly once by the first successful query after
-/// the restart, before any compaction pass could have published them. All
-/// of them arrive in ONE request, so one WAL file holds them. The first
-/// daemon holds its boot pass, which compacts WAL of any age, from before
-/// the ingest through the stop or kill, and an hour between compaction
-/// ticks keeps any later pass away: nothing can publish the file before the
-/// stop. The restart holds its boot pass too, which would otherwise publish
-/// the file at once: the query then finds no parquet row
-/// for the tag and counts every event from the hot buffer, which the boot
-/// hydrated before the listener bound. Released, the boot pass publishes
-/// the file and drains the hydrated batch under one guard, and the count
-/// stays exact.
+/// The first daemon holds its boot pass, which compacts WAL of any age, from
+/// before the ingest through the stop or kill, and an hour between
+/// compaction ticks keeps any later pass away. The restart holds its boot
+/// pass too, which would otherwise publish the acknowledged WAL at once.
 async fn restart_counts_every_acknowledged_event_once(kill: bool) {
     let mut fixture = Fixture::new().await;
     fixture.current_fleet().await;
@@ -1882,10 +1760,6 @@ async fn restart_kill9_counts_every_acknowledged_event_once() {
     restart_counts_every_acknowledged_event_once(true).await;
 }
 
-/// AC14 (#265): a query-only node never reads the WAL. Booted over WAL an
-/// ingest node left behind, it hydrates nothing, answers from parquet
-/// alone, leaves the WAL untouched and logs exactly one warning carrying
-/// the file count and no path.
 #[tokio::test]
 async fn query_only_boot_with_wal() {
     let mut fixture = Fixture::new().await;
@@ -1894,7 +1768,6 @@ async fn query_only_boot_with_wal() {
     let token = writer_token(&fixture).await;
     let time = recent_time();
 
-    // An ingest node publishes one tagged batch to parquet.
     let mut daemon = fixture.spawn();
     let published = ingest(
         &client(&daemon.ready().await, &token),
@@ -1963,8 +1836,6 @@ async fn query_only_boot_with_wal() {
     assert_eq!(bytes(&wal), before, "the WAL is untouched");
 }
 
-/// A query for every event tagged `tag` answers 503 `corpus_recovering`,
-/// with no `Retry-After` (ADR-0041 slice 2).
 async fn assert_search_refused(url: &str, token: &str, tag: &str) {
     let response = common::harness_client_builder()
         .build()
@@ -1986,7 +1857,6 @@ async fn assert_search_refused(url: &str, token: &str, tag: &str) {
     assert_eq!(body["error"]["code"], "corpus_recovering", "{body}");
 }
 
-/// `/api/v1/health` at HTTP 200: its `status` and `checks.corpus`.
 async fn corpus_health(url: &str) -> (String, String) {
     let response = common::harness_client_builder()
         .build()
@@ -2003,20 +1873,11 @@ async fn corpus_health(url: &str) -> (String, String) {
     )
 }
 
-/// AC13 (#265): a contradictory publication marker at boot keeps its scope
-/// out of hydration, and search stays refused as `restart_backlog` pass
-/// after pass for as long as the marker stays: a standing fault refuses
-/// all search (ADR-0041 slice 2). Another service's WAL hydrates and
-/// drains meanwhile.
-///
 /// The marker's canonical output and its temporary output are both gone
 /// (`output_missing`), so the WAL it lists was never published. That is
 /// what the `TrawlPublicationRecoveryBlocked` runbook asks an operator to
 /// establish before removing a marker, because removing it makes
-/// compaction merge that WAL. With the marker gone, the next compaction
-/// pass merges the WAL once and its coverage proof settles the corpus:
-/// `corpus_settled` is logged, health reads `ok`, and reads answer 200
-/// with every planted event counted once.
+/// compaction merge that WAL.
 #[tokio::test]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
@@ -2031,7 +1892,6 @@ async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
     fixture.current_fleet().await;
     fixture.compaction_interval_secs = Some(1);
     let token = writer_token(&fixture).await;
-    // A first boot initializes the data root and databases.
     let mut daemon = fixture.spawn();
     daemon.ready().await;
     daemon.stop().await;
@@ -2177,13 +2037,11 @@ async fn blocked_marker_at_boot_refuses_reads_until_resolved() {
     fixture.assert_lock_free().await;
 }
 
-// Stored data is owner-only (#282, ADR-0052). The daemon inherits a umask of
-// 000 where a test sets one, so every mode below is trawld's own doing.
+// The daemon inherits a umask of 000 where a test sets one, so every mode
+// below is trawld's own doing.
 
-/// The group and other permission bits.
 const GROUP_OTHER: u32 = 0o077;
 
-/// The permission bits at `path`, not following a final symlink.
 fn mode_of(path: &Path) -> u32 {
     std::fs::symlink_metadata(path)
         .unwrap_or_else(|e| panic!("{}: {e}", path.display()))
@@ -2215,7 +2073,6 @@ fn set_mode(path: &Path, mode: u32) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// Every entry under `root`, `root` included, depth first.
 fn tree(root: &Path) -> Vec<PathBuf> {
     let mut paths = vec![root.to_owned()];
     if std::fs::symlink_metadata(root).unwrap().is_dir() {
@@ -2226,16 +2083,6 @@ fn tree(root: &Path) -> Vec<PathBuf> {
     paths
 }
 
-/// AC1 and AC2 (#282): started on a fresh, absent data root under an
-/// inherited umask of 000, trawld creates its storage owner-only. The data
-/// root, the WAL directory and its env directory are 0700; a durable WAL
-/// stage file, held by the boot pass before any compaction, and `EPOCH` are
-/// 0600; once the pass is released, the published Parquet is 0600 and its
-/// partition directories are owner-only. The explicitly moded paths keep
-/// their modes under trawld's umask: the generated `tls/` 0755 and
-/// `cert.pem` 0644, `tls-key/` 0700 and `key.pem` 0600, and the query debug
-/// log 0600. Nothing else under the state directory carries a group or
-/// other bit.
 #[tokio::test]
 async fn ac1_ac2_fresh_start_under_permissive_umask_stores_owner_only() {
     let mut fixture = Fixture::new().await;
@@ -2267,7 +2114,6 @@ async fn ac1_ac2_fresh_start_under_permissive_umask_stores_owner_only() {
     assert_mode(&wal, 0o700);
     assert_mode(&wal.join("prod"), 0o700);
     assert_mode(&stage, 0o600);
-    // AC2: the explicitly moded paths.
     assert_mode(&storage.join("tls"), 0o755);
     assert_mode(&storage.join("tls/cert.pem"), 0o644);
     assert_mode(&storage.join("tls-key"), 0o700);
@@ -2298,10 +2144,6 @@ async fn ac1_ac2_fresh_start_under_permissive_umask_stores_owner_only() {
     fixture.assert_lock_free().await;
 }
 
-/// AC3 (#282): a data root and an out-of-root WAL directory left at 0755
-/// are closed to 0700 at start, through the handle, and nothing beneath
-/// them is chmodded: a valid `EPOCH` and a sentinel, both 0644, keep their
-/// mode, inode and bytes.
 #[tokio::test]
 async fn ac3_start_closes_open_roots_and_nothing_beneath_them() {
     let fixture = Fixture::new().await;
@@ -2368,13 +2210,9 @@ async fn ac3_start_closes_open_roots_and_nothing_beneath_them() {
     fixture.assert_lock_free().await;
 }
 
-/// AC4 (#282): a root trawld cannot close stops the start, with no
-/// privilege and no injected fault. In an unprivileged user and mount
-/// namespace, trawld runs as root and owns the 0755 data root, which is
-/// bind-mounted read-only, so the real `fchmod` fails with EROFS. trawld
-/// exits nonzero with the named error, giving the path, the owner, the
-/// octal mode and the fix, and never listens; the mode is unchanged and the
-/// sole-writer lock is free.
+/// In an unprivileged user and mount namespace, trawld runs as root and owns
+/// the 0755 data root, which is bind-mounted read-only, so the real `fchmod`
+/// fails with EROFS.
 #[tokio::test]
 async fn ac4_root_that_cannot_be_closed_refuses_the_start() {
     let Some(userns) = Userns::for_test("ac4_root_that_cannot_be_closed_refuses_the_start") else {
@@ -2412,14 +2250,11 @@ async fn ac4_root_that_cannot_be_closed_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// #282: a WAL directory under the data root by name, which is a mount of
-/// its own, is not covered by closing the root: other users may reach it by
-/// the path it was mounted from. In an unprivileged user and mount
-/// namespace, `data/wal` is bind-mounted onto itself read-only, so it sits
-/// on the data root's filesystem, in a mount of its own. trawld closes it as
-/// a root of its own, and the real `fchmod` fails with EROFS: the start
-/// refuses, naming the WAL directory, and never listens. The 0700 data root
-/// passes, and the WAL directory keeps its 0755.
+/// A WAL directory under the data root that is a mount of its own is not
+/// covered by closing the root: other users may reach it by the path it
+/// was mounted from. In an unprivileged user and mount namespace,
+/// `data/wal` is bind-mounted onto itself read-only, so the real `fchmod`
+/// fails with EROFS.
 #[tokio::test]
 async fn a_wal_mount_under_the_data_root_is_closed_on_its_own() {
     let Some(userns) = Userns::for_test("a_wal_mount_under_the_data_root_is_closed_on_its_own")
@@ -2451,10 +2286,6 @@ async fn a_wal_mount_under_the_data_root_is_closed_on_its_own() {
     fixture.assert_lock_free().await;
 }
 
-/// AC5 (#282): a data root that is a symlink is not followed. The start
-/// refuses with the symlink error and never listens; the 0755 target and
-/// its `EPOCH` are unchanged, the link is still a link, and the sole-writer
-/// lock is free.
 #[tokio::test]
 async fn ac5_symlinked_data_root_refuses_the_start() {
     let fixture = Fixture::new().await;
@@ -2486,10 +2317,8 @@ async fn ac5_symlinked_data_root_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// #282: a `server.log_file` an older trawld left at 0644, outside the
-/// state directory systemd closes, is tightened to 0600 when trawld opens
-/// it, and a restart keeps it there. The file is appended to, not
-/// replaced: its inode and earlier lines survive.
+/// A `server.log_file` an older trawld left at 0644, outside the state
+/// directory systemd closes, is tightened to 0600 when trawld opens it.
 #[tokio::test]
 async fn a_server_log_file_left_open_is_tightened_at_start() {
     let mut fixture = Fixture::new().await;
@@ -2513,10 +2342,6 @@ async fn a_server_log_file_left_open_is_tightened_at_start() {
     assert!(log.contains("HTTPS server listening"), "{log}");
 }
 
-/// ADR-0057: a results root left world-readable is closed to 0700 at start,
-/// through its handle, like the other storage roots, and nothing beneath
-/// it is chmodded: a 0644 entry keeps its mode, inode and bytes. The close
-/// is logged once, naming the results root.
 #[tokio::test]
 async fn a_world_readable_results_root_is_closed_at_start() {
     let fixture = Fixture::new().await;
@@ -2560,12 +2385,6 @@ async fn a_world_readable_results_root_is_closed_at_start() {
     fixture.assert_lock_free().await;
 }
 
-/// #282: the start closes the storage roots before it waits on PostgreSQL,
-/// so a database that is down never leaves the corpus open while trawld
-/// waits, fails and restarts. Both database URLs name a port nothing
-/// listens on. While trawld still waits on the connection, the 0755 data
-/// root and out-of-root WAL directory are already 0700; then it exits on the
-/// connection error, never having listened.
 #[tokio::test]
 async fn the_roots_close_before_postgres_admission() {
     let mut fixture = Fixture::new().await;
@@ -2603,9 +2422,6 @@ async fn the_roots_close_before_postgres_admission() {
         .await;
 }
 
-/// #282: a repin sibling of the data root that is not a directory refuses
-/// the start before anything reads the corpus, and is left as it was: boot
-/// keeps every storage root owner-only, and a file there is none.
 #[tokio::test]
 async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
     let fixture = Fixture::new().await;
@@ -2631,15 +2447,11 @@ async fn a_repin_sibling_that_is_not_a_directory_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// #282: a query engine that cannot make its spill directory fails the
-/// start with a named error that gives the path, before any listener,
-/// rather than a panic whose message the panic hook drops. A spill
-/// directory refused as not private takes the same path, but an
-/// unprivileged test cannot produce one: the engine asks for mode 0700,
-/// and only a mount that ignores modes answers otherwise.
+/// A query engine that cannot make its spill directory fails the start with
+/// a named error that gives the path, before any listener, rather than a
+/// panic whose message the panic hook drops.
 ///
-/// The spill directory lives in the query scratch directory (ADR-0056),
-/// so a scratch path a few bytes short of `PATH_MAX` stands in: trawld can
+/// A scratch path a few bytes short of `PATH_MAX` stands in: trawld can
 /// make, lock and clear the scratch directory itself, but the spill
 /// directory's longer path inside it is `ENAMETOOLONG`.
 #[tokio::test]
@@ -2678,8 +2490,6 @@ async fn a_spill_directory_that_cannot_be_made_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// #304: the query engine makes nothing in `TMPDIR` (ADR-0056), so a
-/// `TMPDIR` that does not exist no longer stops trawld from starting.
 #[tokio::test]
 async fn a_missing_tmpdir_does_not_stop_the_query_engine() {
     let mut fixture = Fixture::new().await;
@@ -2691,9 +2501,6 @@ async fn a_missing_tmpdir_does_not_stop_the_query_engine() {
     daemon.stop().await;
 }
 
-/// Every entry under `root`, `root` included, with what it is, read without
-/// following a link: a directory and its mode, a file and its bytes, or a
-/// link and its target. A refused start must leave this unchanged.
 fn scratch_tree(root: &Path) -> BTreeMap<PathBuf, String> {
     fn walk(path: &Path, entries: &mut BTreeMap<PathBuf, String>) {
         let meta = std::fs::symlink_metadata(path).unwrap();
@@ -2759,11 +2566,8 @@ fn plant_stale_scratch(scratch: &Path) -> Vec<PathBuf> {
     planted
 }
 
-/// AC11 (#304): a refused scratch directory refuses the start before
-/// PostgreSQL admission, with a message naming `[server] query_scratch_dir`,
-/// and leaves the tree as it found it. A scratch directory with group or
-/// other bits is closed before the lock and the preflight, as ADR-0052
-/// closes a root, so the tests that watch it make it 0700 first.
+/// A scratch directory with group or other bits is closed before the lock
+/// and the preflight, so the tests that watch it make it 0700 first.
 async fn assert_scratch_refusal(fixture: &Fixture, diagnostic: &str, watched: &Path) {
     let before = scratch_tree(watched);
     let mut daemon = fixture.spawn();
@@ -2779,10 +2583,6 @@ async fn assert_scratch_refusal(fixture: &Fixture, diagnostic: &str, watched: &P
     fixture.assert_lock_free().await;
 }
 
-/// AC11 (#304): a second trawld on a held scratch directory refuses to
-/// start, before PostgreSQL admission, and removes nothing, even an entry
-/// it would reclaim from a dead process. Once the first trawld stops, a
-/// start takes the lock and reclaims that entry.
 #[tokio::test]
 async fn query_scratch_second_trawld_refuses() {
     let mut fixture = Fixture::new().await;
@@ -2828,10 +2628,6 @@ async fn query_scratch_second_trawld_refuses() {
     third.stop().await;
 }
 
-/// AC11 (#304): a trawld killed by SIGKILL while it holds the scratch directory
-/// leaves its spill directory, snapshot and export staging files behind,
-/// and the kernel frees its lock. The next start reclaims all of them,
-/// says so, and serves from an empty 0700 scratch directory.
 #[tokio::test]
 async fn query_scratch_boot_reclaims_stale_spill_snapshot_export() {
     let fixture = Fixture::new().await;
@@ -2888,9 +2684,6 @@ async fn query_scratch_boot_reclaims_stale_spill_snapshot_export() {
     daemon.stop().await;
 }
 
-/// AC11 (#304): a scratch directory that is a symlink is not followed. The
-/// start refuses, and the link and its target, stale entries and 0755 mode
-/// included, are unchanged.
 #[tokio::test]
 async fn query_scratch_symlink_refuses_the_start() {
     let fixture = Fixture::new().await;
@@ -2913,12 +2706,7 @@ async fn query_scratch_symlink_refuses_the_start() {
     assert_mode(&target, 0o755);
 }
 
-/// #304 F1: a scratch directory whose path differs from the storage roots'
-/// paths but reaches one of them through a symlink refuses the start, and
-/// boot removes nothing there. Two spellings: an hour directory of the
-/// corpus through a link to the data root, whose one file carries an
-/// export staging file's name, and the WAL directory itself through a link
-/// to the state directory. The configured paths share no prefix with the
+/// The scratch paths, spelled through symlinks, share no prefix with the
 /// roots', so only the opened directories show the overlap.
 #[tokio::test]
 async fn query_scratch_reached_through_a_link_refuses_the_start() {
@@ -2951,9 +2739,6 @@ async fn query_scratch_reached_through_a_link_refuses_the_start() {
     }
 }
 
-/// AC11 (#304): an entry trawld does not make refuses the start, naming the
-/// entry. The preflight reads the whole tree first, so the stale entries
-/// beside it, which a clean boot would reclaim, are left too.
 #[tokio::test]
 async fn query_scratch_foreign_entry_refuses_the_start() {
     let fixture = Fixture::new().await;
@@ -2971,10 +2756,6 @@ async fn query_scratch_foreign_entry_refuses_the_start() {
     assert!(log.contains("has removed nothing"), "{log}");
 }
 
-/// AC11 (#304): a symlink inside the scratch directory refuses the start
-/// and is never followed: one with a snapshot's name at the top, and one
-/// with a spill file's name inside a stale spill directory. Each points at
-/// a file outside the directory, which stays as it was.
 #[tokio::test]
 async fn query_scratch_symlink_entry_refuses_the_start() {
     let fixture = Fixture::new().await;
@@ -3005,10 +2786,8 @@ async fn query_scratch_symlink_entry_refuses_the_start() {
     }
 }
 
-/// AC11 (#304): a scratch directory another user owns refuses the start
-/// before anything changes. An unprivileged test cannot make a directory
-/// another user owns, so it names `/usr`, which root owns; a test run as
-/// root skips. The refusal is judged from the directory's owner alone.
+/// An unprivileged test cannot make a directory another user owns, so it
+/// names `/usr`, which root owns; a test run as root skips.
 #[tokio::test]
 async fn query_scratch_other_owner_refuses_the_start() {
     let euid = rustix::process::geteuid().as_raw();
@@ -3031,11 +2810,9 @@ async fn query_scratch_other_owner_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// AC11 (#304): a stale spill directory that is a mount of its own is not
-/// crossed. In an unprivileged user and mount namespace, the spill
-/// directory is bind-mounted onto itself, so it sits on the scratch
-/// directory's filesystem in another mount. The start refuses, naming it,
-/// and its spill files stay.
+/// In an unprivileged user and mount namespace, the spill directory is
+/// bind-mounted onto itself, so it sits on the scratch directory's
+/// filesystem in another mount.
 #[tokio::test]
 async fn query_scratch_mount_entry_refuses_the_start() {
     let Some(userns) = Userns::for_test("query_scratch_mount_entry_refuses_the_start") else {
@@ -3061,10 +2838,6 @@ async fn query_scratch_mount_entry_refuses_the_start() {
     fixture.assert_lock_free().await;
 }
 
-/// AC11 (#304): a query-only node whose data volume is read-only and which
-/// keeps the default scratch directory beside the data root refuses the
-/// start, and the message names the key to set. In an unprivileged user
-/// and mount namespace, the state directory is bind-mounted read-only.
 #[tokio::test]
 async fn query_scratch_read_only_default_names_the_key() {
     let Some(userns) = Userns::for_test("query_scratch_read_only_default_names_the_key") else {
@@ -3091,7 +2864,6 @@ async fn query_scratch_read_only_default_names_the_key() {
     fixture.assert_lock_free().await;
 }
 
-/// The combined output of the fixture's last spawn.
 fn fixture_log(fixture: &Fixture) -> String {
     std::fs::read_to_string(fixture.root.path().join(fixture.daemon_log)).unwrap()
 }

@@ -141,8 +141,6 @@ test('private-directory removal failure still writes the final report', { timeou
     });
     await verifyResources(report);
     assert.ok((await fs.stat(path.join(dir, 'private'))).isDirectory());
-    // The parent removes this test-owned residue only after checking ownership
-    // and proving the runner stopped its processes and container.
     await fs.rm(path.join(dir, 'private'), { recursive: true, force: true });
   } finally {
     if (run.child.exitCode === null) { run.child.kill('SIGTERM'); await run.done; }
@@ -215,7 +213,6 @@ test('attached evidence binds the selected run, actual processes, and owned SPA 
     };
 
     // Positive preflight control also proves the committed-script guards pass.
-    // The probe stops before mkdir and never permits a browser-key read.
     await customPreflight(dir, probe);
 
     // A later preparation record must neither relabel nor invalidate this run.

@@ -3,10 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Shared wire types for the trawl HTTP API.
-//!
-//! These types are used by both `trawl-server` (serialization) and
-//! `trawl-client` (deserialization) to ensure the API contract stays
-//! in sync across crates.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -31,13 +27,9 @@ pub use crate::capabilities::{
 
 use crate::value::{QueryResult, SchemaColumn};
 
-// -- common enums ------------------------------------------------------------
-
-/// Health status reported by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HealthStatus {
-    /// All subsystems are healthy.
     Ok,
     /// Non-critical subsystem(s) failed; queries still work.
     Degraded,
@@ -45,15 +37,11 @@ pub enum HealthStatus {
     Unavailable,
 }
 
-/// Outcome status of a completed query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum QueryStatus {
-    /// Query completed successfully.
     Success,
-    /// Query failed with an error.
     Error,
-    /// Query exceeded the configured timeout.
     Timeout,
 }
 
@@ -80,7 +68,6 @@ impl std::str::FromStr for QueryStatus {
     }
 }
 
-/// Export output format.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ExportFormat {
@@ -102,9 +89,6 @@ impl fmt::Display for ExportFormat {
     }
 }
 
-// -- error -------------------------------------------------------------------
-
-/// Machine-readable error code for structured error responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
@@ -114,24 +98,17 @@ pub enum ErrorCode {
     ValidationError,
     /// Query execution failure (details redacted).
     ExecutionError,
-    /// Result set exceeded the configured row limit.
     ResultTooLarge,
-    /// Authentication failure.
     AuthError,
     /// Authenticated but missing the required app permission (403), including
     /// a fleet key with no trawl grant.
     Forbidden,
-    /// Generic malformed input.
     BadRequest,
-    /// Resource not found.
     NotFound,
-    /// Query exceeded time limit.
     Timeout,
-    /// Ingestion validation failure.
     IngestError,
     /// Rate limit exceeded (429).
     RateLimited,
-    /// Too many concurrent SSE streams.
     TooManyStreams,
     /// Internal server error (500).
     InternalError,
@@ -162,48 +139,37 @@ pub enum ErrorCode {
     UnsupportedEncoding,
     /// trawld is at its count of requests in progress, or a request is at
     /// its probe or control allowance (503, no `Retry-After`, ADR-0054). The
-    /// request was refused before any handler ran, so nothing from it was
-    /// processed or ingested. The message never carries the configured
-    /// value.
+    /// message never carries the configured value.
     RequestLimitReached,
     /// The query ran out of the memory or scratch space trawld gives
-    /// queries (503, no `Retry-After`, ADR-0056). The server is healthy:
-    /// narrowing the time range or simplifying the query is what helps, so
-    /// the message says that and names no path, size or engine text.
+    /// queries (503, no `Retry-After`, ADR-0056).
     QueryResourceExhausted,
     /// The captured result is past its deadline or was pruned by quota
-    /// (410, ADR-0057). The message says which. It stays this answer for
-    /// the tombstone's 24 hours and is a 404 after.
+    /// (410, ADR-0057).
     ResultGone,
     /// The captured result's metadata is committed but its file is missing
-    /// (409, ADR-0057). Never an empty page and never a silent re-run.
+    /// (409, ADR-0057).
     ResultUnavailable,
     /// The captured result's file does not match its recorded blake3
-    /// digest (500, ADR-0057). The server records an ADR-0040 failure
-    /// event; the message names no path.
+    /// digest (500, ADR-0057).
     ResultCorrupt,
     /// The caller's per-key capture queue is full, or the installation is
     /// at its count of executing captures (429, with `Retry-After`,
     /// ADR-0057). Refused before any executor permit was taken.
     CaptureBusy,
     /// The capture cannot reserve room in the key's or the installation's
-    /// result quota (429, with `Retry-After`, ADR-0057). Refused before any
-    /// executor permit was taken.
+    /// result quota (429, with `Retry-After`, ADR-0057).
     CaptureQuotaExceeded,
     /// The capture's selected cold input is larger than the capture source
-    /// budget (400, ADR-0057). Refused before scanning. For a window, a
-    /// narrower time range or a `service=` filter that pins the services
-    /// helps; for a `from saved` run's stored input, only a narrower window.
+    /// budget (400, ADR-0057).
     CaptureSourceTooLarge,
     /// A `context` focus row lacks `_time`, or a key its scope names
-    /// (400, ADR-0058). The message names the missing field; the read is
-    /// never widened to make up for it.
+    /// (400, ADR-0058).
     FocusIncomplete,
     /// A `context` focus row holds two columns of a name the read needs,
     /// so which value is the focus is not decidable (400, ADR-0058).
     FocusAmbiguous,
     /// A `compare` foreground and baseline window overlap (400, ADR-0058).
-    /// Windows that touch are accepted.
     WindowsOverlap,
     /// A correlation read's input cannot be composed into a query: a
     /// filter with pipe stages or time clauses, a refused group field, an
@@ -220,10 +186,7 @@ pub enum ErrorCode {
     /// finding or note until a writer reopens it (409, ADR-0059).
     InvestigationClosed,
     /// Keeping the result would take the investigation's or the
-    /// installation's evidence past its budget (409, ADR-0059). Refused
-    /// before any executor permit was taken. Evidence frees only when it
-    /// ages out or `server_manage` deletes an investigation, so waiting a
-    /// moment does not help.
+    /// installation's evidence past its budget (409, ADR-0059).
     EvidenceBudgetExceeded,
     /// A saved query's name is blank or contains control or invisible
     /// formatting characters (400).
@@ -232,12 +195,9 @@ pub enum ErrorCode {
     DuplicateName,
     /// The caller's key already holds a manual run, or the installation is
     /// at its count of manual runs (429, with `Retry-After`, ADR-0018).
-    /// Refused before the claim, so no budget was spent, no run row was
-    /// written and no cursor moved. Nothing retries it automatically.
     ManualRunBusy,
 }
 
-/// Source location within a query string.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorSpan {
     /// Byte offset of the start of the error region.
@@ -246,12 +206,9 @@ pub struct ErrorSpan {
     pub end: usize,
 }
 
-/// A single diagnostic detail within a structured error.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorDetail {
-    /// Human-readable description of this specific error.
     pub message: String,
-    /// Source span within the query text (if available).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub span: Option<ErrorSpan>,
     /// Parser context label (e.g. "pipeline", "expression").
@@ -279,12 +236,9 @@ impl fmt::Display for ErrorDetail {
     }
 }
 
-/// Structured error envelope with machine-readable code and optional diagnostics.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorEnvelope {
-    /// Machine-readable error category.
     pub code: ErrorCode,
-    /// Human-readable summary message.
     pub message: String,
     /// Detailed diagnostics. Set for `parse_error`, where each detail has a
     /// span, and for a `validation_error` the emitter reports, whose one
@@ -299,7 +253,6 @@ pub struct ErrorEnvelope {
 }
 
 impl ErrorEnvelope {
-    /// Create a simple envelope with no diagnostic details.
     pub fn simple(code: ErrorCode, message: impl Into<String>) -> Self {
         Self {
             code,
@@ -310,20 +263,15 @@ impl ErrorEnvelope {
     }
 }
 
-/// Standard error response body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
-    /// Structured error envelope.
     pub error: ErrorEnvelope,
 }
-
-// -- request types -----------------------------------------------------------
 
 /// Request body for query execution (`POST /api/v1/query`) and
 /// validation (`POST /api/v1/validate`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
-    /// The trawl DSL query string.
     pub query: String,
     /// Optional limit for pagination (defaults to server's `max_result_rows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -331,8 +279,7 @@ pub struct QueryRequest {
     /// Optional offset for pagination (defaults to 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub offset: Option<usize>,
-    /// Ask for the whole result's [`EventHistogram`]. `/api/v1/query` only;
-    /// absent from the wire when false.
+    /// Ask for the whole result's [`EventHistogram`]. `/api/v1/query` only.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub histogram: bool,
 }
@@ -340,18 +287,14 @@ pub struct QueryRequest {
 /// Request body for creating a saved query (`POST /api/v1/saved`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateSavedRequest {
-    /// Display name for the saved query.
     pub name: String,
-    /// The trawl DSL query string.
     pub query: String,
 }
 
 /// Request body for updating a saved query (`PUT /api/v1/saved/{id}`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateSavedRequest {
-    /// The new trawl DSL query string.
     pub query: String,
-    /// Optional new name (must match `[a-zA-Z0-9_-]+`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
 }
@@ -359,19 +302,14 @@ pub struct UpdateSavedRequest {
 /// Request body for exporting query results (`POST /api/v1/export`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExportRequest {
-    /// The trawl DSL query string.
     pub query: String,
     /// Optional row limit (defaults to server's `max_export_rows`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
 
-// -- health ------------------------------------------------------------------
-
-/// Health check response from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
-    /// Daemon health status.
     pub status: HealthStatus,
     /// Per-subsystem check results: `"ok"` or `"error"` for `duckdb`,
     /// `auth_db`, `storage_db` and `data_path`; `"ok"` or `"refusing"` for
@@ -380,25 +318,16 @@ pub struct HealthResponse {
     /// `"restart_backlog"` for `corpus`, which names why corpus reads
     /// answer `corpus_recovering`. The last two are non-critical, so
     /// `Degraded`.
-    ///
-    /// The daemon always fills this; optional so a body that omits it parses.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checks: Option<HashMap<String, String>>,
-    /// Server version string (e.g. `"0.1.3"`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
 }
 
-// -- schema ------------------------------------------------------------------
-
-/// Schema introspection response from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaResponse {
-    /// Column descriptors (name + type).
     pub columns: Vec<SchemaColumnResponse>,
-    /// Number of parquet files matching the configured glob.
     pub file_count: u64,
-    /// Whether this result was served from cache.
     pub cached: bool,
     /// Earliest date found in the partition directory structure (YYYY-MM-DD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -406,10 +335,8 @@ pub struct SchemaResponse {
     /// Latest date found in the partition directory structure (YYYY-MM-DD).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_date: Option<String>,
-    /// Total byte size of all parquet files on disk.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_bytes: Option<u64>,
-    /// Distinct service names extracted from parquet filenames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub services: Option<Vec<String>>,
     /// Current number of events in the hot buffer (not cached).
@@ -420,10 +347,8 @@ pub struct SchemaResponse {
     pub hot_buffer_bytes: Option<u64>,
 }
 
-/// A single column in the schema response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SchemaColumnResponse {
-    /// Column name.
     pub name: String,
     /// Column data type (e.g. "VARCHAR", "TIMESTAMP").
     #[serde(rename = "type")]
@@ -439,8 +364,6 @@ impl From<SchemaColumn> for SchemaColumnResponse {
     }
 }
 
-// -- query -------------------------------------------------------------------
-
 /// Server execution across query admission and execution.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryExecution {
@@ -450,47 +373,29 @@ pub struct QueryExecution {
     pub duration_ms: u64,
 }
 
-/// Query response with pagination metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryResponse {
     /// Execution facts, absent for synthetic results.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<QueryExecution>,
-    /// The query result (columns + rows).
     #[serde(flatten)]
     pub result: QueryResult,
-    /// Pagination metadata.
     pub pagination: PaginationMeta,
     /// Fields the query bound whose catalog pin the analyzer calls degraded
-    /// (ADR-0011): results may be missing values that pin shelved. Includes
-    /// fields the query filtered on and projected away; absent from the wire
-    /// when empty, which is the healthy case.
-    ///
-    /// Stale by at most one schema-refresh tick, and carried by
-    /// `/api/v1/query` only: the SSE stream keeps its compile-time snapshot
-    /// semantics, and embedded `--data` mode has no catalog to consult.
+    /// (ADR-0011): results may be missing values that pin shelved.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
     /// Result columns holding `OTel` severity numbers other than the
     /// envelope's `_severity`: `sev()` output, or a column that took the
     /// slot's pin (ADR-0013).
-    ///
-    /// Response-level and presentational, like `degraded_fields`. A
-    /// per-`Column` field would have to be filled at ~25 construction sites,
-    /// and it would say nothing about the values, since every format still
-    /// carries the number. Renderers that display tokens (the CLI table, the
-    /// TUI, the SPA's results grid) read it; json/csv/SSE ignore it, so an
-    /// arithmetic consumer is untouched. Absent from the wire when empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub severity_columns: Vec<String>,
     /// The whole result counted by `_time`, answered only to a request
     /// that asked for it with `histogram` and only for a raw-event query.
-    /// Absent from the wire when `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub histogram: Option<EventHistogram>,
 }
 
-/// The number of bins in a ready [`EventHistogram`].
 pub const HISTOGRAM_BUCKETS: usize = 48;
 
 /// The shortest span a ready [`EventHistogram`] draws, in microseconds. A
@@ -522,42 +427,31 @@ pub enum EventHistogram {
         /// so the result holds only the rows that stage kept.
         kept_some: bool,
     },
-    /// The result was not counted.
-    Unavailable { reason: HistogramReason },
+    Unavailable {
+        reason: HistogramReason,
+    },
 }
 
-/// One bin of a ready [`EventHistogram`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HistogramBucket {
-    /// Rows whose `_time` is in the bin.
     pub events: u64,
     /// Those of them whose `_severity` is in the error band or above.
     pub errors: u64,
 }
 
-/// Why an [`EventHistogram`] is unavailable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HistogramReason {
     /// The query has a `sample` stage, so its rows are not the whole result.
     Sample,
-    /// The rows were read from a stored run (`from saved`).
     StoredResult,
     /// The result has no `_time` column typed `timestamp`.
     NoTimeColumn,
-    /// No row of the result has a usable `_time`.
     NoUsableTime,
 }
 
 impl EventHistogram {
     /// Whether this histogram can describe a result of `total` rows.
-    ///
-    /// An unavailable one always can. A ready one needs exactly
-    /// [`HISTOGRAM_BUCKETS`] bins; finite bounds that [`zone::wire_micros`]
-    /// reads, with `start < end`, a span divisible by the bin count and a
-    /// bin width of at least [`HISTOGRAM_MIN_SPAN_MICROS`] / 48 rounded up;
-    /// `errors <= events` in every bin; no errors without `severity`; at
-    /// least one dated row; and bin events plus `undated` equal to `total`.
     #[must_use]
     pub fn consistent_with(&self, total: usize) -> bool {
         let Self::Ready {
@@ -599,79 +493,52 @@ impl EventHistogram {
     }
 }
 
-/// Pagination metadata for query responses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaginationMeta {
-    /// The limit applied to this response.
     pub limit: usize,
-    /// The offset applied to this response.
     pub offset: usize,
-    /// The number of rows actually returned.
     pub returned: usize,
     /// Rows this successful execution produced, before the response window was
     /// cut from them.
     pub total: usize,
 }
 
-// -- validation --------------------------------------------------------------
-
-/// Response from the validate endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ValidationResponse {
-    /// Whether the query is valid.
     pub valid: bool,
-    /// Validation error details with optional span info (empty if valid).
     pub errors: Vec<ErrorDetail>,
     /// Canonically formatted query. Present only when the query is valid
     /// and its text was proven to read back as the same query (ADR-0061).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub formatted: Option<String>,
-    /// Why a valid query carries no `formatted` text. Never set on an
-    /// invalid query, and never one of `errors`: the query itself is fine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub format_error: Option<FormatErrorDetail>,
 }
 
-/// Why the validate endpoint returned no formatted text for a valid query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FormatErrorDetail {
-    /// Which refusal this is.
     pub kind: FormatErrorKind,
-    /// A sentence saying why, for a person.
     pub message: String,
 }
 
-/// The two reasons formatting refuses a valid query.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FormatErrorKind {
-    /// Even the compact layout is longer than the query length limit.
     TooLong,
-    /// The formatter could not write text that reads back as the query.
     Unfaithful,
 }
 
-// -- queries (active/recent) -------------------------------------------------
-
-/// Active and recent queries response from the daemon.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueriesResponse {
-    /// Currently executing queries.
     pub active: Vec<QueryActiveEntry>,
     /// Recently completed queries (most recent first).
     pub recent: Vec<QueryRecentEntry>,
     /// Work that still holds a pool permit after its request answered
-    /// (ADR-0024). Disjoint from `active`: a request whose work is
-    /// retained is listed here and not there. The same request may also
-    /// appear in `recent`, where it recorded its outcome.
-    ///
-    /// `default` because a server predating retained accounting sends no
-    /// such field.
+    /// (ADR-0024).
     #[serde(default)]
     pub retained: Vec<RetainedWorkSnapshot>,
 }
 
-/// An active query with ownership relative to the authenticated reader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryActiveEntry {
     #[serde(flatten)]
@@ -680,7 +547,6 @@ pub struct QueryActiveEntry {
     pub own: bool,
 }
 
-/// A recent query with ownership relative to the authenticated reader.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRecentEntry {
     #[serde(flatten)]
@@ -690,12 +556,8 @@ pub struct QueryRecentEntry {
 }
 
 /// One unit of physical work that outlived the request that started it.
-///
-/// The request stopped waiting (it timed out, or its caller walked away);
-/// the `DuckDB` bind or scan it started did not stop with it, and keeps
-/// its permit until it does. Owner key ids never appear here — `user` and
-/// `query` are populated only for a reader who may see them, and are
-/// omitted from the wire otherwise.
+/// Owner key ids never appear here — `user` and `query` are populated
+/// only for a reader who may see them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetainedWorkSnapshot {
     /// The pool id, the same id `DELETE /queries/{id}` cancels.
@@ -706,100 +568,68 @@ pub struct RetainedWorkSnapshot {
     /// Whether the work passed its work-start transition. A held permit
     /// alone does not prove it started.
     pub started: bool,
-    /// How long the work has outlived its request (ms).
     pub retained_ms: u64,
-    /// The submitting key's display name, for a reader entitled to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
-    /// The DSL, for a reader entitled to it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub query: Option<String>,
 }
 
-/// Snapshot of a currently executing query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActiveQuerySnapshot {
     /// Monotonic query ID.
     pub id: u64,
-    /// Authenticated user name.
     pub user: String,
     /// The key's role names, comma-joined and sorted (`"none"` when the
     /// key holds no roles).
     pub role: String,
-    /// The DSL query string.
     pub query: String,
-    /// How long the query has been running (ms).
     pub running_ms: u64,
 }
 
-/// A completed query from recent history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompletedQuerySnapshot {
     /// Monotonic query ID.
     pub id: u64,
-    /// Authenticated user name.
     pub user: String,
-    /// The DSL query string.
     pub query: String,
-    /// Execution duration in milliseconds.
     pub duration_ms: u64,
     /// Row count (if successful).
     pub rows: Option<usize>,
     /// Error message (if failed).
     pub error: Option<String>,
-    /// Whether the query exceeded the timeout.
     pub timed_out: bool,
 }
 
-/// Response from the cancel query endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CancelResponse {
-    /// Whether the query was found and cancelled.
     pub cancelled: bool,
-    /// The query ID that was requested for cancellation.
     pub query_id: u64,
 }
-
-// -- stats -------------------------------------------------------------------
 
 /// Response from the stats endpoint (admin only).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatsResponse {
-    /// Server uptime in seconds.
     pub uptime_secs: u64,
-    /// Total queries executed since startup.
     pub total_queries: u64,
-    /// Currently executing queries.
     pub active_queries: usize,
-    /// Available connection pool slots.
     pub pool_available: usize,
-    /// Total connection pool capacity.
     pub pool_capacity: usize,
     /// Held permits whose request already answered (ADR-0024): a subset
-    /// of the permits `pool_capacity - pool_available` counts, not an
-    /// addition to them.
+    /// of the permits `pool_capacity - pool_available` counts.
     pub pool_retained: usize,
 }
 
-// -- whoami ------------------------------------------------------------------
-
-/// Identity discriminator orthogonal to roles.
-///
-/// Distinguishes interactive principals (humans logging into the UI) from
-/// non-interactive ones (services calling the API). Has no effect on
-/// authorization on its own — apps can use it for richer audit context
-/// or to gate features (e.g. require human consent for destructive ops).
+/// Identity discriminator orthogonal to roles. Has no effect on
+/// authorization on its own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PrincipalKind {
-    /// Interactive principal — a person using the UI or CLI.
     Human,
-    /// Non-interactive principal — a service or automation account.
     Service,
 }
 
 impl PrincipalKind {
-    /// String representation used on the wire and in the database.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Human => "human",
@@ -826,23 +656,13 @@ impl std::str::FromStr for PrincipalKind {
     }
 }
 
-/// Response from the whoami endpoint — token identity, roles, and the
-/// resolved trawl permission set.
-///
-/// `roles` carries the names of every data-defined role the key holds
-/// (display/audit; roles are cross-app bundles, not app-scoped, ADR-0006).
-/// `permissions` is the server-resolved permission union for this server's
-/// app namespace (`"trawl"`), in canonical order; only permissions this
-/// server recognizes appear.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WhoAmIResponse {
     /// Key prefix (stable 8-char fingerprint). Intended as an immutable
     /// actor identifier for downstream audit logging — `name` can change,
     /// `prefix` cannot.
     pub prefix: String,
-    /// Key name (human-readable label).
     pub name: String,
-    /// Whether the underlying principal is a human or a service.
     pub kind: PrincipalKind,
     /// Names of every role attached to this key, sorted.
     pub roles: Vec<String>,
@@ -871,38 +691,25 @@ pub const PERMISSION_NAMES: &[&str] = &[
     "investigation_write",
 ];
 
-// -- dashboard ---------------------------------------------------------------
-
 /// Outcome of the latest completed storage measurement attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StorageMeasurementStatus {
-    /// An optional source, such as a WAL writer, is absent.
     NotConfigured,
-    /// The configured source has not completed a measurement attempt.
     NotSampled,
-    /// The latest completed attempt measured the whole selected tree.
     Complete,
     /// The latest completed attempt failed; any complete sample is retained.
     Failed,
 }
 
-/// Availability of the accompanying last-complete file count and byte total.
-///
-/// Without a complete sample, numeric fields are zero placeholders. A failed
-/// attempt can retain a sample and its age. Raw filesystem errors are private.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StorageMeasurement {
     pub status: StorageMeasurementStatus,
-    /// Monotonic seconds since the last successful scan completed, evaluated
-    /// when this dashboard snapshot was assembled. This is not stream freshness
-    /// or a transactional filesystem timestamp. None means no complete sample.
     pub sample_age_secs: Option<u64>,
 }
 
 /// Disk headroom, pressure-deletion evidence and per-environment retention
-/// reach (ADR-0042). Capacity reads as how much of each environment's
-/// policy the data disk is projected to hold, never as a countdown.
+/// reach (ADR-0042).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capacity {
     pub headroom: HeadroomReading,
@@ -915,8 +722,6 @@ pub struct Capacity {
     pub growth_excluded: Vec<String>,
 }
 
-/// One headroom measurement attempt stats every filesystem role, so the
-/// rows share its status and age.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HeadroomReading {
     pub measurement: StorageMeasurement,
@@ -926,8 +731,6 @@ pub struct HeadroomReading {
     pub filesystems: Vec<FilesystemHeadroom>,
 }
 
-/// One filesystem trawl writes to. Roles that share a device share a row;
-/// available bytes are never summed across devices.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FilesystemHeadroom {
     /// Non-empty, ordered data, wal, spill.
@@ -935,11 +738,10 @@ pub struct FilesystemHeadroom {
     pub total_bytes: u64,
     pub available_bytes: u64,
     /// The deletion floor. Present only on the row holding
-    /// [`FilesystemRole::Data`]: nothing reclaims the other filesystems.
+    /// [`FilesystemRole::Data`].
     pub floor: Option<DeletionFloor>,
 }
 
-/// What trawl writes to a filesystem.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FilesystemRole {
@@ -947,7 +749,6 @@ pub enum FilesystemRole {
     Data,
     /// The live WAL directory, when ingest is enabled.
     Wal,
-    /// The query engine's spill directory.
     Spill,
 }
 
@@ -957,9 +758,6 @@ pub enum FilesystemRole {
 pub enum DeletionFloor {
     /// A floor of 0: pressure deletion is off.
     Off,
-    /// Pressure deletion runs while available bytes are strictly below
-    /// `floor_bytes`. `deficit_bytes` is `floor_bytes - available_bytes`
-    /// while below it and zero otherwise, including at equality.
     Armed {
         floor_bytes: u64,
         deficit_bytes: u64,
@@ -976,11 +774,9 @@ pub struct PressureEvidence {
     pub removals_disk_pressure: u64,
     /// Sweeps that found available bytes below the floor.
     pub pressure_attempts: u64,
-    /// The last finished sweep, or `None` before the first one.
     pub last_sweep: Option<LastSweep>,
 }
 
-/// The outcome of the last retention sweep and its age.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LastSweep {
     pub outcome: SweepOutcome,
@@ -1005,7 +801,6 @@ pub enum SweepOutcome {
     ExhaustedBelowFloor,
 }
 
-/// One environment's stored data and projected retention reach.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnvironmentCapacity {
     pub env: String,
@@ -1019,13 +814,9 @@ pub struct EnvironmentCapacity {
     pub reach: Reach,
 }
 
-/// How many days of its policy an environment is projected to keep if
-/// the observed days repeat. A conditional projection, not a guarantee.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum Reach {
-    /// A finite-retention environment's projected reach. `low` uses the
-    /// largest observed day and `high` the mean observed day.
     Projected {
         /// First observed date, `YYYY-MM-DD`.
         observed_first: String,
@@ -1035,7 +826,6 @@ pub enum Reach {
         low: ReachEnd,
         high: ReachEnd,
     },
-    /// A keep-forever environment: its growth, with no time claim.
     KeepForever {
         /// First observed date, `YYYY-MM-DD`.
         observed_first: String,
@@ -1044,88 +834,57 @@ pub enum Reach {
         observed_days: u8,
         mean_daily_bytes: u64,
     },
-    /// No projection, and deliberately no number.
-    Withheld { reason: WithheldReason },
+    Withheld {
+        reason: WithheldReason,
+    },
 }
 
-/// One end of a projected reach range.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ReachEnd {
-    /// About this many whole days of the policy.
     Days { days: u64 },
-    /// The full policy fits.
     FullPolicy,
-    /// With a floor of 0, the disk fills before the policy is reached.
     DiskFillsFirst,
 }
 
-/// Why a reach projection was withheld.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WithheldReason {
-    /// Fewer than 3 observed days.
     InsufficientHistory,
-    /// A repin job overlapped the Parquet scan or the headroom sample, or
-    /// repin staging was on the data root, so the samples may count files
-    /// twice or miss free space.
     RetentionSuppressed,
-    /// The Parquet scan or the data filesystem sample is not complete.
     MeasurementUnavailable,
 }
 
 /// Full dashboard snapshot returned by the admin-only dashboard endpoint.
-///
-/// Contains all metrics displayed by the server's live monitor: executor pool,
-/// hot buffer, query throughput, ingest rates, SSE connections, scheduler
-/// status, and recent/active queries. Rates are pre-computed (EMA-smoothed)
-/// by the server — clients render them directly.
+/// Rates are pre-computed (EMA-smoothed) by the server — clients render
+/// them directly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardSnapshot {
-    // -- header --
-    /// Server hostname.
     pub hostname: String,
     /// Listen address (e.g. "0.0.0.0:5514").
     pub listen_addr: String,
-    /// Server uptime in seconds.
     pub uptime_secs: u64,
-    /// Server version string.
     pub version: String,
-    /// Whether the server considers itself healthy.
     pub healthy: bool,
 
-    // -- executor pool --
-    /// Total executor pool capacity.
     pub pool_capacity: usize,
-    /// Currently active (in-use) pool slots.
     pub pool_active: usize,
     /// The subset of `pool_active` held by work no request is waiting on
     /// any more (ADR-0024).
     pub pool_retained: usize,
 
-    // -- hot buffer --
-    /// Current event count in the hot buffer.
     pub hot_buffer_events: usize,
-    /// Maximum event capacity.
     pub hot_buffer_max_events: usize,
-    /// Current byte usage.
     pub hot_buffer_bytes: usize,
-    /// Maximum byte capacity.
     pub hot_buffer_max_bytes: usize,
-    /// Number of active batches.
     pub hot_buffer_batches: usize,
 
-    // -- query throughput --
-    /// Total queries executed since startup.
     pub total_queries: u64,
     /// EMA-smoothed query rate (queries/sec).
     pub query_rate: f64,
-    /// Number of recent queries that resulted in errors.
     pub query_errors: u64,
-    /// Number of recent queries that timed out.
     pub query_timeouts: u64,
 
-    // -- ingest --
     /// HTTP events ingested since process startup; excludes syslog.
     pub ingest_events: u64,
     /// EMA-smoothed HTTP ingest rate (events/sec); excludes syslog.
@@ -1133,7 +892,6 @@ pub struct DashboardSnapshot {
     /// HTTP rejected events since process startup; excludes syslog.
     pub ingest_rejected: u64,
 
-    // -- syslog --
     /// Configured syslog enablement; this does not test listener health.
     #[serde(default)]
     pub syslog_enabled: bool,
@@ -1152,21 +910,17 @@ pub struct DashboardSnapshot {
     /// Syslog events dropped due to backpressure since process startup.
     #[serde(default)]
     pub syslog_dropped: u64,
-    /// Current active syslog TCP connections.
     #[serde(default)]
     pub syslog_tcp_connections: u64,
 
-    // -- WAL --
     /// Last-complete WAL file count, including active files, not eligible work.
     #[serde(default)]
     pub wal_files: u64,
     /// Last-complete bytes in selected WAL files, including active files.
     #[serde(default)]
     pub wal_bytes: u64,
-    /// Availability and age of the WAL totals.
     pub wal_measurement: StorageMeasurement,
 
-    // -- compaction --
     /// Seconds since the last successful cycle. None means no successful cycle
     /// reported since startup; a successful cycle may have no eligible work.
     #[serde(default)]
@@ -1179,59 +933,38 @@ pub struct DashboardSnapshot {
     #[serde(default)]
     pub compaction_errors: u64,
 
-    // -- storage --
     /// Last-complete ingested Parquet file count; excludes saved report files.
     #[serde(default)]
     pub parquet_files: u64,
     /// Last-complete bytes in ingested Parquet files; excludes saved report files.
     #[serde(default)]
     pub parquet_bytes: u64,
-    /// Availability and age of the ingested Parquet totals.
     pub parquet_measurement: StorageMeasurement,
-    /// Disk headroom, retention's pressure-deletion evidence and each
-    /// environment's projected retention reach (ADR-0042). Required, like
-    /// the storage measurements: a missing object is a contract break, not
-    /// "nothing to report".
+    /// Required, like the storage measurements: a missing object is a
+    /// contract break, not "nothing to report".
     pub capacity: Capacity,
 
-    // -- SSE --
-    /// Active SSE streaming connections.
     pub sse_active: usize,
-    /// Maximum SSE connections allowed.
     pub sse_max: usize,
 
-    // -- scheduler --
-    /// Whether the scheduler is enabled.
     pub scheduler_enabled: bool,
-    /// Number of active schedules.
     pub scheduler_schedules: usize,
 
-    // -- queries --
     /// Recently completed queries (most recent first).
     pub recent_queries: Vec<CompletedQuerySnapshot>,
-    /// Currently executing queries.
     pub active_queries: Vec<ActiveQuerySnapshot>,
 }
 
-/// Response from the field values endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldValuesResponse {
-    /// The field name that was sampled.
     pub field: String,
-    /// Distinct values found.
     pub values: Vec<String>,
-    /// Whether this result was served from cache.
     pub cached: bool,
 }
 
-// -- service schema (rich per-service metadata) ------------------------------
-
-/// Rich per-service schema response, powered by background parquet metadata scan.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSchemaResponse {
-    /// Per-service schema and statistics.
     pub services: Vec<ServiceSchema>,
-    /// Whether this result was served from cache.
     pub cached: bool,
     /// Current hot buffer event count (always fresh, never cached).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1241,48 +974,35 @@ pub struct ServiceSchemaResponse {
     pub hot_buffer_bytes: Option<u64>,
 }
 
-/// Schema and statistics for a single service.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceSchema {
     /// Service name (derived from parquet filename stem).
     pub name: String,
-    /// Per-column statistics from parquet metadata.
     pub columns: Vec<ServiceColumnStats>,
-    /// Earliest date directory containing data for this service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub earliest_date: Option<String>,
-    /// Latest date directory containing data for this service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub latest_date: Option<String>,
-    /// Number of parquet files for this service.
     pub file_count: u64,
-    /// Total bytes on disk for this service.
     pub total_bytes: u64,
-    /// Total row count across all files (from parquet metadata `num_rows`).
     pub total_events: u64,
-    /// Per-day event counts for sparkline rendering.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub daily_event_counts: Vec<DailyCount>,
     /// Fields this service has itself conflicted on and which the analyzer
-    /// calls degraded (ADR-0011). Stamped from the schema-refresh tick's
-    /// in-process snapshot, so it is stale by at most one tick, like the
-    /// query notice. A client cannot compute it: carrying a degraded field's
-    /// column is not evidence that this service is what degraded it.
+    /// calls degraded (ADR-0011). A client cannot compute it: carrying a
+    /// degraded field's column is not evidence that this service is what
+    /// degraded it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub degraded_fields: Vec<String>,
 }
 
-/// Per-column statistics extracted from parquet row group metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServiceColumnStats {
-    /// Column name.
     pub name: String,
     /// Column data type (e.g. "VARCHAR", "TIMESTAMP").
     #[serde(rename = "type")]
     pub data_type: String,
-    /// Exact null count from parquet metadata.
     pub null_count: u64,
-    /// Total values (rows) across all row groups.
     pub total_count: u64,
     /// Minimum value (stringified from parquet column stats).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1290,20 +1010,15 @@ pub struct ServiceColumnStats {
     /// Maximum value (stringified from parquet column stats).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_value: Option<String>,
-    /// Total compressed size of this column on disk (bytes).
     pub compressed_bytes: u64,
 }
 
-/// A single day's event count for sparkline rendering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DailyCount {
     /// Date in YYYY-MM-DD format.
     pub date: String,
-    /// Number of events on this date.
     pub count: u64,
 }
-
-// -- field catalog (schema-health surfaces) -----------------------------------
 
 /// Response from `GET /api/v1/schema/fields` — the pinned-field listing
 /// with aggregated observation and conflict evidence.
@@ -1313,16 +1028,13 @@ pub struct CatalogFieldsResponse {
     pub fields: Vec<CatalogFieldSummary>,
     /// Total pins in the catalog (unfiltered).
     pub pinned_total: u64,
-    /// The pin-count ceiling the total is measured against.
     pub pin_capacity: u64,
     /// Whether the listing was cut short by the (clamped) limit.
     pub truncated: bool,
 }
 
-/// One pinned field with its aggregates.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogFieldSummary {
-    /// Field name.
     pub name: String,
     /// Pinned `DuckDB` type (e.g. "BIGINT").
     #[serde(rename = "type")]
@@ -1332,9 +1044,7 @@ pub struct CatalogFieldSummary {
     pub pinned_from: Option<String>,
     /// When the pin was written (ISO 8601 UTC).
     pub pinned_at: String,
-    /// Distinct services that ever carried the field.
     pub service_count: u64,
-    /// Cumulative rows across all services' observations.
     pub row_count: u64,
     /// Earliest observation (ISO 8601 UTC; absent when never observed).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1352,27 +1062,12 @@ pub struct CatalogFieldSummary {
     pub verdict: Option<DegradedVerdict>,
 }
 
-/// The analyzer's verdict on a degraded field (ADR-0011): the pin has been
-/// shelving values for long enough, and in enough volume, that an operator
-/// should decide whether to repin it.
-///
-/// Structured facts only, so the consumer writes the words. A stored sentence
-/// would fix the phrasing of every present and future surface (CLI table,
-/// SPA drawer, an eventual auto-repin's decision record) at the moment the
-/// evidence was recorded.
-///
-/// The verdict is advisory and sender-influenceable by construction: a
-/// single misbehaving producer can raise it (there is deliberately no
-/// multi-sender gate — a homelab commonly has exactly one producer per
-/// field). What it can never do is act: repinning stays behind
-/// `schema_write` and a human.
+/// The analyzer's verdict on a degraded field (ADR-0011).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DegradedVerdict {
     /// Earliest conflict evidence for the field (ISO 8601 UTC).
     pub since: String,
-    /// Distinct services in the evidence. Displayed, never a gate.
     pub services: u64,
-    /// Distinct conflict episodes across every service.
     pub episodes: u64,
     /// Lifetime rows the pin has nulled: durable, and therefore usually
     /// larger than the sibling `rows_nulled` fields, which sum only the
@@ -1392,17 +1087,13 @@ pub struct DegradedVerdict {
 pub struct CatalogFieldResponse {
     /// Field name (catalog spelling — ASCII-lowercase).
     pub name: String,
-    /// Pinned `DuckDB` type.
     #[serde(rename = "type")]
     pub data_type: String,
-    /// Which service's batch set the pin.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pinned_from: Option<String>,
     /// When the pin was written (ISO 8601 UTC).
     pub pinned_at: String,
-    /// One page of per-service observations, most recent first. The service
-    /// axis is client-chosen and never pruned, so the detail never carries
-    /// the whole history — page with `services_cursor`.
+    /// One page of per-service observations, most recent first.
     pub services: Vec<CatalogFieldServiceRow>,
     /// Opaque cursor for the next page of `services` (pass as `?after=`).
     /// Absent on the last page.
@@ -1415,25 +1106,19 @@ pub struct CatalogFieldResponse {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<DegradedVerdict>,
     /// The operator's acknowledgement of the badge, if one stands.
-    ///
-    /// Independent of `verdict`, and deliberately so: an ack that has been
-    /// overtaken by newer evidence appears here beside a re-raised verdict.
-    /// The two together are the story ("acknowledged on Tuesday, still
-    /// shelving values on Thursday"), and filtering one out would hide it.
+    /// Independent of `verdict`: an ack that has been overtaken by newer
+    /// evidence appears here beside a re-raised verdict.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ack: Option<FieldAck>,
 }
 
-/// One service's observation of a field.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogFieldServiceRow {
-    /// Service name.
     pub service: String,
     /// First observation (ISO 8601 UTC).
     pub first_seen: String,
     /// Most recent observation (ISO 8601 UTC).
     pub last_seen: String,
-    /// Cumulative rows in batches that wrote the field.
     pub row_count: u64,
 }
 
@@ -1450,13 +1135,9 @@ pub struct CatalogConflictsResponse {
 /// One recorded conflict: a batch column whose conforming cast nulled rows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CatalogConflictRow {
-    /// Field name.
     pub field: String,
-    /// Service whose batch disagreed with the pin.
     pub service: String,
-    /// The `DuckDB` type the batch actually carried.
     pub observed_type: String,
-    /// The pinned type the values were cast to.
     pub expected_type: String,
     /// Rows whose value the cast nulled (recoverable from `_raw`).
     pub rows_nulled: u64,
@@ -1468,13 +1149,10 @@ pub struct CatalogConflictRow {
     pub at: String,
 }
 
-/// An operator's acknowledgement of a degraded verdict (issue #111): the
-/// body of a successful `POST /api/v1/schema/field/ack`, and the `ack` key
-/// on the field detail.
-///
-/// Acknowledging suppresses the badge for the evidence that existed when it
-/// was written, and nothing further: `evidence_through` is the episode count
-/// the ack covers, so the next conflict episode raises the badge again.
+/// An operator's acknowledgement of a degraded verdict: the body of a
+/// successful `POST /api/v1/schema/field/ack`. `evidence_through` is the
+/// episode count the ack covers, so the next conflict episode raises the
+/// badge again.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldAck {
     /// When the acknowledgement was written or last advanced (ISO 8601 UTC).
@@ -1485,11 +1163,8 @@ pub struct FieldAck {
     /// The operator's note, verbatim as they wrote it (≤1024 bytes).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
-    /// Conflict episodes the acknowledgement covers.
     pub evidence_through: u64,
 }
-
-// -- repin (ADR-0011) --------------------------------------------------------
 
 /// Request body for `POST /api/v1/schema/repin`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1500,13 +1175,10 @@ pub struct RepinRequest {
     /// `VARCHAR`, `SEVERITY`; case-insensitive).
     pub to: String,
     /// Which dialect the corpus's numerals are read in for a `SEVERITY`
-    /// target: `otel` (default) or `syslog`. The two ladders overlap over
-    /// 1-7 with opposite meanings, so no value-shape rule can tell them
-    /// apart; the operator asserts provenance. A dialect with any other
-    /// target is a 400, since it would be silently ignored otherwise.
+    /// target: `otel` (default) or `syslog`. A dialect with any other
+    /// target is a 400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dialect: Option<String>,
-    /// Scan and report only — no mutation.
     #[serde(default)]
     pub dry_run: bool,
     /// Accept a lossy projection (`projected_nulls > 0`), or run a
@@ -1515,9 +1187,8 @@ pub struct RepinRequest {
     pub force: bool,
     /// The most rows the forced rewrite may null before the cutover is
     /// refused. Absent means the server derives one from this job's own
-    /// scan (10% headroom over a floor of 10 rows), which is the ordinary
-    /// case: an operator forcing a repin accepts roughly the plan they read,
-    /// not a number they computed. A ceiling without `force` is a 400.
+    /// scan (10% headroom over a floor of 10 rows). A ceiling without
+    /// `force` is a 400.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nulled_rows: Option<u64>,
     /// The same bound for dialect-ambiguous numerals, consulted only where
@@ -1526,21 +1197,14 @@ pub struct RepinRequest {
     pub max_ambiguous_rows: Option<u64>,
 }
 
-/// One repin job — the dry-run report and the progress/outcome record are
-/// the same shape (they are the same postgres row).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinJobResponse {
-    /// Job id.
     pub id: i64,
-    /// The repinned field.
     pub field: String,
     /// The pin at claim time.
     pub from_type: String,
-    /// The target pin.
     pub to_type: String,
-    /// Whether the job stopped after the scan.
     pub dry_run: bool,
-    /// Whether a lossy projection was explicitly accepted.
     pub force: bool,
     /// `running`, `succeeded`, `failed`, `refused_needs_force`, `blocked`.
     pub status: String,
@@ -1550,9 +1214,7 @@ pub struct RepinJobResponse {
     pub started_at: String,
     /// Terminal instant (ISO 8601 UTC).
     pub finished_at: Option<String>,
-    /// Terminal error text, when any.
     pub error: Option<String>,
-    /// Scan plan: affected files.
     pub files_total: u64,
     /// Scan plan: rows carrying a stored value for the field.
     pub rows_carrying: u64,
@@ -1563,13 +1225,9 @@ pub struct RepinJobResponse {
     /// Scan plan: bytes across the affected files (held twice until the
     /// job's final sweep).
     pub affected_bytes: u64,
-    /// Progress: affected files rewritten so far.
     pub files_done: u64,
-    /// Outcome: rows written through the rewrite.
     pub rows_rewritten: u64,
-    /// Outcome: stored values the rewrite nulled.
     pub rows_nulled: u64,
-    /// Outcome: values resurrected from `_raw`.
     pub rows_resurrected: u64,
     /// The asserted numeral dialect, present exactly for a `SEVERITY`
     /// target. Absent on every other target: a backfilled `otel` would
@@ -1586,21 +1244,11 @@ pub struct RepinJobResponse {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmapped_samples: Vec<String>,
     /// Scan-time liveness, when something is still writing the field.
-    /// Presence is the verdict; the consumer writes the words.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub liveness: Option<RepinLiveness>,
     /// Whether an executing request with this job's flags would be refused
-    /// for want of a force flag.
-    ///
-    /// A dry run succeeds by design, so a plan carrying loss or dialect
-    /// ambiguity has to say so here, or the operator meets the refusal only
-    /// on the request meant to do the work. The server computes it from this
-    /// row's numbers through the same decision the two live gates ask, so a
-    /// dry run cannot promise an outcome the execution would not reach.
-    ///
-    /// Absent until the scan has recorded its plan: a claimed job's counts
-    /// are zeros meaning "not measured yet", and answering `false` there
-    /// would promise a clean run for a job that is about to refuse.
+    /// for want of a force flag. Absent until the scan has recorded its plan:
+    /// a claimed job's counts are zeros meaning "not measured yet".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requires_force: Option<bool>,
     /// Why force is required, in the words the refusal itself uses. Present
@@ -1609,22 +1257,16 @@ pub struct RepinJobResponse {
     pub requires_force_reason: Option<String>,
     /// When an operator asked for this job to stop (ISO 8601 UTC), if any.
     /// Written with `cancelled_by` and never overwritten, so it names the
-    /// first asker. A `running` row carrying it is a cancel in flight: the
-    /// job is walking to its next file boundary. A `failed` row carrying it
-    /// is the crash state — the process died between the request and any
-    /// boundary observing it, and recovery may not infer `cancelled` from a
-    /// request nothing acted on.
+    /// first asker. A `failed` row carrying it is the crash state — the
+    /// process died between the request and any boundary observing it, and
+    /// recovery may not infer `cancelled` from a request nothing acted on.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancel_requested_at: Option<String>,
-    /// Display name of the key that asked. Same identity source as
-    /// `requested_by`, so the row is coherent about who did what.
+    /// Display name of the key that asked.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cancelled_by: Option<String>,
-    /// The loss ceiling the request stated, echoed back. Absent when the
-    /// request stated none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_nulled_rows: Option<u64>,
-    /// The ambiguity ceiling the request stated, echoed back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_ambiguous_rows: Option<u64>,
     /// The loss ceiling the job is held to: the stated value when there was
@@ -1638,13 +1280,6 @@ pub struct RepinJobResponse {
     pub accepted_max_ambiguous_rows: Option<u64>,
 }
 
-/// Evidence that a repin's subject is still being written.
-///
-/// A repin translates history. A field a live sender still feeds keeps
-/// arriving in the ingest-time reading, so a syslog-dialect rewrite leaves
-/// a discontinuity at the cutover instant; the fix for the live half is
-/// `[ingest] severity_from`, not another repin. Facts only, presence being
-/// the verdict (the `Option<DegradedVerdict>` shape).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinLiveness {
     /// Newest observation of the field (ISO 8601 UTC).
@@ -1659,7 +1294,6 @@ pub struct RepinLiveness {
 /// is the plan the refusal is based on).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinResponse {
-    /// The job row.
     pub job: RepinJobResponse,
 }
 
@@ -1671,32 +1305,20 @@ pub struct RepinStatusResponse {
     pub job: Option<RepinJobResponse>,
 }
 
-/// What `POST /api/v1/schema/repin/cancel` answered (#109).
-///
-/// The three variants are exclusive because the server decides them under
-/// one lock: a job is either still stoppable, past the point where there is
-/// anything left to unwind, or absent. The HTTP status carries the same
-/// verdict (202 / 409 / 404), and a client that reads both must find them
-/// agreeing.
+/// What `POST /api/v1/schema/repin/cancel` answered. The HTTP status
+/// carries the same verdict (202 / 409 / 404).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepinCancelOutcome {
-    /// The request is accepted. The job stops at its next file boundary.
     Cancelling,
-    /// The job latched its point of no return first: the corpus is being
-    /// swapped and the job will complete. Not queued for later.
     PastPointOfNoReturn,
-    /// No repin job is running on this node.
     NoJobRunning,
 }
 
 /// Response body for `POST /api/v1/schema/repin/cancel`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepinCancelResponse {
-    /// The verdict, mirroring the HTTP status.
     pub outcome: RepinCancelOutcome,
-    /// The verdict in words. The accepted one quotes the latency contract:
-    /// what "cancelling" promises, and what it does not.
     pub detail: String,
     /// The job the verdict is about, when there is one. Absent for
     /// `no_job_running`, and absent when the store could not be read — a
@@ -1706,32 +1328,18 @@ pub struct RepinCancelResponse {
 }
 
 /// Request body for `POST /api/v1/schema/gc-pins`.
-///
-/// Reclaims pin slots held by fields nothing writes any more. A pin is a
-/// scarce install-wide resource (`MAX_PINNED_FIELDS`), and a typo'd or
-/// retired sender field otherwise holds its slot forever.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GcPinsRequest {
-    /// Scan and report only — no mutation.
     #[serde(default)]
     pub dry_run: bool,
-    /// How long a field must have gone unobserved to be dead. Defaults
-    /// server-side to 30 days; `0` is accepted literally (the standing
-    /// parquet footers are the second, independent proof). The server
-    /// raises it to the retention window when that is longer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub older_than_secs: Option<u64>,
 }
 
 /// Response from `POST /api/v1/schema/gc-pins`, the same shape for a dry
 /// run and a real one — `dry_run` and `deleted` are what tell them apart.
-///
-/// Every number the operator reads is the server's own: the effective
-/// window is decided once, in `catalog::gc`, and reported here. No client
-/// recomputes it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcPinsResponse {
-    /// Whether this run stopped after the scan.
     pub dry_run: bool,
     /// The one instant the run is anchored to (RFC 3339 UTC): cutoff,
     /// audit events and this report all read it.
@@ -1739,17 +1347,14 @@ pub struct GcPinsResponse {
     /// The requested window in seconds, after the server default applied.
     pub requested_older_than_secs: u64,
     /// The retention window in seconds, when a finite retention horizon
-    /// exists. A pin cannot be called dead over a span shorter than the
-    /// corpus trawl still keeps, and the field is absent when the global
-    /// `max_age_days` or any `[retention.env.*]` entry is 0, since no
-    /// finite age then bounds what the corpus still holds.
+    /// exists: absent when the global `max_age_days` or any
+    /// `[retention.env.*]` entry is 0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retention_floor_secs: Option<u64>,
     /// The window actually applied: the larger of the two above.
     pub effective_older_than_secs: u64,
     /// Pins that passed the observation axis, before the footer scan.
     pub pins_examined: u64,
-    /// Parquet files whose schema the run read.
     pub files_scanned: u64,
     /// Would-delete on a dry run, deleted on a real one. Field-sorted.
     pub candidates: Vec<GcPinCandidate>,
@@ -1757,7 +1362,6 @@ pub struct GcPinsResponse {
     pub deleted: u64,
 }
 
-/// One pin the run judged dead.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcPinCandidate {
     /// The field name (catalog spelling: ASCII-lowercase).
@@ -1769,20 +1373,14 @@ pub struct GcPinCandidate {
     /// pin was never observed at all.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_seen: Option<String>,
-    /// How many services ever carried it.
     pub services: i64,
 }
 
-// -- history -----------------------------------------------------------------
-
-/// Response after clearing the authenticated key's query history.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ClearHistoryResponse {
-    /// Number of history rows deleted by this request.
     pub deleted: u64,
 }
 
-/// Response from the history endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryResponse {
     /// Matching history entries, ordered by execution time then ID descending.
@@ -1791,95 +1389,64 @@ pub struct HistoryResponse {
     pub total: usize,
 }
 
-/// A single query history entry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryEntryResponse {
-    /// History entry ID.
     pub id: i64,
-    /// The DSL query string.
     pub query: String,
     /// When the query was executed (ISO 8601 UTC).
     pub executed_at: String,
-    /// Execution duration in milliseconds.
     pub duration_ms: u64,
-    /// Number of rows returned.
     pub row_count: usize,
-    /// Query outcome.
     pub status: QueryStatus,
 }
 
-// -- saved queries -----------------------------------------------------------
-
-/// Response from the list saved queries endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListSavedResponse {
     /// Saved queries (sorted by name).
     pub queries: Vec<SavedQueryResponse>,
 }
 
-/// A single saved query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedQueryResponse {
-    /// Saved query ID.
     pub id: i64,
-    /// Query name.
     pub name: String,
-    /// The DSL query string.
     pub query: String,
     /// When the query was created (ISO 8601 UTC).
     pub created_at: String,
     /// When the query was last updated (ISO 8601 UTC).
     pub updated_at: String,
-    /// Schedule attached to this saved query (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schedule: Option<ScheduleResponse>,
 }
 
-/// Response from the delete saved query endpoint.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteSavedResponse {
-    /// Whether the query was successfully deleted.
     pub deleted: bool,
 }
 
-// -- schedules ---------------------------------------------------------------
-
-/// Schedule attached to a saved query.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScheduleResponse {
-    /// Schedule ID.
     pub id: i64,
-    /// The saved query this schedule belongs to.
     pub saved_query_id: i64,
     /// Human-readable interval (e.g. "5m", "1h").
     pub interval: String,
-    /// Interval in seconds.
     pub interval_secs: u64,
-    /// Maximum number of runs (if set).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u64>,
-    /// Whether the schedule is active.
     pub enabled: bool,
     /// When the schedule was created (ISO 8601 UTC).
     pub created_at: String,
     /// When the schedule was last updated (ISO 8601 UTC).
     pub updated_at: String,
-    /// Most recent report run summary (if any).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_run: Option<ReportRunSummary>,
-    /// Runs the schedule has claimed over its life, manual and scheduled,
-    /// including runs retention has since deleted. It is the count
-    /// `max_runs` caps; editing the schedule keeps it, and only deleting
-    /// and recreating the schedule starts it again at 0.
     pub total_runs: u64,
     /// Whether the run budget is spent: `max_runs` is set and `total_runs`
-    /// has reached it. An exhausted schedule claims no run, manual or
-    /// scheduled, until `max_runs` is raised. `max_runs = 0` is exhausted
-    /// from the start.
+    /// has reached it.
     pub exhausted: bool,
     /// The report window this schedule covers, normalized: the literal
     /// `"since_last"` or a duration such as `"2h"`. Absent means query
-    /// mode, where the saved DSL runs verbatim (ADR-0018 ruling 6).
+    /// mode (ADR-0018 ruling 6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
     /// Late-arrival allowance as a duration string, present exactly when
@@ -1887,32 +1454,15 @@ pub struct ScheduleResponse {
     /// is the value in force, not an absence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag: Option<String>,
-    /// The same allowance in seconds, for a client that does arithmetic on
-    /// it rather than printing it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag_secs: Option<u64>,
     /// The `since_last` watermark, the instant the next window starts
-    /// from (RFC 3339, UTC, microseconds).
-    ///
-    /// It says nothing about whether a run has happened. A fresh tiling
-    /// schedule is seeded at the origin of the coverage it owes,
-    /// `next_fire_at - interval - lag`, before it has ever run; only after
-    /// a success is it the end of the newest window a run covered. Read it
-    /// as where coverage resumes, never as proof of a run. `total_runs`
-    /// and `last_run` are what answer that.
-    ///
-    /// Absent for a fixed window and for query mode, neither of which
-    /// claims coverage. A schedule that used to tile keeps its watermark
-    /// stored across a mode change, so switching back to `since_last`
-    /// resumes from it rather than from the new anchor. It is not reported
-    /// while the schedule is in a mode that does not mean it.
+    /// from (RFC 3339, UTC, microseconds). It says nothing about whether a
+    /// run has happened: read it as where coverage resumes, never as proof
+    /// of a run. Absent for a fixed window and for query mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub covered_through: Option<String>,
-    /// The planned next fire instant (RFC 3339, UTC, microseconds). Always
-    /// present: every schedule has a fire cursor, windowed or not. A
-    /// successful manual run moves a cursor it overtook to the cadence's
-    /// next boundary, so this is also where to see that a manual run
-    /// consumed an overdue fire.
+    /// The planned next fire instant (RFC 3339, UTC, microseconds).
     pub next_fire_at: String,
 }
 
@@ -1926,30 +1476,12 @@ pub struct SetScheduleRequest {
     /// `bad_request`, and the schedule is not written.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_runs: Option<u64>,
-    /// Whether the schedule is enabled.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// The report window this schedule should cover (ADR-0018 ruling 6).
-    ///
-    /// Two spellings. `"since_last"` tiles: each run covers
-    /// `[the previous run's window end, this fire - lag)`, so consecutive
-    /// runs cover consecutive intervals and a failed run's gap is healed by
-    /// the next success. A duration such as `"2h"` is a fixed trailing
-    /// span, re-measured from every fire and never healing anything.
-    ///
-    /// Absent is query mode: the saved DSL runs verbatim and the run row
-    /// records no bounds. A window against a saved query that carries its
-    /// own `last=`/`earliest=`/`latest=`, or reads `from saved`, is a 400
-    /// naming both sides.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<String>,
     /// Late-arrival allowance, a duration such as `"5m"` (default `"0s"`).
-    ///
-    /// It shifts BOTH window bounds back, so it delays coverage rather than
-    /// widening it: an event that landed after the boundary it belongs to
-    /// is still inside the window that covers it. Only meaningful with a
-    /// `window` — a lag without one is a 400, since query mode has no
-    /// bounds to shift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lag: Option<String>,
 }
@@ -1958,12 +1490,9 @@ fn default_true() -> bool {
     true
 }
 
-/// Summary of a single report run (no result data).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ReportRunSummary {
-    /// Run ID.
     pub id: i64,
-    /// DSL query snapshot at execution time.
     pub query: String,
     /// Run status: "running", "success", "error", "timeout".
     pub status: String,
@@ -1972,10 +1501,8 @@ pub struct ReportRunSummary {
     /// When the run finished (ISO 8601 UTC).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<String>,
-    /// Execution duration in milliseconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
-    /// Number of result rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub row_count: Option<usize>,
     /// Error message (if status is "error").
@@ -1986,12 +1513,10 @@ pub struct ReportRunSummary {
     pub result_path: Option<String>,
     /// Inclusive lower bound of the window this run covered (RFC 3339, UTC,
     /// microseconds). All four `window_*` fields are absent together for a
-    /// run claimed in Query text mode. Changing the schedule mode later
-    /// does not add a window to an existing run (ADR-0018 ruling 11).
+    /// run claimed in Query text mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_start: Option<String>,
-    /// Exclusive upper bound of the covered window. Windows are half-open
-    /// `[start, end)`, so tiled runs cannot double-count a boundary event.
+    /// Exclusive upper bound of the covered window.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_end: Option<String>,
     /// Whether the window was clamped forward past an uncovered catch-up
@@ -2003,13 +1528,11 @@ pub struct ReportRunSummary {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_kind: Option<String>,
     /// How the run started: `"scheduled"` at a planned fire, or `"manual"`
-    /// when an operator fired the schedule's next window early. Absent for
-    /// a run recorded before origins were.
+    /// when an operator fired the schedule's next window early.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
 
-/// Paginated list of report runs.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListReportRunsResponse {
     /// Report run summaries (most recent first).
@@ -2019,10 +1542,8 @@ pub struct ListReportRunsResponse {
     pub total: usize,
 }
 
-/// Full report run including result data.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReportRunResponse {
-    /// Run summary metadata.
     #[serde(flatten)]
     pub summary: ReportRunSummary,
     /// Query result (decompressed). Absent for error/running runs.
@@ -2030,52 +1551,40 @@ pub struct ReportRunResponse {
     pub result: Option<QueryResult>,
 }
 
-/// Response from deleting a schedule.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeleteScheduleResponse {
-    /// Whether a schedule was deleted.
     pub deleted: bool,
 }
 
-/// A report run enriched with the owning saved query's name and ID.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GlobalRunSummary {
     /// Saved query ("net") ID.
     pub net_id: i64,
-    /// Saved query name.
     pub net_name: String,
-    /// Run details.
     #[serde(flatten)]
     pub run: ReportRunSummary,
 }
 
-/// Paginated list of runs across all saved queries.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ListAllRunsResponse {
     /// Runs (most recent first).
     pub runs: Vec<GlobalRunSummary>,
-    /// Number of runs kept for this user, across saved queries.
     pub total: usize,
 }
 
-/// Aggregate statistics across all report runs for a user.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunsStatsResponse {
     /// Number of runs kept (all statuses). Retention deletes runs, so this
     /// counts what is kept, not what schedules have claimed.
     pub total_runs: u64,
-    /// Number of successful runs.
     pub success_count: u64,
-    /// Number of failed runs.
     pub error_count: u64,
-    /// Number of timed-out runs.
     pub timeout_count: u64,
     /// Average execution duration in milliseconds (None if no completed runs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub avg_duration_ms: Option<u64>,
 }
 
-/// Allowlisted global Runs ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunsSortKey {
@@ -2087,7 +1596,6 @@ pub enum RunsSortKey {
     Rows,
 }
 impl RunsSortKey {
-    /// Return the exact lowercase HTTP token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2113,7 +1621,6 @@ impl std::str::FromStr for RunsSortKey {
     }
 }
 
-/// Allowlisted global Runs ordering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RunsSortDir {
@@ -2122,7 +1629,6 @@ pub enum RunsSortDir {
     Desc,
 }
 impl RunsSortDir {
-    /// Return the exact lowercase HTTP token.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -2142,13 +1648,6 @@ impl std::str::FromStr for RunsSortDir {
     }
 }
 
-// -- ingest ------------------------------------------------------------------
-
-/// A per-event error from the ingest endpoint.
-///
-/// Reported when individual events in a batch fail validation while
-/// other events in the same batch succeed. The ingest preview reports a
-/// rejected event with the same `index`, `reason` and `message`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IngestEventError {
     /// Zero-based event index (array position or ndjson line number including blanks).
@@ -2158,22 +1657,14 @@ pub struct IngestEventError {
     /// reference's rejection table, and the `reason` label of
     /// `trawl_ingest_events_rejected_total`.
     pub reason: String,
-    /// Human-readable error description.
     pub message: String,
 }
 
-/// Response from the ingest endpoint.
-///
-/// When every event is valid, `rejected` and `errors` are omitted from the
-/// JSON body, so a decoder has to default them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IngestResponse {
-    /// Number of records accepted and written to the WAL.
     pub accepted: usize,
-    /// Number of records rejected due to per-event validation errors.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub rejected: usize,
-    /// Per-event error details (one entry per rejected event).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub errors: Vec<IngestEventError>,
 }
@@ -2188,8 +1679,6 @@ fn is_zero(n: &usize) -> bool {
 mod tests {
     #[test]
     fn query_execution_serialization() {
-        // A cut window: `total` must survive the round trip as the number the
-        // execution produced, not be rebuilt from the rows on the wire.
         let wire = serde_json::json!({"columns": [], "rows": [],
             "pagination": {"limit": 10, "offset": 0, "returned": 10, "total": 59}});
         let mut response: super::QueryResponse = serde_json::from_value(wire.clone()).unwrap();
@@ -2209,9 +1698,7 @@ mod tests {
 
     /// `QueryResponse` and `ReportRunResponse` both go through serde's
     /// flatten buffer, which hands the result codec buffered content
-    /// rather than the JSON text. The typed cells must land the same way
-    /// there: exact integers, refusals naming the column, and a `u64`
-    /// that stays exact through the buffer (the refusal quotes it whole).
+    /// rather than the JSON text.
     #[test]
     fn typed_results_survive_the_flatten_buffer() {
         use crate::value::{Column, ColumnType, QueryResult, Value};
@@ -2253,9 +1740,6 @@ mod tests {
         assert_eq!(decoded.result.as_ref(), Some(&result));
         assert_eq!(serde_json::to_value(&decoded).unwrap(), run);
 
-        // A JSON number under `integer` is refused even inside the
-        // buffer, and the refusal quotes the number exactly: the buffer
-        // kept it a `u64`, never a float.
         run["result"]["rows"][0][0] = serde_json::json!(u64::MAX);
         let err = serde_json::from_str::<super::ReportRunResponse>(&run.to_string())
             .expect_err("a JSON number is not an integer cell");
@@ -2331,14 +1815,11 @@ mod tests {
 
     use super::*;
 
-    /// Round-trip a type through JSON serialization.
     fn roundtrip<T: Serialize + for<'de> Deserialize<'de> + std::fmt::Debug>(value: &T) -> T {
         let json = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&json).expect("deserialize")
     }
 
-    /// The capacity enums' wire tokens are the contract the SPA and the
-    /// wire fixtures decode, so they are pinned here rather than inferred.
     #[test]
     fn capacity_enums_serialize_with_their_tags() {
         use serde_json::json;
@@ -2480,17 +1961,12 @@ mod tests {
         let verdict = rt.verdict.expect("the verdict survives the wire");
         assert_eq!(verdict.rows_shelved, 120);
         assert_eq!(verdict.suggested_to, "VARCHAR");
-        // Verdict and ack ride together: an acknowledgement overtaken by
-        // new evidence is exactly this shape.
         let ack = rt.ack.expect("the acknowledgement survives the wire");
         assert_eq!(ack.acked_by, "tkl_abc123");
         assert_eq!(ack.evidence_through, 4);
         assert_eq!(ack.note.as_deref(), Some("sender is being fixed"));
     }
 
-    /// An unacknowledged field carries no `ack` key at all, and an ack
-    /// without a note carries no `note` key. Absence is the current wire
-    /// representation for an unset acknowledgement or note.
     #[test]
     fn an_unacknowledged_field_carries_no_ack_key() {
         let resp = CatalogFieldResponse {
@@ -2517,11 +1993,6 @@ mod tests {
         assert!(!json.contains("\"note\""), "{json}");
     }
 
-    /// A repin request states its ceilings or states nothing. A body from a
-    /// client that predates them deserializes with both absent, and one
-    /// written without them puts no key on the wire, so the server reads
-    /// "derive from the scan" rather than a zero somebody meant as
-    /// "unlimited".
     #[test]
     fn repin_ceilings_are_absent_unless_the_request_states_them() {
         let older: RepinRequest =
@@ -2543,9 +2014,6 @@ mod tests {
         assert_eq!(rt.max_ambiguous_rows, None);
     }
 
-    /// The job row carries both pairs: what the request asked for, and what
-    /// the job is held to. The accepted pair is what the CLI binds a second
-    /// request to, so it has to survive the round trip intact.
     #[test]
     fn repin_job_reports_requested_and_accepted_ceilings() {
         let json = serde_json::to_string(&RepinJobResponse {
@@ -2583,7 +2051,6 @@ mod tests {
             cancelled_by: None,
         })
         .unwrap();
-        // An unstated request ceiling is absent, not zero.
         assert!(!json.contains("\"max_nulled_rows\""), "{json}");
 
         let rt: RepinJobResponse = serde_json::from_str(&json).unwrap();
@@ -2593,8 +2060,6 @@ mod tests {
         assert_eq!(rt.accepted_max_ambiguous_rows, Some(3));
     }
 
-    /// A healthy field carries no `verdict` key and no `samples` key at all:
-    /// absent is the only encoding of "not degraded".
     #[test]
     fn a_healthy_field_serialises_without_the_new_keys() {
         let resp = CatalogFieldsResponse {
@@ -2618,7 +2083,6 @@ mod tests {
         let json = serde_json::to_string(&resp).unwrap();
         assert!(!json.contains("verdict"), "{json}");
 
-        // A body without the key still deserialises.
         let old = r#"{"fields":[{"name":"duration","type":"BIGINT",
             "pinned_at":"2026-08-01T10:00:00Z","service_count":1,"row_count":5,
             "conflict_count":0,"rows_nulled":0}],
@@ -2647,9 +2111,6 @@ mod tests {
         assert!(rt.truncated);
     }
 
-    /// The `/api/v1/schema/services` wire shape is the TUI and SPA contract:
-    /// types come from the catalog, and the JSON keys are fixed. Golden-pin
-    /// every key.
     #[test]
     fn service_schema_wire_keys_are_pinned() {
         let resp = ServiceSchemaResponse {
@@ -2673,8 +2134,6 @@ mod tests {
                     date: "2026-01-01".into(),
                     count: 1,
                 }],
-                // Empty is the healthy install; the pinned key set below is
-                // what proves it stays off the wire there.
                 degraded_fields: Vec::new(),
             }],
             cached: true,
@@ -2833,8 +2292,6 @@ mod tests {
         assert_eq!(rt.error.details[0].span.as_ref().unwrap().start, 15);
     }
 
-    /// `conflict` is present only on `sequence_conflict`, and an envelope
-    /// written before it existed still decodes.
     #[test]
     fn a_sequence_conflict_carries_both_sequences() {
         let resp = ErrorResponse {
@@ -2918,7 +2375,6 @@ mod tests {
         );
     }
 
-    /// Every wire code with its spelling.
     const EVERY_ERROR_CODE: [(ErrorCode, &str); 39] = [
         (ErrorCode::ParseError, "parse_error"),
         (ErrorCode::ValidationError, "validation_error"),
@@ -3045,7 +2501,6 @@ mod tests {
             histogram: false,
         };
         let json = serde_json::to_string(&req).unwrap();
-        // skip_serializing_if means offset should be absent
         assert!(!json.contains("offset"));
         let rt: QueryRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(rt.query, req.query);
@@ -3063,7 +2518,6 @@ mod tests {
         assert!(!req.histogram, "a missing flag decodes false");
     }
 
-    /// The histogram flag is on the wire only when it is true.
     #[test]
     fn query_request_histogram_flag_is_sent_only_when_true() {
         let mut req = QueryRequest {
@@ -3086,7 +2540,6 @@ mod tests {
         assert!(!off.histogram);
     }
 
-    /// A UTC wire instant `micros` past the epoch.
     fn instant(micros: i64) -> String {
         zone::wire_timestamp(micros, chrono::FixedOffset::east_opt(0).unwrap())
     }
@@ -3119,7 +2572,6 @@ mod tests {
         }
     }
 
-    /// `ready()` with `edit` applied to its fields.
     fn ready_with(
         edit: impl FnOnce(&mut String, &mut String, &mut Vec<HistogramBucket>, &mut u64, &mut bool),
     ) -> EventHistogram {
@@ -3138,9 +2590,6 @@ mod tests {
         histogram
     }
 
-    /// Both states round-trip under the `state` tag, and every reason has
-    /// its `snake_case` spelling. A response carries the histogram only when
-    /// it has one.
     #[test]
     fn event_histogram_round_trips_with_the_state_tag() {
         let ready = ready();
@@ -3197,9 +2646,8 @@ mod tests {
         assert_eq!(back.histogram, response.histogram);
     }
 
-    /// `consistent_with`, one row per rule, each beside the case it breaks.
     #[test]
-    #[allow(clippy::too_many_lines)] // one table
+    #[allow(clippy::too_many_lines)]
     fn event_histogram_consistency_truth_table() {
         let unavailable = EventHistogram::Unavailable {
             reason: HistogramReason::Sample,
@@ -3438,7 +2886,6 @@ mod tests {
 
     #[test]
     fn successful_ingest_omits_zero_rejections() {
-        // A successful batch omits its zero rejection count and empty errors.
         let json = r#"{"accepted": 5}"#;
         let resp: IngestResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.accepted, 5);
@@ -3459,7 +2906,6 @@ mod tests {
         };
         let json = serde_json::to_string(&resp).unwrap();
         assert!(json.contains("\"ok\""));
-        // checks omitted when None
         assert!(!json.contains("checks"));
         assert!(!json.contains("version"));
     }
@@ -3502,7 +2948,6 @@ mod tests {
 
     #[test]
     fn health_response_without_checks_deserializes() {
-        // A response without the `checks` field still parses.
         let json = r#"{"status":"ok"}"#;
         let resp: HealthResponse = serde_json::from_str(json).unwrap();
         assert_eq!(resp.status, HealthStatus::Ok);
@@ -3529,8 +2974,6 @@ mod tests {
 
     #[test]
     fn whoami_multi_role_roundtrip() {
-        // Roles are cross-app bundles: every role name travels, unfiltered;
-        // permissions stay trawl-scoped.
         let resp = WhoAmIResponse {
             prefix: "abcd1234".into(),
             name: "siem-bot".into(),
@@ -3608,9 +3051,6 @@ mod tests {
         assert_eq!(rt.hot_buffer_events, Some(42));
     }
 
-    /// A body with no `degraded_fields` key is indistinguishable from a
-    /// healthy one: absent on the way in reads as "nothing degraded", and
-    /// empty on the way out never reaches the wire at all.
     #[test]
     fn service_schema_degraded_fields_defaults_and_omits() {
         let healthy = serde_json::json!({
@@ -3659,8 +3099,6 @@ mod tests {
         assert!(!rt.cached);
     }
 
-    /// A capacity object carrying every reach, reach-end and withheld
-    /// variant at once.
     fn capacity_fixture() -> Capacity {
         let observed = |first: &str| (first.to_owned(), "2026-09-25".to_owned());
         let projected = |low, high| {
@@ -3761,15 +3199,11 @@ mod tests {
         }
     }
 
-    /// Every capacity variant survives the wire, alone and inside the
-    /// dashboard snapshot, and the snapshot refuses to decode without it.
     #[test]
     fn dashboard_capacity_roundtrip() {
         let full = capacity_fixture();
         assert_eq!(roundtrip(&full), full);
 
-        // The variants one object cannot hold at once: the other floor
-        // state, every sweep outcome, no sweep yet, and no sample yet.
         let mut variants = Vec::new();
         for outcome in [
             SweepOutcome::Completed,
@@ -3819,8 +3253,6 @@ mod tests {
         assert!(serde_json::from_value::<DashboardSnapshot>(missing).is_err());
     }
 
-    /// One fully populated snapshot, shared by the tests that need a
-    /// complete wire shape to take a field away from.
     fn dashboard_fixture() -> DashboardSnapshot {
         DashboardSnapshot {
             hostname: "test-host".into(),
@@ -3946,8 +3378,6 @@ mod tests {
         }
     }
 
-    /// Retained work is reported explicitly. An omitted measurement must not
-    /// silently turn into a claim that no executor remains busy.
     #[test]
     fn retained_counts_are_required_and_roundtrip() {
         let without_retained = |value: &serde_json::Value| {

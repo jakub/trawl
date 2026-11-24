@@ -20,11 +20,8 @@ type RepinRequest = { field: string; to: string; dry_run: boolean; force: boolea
 const free: Reply = { json: { job: null } };
 const held: Reply = { json: { job: { ...running, field: OTHER } } };
 const failed: Reply = { status: 503, json: { error: { code: 'unavailable', message: 'Fixture status unavailable' } } };
-/** What a read by id gets for a job the server does not hold. */
 const gone: Reply = { status: 404, json: { error: { code: 'not_found', message: 'repin job not found' } } };
 
-/** A read remains pending until the test releases it. No timer decides when
- * the response arrives, including responses delivered after modal disposal. */
 function pending() {
   let release!: (reply: Reply) => void;
   let completed!: () => void;
@@ -48,17 +45,12 @@ async function prepare(page: Page) {
   } }));
 
   const script = {
-    // Install-wide reads (no `?id=`), answered from `status`.
     reads: 0,
-    // The ids of reads by id, answered in order from `jobs`; once `jobs`
-    // is empty the job is `gone`.
     jobReads: [] as number[],
     jobs: [] as Reply[],
     posts: [] as RepinRequest[],
     status: [] as (Reply | ReturnType<typeof pending>)[],
     postMode: 'busy' as 'busy' | 'plan' | 'lost' | 'late',
-    // Merged over the row a `late` 202 carries, which is otherwise the
-    // claimed job still running.
     late: {} as Record<string, unknown>,
     // `bad_request` is the server's supported ErrorResponse code for busy.
     // The audit's `conflict` spelling exercises the conservative fallback.
@@ -89,8 +81,6 @@ async function prepare(page: Page) {
     } else if (script.postMode === 'lost' && !body.dry_run) {
       await route.fulfill(failed);
     } else if (script.postMode === 'late') {
-      // The scan outlasted the server's answer bound: 202 with the
-      // claimed row, dry run included (ADR-0054).
       await route.fulfill({ status: 202, json: { job: { ...running, field: body.field, to_type: body.to,
         dry_run: body.dry_run, id: 4212, files_done: 0, ...script.late } } });
     } else {
@@ -130,7 +120,6 @@ for (const [name, reply, busyCode] of [
     await open(page);
     await expect.poll(() => script.reads).toBe(2);
     await expect(modal(page).getByRole('button', { name: 'Checking…', exact: true })).toBeDisabled();
-    // The selector ignores changes while the scan/probe is in flight.
     await modal(page).getByRole('button', { name: 'DOUBLE', exact: true }).click();
     await expect(modal(page).getByRole('button', { name: 'BIGINT', exact: true })).toHaveAttribute('aria-pressed', 'true');
     probe.release(reply);
@@ -160,7 +149,6 @@ test('repin operator rechecks held, unknown and free slots before requesting a n
     await check.click();
     await expect.poll(() => script.reads).toBe(before + 1);
     await expect(modal(page).getByRole('button', { name: 'Checking…', exact: true })).toBeDisabled();
-    // Keyboard submission while probing must not issue another status read.
     await page.keyboard.press('Control+Enter');
     probe.release(reply);
     await probe.done;
@@ -246,7 +234,6 @@ test('repin plan answered 202 past the server bound is followed by its id to its
   // Drawer mount, and from then on another field's job holds the slot, so
   // the install-wide read never names the plan's job again.
   script.status.push(free, held, held, held);
-  // The plan's follow: one read still scanning, one with the report.
   script.jobs.push({ json: { job: planned } },
     { json: { job: { ...planned, status: 'succeeded', finished_at: '2026-08-01T09:21:00Z' } } });
   await page.goto(`/search/schema?field=${FIELD}`);
@@ -282,7 +269,6 @@ for (const [name, late, outcome] of [
       await expect(modal(page).getByRole('button', { name: /Run repin/ })).toHaveCount(0);
     }
     expect(script.posts).toEqual([{ field: FIELD, to: 'BIGINT', dry_run: true, force: false }]);
-    // A terminal row is the answer: nothing is read after it.
     expect(script.jobReads).toEqual([]);
     expect(script.reads).toBe(1);
     await expectNoBackgroundWork(page);
@@ -309,7 +295,6 @@ test('repin run answered 202 is followed by its id after another job takes the s
   const script = await prepare(page);
   script.postMode = 'plan';
   const started = { ...running, field: FIELD, to_type: 'BIGINT', dry_run: false, id: 4212, files_done: 0 };
-  // Drawer mount, and from then on another field's job holds the slot.
   script.status.push(free, held, held, held);
   script.jobs.push({ json: { job: { ...started, status: 'succeeded', files_done: 12,
     rows_rewritten: 41822, finished_at: '2026-08-01T09:21:00Z' } } });
@@ -319,7 +304,6 @@ test('repin run answered 202 is followed by its id after another job takes the s
   await expect(run).toBeEnabled();
   script.postMode = 'late';
   await run.click();
-  // The 202 hands the running job to the case file, which follows it.
   await expect(modal(page)).toHaveCount(0);
   await expect(page.getByText('Repin finished', { exact: true })).toBeVisible();
   await expect(page.getByText('Repin status unavailable', { exact: false })).toHaveCount(0);

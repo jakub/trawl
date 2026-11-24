@@ -2,36 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Configuration loading for `trawl-web`.
-//!
-//! The proxy reads the same `config.toml` as trawld, looking at its
-//! `[web]` section. Fields absent from that section fall back to defaults
-//! picked here so operators can drop the proxy into an existing deployment
-//! without touching the daemon's config.
-//!
-//! When present, the common `FLEET_SESSION_*` runtime variables override only
-//! their corresponding cookie settings. When absent, existing production
-//! `[web]` key, domain, and secure-cookie configuration remains authoritative.
-//!
-//! One setting has no default at all: `[web] public_origins`, the CSRF
-//! allowlist (ADR-0016). Resolution fails and the proxy does not start
-//! when neither the config file nor `FLEET_SESSION_PUBLIC_ORIGINS` states a
-//! browser-visible origin, because every alternative is worse. Deriving one
-//! from `bind_addr` guesses at what the browser's address bar says, and
-//! treating an empty list as "allow everything" installs the vulnerability
-//! this allowlist exists to close, silently.
-//!
 //! Resolution runs in two steps, so `trawl-web --doctor` can inspect a
 //! configuration without the side effects of starting on it:
-//!
-//! 1. [`Sources::resolve`] is pure. From the parsed file and one
-//!    observation of the environment ([`RuntimeParts`]), it selects every
-//!    setting and records where each came from, one result per component.
-//!    It reads no file, logs nothing, and generates no key.
-//! 2. [`ResolvedConfig::from_sources`] is startup's step. It fails on the
-//!    first component error in startup's order, reads the key and pin
-//!    files, logs the warnings that carry configured values, and generates
-//!    an ephemeral key when no key source is configured.
+//! [`Sources::resolve`] is pure, and [`ResolvedConfig::from_sources`] is
+//! startup's step.
 
 use std::ffi::{OsStr, OsString};
 use std::fmt::Write as _;
@@ -48,30 +22,19 @@ use fleet_auth::{
 use trawl_config::{Config, ServerConfig, WebConfig};
 use zeroize::Zeroizing;
 
-/// Default bind address for the proxy HTTP listener.
 pub const DEFAULT_BIND_ADDR: &str = "127.0.0.1:8090";
 
-/// Upstream URL used when `[web].upstream_url` is unset and the caller
-/// supplied no [`ServerConfig`] to derive one from. `[server].http_addr`
-/// carries a serde default, so a config loaded from disk always derives its
-/// own upstream and never reaches this. The port is the one both packaged
-/// deployments give trawld, not `trawl_config::DEFAULT_HTTP_ADDR`.
+/// `[server].http_addr` carries a serde default, so a config loaded from disk
+/// never reaches this. The port is the one both packaged deployments give
+/// trawld, not `trawl_config::DEFAULT_HTTP_ADDR`.
 pub const FALLBACK_UPSTREAM_URL: &str = "https://127.0.0.1:5514";
 
-/// Default session TTL in seconds (24h).
 pub const DEFAULT_SESSION_TTL_SECS: u64 = 86_400;
 
-/// Env var name overriding `[web] bind_addr`. Lets a listener move without
-/// editing the `trawld.toml` shared with the daemon — `bin/dev` uses it to
-/// bind an address the browser's hostname resolves to (remote dev over a
-/// tailnet) or to shift off a port collision.
 pub const ENV_BIND_ADDR: &str = "TRAWL_WEB_BIND_ADDR";
 
-/// Env var name overriding `[web] upstream_ca_path`. Lets a process pin
-/// trawld's certificate without editing the `trawld.toml` shared with the
-/// daemon — `bin/dev` uses it to pin the certificate the development
-/// trawld generates. An empty value counts as unset, as for
-/// [`ENV_BIND_ADDR`], so the file's setting applies.
+/// An empty value counts as unset, as for [`ENV_BIND_ADDR`], so the file's
+/// setting applies.
 pub const ENV_UPSTREAM_CA_PATH: &str = "TRAWL_WEB_UPSTREAM_CA_PATH";
 
 /// Env var name overriding trawld's `[server] http_addr`, which
@@ -79,7 +42,6 @@ pub const ENV_UPSTREAM_CA_PATH: &str = "TRAWL_WEB_UPSTREAM_CA_PATH";
 /// upstream from the same address, so it reads the variable too.
 pub const ENV_HTTP_ADDR: &str = "TRAWL_HTTP_ADDR";
 
-/// All runtime settings the proxy needs, with defaults applied.
 #[derive(Debug)]
 pub struct ResolvedConfig {
     pub bind_addr: String,
@@ -90,9 +52,6 @@ pub struct ResolvedConfig {
     pub session_ttl_secs: u64,
     pub allow_insecure_cookies: bool,
     pub upstream_tls: UpstreamTls,
-    /// Where the connection to trawld goes when `[web]
-    /// upstream_connect_addr` is set. `None`: the `upstream_url` host is
-    /// resolved normally.
     pub upstream_connect: Option<UpstreamConnect>,
     pub cookie_key: SessionKey,
     /// Parent domain for the shared `fleet_session` SSO cookie
@@ -101,40 +60,18 @@ pub struct ResolvedConfig {
     pub shared_domain: Option<String>,
     /// The browser-visible origins cookie-authenticated requests may come
     /// from (ADR-0016).
-    ///
-    /// Non-`Option` and non-empty by construction: [`PublicOrigins`] has no
-    /// way to build an empty list, so every holder of a `ResolvedConfig`
-    /// knows the operator stated an origin and the guard is a plain
-    /// membership test with no "unset means allow" branch to forget.
     pub public_origins: PublicOrigins,
-    /// The bounds the proxy holds each request to.
     pub limits: ProxyLimits,
 }
 
-/// The bounds the proxy holds each request to (ADR-0054, amended
-/// 2026-10-17).
-///
-/// The body limit and the upstream deadline come from trawld's own
-/// `[server]` settings in the file both daemons read, so the proxy
-/// refuses what trawld would refuse without sending it, and gives up on
-/// trawld's head only after trawld's own query deadline has passed. A
-/// trawl-web pointed at a trawld with a different file enforces its own
-/// file's values. The body deadline, the slack over trawld's deadline
-/// and the body budget are constants; a test shrinks them through this
-/// struct, and no key sets them.
+/// The bounds the proxy holds each request to (ADR-0054).
+/// The body deadline, the slack over trawld's deadline and the body budget
+/// are constants; a test shrinks them through this struct, and no key sets
+/// them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ProxyLimits {
-    /// The most the proxy buffers of one request body before it calls
-    /// trawld: `[server] max_request_body_bytes`.
     pub request_body_bytes: usize,
-    /// The most the proxy buffers of request bodies at once, across
-    /// every request in progress (`body_budget`). A body is reserved
-    /// from it before a byte is read, and a body the budget cannot
-    /// cover is refused 503 `request_limit_reached` at once.
     pub body_budget_bytes: usize,
-    /// How long the proxy waits for a request body to arrive whole, on
-    /// every route (`middleware::body_deadline`). Past it the request is
-    /// answered 408 `timeout` and its count released.
     pub body_read_timeout: Duration,
     /// How long the proxy waits for trawld's response head: `[server]
     /// timeout_secs` plus [`Self::UPSTREAM_HEAD_SLACK`]. Past it the
@@ -147,16 +84,10 @@ pub struct ProxyLimits {
 }
 
 impl ProxyLimits {
-    /// How long a request body may take to arrive.
     pub const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
-    /// How much longer than trawld's own `timeout_secs` the proxy waits
-    /// for a head, so trawld's 504 arrives first in the ordinary case
-    /// and the proxy's covers only a trawld that is not answering at all.
     pub const UPSTREAM_HEAD_SLACK: Duration = Duration::from_secs(10);
 
-    /// The limits for `server`, or for trawld's defaults when the proxy
-    /// resolves without a `[server]` section.
     #[must_use]
     pub fn from_server(server: Option<&ServerConfig>) -> Self {
         let timeout_secs = server.map_or(trawl_config::DEFAULT_TIMEOUT_SECS, |server| {
@@ -175,11 +106,8 @@ impl ProxyLimits {
     }
 }
 
-/// How the proxy's upstream client decides whether to trust trawld's
-/// TLS certificate. Both modes verify the chain and the host name
-/// (ADR-0048).
+/// Both modes verify the chain and the host name (ADR-0048).
 pub enum UpstreamTls {
-    /// The platform trust store.
     System,
     /// Only the roots read from `[web] upstream_ca_path`. No platform or
     /// built-in root is trusted.
@@ -193,30 +121,24 @@ pub enum UpstreamTls {
     },
 }
 
-/// A digest of a pin file's contents and the trust anchors they parsed to.
-///
 /// The digest stays with the certificates so a later read of the file can
-/// tell whether it changed since the client was built from it. Only
-/// [`pinned_roots`] builds one.
+/// tell whether it changed since the client was built from it.
 pub struct PinnedRoots {
     digest: blake3::Hash,
     certificates: Vec<reqwest::Certificate>,
 }
 
 impl PinnedRoots {
-    /// The trust anchors, in file order.
     #[must_use]
     pub fn certificates(&self) -> &[reqwest::Certificate] {
         &self.certificates
     }
 
-    /// The BLAKE3 digest of the file contents the certificates came from.
     pub(crate) fn digest(&self) -> blake3::Hash {
         self.digest
     }
 }
 
-/// Shows the count only, like [`UpstreamTls`]'s `Debug`.
 impl std::fmt::Debug for PinnedRoots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<{} certificates>", self.certificates.len())
@@ -243,11 +165,6 @@ impl std::fmt::Debug for UpstreamTls {
 
 /// A fixed socket address for the connection to trawld, from `[web]
 /// upstream_connect_addr` (ADR-0048).
-///
-/// The client dials `addr` whenever the upstream URL names `host`, and
-/// never asks a resolver for it. TLS still verifies `host`, so a sidecar can
-/// reach trawld over loopback and check that the certificate names the
-/// host in `upstream_url`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpstreamConnect {
     /// The `upstream_url` host: a DNS name, never an IP literal.
@@ -256,7 +173,6 @@ pub struct UpstreamConnect {
     pub addr: SocketAddr,
 }
 
-/// Errors while loading or validating proxy configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("failed to read config file {path}: {source}")]
@@ -289,13 +205,6 @@ pub enum ConfigError {
         reason: &'static str,
     },
 
-    /// The configured browser-origin allowlist is empty or unusable.
-    ///
-    /// The wrapped error names the rule (empty list, which entry failed to
-    /// parse, which two entries are the same origin); this variant appends
-    /// the two doors that set it: an operator told the list is empty, on a
-    /// machine where a package owns the config file, needs to know the
-    /// environment can supply it too.
     #[error(
         "{source} (set it in `[web] public_origins` in config.toml, or in the \
          {ENV_SESSION_PUBLIC_ORIGINS} environment variable)"
@@ -305,12 +214,6 @@ pub enum ConfigError {
         source: PublicOriginsError,
     },
 
-    /// `FLEET_SESSION_PUBLIC_ORIGINS` was set but does not parse.
-    ///
-    /// Carried whole rather than re-worded: the shared runtime parser's
-    /// message already names the variable, the failing entry's index and
-    /// the rule that refused it, and a second wording here would be a
-    /// second vocabulary for one failure.
     #[error(transparent)]
     SessionEnvOrigins(SessionRuntimeError),
 
@@ -320,11 +223,9 @@ pub enum ConfigError {
     #[error("`[web] upstream_url` {0}")]
     UpstreamUrl(UpstreamUrlError),
 
-    /// `[web] upstream_connect_addr` cannot be used with this upstream.
     #[error("`[web] upstream_connect_addr` {0}")]
     UpstreamConnectAddr(ConnectAddrError),
 
-    /// `[web] upstream_ca_path` cannot be used as a trust root.
     #[error("upstream CA file {path}: {reason}")]
     UpstreamCa { path: PathBuf, reason: String },
 }
@@ -337,13 +238,11 @@ pub enum UpstreamUrlError {
     /// never quotes its input.
     #[error("does not parse as a URL: {0}")]
     Unparseable(String),
-    /// The URL carries a user name or a password.
     #[error(
         "carries a user name or password. trawl-web sends each signed-in user's own key \
          to trawld, so the URL must hold no credentials: remove the part before `@`"
     )]
     Userinfo,
-    /// The URL carries a query or a fragment, even an empty one.
     #[error(
         "carries a query or fragment. trawl-web appends each request's path and query \
          to the URL, so it must end at the path: remove the part from `?` or `#`"
@@ -356,16 +255,12 @@ pub enum UpstreamUrlError {
          so the upstream must be https"
     )]
     NotHttps { scheme: String },
-    /// The URL names no host.
     #[error("names no host")]
     NoHost,
 }
 
-/// Why `[web] upstream_connect_addr` was refused. The address is not
-/// echoed; the operator has it in the file.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ConnectAddrError {
-    /// Not an IP address and port.
     #[error(
         "is not an IP address and port, such as `127.0.0.1:5514` or `[::1]:5514`. \
          A host name is not accepted"
@@ -374,14 +269,11 @@ pub enum ConnectAddrError {
     /// Port 0 would let the client pick the port from the URL instead.
     #[error("needs a port other than 0")]
     PortZero,
-    /// The upstream URL's host is an IP address, so there is no name for
-    /// TLS to verify apart from the address the connection goes to.
     #[error(
         "needs an `upstream_url` whose host is a DNS name. TLS verifies that name \
          while the connection goes to this address, and the URL names an IP address"
     )]
     IpHost,
-    /// The URL's port and the address's port differ.
     #[error(
         "has port {addr_port}, but `upstream_url` has port {url_port} \
          (443 when the URL states none). The client would ignore one of them, \
@@ -391,14 +283,6 @@ pub enum ConnectAddrError {
 }
 
 impl ResolvedConfig {
-    /// Load and resolve settings from a config file path.
-    ///
-    /// Reads the file, parses it as the whole schema, and resolves it
-    /// through [`Self::from_parsed`].
-    ///
-    /// # Errors
-    /// Returns `ConfigError` variants for read/parse failures, an invalid
-    /// environment override, or a setting that does not resolve.
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadFile {
             path: path.to_owned(),
@@ -411,19 +295,6 @@ impl ResolvedConfig {
         Self::from_parsed(&config.web, Some(&config.server))
     }
 
-    /// Resolve from an already-parsed `WebConfig`. `server` is used only
-    /// to derive the default upstream URL when `web.upstream_url` is
-    /// absent — pass `None` in tests that don't need that resolution.
-    ///
-    /// Observes the process environment once, refuses any invalid
-    /// `FLEET_SESSION_*` value before anything else, and then runs
-    /// [`Sources::resolve`] and [`Self::from_sources`].
-    ///
-    /// # Errors
-    /// Returns a [`ConfigError`] when a common Fleet runtime override is
-    /// invalid, a setting does not resolve, or an explicitly configured
-    /// production key or pinned CA cannot be loaded. No key source at all
-    /// is not an error: an ephemeral key is generated, with a warning.
     pub fn from_parsed(
         web: &WebConfig,
         server: Option<&ServerConfig>,
@@ -431,10 +302,6 @@ impl ResolvedConfig {
         Self::startup(web, server, RuntimeEnv::from_process(), expand_tilde)
     }
 
-    /// Startup from one observation of the environment, `env`, with
-    /// `expand` standing in for [`expand_tilde`]: the whole parse of the
-    /// `FLEET_SESSION_*` variables, which refuses first, then
-    /// [`Sources::resolve`] and [`Self::from_sources_with`].
     fn startup(
         web: &WebConfig,
         server: Option<&ServerConfig>,
@@ -461,35 +328,15 @@ impl ResolvedConfig {
         Self::from_sources(Sources::resolve(web, server, runtime))
     }
 
-    /// Turn resolved sources into the running configuration: startup's
-    /// step, and the only place the side effects of resolution happen.
-    ///
-    /// Fails on the first component error in startup's order: public
-    /// origins, cookie key, upstream (URL, connect address, CA path, then
-    /// the pin file itself), cookie settings, bind address. Along the way
-    /// it logs the warnings that carry configured values, reads the
-    /// `cookie_secret_env` variable or the `cookie_secret_path` file, reads
-    /// the pinned CA file (logging `upstream_ca_pending` when it does not
-    /// exist yet), and generates an ephemeral key, with a warning, when no
-    /// key source is configured.
-    ///
     /// A `~` in the key file's path and in the pin's path is expanded by
-    /// [`expand_tilde`] at the step that reads that file, and nowhere else,
-    /// as startup always expanded them. So the home directory is looked up,
-    /// which with `HOME` unset or empty asks the user database, only once
-    /// every earlier step has passed, and never for a path that is not read.
+    /// [`expand_tilde`] at the step that reads that file, and nowhere else, so
+    /// the home directory is looked up only once every earlier step has passed.
     ///
     /// The doctor never calls this.
-    ///
-    /// # Errors
-    /// Returns the first component's [`ConfigError`], or the error from
-    /// reading the key or the pin.
     pub fn from_sources(sources: Sources) -> Result<Self, ConfigError> {
         Self::from_sources_with(sources, expand_tilde)
     }
 
-    /// [`Self::from_sources`] with `expand` in place of [`expand_tilde`],
-    /// so a test can see when, and for which path, `~` is expanded.
     fn from_sources_with(
         sources: Sources,
         mut expand: impl FnMut(&Path) -> PathBuf,
@@ -538,34 +385,19 @@ impl ResolvedConfig {
     }
 }
 
-/// The raw values of every environment variable resolution reads, taken in
-/// one observation.
-///
-/// `None` is an unset variable. Fields are public so a caller that cannot
-/// set process variables, a test among them, can state them.
 #[derive(Default)]
 pub struct RuntimeEnv {
-    /// [`ENV_SESSION_AEAD_KEY`].
     pub aead_key: Option<OsString>,
-    /// [`ENV_SESSION_COOKIE_DOMAIN`].
     pub cookie_domain: Option<OsString>,
-    /// [`ENV_SESSION_COOKIE_PATH`].
     pub cookie_path: Option<OsString>,
-    /// [`ENV_SESSION_COOKIE_SECURE`].
     pub cookie_secure: Option<OsString>,
-    /// [`ENV_SESSION_PUBLIC_ORIGINS`].
     pub public_origins: Option<OsString>,
-    /// [`ENV_BIND_ADDR`].
     pub bind_addr: Option<OsString>,
-    /// [`ENV_UPSTREAM_CA_PATH`].
     pub upstream_ca_path: Option<OsString>,
-    /// [`ENV_HTTP_ADDR`].
     pub http_addr: Option<OsString>,
 }
 
 impl RuntimeEnv {
-    /// Read each variable from the process environment, once.
-    ///
     /// The `cookie_secret_env` variable is not among them: its name comes
     /// from the file, and [`key_from_env`] reads it only when the key is
     /// actually loaded. Nor is `HOME`: `~` expands where each file is
@@ -630,25 +462,18 @@ impl std::fmt::Debug for RuntimeEnv {
     }
 }
 
-/// The variables resolution reads that are not `FLEET_SESSION_*`, raw.
 struct HostEnv {
     bind_addr: Option<OsString>,
     upstream_ca_path: Option<OsString>,
     http_addr: Option<OsString>,
 }
 
-/// `path` with a leading `~` expanded as startup has always expanded it,
-/// by [`shellexpand::tilde`]: to `HOME` when it is set and not empty, else
-/// to the user database's home directory, and left as written when neither
-/// gives one. May block: with `HOME` unset or empty, the user database can
-/// be a network service. Call it only at the step that reads the file.
+/// May block: with `HOME` unset or empty, the user database can be a
+/// network service. Call it only at the step that reads the file.
 pub(crate) fn expand_tilde(path: &Path) -> PathBuf {
     PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned())
 }
 
-/// The environment's part in resolution: each `FLEET_SESSION_*` variable
-/// parsed on its own, with its own result, and the other variables raw.
-///
 /// The field types are those of [`SessionRuntimeOverrides`], each wrapped
 /// in its own `Result`, so one invalid variable fails only the component
 /// it feeds.
@@ -664,8 +489,6 @@ pub struct RuntimeParts {
 }
 
 impl RuntimeParts {
-    /// Read the process environment once and parse each `FLEET_SESSION_*`
-    /// variable on its own: the doctor's observation.
     #[must_use]
     pub fn from_process_env() -> Self {
         Self::from_each_variable(RuntimeEnv::from_process())
@@ -714,9 +537,6 @@ impl RuntimeParts {
     /// A value that is not UTF-8 refuses first, in the order key, domain,
     /// path, secure, origins; then the first value that does not parse, in
     /// the parser's order.
-    ///
-    /// # Errors
-    /// Returns the first invalid variable's [`ConfigError`].
     pub fn from_whole_parse(env: RuntimeEnv) -> Result<Self, ConfigError> {
         let ([key, domain, path, secure, origins], host) = env.split();
         let path_set = path.is_some();
@@ -739,7 +559,6 @@ impl RuntimeParts {
         Ok(Self::from_overrides(overrides, path_set, host))
     }
 
-    /// Parts from a whole parse that succeeded.
     fn from_overrides(overrides: SessionRuntimeOverrides, path_set: bool, host: HostEnv) -> Self {
         Self {
             key: Ok(overrides.key),
@@ -783,15 +602,11 @@ impl std::fmt::Debug for RuntimeParts {
     }
 }
 
-/// Where a resolved setting came from.
-///
 /// Every variant is safe to print: environment names are this crate's or
 /// fleet-auth's constants, never operator text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SettingSource {
-    /// Stated in the config file.
     File,
-    /// Set by the named environment variable.
     Environment(&'static str),
     /// The upstream URL, derived from `[server] http_addr` in the config
     /// file, or from that setting's default when the file leaves it out.
@@ -799,48 +614,28 @@ pub enum SettingSource {
     /// The upstream URL, derived from trawld's listen-address override,
     /// the named variable ([`ENV_HTTP_ADDR`]).
     DerivedFromEnvironment(&'static str),
-    /// Neither the file nor the environment sets it; the built-in default
-    /// applies.
     Default,
 }
 
-/// Every component of the proxy's configuration, resolved without side
-/// effects, each with its own result and the source it came from.
-///
-/// Built only by [`Sources::resolve`]. Startup hands it to
-/// [`ResolvedConfig::from_sources`]; the doctor reads the components.
 pub struct Sources {
-    /// The browser-origin allowlist (ADR-0016).
     pub public_origins: Result<Origins, ConfigError>,
     /// The selected cookie key source. Only an environment key is already
     /// loaded; the others are selections that nothing has read yet.
     pub cookie_key: Result<KeySource, ConfigError>,
-    /// The session cookie's attributes and lifetime.
     pub cookie_settings: Result<CookieSettings, ConfigError>,
     /// The upstream URL, connect address and trust source. The pinned CA
     /// file is named, not read.
     pub upstream: Result<UpstreamPlan, ConfigError>,
-    /// The proxy's listen address.
     pub bind_addr: Result<BindAddr, ConfigError>,
-    /// The bounds the proxy holds each request to. Derived from trawld's
-    /// own settings and constants; nothing here can fail.
     pub limits: ProxyLimits,
-    /// The configured values the startup warnings compare with the
-    /// environment. Private, so only [`ResolvedConfig::from_sources`]
-    /// reaches them.
     configured: Configured,
 }
 
 impl Sources {
-    /// Select every setting from the parsed file and `runtime`, recording
-    /// where each came from.
-    ///
     /// Pure: no file is read, nothing is logged, no key is generated, and
     /// neither the `cookie_secret_env` variable nor the home directory is
-    /// looked up. The key and pin paths are kept as written: a `~` in them
-    /// expands where the file is read (see [`ResolvedConfig::from_sources`]).
-    /// Precedence is startup's, and a selected source that is invalid fails
-    /// its component with no fallback to the next source.
+    /// looked up. A selected source that is invalid fails its component with no
+    /// fallback to the next source.
     #[must_use]
     pub fn resolve(web: &WebConfig, server: Option<&ServerConfig>, runtime: RuntimeParts) -> Self {
         let RuntimeParts {
@@ -895,8 +690,6 @@ impl std::fmt::Debug for Sources {
     }
 }
 
-/// The configured values the startup warnings compare with the
-/// environment.
 struct Configured {
     cookie_secret_env: Option<String>,
     cookie_secret_path: Option<PathBuf>,
@@ -905,11 +698,8 @@ struct Configured {
     public_origins: Vec<String>,
 }
 
-/// The resolved browser-origin allowlist and where it came from.
 pub struct Origins {
-    /// The allowlist in force.
     pub origins: PublicOrigins,
-    /// The file or the environment.
     pub from: OriginsFrom,
 }
 
@@ -923,10 +713,8 @@ impl std::fmt::Debug for Origins {
     }
 }
 
-/// Where the allowlist came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OriginsFrom {
-    /// `[web] public_origins` in the config file.
     File,
     /// [`ENV_SESSION_PUBLIC_ORIGINS`], which replaces the file's list
     /// whenever it is set, even to the same origins.
@@ -937,20 +725,14 @@ pub enum OriginsFrom {
     },
 }
 
-/// The selected cookie key source, in startup's precedence:
-/// [`ENV_SESSION_AEAD_KEY`], then `[web] cookie_secret_env`, then `[web]
-/// cookie_secret_path`, then none.
 pub enum KeySource {
-    /// [`ENV_SESSION_AEAD_KEY`], already parsed.
     FleetEnv(SessionKey),
     /// The variable `[web] cookie_secret_env` names; not read yet
     /// ([`key_from_env`] reads it). `name` is operator text: an operator
     /// may have pasted the key itself here, so it is not printed as is.
     ConfigEnv {
-        /// The configured variable name.
         name: String,
     },
-    /// `[web] cookie_secret_path`; not read yet.
     File {
         /// The path as written: a `~` in it expands where the file is read.
         path: PathBuf,
@@ -972,25 +754,17 @@ impl std::fmt::Debug for KeySource {
     }
 }
 
-/// The session cookie's attributes and lifetime, each with its source.
 pub struct CookieSettings {
-    /// Whether the cookie carries `Secure`.
     pub secure: bool,
-    /// [`ENV_SESSION_COOKIE_SECURE`], the file (`allow_insecure_cookies =
-    /// true`), or the default (Secure on).
     pub secure_from: SettingSource,
     /// The shared SSO domain (`Domain=`), or `None` for a host-only
     /// cookie. Operator text: not for output.
     pub shared_domain: Option<String>,
-    /// [`ENV_SESSION_COOKIE_DOMAIN`], the file (`[web] shared_domain`,
-    /// non-empty), or the default (host-only).
     pub domain_from: SettingSource,
     /// [`ENV_SESSION_COOKIE_PATH`] or the default. Either way the path is
     /// `/`, the only one Fleet sessions accept.
     pub path_from: SettingSource,
-    /// The session lifetime, in seconds.
     pub ttl_secs: u64,
-    /// `[web] session_ttl_secs` or the default.
     pub ttl_from: SettingSource,
 }
 
@@ -1009,19 +783,13 @@ impl std::fmt::Debug for CookieSettings {
     }
 }
 
-/// The upstream URL, where the connection goes, and what it trusts.
 pub struct UpstreamPlan {
     /// The URL as configured or derived, which passed
     /// [`check_upstream_url`]. The value is not for output.
     pub url: String,
-    /// `url`, parsed.
     pub checked_url: reqwest::Url,
-    /// `[web] upstream_url`, or derived from `[server] http_addr` or
-    /// [`ENV_HTTP_ADDR`], or the fallback.
     pub url_from: SettingSource,
-    /// `[web] upstream_connect_addr`, checked against `url`.
     pub connect: Option<UpstreamConnect>,
-    /// The platform roots or a pinned CA file.
     pub trust: TrustSource,
 }
 
@@ -1036,17 +804,12 @@ impl std::fmt::Debug for UpstreamPlan {
     }
 }
 
-/// How the upstream certificate is to be verified, before any file is
-/// read.
 #[derive(Clone, PartialEq, Eq)]
 pub enum TrustSource {
-    /// The platform trust store.
     System,
-    /// The CA file at `path`, not empty; not read yet.
     Pinned {
         /// The path as written: a `~` in it expands where the file is read.
         path: PathBuf,
-        /// [`ENV_UPSTREAM_CA_PATH`] or `[web] upstream_ca_path`.
         from: SettingSource,
     },
 }
@@ -1061,13 +824,11 @@ impl std::fmt::Debug for TrustSource {
     }
 }
 
-/// The listen address and where it came from.
 #[derive(Clone, PartialEq, Eq)]
 pub struct BindAddr {
     /// The address, unparsed, as startup binds it. Operator text: not for
     /// output.
     pub addr: String,
-    /// [`ENV_BIND_ADDR`], `[web] bind_addr`, or the default.
     pub from: SettingSource,
 }
 
@@ -1176,8 +937,6 @@ fn resolve_cookie_settings(
     })
 }
 
-/// The upstream URL and its rules, the connect address, and the trust
-/// source, in startup's order. The pin file is named as written, not read.
 fn resolve_upstream(
     web: &WebConfig,
     server: Option<&ServerConfig>,
@@ -1213,16 +972,8 @@ fn resolve_upstream(
     })
 }
 
-/// Announce every runtime override that displaces deployed configuration.
-///
 /// The `FLEET_SESSION_*` variables exist for `fleet-dev`, but this is the
-/// production binary and it reads them unconditionally. Silently clearing
-/// `Secure` or swapping the cookie key out from under a configured deployment
-/// is exactly the accident [`warn_on_ambiguous_key`] already warns about
-/// for the far less dangerous env-versus-path ambiguity.
-///
-/// Reads which component the environment supplied from `sources`, and the
-/// configured values it displaced from `sources.configured`.
+/// production binary and it reads them unconditionally.
 fn warn_on_runtime_override(sources: &Sources) {
     let configured = &sources.configured;
     if matches!(sources.cookie_key, Ok(KeySource::FleetEnv(_)))
@@ -1265,20 +1016,13 @@ fn warn_on_runtime_override(sources: &Sources) {
         && !configured.public_origins.is_empty()
     {
         // Both packaged deployments render one list into the config file
-        // and hand the same list to the environment — the helm chart
-        // injects the variable whenever the sidecar runs — so warning on
-        // the variable's mere presence fires on every default install and
-        // teaches operators to scroll past the one line that says their
-        // allowlist is not the one they wrote. Compare the two instead.
-        // A configured list that does not parse counts as displaced: it
-        // could never have been in force, and that is worth saying.
+        // and hand the same list to the environment, so warning on
+        // the variable's mere presence fires on every default install.
+        // A configured list that does not parse counts as displaced.
         let displaced = !PublicOrigins::parse(&configured.public_origins)
             .is_ok_and(|configured| same_origins(&configured, from_environment));
         // The override's origins are printed because they parsed: each is
-        // at most a serialized origin's worth of ASCII, and the point of
-        // the line is telling the operator which allowlist is in force.
-        // Their COUNT is its own field and the text is capped, because a
-        // list long enough to bury the message is a list nobody reads.
+        // at most a serialized origin's worth of ASCII.
         let (origins_count, origins) = summarize_origins(from_environment);
         if displaced {
             // The configured entries stay counted rather than printed:
@@ -1304,33 +1048,15 @@ fn warn_on_runtime_override(sources: &Sources) {
     }
 }
 
-/// Whether two allowlists hold the same origins, order aside.
-///
 /// [`PublicOrigins::parse`] refuses two entries that normalize alike, so
 /// neither list can repeat an origin and equal lengths plus one-way
-/// containment is set equality. Both sides went through the same parser, so
-/// `https://x:443` in the file and `https://x` in the environment are the
-/// same origin here exactly as they are at the guard.
+/// containment is set equality.
 fn same_origins(left: &PublicOrigins, right: &PublicOrigins) -> bool {
     left.iter().count() == right.iter().count() && left.iter().all(|origin| right.contains(origin))
 }
 
-/// How many origins one diagnostic line names before it stops listing.
-///
-/// A deployment states one or two origins; eight is well past what anyone
-/// reads off a startup line, and the list is operator-supplied with no
-/// ceiling on its length, so the line needs one of its own.
 const MAX_LOGGED_ORIGINS: usize = 8;
 
-/// Summarize an allowlist for one log line: how many origins there are,
-/// and the first few of them.
-///
-/// Two fields rather than one string, because the count is the fact an
-/// operator checks (did my list load?) and the text is the sample that
-/// tells them which list loaded. The text goes through `Display` on each
-/// [`fleet_auth::Origin`] rather than the operator's own strings, so it
-/// shows what the guard will actually compare against: `https://x:443` in
-/// the file shows as `https://x`, which is what a browser sends.
 pub fn summarize_origins(origins: &PublicOrigins) -> (usize, String) {
     let count = origins.iter().count();
     let mut text = origins
@@ -1345,8 +1071,6 @@ pub fn summarize_origins(origins: &PublicOrigins) -> (usize, String) {
     (count, text)
 }
 
-/// Map the shared fleet-auth runtime parser's errors onto [`ConfigError`],
-/// so an operator sees one config-error vocabulary whatever produced it.
 impl From<SessionRuntimeError> for ConfigError {
     fn from(error: SessionRuntimeError) -> Self {
         match error {
@@ -1367,8 +1091,7 @@ impl From<SessionRuntimeError> for ConfigError {
     }
 }
 
-/// The text of the environment override `name`, whose raw value is
-/// `value`. A value that is set but not UTF-8 is refused, naming the
+/// A value that is set but not UTF-8 is refused, naming the
 /// variable and never the value: read as unset, it would silently hand the
 /// choice back to the file.
 fn env_override<'a>(name: &str, value: Option<&'a OsStr>) -> Result<Option<&'a str>, ConfigError> {
@@ -1381,15 +1104,6 @@ fn env_override<'a>(name: &str, value: Option<&'a OsStr>) -> Result<Option<&'a s
         .transpose()
 }
 
-/// Pick the listen address: [`ENV_BIND_ADDR`] first, then `[web] bind_addr`,
-/// then [`DEFAULT_BIND_ADDR`]. Empty values count as unset at both levels.
-///
-/// Takes the environment value as an argument so the precedence is
-/// testable without mutating process env (forbidden under `unsafe_code =
-/// "forbid"`).
-///
-/// # Errors
-/// Returns [`ConfigError::EnvUtf8`] when the environment value is not UTF-8.
 fn select_bind_addr(
     env_value: Option<&OsStr>,
     configured: Option<&str>,
@@ -1404,7 +1118,6 @@ fn select_bind_addr(
     })
 }
 
-/// [`select_bind_addr`]'s address alone.
 #[cfg(test)]
 fn resolve_bind_addr(
     env_value: Option<&OsStr>,
@@ -1413,20 +1126,6 @@ fn resolve_bind_addr(
     select_bind_addr(env_value, configured).map(|(addr, _)| addr)
 }
 
-/// Pick the CA pin: [`ENV_UPSTREAM_CA_PATH`] first, then `[web]
-/// upstream_ca_path`. An empty environment value counts as unset, as for
-/// [`ENV_BIND_ADDR`]. An empty configured path is passed on and refused by
-/// [`refuse_empty_pin`]: falling back to the platform roots would change the
-/// trust mode on a blank value.
-///
-/// Takes the environment value as an argument so the precedence is
-/// testable without mutating process env (forbidden under `unsafe_code =
-/// "forbid"`).
-///
-/// # Errors
-/// Returns [`ConfigError::EnvUtf8`] when the environment value is not
-/// UTF-8. Read as unset, it would fall back to the file's pin or to the
-/// platform roots.
 fn select_upstream_ca_path(
     env_value: Option<&OsStr>,
     configured: Option<&Path>,
@@ -1440,7 +1139,6 @@ fn select_upstream_ca_path(
     Ok(configured.map(|path| (path.to_owned(), SettingSource::File)))
 }
 
-/// [`select_upstream_ca_path`]'s path alone.
 #[cfg(test)]
 fn resolve_upstream_ca_path(
     env_value: Option<&OsStr>,
@@ -1451,22 +1149,13 @@ fn resolve_upstream_ca_path(
 
 /// Check the rules every upstream URL follows, whatever the trust mode
 /// (ADR-0048).
-///
-/// - It parses, with the parser the client dials with.
 /// - It carries no user name or password. reqwest would turn them into a
 ///   Basic `Authorization` header, and the URL goes into the startup log.
 /// - It carries no query or fragment. Each request's path and query are
 ///   appended to the URL as text, which would land them inside the query
 ///   or fragment, and a query may hold a token the startup log would show.
-///   A path prefix is kept: the request path is appended after it.
-/// - It is `https`, since both trust modes verify trawld's certificate and
-///   a plain `http` upstream would send every user's key in cleartext.
-/// - It names a host.
-///
-/// No error quotes the URL.
-///
-/// # Errors
-/// Returns the [`UpstreamUrlError`] naming the rule that refused.
+/// - It is `https`: a plain `http` upstream would send every user's key in
+///   cleartext.
 pub fn check_upstream_url(upstream_url: &str) -> Result<reqwest::Url, UpstreamUrlError> {
     let url = reqwest::Url::parse(upstream_url)
         .map_err(|e| UpstreamUrlError::Unparseable(e.to_string()))?;
@@ -1494,25 +1183,12 @@ pub fn check_upstream_url(upstream_url: &str) -> Result<reqwest::Url, UpstreamUr
 }
 
 /// Parse `[web] upstream_connect_addr` against the checked upstream URL
-/// (ADR-0048).
-///
-/// - The value is an IP address and port, IPv6 in brackets. A name is
-///   refused: resolving it would be the resolver answer this setting
-///   exists to replace.
-/// - The URL's host is a DNS name. TLS verifies that name while the
-///   connection goes to `addr`; with an IP literal there is nothing to
-///   verify apart from the address itself.
-/// - The ports agree. The client dials the URL's port when the URL states
-///   one and the address's port when it does not, so a mismatch would
-///   silently drop one of them. The URL's port counts as 443 when it
-///   states none, which also covers an explicit `:443` that the parser
-///   normalizes away.
-///
-/// `url` has passed [`check_upstream_url`], so it is https and names a
-/// host.
-///
-/// # Errors
-/// Returns the [`ConnectAddrError`] naming the rule that refused.
+/// (ADR-0048). A name is refused: resolving it would be the resolver
+/// answer this setting exists to replace. The client dials the URL's port
+/// when the URL states one and the address's port when it does not, so a
+/// mismatch would silently drop one of them. The URL's port counts as 443
+/// when it states none, which also covers an explicit `:443` that the
+/// parser normalizes away.
 pub fn resolve_upstream_connect(
     url: &reqwest::Url,
     addr: &str,
@@ -1538,14 +1214,6 @@ pub fn resolve_upstream_connect(
     })
 }
 
-/// Decide how the upstream client verifies trawld's certificate, as
-/// startup does: no `ca_path` means the platform roots, and otherwise the
-/// path is expanded by [`expand_tilde`], refused by [`refuse_empty_pin`]
-/// when empty, and read once by [`load_pin`]. Startup itself takes the
-/// path from [`Sources`].
-///
-/// # Errors
-/// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
 #[cfg(test)]
 pub(crate) fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls, ConfigError> {
     match ca_path {
@@ -1554,12 +1222,8 @@ pub(crate) fn resolve_upstream_tls(ca_path: Option<&Path>) -> Result<UpstreamTls
     }
 }
 
-/// `path`, unless it is empty.
-///
-/// # Errors
-/// Returns [`ConfigError::UpstreamCa`] when the path is empty: falling back
-/// to the platform roots would change the trust mode on a blank value, and
-/// reading it would report a missing file.
+/// Falling back to the platform roots would change the trust mode on a
+/// blank value, and reading it would report a missing file.
 fn refuse_empty_pin(path: PathBuf) -> Result<PathBuf, ConfigError> {
     if path.as_os_str().is_empty() {
         return Err(ConfigError::UpstreamCa {
@@ -1571,21 +1235,6 @@ fn refuse_empty_pin(path: PathBuf) -> Result<PathBuf, ConfigError> {
     Ok(path)
 }
 
-/// Read the pin file at `path` once, as startup does.
-///
-/// - Absent (`NotFound`): the pin is pending, and one `upstream_ca_pending`
-///   warning says so. trawld writes its generated certificate on its first
-///   start, which may come after trawl-web's.
-/// - Any other read error, a path that is not a regular file, a file larger
-///   than `MAX_PIN_FILE_BYTES` (1 MiB), or contents that do not parse as a
-///   certificate bundle: refused, so a broken pin stops startup instead of
-///   failing every request later.
-///
-/// Startup's step: it logs. The doctor reads the pin through
-/// [`read_capped_file`] and parses it with [`pinned_roots`] instead.
-///
-/// # Errors
-/// Returns [`ConfigError::UpstreamCa`] naming the file and the reason.
 fn load_pin(path: PathBuf) -> Result<UpstreamTls, ConfigError> {
     let refuse = |reason: &str| ConfigError::UpstreamCa {
         path: path.clone(),
@@ -1606,32 +1255,15 @@ fn load_pin(path: PathBuf) -> Result<UpstreamTls, ConfigError> {
     Ok(UpstreamTls::PinnedCa { path, roots })
 }
 
-/// The largest pin file trawl-web reads, in bytes: 1 MiB.
-///
-/// A pin names trawld's CA: its one generated certificate is under 1 KiB,
-/// and even a whole public root bundle is a few hundred KiB. A bigger file
-/// is not a CA bundle, and reading it whole, at startup or on every
-/// re-read, would let whoever can write the path make trawl-web allocate
-/// the file's size, past a container's memory limit.
 pub(crate) const MAX_PIN_FILE_BYTES: u64 = 1024 * 1024;
 
-/// Read the file at `path`, refusing anything but a regular file of at
-/// most `cap` bytes.
-///
 /// The open never waits: on unix it passes `O_NONBLOCK`, so a FIFO with
 /// no writer opens at once instead of blocking until one appears. The
 /// type and size checks run on the opened handle, so the path cannot be
-/// swapped between check and read. A FIFO, directory or device is refused
-/// with `InvalidInput`. A file over the cap is refused with `FileTooLarge`
-/// before any of it is read, and the read itself stops one byte past the
-/// cap, so a file that grows after the size check is refused too and never
-/// read whole. Reading a regular file can still stall, on a network
-/// volume for one, so callers on the async runtime run this on the
-/// blocking pool.
-///
-/// Errors keep the kind the open or read produced, so a caller can tell
-/// `NotFound` from `PermissionDenied`; their text is the OS's, or one of
-/// the two fixed refusals above.
+/// swapped between check and read. The read stops one byte past the
+/// cap, so a file that grows after the size check is refused too.
+/// Reading a regular file can still stall, on a network volume for one, so
+/// callers on the async runtime run this on the blocking pool.
 pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read as _;
 
@@ -1654,9 +1286,6 @@ pub(crate) fn read_capped_file(path: &Path, cap: u64) -> std::io::Result<Vec<u8>
 /// through, or a file past the cap, drops the buffer here, zeroized. It
 /// suits a small cap, such as a key's: the whole buffer is allocated even
 /// for a short file.
-///
-/// # Errors
-/// As [`read_capped_file`].
 pub(crate) fn read_capped_secret(path: &Path, cap: u64) -> std::io::Result<Zeroizing<Vec<u8>>> {
     use std::io::Read as _;
 
@@ -1679,9 +1308,6 @@ pub(crate) fn read_capped_secret(path: &Path, cap: u64) -> std::io::Result<Zeroi
     Ok(buffer)
 }
 
-/// Open `path` for [`read_capped_file`] and [`read_capped_secret`]: never
-/// waiting on a FIFO, refusing what is not a regular file, and refusing a
-/// file already past `cap`, each on the opened handle.
 fn open_capped(path: &Path, cap: u64) -> std::io::Result<std::fs::File> {
     let mut options = std::fs::OpenOptions::new();
     options.read(true);
@@ -1704,7 +1330,6 @@ fn open_capped(path: &Path, cap: u64) -> std::io::Result<std::fs::File> {
     Ok(file)
 }
 
-/// The capped readers' refusal of a file larger than `cap`.
 fn too_large(cap: u64) -> std::io::Error {
     std::io::Error::new(
         std::io::ErrorKind::FileTooLarge,
@@ -1712,10 +1337,6 @@ fn too_large(cap: u64) -> std::io::Error {
     )
 }
 
-/// Read the pin file at `path` through [`read_capped_file`], capped at
-/// [`MAX_PIN_FILE_BYTES`]. A file over the cap is refused with a message
-/// naming the cap in MiB. The one reader for a pin file, at startup and
-/// on any later read.
 pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
     read_capped_file(path, MAX_PIN_FILE_BYTES).map_err(|e| {
         if e.kind() == std::io::ErrorKind::FileTooLarge {
@@ -1732,12 +1353,9 @@ pub(crate) fn read_pin_file(path: &Path) -> std::io::Result<Vec<u8>> {
     })
 }
 
-/// Parse a PEM bundle into trust anchors, refusing one that yields none.
-///
 /// Every certificate goes through the same root-store check the TLS stack
 /// applies when the client is built, so a bundle that passes here cannot
-/// fail there with a bare "builder error". The one parser for a pin file,
-/// at startup and on any later read.
+/// fail there with a bare "builder error".
 pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
     use rustls::pki_types::CertificateDer;
     use rustls::pki_types::pem::PemObject as _;
@@ -1765,21 +1383,6 @@ pub(crate) fn pinned_roots(pem: &[u8]) -> Result<PinnedRoots, &'static str> {
     })
 }
 
-/// Derive the default upstream URL from trawld's `[server].http_addr`, and
-/// say where it came from.
-///
-/// Trawld always speaks HTTPS (it auto-generates a self-signed cert if
-/// none is configured), so we always produce an `https://` URL.
-/// Wildcard bind addresses (`0.0.0.0`, `::`, `[::]`) are rewritten to
-/// loopback — the proxy reaches trawld on the same host, never across
-/// the wire. IPv6 literals are wrapped in brackets per RFC 3986.
-///
-/// The address follows [`ServerConfig::resolve_http_addr`]'s rule rather
-/// than the raw field: trawld honours [`ENV_HTTP_ADDR`], and a proxy still
-/// aiming at the file's port would talk to nothing. The variable's value,
-/// `http_addr_env`, is an argument so this stays pure. The rule itself is
-/// trawl-config's [`ServerConfig::http_addr_override`]; like
-/// `resolve_http_addr`, a value that is not UTF-8 counts as unset.
 fn derive_upstream(
     server: Option<&ServerConfig>,
     http_addr_env: Option<&OsStr>,
@@ -1799,7 +1402,6 @@ fn derive_upstream(
         "0.0.0.0" | "::" => "127.0.0.1",
         other => other,
     };
-    // RFC 3986 requires IPv6 literals in URLs to be bracketed.
     let url = if is_ipv6 && host != "127.0.0.1" {
         format!("https://[{host}]{port_suffix}")
     } else {
@@ -1808,21 +1410,15 @@ fn derive_upstream(
     (url, from)
 }
 
-/// [`derive_upstream`]'s URL, with [`ENV_HTTP_ADDR`] read from the process.
 #[cfg(test)]
 fn default_upstream_from_server(server: Option<&ServerConfig>) -> String {
     derive_upstream(server, std::env::var_os(ENV_HTTP_ADDR).as_deref()).0
 }
 
-/// Split "host:port" / "[ipv6]:port" / bare host into
-/// (host-without-brackets, ":port" or "").
 /// Does not validate; malformed input passes through unchanged so an
 /// operator with an oddly-formatted addr gets an explanatory reqwest
 /// error rather than a silent URL-building mistake.
 fn split_addr(addr: &str) -> (&str, &str) {
-    // IPv6 literal in brackets, e.g. "[::1]:5514". Strip the brackets
-    // for the host component; the caller re-adds them when building the
-    // URL.
     if let Some(rest) = addr.strip_prefix('[')
         && let Some(end) = rest.find(']')
     {
@@ -1830,28 +1426,14 @@ fn split_addr(addr: &str) -> (&str, &str) {
         let port = &rest[end + 1..];
         return (host, port);
     }
-    // IPv4 or hostname with optional :port.
     addr.rsplit_once(':').map_or((addr, ""), |(host, port)| {
         (host, &addr[host.len()..host.len() + 1 + port.len()])
     })
 }
 
-/// Load the cookie key from the environment variable `name`, the one `[web]
-/// cookie_secret_env` names: base64 of 32 bytes.
-///
 /// Reads that one variable from the process. Logs nothing and generates
 /// nothing, so the doctor calls it as startup does.
-///
-/// # Errors
-/// [`ConfigError::EnvMissing`] when the variable is unset,
-/// [`ConfigError::EnvUtf8`] when it is not UTF-8, and
-/// [`ConfigError::EnvKey`] when it is not a key. Each names the variable,
-/// never its value.
 pub(crate) fn key_from_env(name: &str) -> Result<SessionKey, ConfigError> {
-    // Distinguish "var unset" from "var set but not UTF-8": the
-    // former is a config mistake (wrong name, forgotten export),
-    // the latter is an encoding issue. One shared "not valid UTF-8"
-    // error would point operators at the wrong problem.
     let raw = match std::env::var(name) {
         Ok(v) => Zeroizing::new(v),
         Err(std::env::VarError::NotPresent) => {
@@ -1870,12 +1452,6 @@ pub(crate) fn key_from_env(name: &str) -> Result<SessionKey, ConfigError> {
     })
 }
 
-/// Warn when both configured key sources are set.
-///
-/// Both set → env wins silently by policy. That's a config shape that's
-/// easy to set accidentally (e.g. an env var from a secrets provider
-/// unexpectedly overlaps with a path configured in the TOML), so emit a
-/// loud warning naming both identifiers.
 fn warn_on_ambiguous_key(configured: &Configured) {
     if configured.cookie_secret_env.is_some() && configured.cookie_secret_path.is_some() {
         tracing::warn!(
@@ -1887,8 +1463,6 @@ fn warn_on_ambiguous_key(configured: &Configured) {
     }
 }
 
-/// No source configured — generate one but loudly warn. Sessions won't
-/// survive a proxy restart, so this is only reasonable for dev.
 fn ephemeral_key() -> SessionKey {
     tracing::warn!(
         event_type = "session_key_ephemeral",
@@ -1905,7 +1479,6 @@ mod tests {
     use super::*;
     use crate::test_support::captured_logs;
 
-    /// The origin every fixture below states as the browser-visible one.
     const TEST_ORIGIN: &str = "https://trawl.example.com";
 
     #[test]
@@ -1970,9 +1543,6 @@ session_ttl_secs = 3600
 
     #[test]
     fn a_long_allowlist_is_summarized_by_count_and_a_capped_sample() {
-        // Nothing bounds how many origins an operator states, so the
-        // startup line states the number and shows a sample rather than
-        // pasting the whole list into one field.
         let entries: Vec<String> = (0..20)
             .map(|i| format!("https://o{i}.example.com"))
             .collect();
@@ -1995,17 +1565,9 @@ session_ttl_secs = 3600
                 .expect("two origins parse");
         let (count, text) = summarize_origins(&origins);
         assert_eq!(count, 2);
-        // Normalized, so the line shows what the guard compares against.
         assert_eq!(text, "https://trawl.example.com,http://localhost:8090");
     }
 
-    /// A `[web]` section carrying the one setting that has no default.
-    ///
-    /// `public_origins` is required (ADR-0016), so a bare
-    /// `WebConfig::default()` no longer resolves. That refusal is the
-    /// feature, and these fixtures state an origin the way a deployment
-    /// must. Spelled as a function so `..configured_web()` leaves every
-    /// other field at its `WebConfig` default.
     fn configured_web() -> WebConfig {
         WebConfig {
             public_origins: vec![TEST_ORIGIN.to_owned()],
@@ -2016,7 +1578,6 @@ session_ttl_secs = 3600
     #[test]
     fn defaults_applied_when_web_section_carries_only_the_required_origin() {
         let web = configured_web();
-        // Will generate ephemeral key (prints a warning) — that's fine in tests.
         let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
         assert_eq!(resolved.bind_addr, DEFAULT_BIND_ADDR);
         assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
@@ -2100,8 +1661,6 @@ session_ttl_secs = 3600
     #[test]
     fn localhost_runtime_is_insecure_and_explicitly_host_only() {
         let web = WebConfig {
-            // Prove that an empty runtime domain actively clears a production
-            // parent-domain setting rather than behaving like "unset".
             shared_domain: Some(".fleet.lab.ktle.net".into()),
             allow_insecure_cookies: false,
             ..configured_web()
@@ -2162,8 +1721,6 @@ session_ttl_secs = 3600
 
     #[test]
     fn runtime_parser_errors_keep_the_pre_hoist_config_error_surface() {
-        // The exhaustive invalid-value cases live with the parser in
-        // fleet-auth; this pins the mapping back onto ConfigError.
         let err = ConfigError::from(SessionRuntimeError::NotUnicode {
             name: ENV_SESSION_AEAD_KEY,
         });
@@ -2183,22 +1740,14 @@ session_ttl_secs = 3600
             ConfigError::SessionEnvValue { name, .. } if name == ENV_SESSION_COOKIE_DOMAIN
         ));
 
-        // Fail-closed still holds end to end through the fleet-auth parser.
         assert!(
             SessionRuntimeOverrides::parse(Some("not-base64".into()), None, None, None, None)
                 .is_err()
         );
     }
 
-    // -- the browser-origin allowlist (ADR-0016) ---------------------------
-
     #[test]
     fn an_empty_allowlist_refuses_to_resolve_and_names_both_doors() {
-        // The loud half of ADR-0016: there is no derived default, so a
-        // deployment that says nothing does not start. The message has to
-        // name both places an operator can say it, because a packaged
-        // install may own the config file while the environment is the
-        // only thing the operator controls.
         let web = WebConfig::default();
         let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
         let error = ResolvedConfig::from_parsed_with_runtime(&web, None, runtime)
@@ -2220,9 +1769,6 @@ session_ttl_secs = 3600
 
     #[test]
     fn a_bad_configured_entry_is_refused_at_its_own_index() {
-        // The whole list is refused, never the working subset: a typo that
-        // silently dropped one origin shows up much later as a mysterious
-        // 403 for whoever browses to it.
         let web = WebConfig {
             public_origins: vec![
                 TEST_ORIGIN.to_owned(),
@@ -2247,8 +1793,6 @@ session_ttl_secs = 3600
     #[test]
     fn a_configured_list_resolves_to_the_normalized_origins() {
         let web = WebConfig {
-            // The default port is written out here and must normalize
-            // away, because the browser will not send it.
             public_origins: vec!["https://trawl.example.com:443".to_owned()],
             ..WebConfig::default()
         };
@@ -2278,7 +1822,6 @@ session_ttl_secs = 3600
             captured_logs(|| ResolvedConfig::from_parsed_with_runtime(&web, None, runtime));
         let resolved = resolved.unwrap();
 
-        // Replacement, not a merge: the configured origins are gone.
         assert!(
             resolved
                 .public_origins
@@ -2300,24 +1843,16 @@ session_ttl_secs = 3600
             warning.contains(ENV_SESSION_PUBLIC_ORIGINS),
             "got: {warning}"
         );
-        // The count of displaced entries, and the origins now in force.
         assert!(warning.contains("configured_entries=2"), "got: {warning}");
         assert!(
             warning.contains("origins=http://localhost:8081"),
             "got: {warning}"
         );
-        // Never the operator's unparsed configured text.
         assert!(!warning.contains(TEST_ORIGIN), "got: {warning}");
     }
 
     #[test]
     fn an_environment_list_matching_the_file_is_noted_at_info_not_warned() {
-        // What every default helm install does: the chart renders the list
-        // into the TOML and hands the same list to the sidecar's
-        // environment. Nothing is displaced, so the displacement warning
-        // must stay quiet — otherwise it fires at every pod start and
-        // stops meaning anything. Order differs and one entry writes out
-        // the default port, both of which the parser normalizes away.
         let web = WebConfig {
             public_origins: vec![
                 "http://localhost:8090".to_owned(),
@@ -2353,10 +1888,6 @@ session_ttl_secs = 3600
 
     #[test]
     fn an_unparseable_configured_list_is_a_displacement_and_warns() {
-        // The file states an allowlist that could never have been in
-        // force. The environment's list is what runs, which is exactly the
-        // displacement the warning exists for — and the only hint the
-        // operator gets that their config file is broken.
         let web = WebConfig {
             public_origins: vec!["https://trawl.example.com/app".to_owned()],
             ..WebConfig::default()
@@ -2383,14 +1914,11 @@ session_ttl_secs = 3600
             .unwrap_or_else(|| panic!("a broken configured list is displaced; got: {lines:?}"));
         assert!(warning.starts_with("WARN"), "got: {warning}");
         assert!(warning.contains("configured_entries=1"), "got: {warning}");
-        // Still never the operator's unparsed text, least of all here.
         assert!(!warning.contains("/app"), "got: {warning}");
     }
 
     #[test]
     fn the_environment_alone_satisfies_the_requirement_without_warning() {
-        // Nothing is displaced when the file says nothing, so this is the
-        // normal dev-stack path and must be quiet.
         let web = WebConfig::default();
         let runtime = SessionRuntimeOverrides::parse(
             None,
@@ -2414,10 +1942,6 @@ session_ttl_secs = 3600
 
     #[test]
     fn a_bad_environment_entry_fails_startup_naming_the_variable_and_index() {
-        // Driven through the parser and the error mapping rather than
-        // `from_parsed`, which reads the real process environment: this
-        // crate forbids `unsafe`, so a test cannot set a variable, and
-        // these two steps are exactly what startup does with the value.
         let error = SessionRuntimeOverrides::parse(
             None,
             None,
@@ -2450,16 +1974,10 @@ session_ttl_secs = 3600
         );
         assert_eq!(resolve(None, Some("127.0.0.1:9000")), "127.0.0.1:9000");
         assert_eq!(resolve(None, None), DEFAULT_BIND_ADDR);
-        // Exported-but-blank is a shell accident, not a bind request — at
-        // either level.
         assert_eq!(resolve(env(""), Some("127.0.0.1:9000")), "127.0.0.1:9000");
         assert_eq!(resolve(env(""), Some("")), DEFAULT_BIND_ADDR);
     }
 
-    /// An override that is set but not UTF-8 is refused, naming the
-    /// variable and never its value. Read as unset, it would silently hand
-    /// the choice back to the file: for the CA pin, possibly to the
-    /// platform roots.
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_override_is_refused_naming_the_variable() {
@@ -2494,9 +2012,6 @@ session_ttl_secs = 3600
         }
     }
 
-    /// The limits follow `[server]`: the body limit as written, the head
-    /// deadline 10 s past `timeout_secs`; without a section, trawld's
-    /// defaults.
     #[test]
     fn proxy_limits_follow_the_server_section() {
         let web = configured_web();
@@ -2554,7 +2069,6 @@ session_ttl_secs = 3600
             ..dummy_server()
         };
         let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
-        // RFC 3986 requires brackets around IPv6 in URLs.
         assert_eq!(resolved.upstream_url, "https://[::1]:5514");
     }
 
@@ -2566,8 +2080,6 @@ session_ttl_secs = 3600
             ..dummy_server()
         };
         let resolved = ResolvedConfig::from_parsed(&web, Some(&srv)).unwrap();
-        // `::` wildcard maps to loopback IPv4 — same-host reach, no need
-        // for IPv6 at all.
         assert_eq!(resolved.upstream_url, "https://127.0.0.1:5514");
     }
 
@@ -2592,10 +2104,8 @@ session_ttl_secs = 3600
         assert_eq!(resolved.upstream_url, FALLBACK_UPSTREAM_URL);
     }
 
-    /// Build a `ServerConfig` for tests. The upstream-URL derivation reads
-    /// only `http_addr`, but `ServerConfig` implements no `Default`, so it
-    /// comes from a TOML parse where every other field takes its serde
-    /// default.
+    /// `ServerConfig` implements no `Default`, so it comes from a TOML parse
+    /// where every other field takes its serde default.
     fn dummy_server() -> ServerConfig {
         toml::from_str::<ServerConfig>("http_addr = \"127.0.0.1:8080\"").unwrap()
     }
@@ -2615,12 +2125,9 @@ session_ttl_secs = 3600
 
     #[test]
     fn shared_domain_empty_or_absent_is_none() {
-        // Absent → standalone.
         let resolved = ResolvedConfig::from_parsed(&configured_web(), None).unwrap();
         assert!(resolved.shared_domain.is_none());
 
-        // Empty string == unset — lets an operator blank the value to
-        // disable SSO without deleting the line.
         let web = WebConfig {
             shared_domain: Some(String::new()),
             ..configured_web()
@@ -2629,9 +2136,6 @@ session_ttl_secs = 3600
         assert!(resolved.shared_domain.is_none());
     }
 
-    // -- upstream URL rules and the pinned CA (ADR-0048) -------------------
-
-    /// Resolve `web` with no runtime overrides and no `[server]`.
     fn resolve(web: &WebConfig) -> Result<ResolvedConfig, ConfigError> {
         let runtime = SessionRuntimeOverrides::parse(None, None, None, None, None).unwrap();
         ResolvedConfig::from_parsed_with_runtime(web, None, runtime)
@@ -2649,7 +2153,6 @@ session_ttl_secs = 3600
             ("ws://127.0.0.1:5514", "ws"),
             ("unix:/run/trawld.sock", "unix"),
         ] {
-            // Platform roots, then a pinned CA: the rule is the same.
             for ca in [None, Some(ca_path.clone())] {
                 let pinned = ca.is_some();
                 let web = WebConfig {
@@ -2673,8 +2176,6 @@ session_ttl_secs = 3600
             }
         }
 
-        // The derived default stays https and resolves under both modes,
-        // for every shape of `[server] http_addr`.
         for http_addr in ["0.0.0.0:5514", "[::]:5514", "127.0.0.1:5514", "[::1]:5514"] {
             let srv = ServerConfig {
                 http_addr: http_addr.into(),
@@ -2782,7 +2283,6 @@ session_ttl_secs = 3600
             );
         }
 
-        // A path prefix is kept: each request's path is appended after it.
         for upstream in ["https://trawld:5514/", "https://trawld:5514/prefix"] {
             let web = WebConfig {
                 upstream_url: Some(upstream.to_owned()),
@@ -2830,15 +2330,12 @@ session_ttl_secs = 3600
                 "trawl.test",
                 "[::1]:5514",
             ),
-            // The parser lowercases the host, and the client matches the
-            // lowercased name.
             (
                 "https://Trawl.Lab.Example:5514",
                 "127.0.0.1:5514",
                 "trawl.lab.example",
                 "127.0.0.1:5514",
             ),
-            // No port in the URL, or `:443` written out: both are 443.
             (
                 "https://trawl.test",
                 "127.0.0.1:443",
@@ -2867,7 +2364,6 @@ session_ttl_secs = 3600
                 "{upstream} via {addr}"
             );
         }
-        // Unset: the host resolves normally.
         let web = WebConfig {
             upstream_url: Some("https://trawl.test:5514".to_owned()),
             ..configured_web()
@@ -2895,8 +2391,6 @@ session_ttl_secs = 3600
             resolve_upstream_connect(&url, "127.0.0.1:0"),
             Err(ConnectAddrError::PortZero)
         );
-        // `:443` is normalized away by the parser, and the client would
-        // then dial the address's port. It still counts as a mismatch.
         let default_port = check_upstream_url("https://trawl.test:443").unwrap();
         let error = resolve_upstream_connect(&default_port, "127.0.0.1:5514").unwrap_err();
         assert_eq!(
@@ -2934,7 +2428,6 @@ session_ttl_secs = 3600
         );
         assert_eq!(resolve(None, Some(configured)), Some(configured.to_owned()));
         assert_eq!(resolve(None, None), None);
-        // Exported-but-blank is a shell accident: the file's setting holds.
         assert_eq!(
             resolve(env(""), Some(configured)),
             Some(configured.to_owned())
@@ -2965,8 +2458,6 @@ session_ttl_secs = 3600
     #[test]
     fn a_missing_pinned_ca_file_is_pending_and_warns_once() {
         let dir = tempfile::tempdir().unwrap();
-        // The parent does not exist either, as before trawld's first start
-        // creates its `tls` directory.
         let missing = dir.path().join("tls").join("cert.pem");
         let (tls, lines) = captured_logs(|| resolve_upstream_tls(Some(&missing)));
         let tls = tls.expect("a missing pin file is pending, not a refusal");
@@ -3029,9 +2520,6 @@ session_ttl_secs = 3600
             assert!(error.to_string().contains("ca.pem"), "{error}");
         }
 
-        // Only a file that does not exist is pending. One that exists but
-        // cannot be read refuses: a directory, a path through a file, and
-        // an empty path, which would otherwise read as "not found".
         let through_a_file = dir.path().join("ca.pem").join("cert.pem");
         for unreadable in [dir.path(), through_a_file.as_path(), Path::new("")] {
             let error = resolve_upstream_tls(Some(unreadable))
@@ -3043,9 +2531,7 @@ session_ttl_secs = 3600
         }
     }
 
-    /// A pin file over [`MAX_PIN_FILE_BYTES`] refuses before it is read,
-    /// whatever it holds. The file is sparse, so the test allocates nothing.
-    /// A file of exactly the cap still reads.
+    /// The file is sparse, so the test allocates nothing.
     #[test]
     fn an_oversized_pinned_ca_file_refuses_at_resolution() {
         let dir = tempfile::tempdir().unwrap();
@@ -3084,8 +2570,6 @@ session_ttl_secs = 3600
             upstream_ca_path: Some(ca_path),
             ..configured_web()
         };
-        // Reads the real process environment for the CA override, which
-        // the test runner does not set.
         let resolved = resolve(&web).unwrap();
         assert!(matches!(
             resolved.upstream_tls,
@@ -3093,9 +2577,6 @@ session_ttl_secs = 3600
         ));
     }
 
-    /// The Debian package pins the certificate trawld generates for itself.
-    /// The path itself is guarded beside trawld's generator, in
-    /// `trawl-server`'s `tls.rs`, where the file name is defined.
     #[test]
     fn the_debian_default_config_pins_trawld_generated_certificate() {
         let config = Config::parse_toml(include_str!("../../trawl-server/debian/trawld.toml"))
@@ -3111,9 +2592,6 @@ session_ttl_secs = 3600
             "the packaged trawld.toml sets [web] upstream_ca_path"
         );
 
-        // With trawld's certificate at the pinned path, the pin resolves. The
-        // certificate here is the shape trawld generates: self-signed, with
-        // the loopback names as SANs.
         let dir = tempfile::tempdir().unwrap();
         let generated = dir.path().join("cert.pem");
         let cert = rcgen::generate_simple_self_signed(vec![
@@ -3132,8 +2610,6 @@ session_ttl_secs = 3600
             "the Debian upstream {upstream} must accept a pin"
         );
 
-        // Before trawld's first start writes it, trawl-web still starts,
-        // with the pin pending.
         let missing = dir.path().join("tls").join("cert.pem");
         assert!(
             matches!(
@@ -3144,7 +2620,6 @@ session_ttl_secs = 3600
         );
     }
 
-    /// A self-signed CA certificate in PEM.
     fn test_ca_pem() -> String {
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
@@ -3165,10 +2640,8 @@ session_ttl_secs = 3600
             ..configured_web()
         };
         let resolved = ResolvedConfig::from_parsed(&web, None).unwrap();
-        let _ = resolved.cookie_key; // successfully loaded
+        let _ = resolved.cookie_key;
     }
-
-    // -- sources without side effects (the doctor's resolver) ---------------
 
     #[expect(
         clippy::unnecessary_wraps,
@@ -3222,11 +2695,9 @@ session_ttl_secs = 3600
         ]
     }
 
-    /// Every selection resolution can make names its source, and making it
-    /// reads no file, logs nothing, and generates no key: the key file and
-    /// the pin below do not exist, the `cookie_secret_env` variable is not
-    /// set, and every environment override that startup warns about is
-    /// present, yet no line is logged.
+    /// The key file and the pin below do not exist, the `cookie_secret_env`
+    /// variable is not set, and every environment override that startup warns
+    /// about is present, yet no line is logged.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one assertion group per selection")]
     fn sources_name_every_selection() {
@@ -3246,8 +2717,6 @@ session_ttl_secs = 3600
             ..dummy_server()
         };
 
-        // Cookie key, in startup's precedence, with no fallback past an
-        // invalid selected source.
         let both = WebConfig {
             cookie_secret_env: Some("TRAWL_TEST_C2_NEVER_SET".into()),
             cookie_secret_path: Some(missing_key.clone()),
@@ -3289,7 +2758,6 @@ session_ttl_secs = 3600
         assert!(
             matches!(&sources.cookie_key, Ok(KeySource::File { path }) if *path == missing_key)
         );
-        // A `~` is kept as written: it expands where the file is read.
         let tilde = WebConfig {
             cookie_secret_path: Some("~/.trawl-c2-absent/web.cookie".into()),
             ..configured_web()
@@ -3300,8 +2768,6 @@ session_ttl_secs = 3600
         let sources = resolve(&configured_web(), None, RuntimeEnv::default());
         assert!(matches!(sources.cookie_key, Ok(KeySource::None)));
 
-        // Public origins: the environment replaces the file by presence,
-        // even with the same list, and an invalid one does not fall back.
         let two = WebConfig {
             public_origins: vec![TEST_ORIGIN.to_owned(), "http://localhost:8090".to_owned()],
             ..WebConfig::default()
@@ -3368,7 +2834,6 @@ session_ttl_secs = 3600
             })
         ));
 
-        // Cookie settings: each variable overrides only its own setting.
         let settings = |sources: Sources| sources.cookie_settings.unwrap();
         let s = settings(resolve(&configured_web(), None, RuntimeEnv::default()));
         assert!(s.secure);
@@ -3448,8 +2913,6 @@ session_ttl_secs = 3600
             "{sources:?}"
         );
 
-        // Upstream URL: the file, trawld's address (its override first),
-        // or the fallback.
         let url_from = |sources: &Sources| {
             let upstream = sources.upstream.as_ref().unwrap();
             (upstream.url.clone(), upstream.url_from)
@@ -3492,7 +2955,6 @@ session_ttl_secs = 3600
             (FALLBACK_UPSTREAM_URL.to_owned(), SettingSource::Default)
         );
 
-        // Trust: the pin is named, never read, and an empty path refuses.
         let trust = |sources: Sources| sources.upstream.map(|u| u.trust);
         let pinned_in_file = WebConfig {
             upstream_ca_path: Some(missing_pin.clone()),
@@ -3555,7 +3017,6 @@ session_ttl_secs = 3600
             })
         );
 
-        // Bind address: the variable, the file, or the default.
         let bind = |web: &WebConfig, env: RuntimeEnv| resolve(web, None, env).bind_addr.unwrap();
         let bound = WebConfig {
             bind_addr: Some("127.0.0.1:9000".into()),
@@ -3590,10 +3051,6 @@ session_ttl_secs = 3600
         );
     }
 
-    /// `Sources` and its parts show sources and shapes, never the URL, a
-    /// host, an origin, the shared domain, the key, its variable's name or
-    /// path, the pin path or the listen address, whichever source each came
-    /// from.
     #[test]
     fn sources_debug_shows_no_configured_value() {
         const SENTINEL: &str = "s3ntinel";
@@ -3608,8 +3065,6 @@ session_ttl_secs = 3600
             bind_addr: Some(format!("{SENTINEL}.bind:9000")),
             ..WebConfig::default()
         };
-        // The upstream derived from the server's address, and the key read
-        // from a file.
         let derived = WebConfig {
             upstream_url: None,
             upstream_connect_addr: None,
@@ -3673,8 +3128,6 @@ session_ttl_secs = 3600
         }
     }
 
-    /// `Sources::resolve` keeps the key and pin paths as written and looks
-    /// nothing up, whatever home directory the process has.
     #[test]
     fn resolve_keeps_tilde_paths_as_written() {
         let web = WebConfig {
@@ -3703,13 +3156,6 @@ session_ttl_secs = 3600
         );
     }
 
-    /// Startup expands `~` exactly where it always did: in the key file's
-    /// path as the key is read, and in the pin's path as the pin is read,
-    /// each after every earlier check passed. So an error that comes
-    /// earlier in startup's order is returned before any home directory is
-    /// looked up, however many `~` paths the configuration holds; with
-    /// `HOME` unset, that lookup can wait on the user database. `expand`
-    /// records each path it is asked for and expands against a stated home.
     #[cfg(unix)]
     #[test]
     #[expect(
@@ -3723,7 +3169,6 @@ session_ttl_secs = 3600
             name: String,
             web: WebConfig,
             env: RuntimeEnv,
-            /// The error startup returns, as its text.
             error: String,
             /// The paths expanded before it, in order.
             expanded: Vec<&'static str>,
@@ -3830,8 +3275,6 @@ session_ttl_secs = 3600
                 expanded: vec!["~/cookie.key", "~/ca.pem"],
             },
         ];
-        // Every invalid `FLEET_SESSION_*` variable refuses first, with the
-        // whole parse's own error.
         let fleet: [Fleet; 5] = [
             (
                 ENV_SESSION_AEAD_KEY,
@@ -3894,7 +3337,6 @@ session_ttl_secs = 3600
             let (result, asked) = startup(&case.web, case.env);
             let error = result.map(|_| ()).expect_err(&case.name).to_string();
             let expected = if case.error.is_empty() {
-                // The component's own error, as resolution records it.
                 let sources = Sources::resolve(
                     &case.web,
                     None,
@@ -3917,8 +3359,6 @@ session_ttl_secs = 3600
             assert_eq!(asked, expanded, "{}: {error}", case.name);
         }
 
-        // With every check passing, both paths expand, key first, and the
-        // files at the expanded paths are the ones read.
         let (result, asked) = startup(&tilde_paths, RuntimeEnv::default());
         let resolved = result.expect("startup resolves");
         assert_eq!(
@@ -3938,8 +3378,6 @@ session_ttl_secs = 3600
             resolved.upstream_tls
         );
 
-        // The expansion startup uses is `shellexpand::tilde`'s, unchanged:
-        // the pin below does not exist, so startup keeps its expanded path.
         let pin = "~/.trawl-c2-absent/tls/cert.pem";
         let expected = PathBuf::from(shellexpand::tilde(pin).as_ref());
         assert!(
@@ -3970,10 +3408,6 @@ session_ttl_secs = 3600
         );
     }
 
-    /// Each variable parsed alone gets the result the whole parse gives it:
-    /// when the whole parse succeeds, every part holds its value, and when
-    /// it fails, its error is the first failing part's, in the parser's
-    /// order (key, path, secure, domain, origins).
     #[test]
     #[expect(clippy::too_many_lines, reason = "one table row per case")]
     fn runtime_parts_agree_with_the_whole_parse() {
@@ -4054,8 +3488,6 @@ session_ttl_secs = 3600
                 None,
                 Some("https://a.example,https://a.example:443"),
             ],
-            // Several invalid at once: the whole parse names the first in
-            // its order, each part its own.
             [
                 Some("not-base64"),
                 Some("bad domain"),
@@ -4114,9 +3546,6 @@ session_ttl_secs = 3600
         }
     }
 
-    /// A value that is not UTF-8 refuses the whole parse before any value
-    /// is parsed, as fleet-auth's `from_process_env` does, and fails only
-    /// its own part when each variable is parsed alone.
     #[cfg(unix)]
     #[test]
     fn a_non_utf8_fleet_variable_refuses_first_and_alone() {
@@ -4143,12 +3572,6 @@ session_ttl_secs = 3600
         assert!(matches!(each.path_set, Ok(false)));
     }
 
-    /// Startup and the doctor run one resolver. Given the same file and the
-    /// same valid environment, the whole parse and the per-variable parse
-    /// select the same values from the same sources, and startup's
-    /// `from_sources` runs on exactly those values. An invalid variable
-    /// stops startup with the error the doctor's matching component
-    /// carries, and fails only that component.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one resolver, compared end to end")]
     fn startup_and_doctor_share_resolve() {
@@ -4250,7 +3673,6 @@ session_ttl_secs = 3600
             assert_eq!(resolved.cookie_key.to_base64url().as_str(), key, "{case}");
         }
 
-        // A component error reaches startup unchanged, in startup's order.
         let broken = WebConfig {
             upstream_url: Some("http://trawld:5514".into()),
             bind_addr: Some("127.0.0.1:9000".into()),
@@ -4277,8 +3699,6 @@ session_ttl_secs = 3600
         assert_eq!(error.to_string(), origins_error, "origins come first");
         assert_ne!(origins_error, upstream_error);
 
-        // An invalid variable stops startup; the doctor fails only the
-        // component it feeds, with the same error.
         let bad_key = || RuntimeEnv {
             aead_key: os("not-base64"),
             ..RuntimeEnv::default()
@@ -4304,9 +3724,6 @@ session_ttl_secs = 3600
         assert!(doctor.bind_addr.is_ok());
     }
 
-    /// The capped reader refuses a file past its cap, a directory and a
-    /// FIFO with no writer, the last without waiting, and keeps the kind of
-    /// an open error.
     #[test]
     fn read_capped_file_refuses_past_its_cap_and_never_waits() {
         let dir = tempfile::tempdir().unwrap();
@@ -4323,9 +3740,6 @@ session_ttl_secs = 3600
         let error = read_capped_file(&dir.path().join("absent"), 1024).expect_err("a missing file");
         assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
 
-        // The secret reader refuses the same things, and reads into the
-        // one buffer it allocated first: one byte past the cap, never
-        // grown, so no reallocation leaves an unscrubbed copy behind.
         let secret = read_capped_secret(&path, KEY_LEN as u64 + 1).unwrap();
         assert_eq!(*secret, [0x42; KEY_LEN + 1]);
         assert_eq!(secret.capacity(), KEY_LEN + 2);

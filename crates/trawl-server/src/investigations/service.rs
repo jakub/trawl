@@ -3,41 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The investigation capability, transport-free (ADR-0059).
-//!
-//! # Authority
-//!
-//! Reading needs `query` and `investigation_read`; writing needs
-//! `investigation_write` as well; extending retention and deleting need
-//! `server_manage` on top of that. Every function checks its authority
-//! first, before it parses the id or looks anything up, so a key without
-//! it gets the same 403 for an id that exists and one that does not. A
-//! reader then gets 404 for an id the installation does not hold.
-//!
-//! No statement is scoped by the caller's key: every reader sees every
-//! investigation. The key's prefix and name are recorded as attribution
-//! ([`StoreActor`]); its id stays server side, for the create replay check
-//! and for leaving the caller's own entries out of `activity`.
-//!
-//! # Bounds
-//!
-//! Serde admits any length, so every text bound of
-//! [`trawl_api::investigations`] is checked here before the store sees the
-//! request, and so is the absence of NUL, which `PostgreSQL` text refuses.
-//! A refusal is 400 and names the field and the rule, never the stored
-//! state. A keep and a finding cite rows of results kept for this
-//! investigation, checked by [`resolve_references`]. A citation of the
-//! caller's own live temporary result promotes that whole result into the
-//! investigation with the append, charged once to the evidence budgets. The
-//! promotion's transaction and the settlement of its charge run in a task
-//! of their own, so a request that goes away cuts neither short
-//! ([`append_promoting`]).
-//!
-//! # Allowances
-//!
-//! A read answers [`READ_DEFAULT_LIMIT`] entries unless it asks for
-//! another `limit`, at most [`READ_MAX_LIMIT`]. An append or an overwrite
-//! that carries a `seen_seq` answers at most [`ACTIVITY_LIMIT`] entries of
-//! other actors' activity, with `more` when it cut some.
 
 use std::sync::Arc;
 
@@ -70,10 +35,8 @@ use crate::store::{
 };
 use crate::transport::request_limit;
 
-/// Entries a read answers when it names no `limit`.
 pub const READ_DEFAULT_LIMIT: u64 = 100;
 
-/// The most entries one read answers.
 pub const READ_MAX_LIMIT: u64 = 200;
 
 /// The most entries of other actors' activity an append or an overwrite
@@ -81,30 +44,18 @@ pub const READ_MAX_LIMIT: u64 = 200;
 /// at the read that has the rest.
 pub const ACTIVITY_LIMIT: u64 = 50;
 
-// -- authority ---------------------------------------------------------------
-
-/// What a route needs of the caller: the rules the routes that read a
-/// body name with [`crate::policy::Authorized`], so both say the same.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Authority {
-    /// [`needs::InvestigationRead`]: `query` and `investigation_read`.
     Read,
-    /// [`needs::InvestigationWrite`]: [`Self::Read`] and
-    /// `investigation_write`.
     Write,
-    /// [`needs::InvestigationManage`]: [`Self::Write`] and `server_manage`.
     Manage,
 }
 
-/// Whether `verified` reads investigations and their kept evidence: it
-/// holds `query` and `investigation_read`.
 #[must_use]
 pub fn reads_investigations(verified: &VerifiedKey) -> bool {
     needs::InvestigationRead::admits(verified)
 }
 
-/// The caller's authority, checked before anything is looked up: the same
-/// 403 for every id.
 fn authorize(verified: &VerifiedKey, needed: Authority) -> Result<(), ServerError> {
     let granted = match needed {
         Authority::Read => needs::InvestigationRead::admits(verified),
@@ -118,28 +69,14 @@ fn authorize(verified: &VerifiedKey, needed: Authority) -> Result<(), ServerErro
     }
 }
 
-/// 403 unless `verified` may read investigations. The routes call it
-/// before they look at the request, so a refusal of the request's shape
-/// never comes first.
-///
-/// # Errors
-/// 403 without `query` and `investigation_read`.
 pub(crate) fn authorize_read(verified: &VerifiedKey) -> Result<(), ServerError> {
     authorize(verified, Authority::Read)
 }
 
-/// [`authorize_read`] for writing: `investigation_write` as well.
-///
-/// # Errors
-/// 403 without write authority.
 pub(crate) fn authorize_write(verified: &VerifiedKey) -> Result<(), ServerError> {
     authorize(verified, Authority::Write)
 }
 
-/// [`authorize_read`] for extending and deleting: `server_manage` as well.
-///
-/// # Errors
-/// 403 without `server_manage` and write authority.
 pub(crate) fn authorize_manage(verified: &VerifiedKey) -> Result<(), ServerError> {
     authorize(verified, Authority::Manage)
 }
@@ -154,7 +91,6 @@ fn parse_id(text: &str) -> Result<InvestigationId, ServerError> {
     })
 }
 
-/// The caller as the store records it.
 fn actor(verified: &VerifiedKey) -> StoreActor {
     StoreActor {
         key_id: verified.id,
@@ -163,7 +99,6 @@ fn actor(verified: &VerifiedKey) -> StoreActor {
     }
 }
 
-/// `secs` as a duration, saturating.
 fn seconds(secs: u64) -> TimeDelta {
     i64::try_from(secs)
         .ok()
@@ -171,23 +106,17 @@ fn seconds(secs: u64) -> TimeDelta {
         .unwrap_or(TimeDelta::MAX)
 }
 
-/// `at + secs`, saturating at the latest instant.
 fn after(at: DateTime<Utc>, secs: u64) -> DateTime<Utc> {
     at.checked_add_signed(seconds(secs))
         .unwrap_or(DateTime::<Utc>::MAX_UTC)
 }
 
-/// How far each change slides the evidence clock: `[investigation]
-/// evidence_idle_secs`.
 fn retention(state: &AppState) -> RetentionRule {
     RetentionRule {
         idle: seconds(state.results.investigation.evidence_idle_secs),
     }
 }
 
-// -- bounds ------------------------------------------------------------------
-
-/// `text`, the field `what`, holds at most `max` bytes and no NUL.
 fn check_text(what: &str, text: &str, max: usize) -> Result<(), ServerError> {
     if text.len() > max {
         return Err(ServerError::BadRequest(format!(
@@ -203,7 +132,6 @@ fn check_text(what: &str, text: &str, max: usize) -> Result<(), ServerError> {
     Ok(())
 }
 
-/// [`check_text`], and `text` is not blank.
 fn check_required(what: &str, text: &str, max: usize) -> Result<(), ServerError> {
     if text.trim().is_empty() {
         return Err(ServerError::BadRequest(format!("{what} is empty")));
@@ -211,7 +139,6 @@ fn check_required(what: &str, text: &str, max: usize) -> Result<(), ServerError>
     check_text(what, text, max)
 }
 
-/// At most `max` items in the list `what`.
 fn check_count(what: &str, count: usize, max: usize) -> Result<(), ServerError> {
     if count > max {
         return Err(ServerError::BadRequest(format!(
@@ -221,7 +148,6 @@ fn check_count(what: &str, count: usize, max: usize) -> Result<(), ServerError> 
     Ok(())
 }
 
-/// `id`, cited by `what`, has the result id shape.
 fn check_result_id(what: &str, id: &str) -> Result<(), ServerError> {
     if root::is_result_id(id) {
         Ok(())
@@ -232,14 +158,12 @@ fn check_result_id(what: &str, id: &str) -> Result<(), ServerError> {
     }
 }
 
-/// The create request's bounds.
 fn check_creation(req: &CreateInvestigation) -> Result<(), ServerError> {
     check_required("title", &req.title, TITLE_MAX_BYTES)?;
     check_required("question", &req.question, QUESTION_MAX_BYTES)?;
     check_text("scope", &req.scope, SCOPE_MAX_BYTES)
 }
 
-/// A row an append cites: where it was cited, for the refusal, and the row.
 #[derive(Debug)]
 struct Citation<'a> {
     what: String,
@@ -247,8 +171,6 @@ struct Citation<'a> {
     row: u64,
 }
 
-/// The append's bounds, and the rows it cites. A keep cites each of its
-/// rows; a finding its references and its counterevidence.
 fn check_append(entry: &AppendEntry) -> Result<Vec<Citation<'_>>, ServerError> {
     match entry {
         AppendEntry::Keep {
@@ -307,8 +229,6 @@ fn check_append(entry: &AppendEntry) -> Result<Vec<Citation<'_>>, ServerError> {
     }
 }
 
-/// The citations of the finding list `list`, each checked for the result
-/// id shape.
 fn cite<'a>(list: &str, refs: &'a [EvidenceRef]) -> Result<Vec<Citation<'a>>, ServerError> {
     refs.iter()
         .enumerate()
@@ -324,7 +244,6 @@ fn cite<'a>(list: &str, refs: &'a [EvidenceRef]) -> Result<Vec<Citation<'a>>, Se
         .collect()
 }
 
-/// The payload an append records: the entry without its `seen_seq`.
 fn payload(entry: AppendEntry) -> EntryPayload {
     match entry {
         AppendEntry::Keep {
@@ -355,23 +274,15 @@ fn payload(entry: AppendEntry) -> EntryPayload {
     }
 }
 
-/// A cited result the append promotes: the caller's own live temporary
-/// result, the bytes it stores ([`CaptureRow::stored_bytes`]: its file
-/// and its facts document), and the first citation that named it.
 struct Promotion {
     result_id: String,
     stored_bytes: u64,
     what: String,
 }
 
-/// What a cited result is to investigation `id` and the caller.
 enum Cited {
-    /// Kept evidence of this investigation.
     Evidence,
-    /// The caller's own live temporary result with its file: the append
-    /// promotes it.
     Promotable,
-    /// Kept evidence of another investigation.
     KeptElsewhere,
 }
 
@@ -402,13 +313,6 @@ fn classify(
 /// Check that every cited row is a row of a result the append may cite in
 /// investigation `id`: kept evidence of it, or the caller's own live
 /// temporary result, which the append promotes. Answers the promotions.
-///
-/// A result kept by another investigation is 409: evidence belongs to one
-/// investigation. Anything else is 400 naming the citation, with the same
-/// words whether the result is absent, another key's temporary result,
-/// past its deadline, pruned, or without its file, so a refusal tells the
-/// caller nothing a read would not. The store checks each promotion again under the
-/// investigation's lock ([`crate::store::InvestigationStore::append_citing`]).
 ///
 /// A cited result can be pruned between this check and the append's
 /// commit. That is the order the two would have had anyway: a finding
@@ -462,14 +366,12 @@ async fn resolve_references(
     Ok(promotions)
 }
 
-/// The 400 for a citation of a result the append cannot cite.
 fn not_citable(what: &str, result_id: &str) -> ServerError {
     ServerError::BadRequest(format!(
         "{what} cites result {result_id}, which is not kept evidence of this investigation"
     ))
 }
 
-/// The 409 for a citation of another investigation's evidence.
 fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
     ServerError::Conflict(format!(
         "{what} cites result {result_id}, which is already kept by another investigation"
@@ -484,23 +386,6 @@ fn kept_elsewhere(what: &str, result_id: &str) -> ServerError {
 /// `evidence_budget_exceeded` with nothing written, which [`append`] may
 /// still turn into an append at no charge; a promotion the store refuses
 /// under the lock answers as [`resolve_references`] would have.
-///
-/// The transaction and the charge's settlement run in a task of their own
-/// ([`Promoting::run`]), which the request awaits. A request that goes
-/// away, as when its client hangs up, cuts neither short: the charge
-/// stays on the book until the transaction has ended and the table counts
-/// what it committed. Released with the request, it would let the next
-/// pass admit a promotion past the budget while this one's commit lands.
-/// The task keeps the request's count until then too, on a
-/// [`request_limit::Lease`] that gives it back no later than `deadline`
-/// whatever the task awaits then, an unanswered `COMMIT` included
-/// (ADR-0054). Its waits for a connection, the investigation, the results
-/// and each answer end together at `deadline` with nothing written, a 429
-/// `capture_busy` as the pass's own wait is, bounded at that instant by
-/// Postgres and by the store alike ([`InvestigationStore::append_citing`]),
-/// and so does the wait for a rollback. The commit is never cut short,
-/// and none is sent after the deadline: a commit sent before it lands, and
-/// the charge's settlement may end after it, outside the count.
 async fn append_promoting(
     state: &AppState,
     id: &InvestigationId,
@@ -567,13 +452,10 @@ async fn append_promoting(
     }
 }
 
-/// The ids of the results `promotions` promotes.
 fn promoted_ids(promotions: &[Promotion]) -> Vec<&str> {
     promotions.iter().map(|p| p.result_id.as_str()).collect()
 }
 
-/// A promotion's transaction, owned by the task that runs it and settles
-/// its charge ([`append_promoting`]).
 struct Promoting {
     results: Arc<ResultsState>,
     store: InvestigationStore,
@@ -583,7 +465,6 @@ struct Promoting {
     result_ids: Vec<String>,
     now: DateTime<Utc>,
     retention: RetentionRule,
-    /// When the transaction stops waiting to commit.
     deadline: Deadline,
 }
 
@@ -674,8 +555,6 @@ impl Promoting {
         });
     }
 
-    /// Whether every result this promotion names is kept by its
-    /// investigation.
     async fn promoted(&self) -> Result<bool, StoreError> {
         for result_id in &self.result_ids {
             let kept_here = self
@@ -695,13 +574,8 @@ impl Promoting {
     }
 }
 
-// -- the routes --------------------------------------------------------------
-
 /// Every investigation, open ones first, then each group most recently
 /// changed first, at most [`MAX_LIST`].
-///
-/// # Errors
-/// 403 without read authority; a store failure.
 pub async fn list(
     state: &AppState,
     verified: &VerifiedKey,
@@ -716,14 +590,6 @@ pub async fn list(
 /// Create investigation `id` unless it exists. Answers whether this call
 /// created it, and the investigation. The same creator key sending the same
 /// request again gets the existing one back with nothing advanced.
-///
-/// Its evidence clock starts at `[investigation] evidence_idle_secs` from
-/// now, under a ceiling `evidence_ceiling_secs` from now.
-///
-/// # Errors
-/// 403 without write authority; 400 for a malformed id or a field out of
-/// bounds; 409 `investigation_exists` when the id is taken by another
-/// creator or another request; a store failure.
 pub async fn create(
     state: &AppState,
     verified: &VerifiedKey,
@@ -753,13 +619,8 @@ pub async fn create(
     }
 }
 
-/// Investigation `id` and at most `limit` entries changed after `since`
-/// (default 0, everything), in `updated_seq` order. `limit` defaults to
-/// [`READ_DEFAULT_LIMIT`] and may not pass [`READ_MAX_LIMIT`].
-///
-/// # Errors
-/// 403 without read authority; 400 for a malformed id or a limit out of
-/// range; 404 for an unknown id; a store failure.
+/// Investigation `id` and at most `limit` entries changed after `since`, in
+/// `updated_seq` order.
 pub async fn read(
     state: &AppState,
     verified: &VerifiedKey,
@@ -789,14 +650,6 @@ pub async fn read(
     })
 }
 
-/// Append a keep, a finding or a note to investigation `id`, which must be
-/// open. A citation of the caller's own live temporary result promotes it
-/// into the investigation with the entry. Evidence the due-write rule
-/// pruned is unlinked once the append commits. With a `seen_seq`, the
-/// answer carries the entries other keys changed after it, at most
-/// [`ACTIVITY_LIMIT`], read after the commit: a read that fails answers
-/// the written entry with none and `more` set ([`activity`]).
-///
 /// The evidence budget counts a result once. So when it refuses the
 /// promotions, the append waits for every other promotion of those
 /// results into `id` that still holds a charge, bounded by the query
@@ -808,12 +661,6 @@ pub async fn read(
 /// without a charge; the promotions still left are charged once more,
 /// under the same deadline, and that charge's answer stands: a second
 /// refusal is the append's answer, and the append does not wait again.
-///
-/// # Errors
-/// 403 without write authority; 400 for a malformed id, a field out of
-/// bounds or a citation [`resolve_references`] refuses; 404 for an unknown
-/// id; 409 `investigation_closed`, for a result kept by another
-/// investigation, or `evidence_budget_exceeded`; a store failure.
 pub async fn append(
     state: &AppState,
     verified: &VerifiedKey,
@@ -890,12 +737,7 @@ async fn written_activity(
 }
 
 /// What other keys wrote to investigation `id` after `seen`, read after a
-/// write to it committed: an append, an overwrite, or a capture attached
-/// to it. The write is committed whatever this read meets, and must never
-/// read as a failure that invites a second write (ADR-0059). So a failure
-/// answers no entries with `more` set, sending the caller to the
-/// investigation's read, and an investigation deleted since answers none
-/// through `deleted_through`.
+/// write to it committed (ADR-0059).
 pub(crate) async fn activity(
     investigations: &InvestigationStore,
     id: &InvestigationId,
@@ -929,22 +771,6 @@ pub(crate) async fn activity(
     }
 }
 
-/// Overwrite the title, the question or the status of investigation `id`
-/// if its sequence is still `expected_seq`. A closed investigation takes
-/// only a reopen. The answer is the investigation as the write left it,
-/// the entry it wrote, and, when the request sent a `seen_seq`, the
-/// activity since it.
-///
-/// One field per request: the store applies one overwrite per sequence
-/// check, and two applied under one `expected_seq` would conflict with
-/// each other. `seen_seq` is not a field: it changes no check and no
-/// conflict.
-///
-/// # Errors
-/// 403 without write authority; 400 for a malformed id, a patch that
-/// changes nothing or more than one field, or a field out of bounds; 404
-/// for an unknown id; 409 `sequence_conflict` or `investigation_closed`; a
-/// store failure.
 pub async fn patch(
     state: &AppState,
     verified: &VerifiedKey,
@@ -983,9 +809,6 @@ pub async fn patch(
     let store = &state.storage.investigations;
     let actor = actor(verified);
     let now = state.results.clock.now();
-    // The header comes from the write's own transaction, and the activity
-    // read cannot fail: nothing after the commit answers a landed write as
-    // a failure.
     let Overwritten {
         entry,
         investigation,
@@ -1007,15 +830,6 @@ pub async fn patch(
     })
 }
 
-/// Overwrite the status of the finding whose entry is `finding_seq` in
-/// investigation `id`, if its sequence is still `expected_seq`. The
-/// investigation must be open. The answer is the entry written and, when
-/// the request sent a `seen_seq`, the activity since it.
-///
-/// # Errors
-/// 403 without write authority; 400 for a malformed id; 404 for an
-/// unknown id or a `finding_seq` that names no finding of it; 409
-/// `sequence_conflict` or `investigation_closed`; a store failure.
 pub async fn set_finding_status(
     state: &AppState,
     verified: &VerifiedKey,
@@ -1043,15 +857,6 @@ pub async fn set_finding_status(
     Ok(AppendResponse { entry, activity })
 }
 
-/// Keep the evidence of investigation `id` until `retain_until`, raising
-/// its ceiling to it if need be, if its sequence is still `expected_seq`.
-/// `retain_until` is an RFC 3339 UTC instant no earlier than now and no
-/// earlier than the current deadline: an extension never shortens.
-///
-/// # Errors
-/// 403 without `server_manage` and write authority; 400 for a malformed id
-/// or a `retain_until` that does not read or would shorten; 404 for an
-/// unknown id; 409 `sequence_conflict`; a store failure.
 pub async fn extend(
     state: &AppState,
     verified: &VerifiedKey,
@@ -1095,7 +900,6 @@ pub async fn extend(
     Ok(row.to_wire())
 }
 
-/// `text` as an RFC 3339 instant in UTC, to the microsecond.
 fn parse_utc(text: &str) -> Result<DateTime<Utc>, ServerError> {
     let refused = || {
         ServerError::BadRequest(
@@ -1109,15 +913,6 @@ fn parse_utc(text: &str) -> Result<DateTime<Utc>, ServerError> {
     Ok(truncate_to_micros(at.with_timezone(&Utc)))
 }
 
-/// Delete investigation `id` and its log, unless admitted work is still
-/// running, and unlink its kept evidence files. An unlink that fails is
-/// logged: the row is already pruned, so no read reaches the file, and the
-/// boot reconciliation removes a file no live row names.
-///
-/// # Errors
-/// 403 without `server_manage` and write authority; 400 for a malformed
-/// id; 404 for an unknown id; 409 while a step's work runs; a store
-/// failure.
 pub async fn delete(state: &AppState, verified: &VerifiedKey, id: &str) -> Result<(), ServerError> {
     authorize(verified, Authority::Manage)?;
     let id = parse_id(id)?;

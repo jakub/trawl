@@ -4,9 +4,6 @@
 
 use super::*;
 
-/// The `OTel` short names are injective over the whole 1-24 ladder — the
-/// property that lets `_severity` render as text and be filtered by that
-/// same text without two numbers sharing a spelling.
 #[test]
 fn otel_names_are_injective_over_the_ladder() {
     let mut seen = std::collections::BTreeSet::new();
@@ -19,7 +16,6 @@ fn otel_names_are_injective_over_the_ladder() {
     assert_eq!(otel_name(25), None);
 }
 
-/// The exact names are the band base plus an optional 2-4 suffix.
 #[test]
 fn exact_names_spell_the_band_base_and_suffix() {
     let cases: &[(u8, &str)] = &[
@@ -39,10 +35,7 @@ fn exact_names_spell_the_band_base_and_suffix() {
         assert_eq!(otel_name(n), Some(name), "{n}");
         assert_eq!(number_for_exact(name), Some(n), "{name}");
     }
-    // Case-insensitive, like the token table.
     assert_eq!(number_for_exact("ERROR2"), Some(18));
-    // A suffix outside 2-4, an unknown base, and the aliases the token
-    // table carries are not exact names.
     assert_eq!(number_for_exact("error1"), None);
     assert_eq!(number_for_exact("error5"), None);
     assert_eq!(number_for_exact("gold"), None);
@@ -51,9 +44,6 @@ fn exact_names_spell_the_band_base_and_suffix() {
     assert_eq!(number_for_exact(""), None);
 }
 
-/// The wire-shaped display rule: a `_severity` cell is BIGINT, so the
-/// narrowing is part of the rule and anything off the ladder — including
-/// a value outside `u8` entirely — has no reading.
 #[test]
 fn token_text_reads_a_wire_severity_cell() {
     assert_eq!(token_text(17), Some("error"));
@@ -72,7 +62,6 @@ fn token_text_reads_a_wire_severity_cell() {
     }
 }
 
-/// Every token in `TOKEN_TABLE` maps to its exact number.
 #[test]
 fn token_table_exact_numbers() {
     let cases: &[(&str, u8)] = &[
@@ -106,7 +95,6 @@ fn token_table_exact_numbers() {
     }
 }
 
-/// Tokens are matched case-insensitively.
 #[test]
 fn tokens_case_fold() {
     for (input, number) in [
@@ -123,7 +111,6 @@ fn tokens_case_fold() {
     }
 }
 
-/// Unknown tokens do not map.
 #[test]
 fn unknown_tokens_rejected() {
     for input in ["SPICY", "", "warnn", "4", "13", "verbose", "severe"] {
@@ -131,8 +118,6 @@ fn unknown_tokens_rejected() {
     }
 }
 
-/// Syslog numerals invert: 0 (emerg) is the top of the `OTel` ladder,
-/// 7 (debug) near the bottom. A naive passthrough fails this loudly.
 #[test]
 fn syslog_inversion() {
     let cases: &[(u8, u8)] = &[
@@ -148,22 +133,18 @@ fn syslog_inversion() {
     for &(syslog, otel) in cases {
         assert_eq!(from_syslog(syslog), Some(otel), "syslog {syslog}");
     }
-    // The two poles, asserted by band so a passthrough cannot sneak by:
     assert_eq!(band_name(from_syslog(0).unwrap()), Some("fatal"));
     assert_eq!(band_name(from_syslog(7).unwrap()), Some("debug"));
     assert_eq!(from_syslog(8), None);
     assert_eq!(from_syslog(255), None);
 }
 
-/// Band bounds are the `OTel` ladder: TRACE 1-4 … FATAL 21-24.
 #[test]
 fn band_bounds() {
     assert_eq!(band_of(1), Some((1, 4)));
     assert_eq!(band_of(4), Some((1, 4)));
     assert_eq!(band_of(5), Some((5, 8)));
     assert_eq!(band_of(9), Some((9, 12)));
-    // `notice` (10) sits in the info band: the OTel ladder has no band
-    // of its own for it.
     assert_eq!(band_of(10), Some((9, 12)));
     assert_eq!(band_of(13), Some((13, 16)));
     assert_eq!(band_of(17), Some((17, 20)));
@@ -191,8 +172,6 @@ fn band_names() {
     assert_eq!(band_name(0), None);
 }
 
-// ── the reader (ADR-0013) ─────────────────────────────────────────────
-
 use serde_json::json;
 
 /// The reader's text matrix, both dialects — the same list the SQL mirror
@@ -200,7 +179,6 @@ use serde_json::json;
 /// added here belongs there too.
 #[test]
 fn reading_text_matrix() {
-    // (input, otel, syslog) — words are dialect-free, numerics are not.
     let cases: &[(&str, Option<u8>, Option<u8>)] = &[
         ("error", Some(17), Some(17)),
         ("ERR", Some(17), Some(17)),
@@ -209,14 +187,12 @@ fn reading_text_matrix() {
         ("error2", Some(18), Some(18)),
         ("warn", Some(13), Some(13)),
         ("notice", Some(10), Some(10)),
-        // Numerics: OTel passes 1-24 through, syslog inverts 0-7.
         ("0", None, Some(24)),
         ("1", Some(1), Some(23)),
         ("7", Some(7), Some(5)),
         ("8", Some(8), None),
         ("24", Some(24), None),
         ("25", None, None),
-        // Leading zeros are still digits.
         ("0404", None, None),
         ("007", Some(7), Some(5)),
         ("+17", Some(17), None),
@@ -255,10 +231,6 @@ fn reading_text_matrix() {
     }
 }
 
-/// The trim is the enumerated Unicode `White_Space` set — `str::trim`'s
-/// set, character for character, which is what lets ingest delegate here
-/// unchanged — and `DuckDB` trims the same one (probed), so a padded value
-/// cannot read one way live and another in batch.
 #[test]
 fn reading_text_trims_the_unicode_whitespace_set() {
     for padded in [
@@ -270,17 +242,14 @@ fn reading_text_trims_the_unicode_whitespace_set() {
         "\u{202f}\u{2009}error\t",
     ] {
         assert_eq!(reading_text(padded, Dialect::Otel), Some(17), "{padded:?}");
-        // `str::trim` is the same set, so the two agree everywhere.
         assert_eq!(
             reading_text(padded, Dialect::Otel),
             reading_text(padded.trim(), Dialect::Otel),
             "{padded:?}"
         );
     }
-    // Numerics trim too, and inner whitespace is part of the value.
     assert_eq!(reading_text("\u{a0}17\u{a0}", Dialect::Otel), Some(17));
     assert_eq!(reading_text("er\u{a0}ror", Dialect::Otel), None);
-    // The set is exactly `char::is_whitespace`'s.
     for c in WHITESPACE {
         assert!(c.is_whitespace(), "{c:?} is not White_Space");
     }
@@ -294,9 +263,6 @@ fn reading_text_trims_the_unicode_whitespace_set() {
     );
 }
 
-/// The JSON shapes: a string reads as text, an integer as a number, and
-/// everything else — including a fractional number, which names no rung —
-/// has no reading.
 #[test]
 fn reading_over_json_shapes() {
     assert_eq!(reading(&json!("error"), Dialect::Otel), Some(17));
@@ -304,7 +270,6 @@ fn reading_over_json_shapes() {
     assert_eq!(reading(&json!("17"), Dialect::Otel), Some(17));
     assert_eq!(reading(&json!(3), Dialect::Syslog), Some(17));
     assert_eq!(reading(&json!("3"), Dialect::Syslog), Some(17));
-    // 17.0 is a JSON float: `as_i64` declines it, so it names no rung.
     assert_eq!(reading(&json!(17.0), Dialect::Otel), None);
     assert_eq!(reading(&json!(1.5), Dialect::Otel), None);
     assert_eq!(reading(&json!(true), Dialect::Otel), None);
@@ -313,7 +278,6 @@ fn reading_over_json_shapes() {
     assert_eq!(reading(&json!({"n": 17}), Dialect::Otel), None);
 }
 
-/// The numeric half is the one place a dialect changes anything.
 #[test]
 fn reading_number_per_dialect() {
     for n in 1..=24i64 {
@@ -334,9 +298,6 @@ fn reading_number_per_dialect() {
     assert_eq!(reading_number(i64::MAX, Dialect::Syslog), None);
 }
 
-/// The dialect vocabulary is closed, ASCII-case-insensitive, and its
-/// tokens round-trip — the same set the DSL's `sev()` second argument and
-/// the ingest config accept.
 #[test]
 fn dialect_tokens_round_trip() {
     assert_eq!(Dialect::from_token("otel"), Some(Dialect::Otel));
@@ -352,8 +313,6 @@ fn dialect_tokens_round_trip() {
     assert_eq!(Dialect::default(), Dialect::Otel);
 }
 
-/// The table the SQL mirror generates its arms from is the table this
-/// module matches against — exposed read-only, in table order.
 #[test]
 fn token_entries_expose_the_table() {
     let entries: Vec<(&str, u8)> = token_entries().collect();
@@ -364,9 +323,6 @@ fn token_entries_expose_the_table() {
     }
 }
 
-/// The render rule folds case, because `DuckDB` identifiers do: a
-/// `let S = sev(x)` returns the column spelled `S` while the pin scope
-/// declares the folded `s`, so an exact match would render numbers there.
 #[test]
 fn renders_as_severity_folds_ascii_case() {
     let declared = vec!["s".to_owned(), "myLevel".to_owned()];
@@ -376,24 +332,14 @@ fn renders_as_severity_folds_ascii_case() {
             "{column} must render as severity"
         );
     }
-    // The envelope slot, by name, whatever the spelling.
     assert!(renders_as_severity("_severity", &[]));
     assert!(renders_as_severity("_SEVERITY", &[]));
-    // Anything else is ordinary data.
     assert!(!renders_as_severity("severity", &declared));
     assert!(!renders_as_severity("st", &declared));
     assert!(!renders_as_severity("s2", &declared));
     assert!(!renders_as_severity("s", &[]));
 }
 
-/// The dialect-ambiguous set is exactly the integers 1-7.
-///
-/// The two ladders overlap only there: `0` is emerg to syslog and nothing
-/// to `OTel`, 8-24 are `OTel` rungs syslog has no numeral for, and every
-/// token is dialect-free by construction. Pinned over a wide integer
-/// range and the whole token vocabulary, because this set is what the
-/// repin's ambiguity gate refuses on — a rung leaking in either direction
-/// is either a silent mistranslation or a refusal nothing can clear.
 #[test]
 fn dialect_ambiguity_is_exactly_the_syslog_overlap() {
     for n in -30..=30i64 {
@@ -404,8 +350,6 @@ fn dialect_ambiguity_is_exactly_the_syslog_overlap() {
             "integer {n} misclassified"
         );
     }
-    // Spelling never decides: a sign, padding and leading zeros all read
-    // through to the same integer, so they carry its verdict.
     for (text, ambiguous) in [
         ("+3", true),
         (" 3 ", true),
@@ -422,8 +366,6 @@ fn dialect_ambiguity_is_exactly_the_syslog_overlap() {
     ] {
         assert_eq!(dialect_ambiguous(text), ambiguous, "{text:?}");
     }
-    // Words are dialect-free: every token and every exact short name reads
-    // the same in both dialects, whatever its case.
     for (token, _) in token_entries() {
         for spelling in [token.to_owned(), token.to_uppercase()] {
             assert!(!dialect_ambiguous(&spelling), "token {spelling}");

@@ -1,8 +1,9 @@
 diff --git a/crates/trawl-web-ui/src/pages/investigations.rs b/crates/trawl-web-ui/src/pages/investigations.rs
+index b0de3ef5..fb036e85 100644
 --- a/crates/trawl-web-ui/src/pages/investigations.rs
 +++ b/crates/trawl-web-ui/src/pages/investigations.rs
-@@ -870,7 +870,7 @@ impl BoardReads {
-     /// the pause itself ([`Self::poll`]).
+@@ -676,7 +676,7 @@ impl BoardReads {
+     /// pause itself ([`Self::poll`]).
      fn defer(self, ask: Ask) -> bool {
          let visible = tab_visible();
 -        let held = self.held();

@@ -1,4 +1,3 @@
-//! Fresh baseline, refusal, and forward-migration contracts on owned PostgreSQL.
 #![cfg(feature = "keystore")]
 use fleet_auth::{SchemaError, migrate};
 use sqlx::PgPool;
@@ -86,7 +85,6 @@ async fn fresh_registry_grants_nothing(pool: PgPool) {
     );
 }
 
-/// Runtime callers cannot bypass the fresh baseline by omitting migration.
 #[sqlx::test(migrations = false)]
 async fn runtime_connect_rejects_old_and_invalid_histories_without_writes(pool: PgPool) {
     use sqlx::{ConnectOptions as _, Executor as _};
@@ -163,9 +161,6 @@ async fn runtime_connect_rejects_old_and_invalid_histories_without_writes(pool: 
     reopened.verify_key(&token).await.unwrap();
 }
 
-/// The connection form classifies exactly as the pool form, and hands the
-/// connection back outside the snapshot: the next statement on it sees a
-/// change committed after validation returned.
 #[sqlx::test(migrations = false)]
 async fn validation_on_a_connection_matches_the_pool_form(pool: PgPool) {
     use sqlx::{Connection as _, Executor as _};

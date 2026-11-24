@@ -19,8 +19,6 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 
-# Files that change what every job builds, or how CI runs it. An entry
-# ending in "/" is a directory prefix; any other entry is an exact path.
 GLOBAL = (
     'Cargo.toml',
     'Cargo.lock',
@@ -30,15 +28,9 @@ GLOBAL = (
     'ci/changed-scopes.py',
 )
 
-# scope -> (subject crate, extra paths that only this scope reads)
 SCOPES = {
-    # The web UI mutation jobs and the atmosphere mutation build the SPA and
-    # run its e2e suite, whose stub server, specs and patches all live in
-    # the crate's e2e/ directory.
     'web_mutations': ('crates/trawl-web-ui', ()),
-    # server-mutations runs trawl-server's nextest filters under the
-    # workspace nextest config, against the postgres the helper script
-    # configures. trawl-core's host build prepares the DuckDB runtime with
+    # trawl-core's host build prepares the DuckDB runtime with
     # scripts/release/distribution.py from the manifest and license beside
     # it (build_support/duckdb.rs); the SPA's wasm32 build skips that.
     'server_mutations': ('crates/trawl-server', (

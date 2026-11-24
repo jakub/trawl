@@ -15,15 +15,10 @@ use trawl_core::ast::{
 };
 use trawl_core::parser::{ParseError, parse};
 
-/// The messages a comment opener inside an unquoted token carries. One
-/// rule, but the working spelling differs by position, so the position
-/// rides in the message and each hint offers an escape that keeps the
-/// query meaning what it meant.
 const MSG_OPENER: &str = "'#' inside an unquoted token";
 const MSG_OPENER_VALUE: &str = "'#' inside an unquoted value";
 const MSG_OPENER_NEGATED: &str = "'#' inside a negated search term";
 const MSG_OPENER_COMMAND: &str = "'#' inside a pipe stage name";
-/// The message a bare term opening with `//` carries.
 const MSG_SLASHES: &str = "'//' does not start a comment — '#' is the comment character";
 
 fn ok(dsl: &str) -> Query {
@@ -63,50 +58,35 @@ fn eq(field: &str, value: &str) -> FieldFilter {
     }
 }
 
-/// The search tokens of a query, in order — so a hint's advised rewrite
-/// can be checked for what it means, not merely that it parsed.
 fn tokens(query: &Query) -> Vec<&SearchToken> {
     query.search.groups[0].iter().map(|t| &t.node).collect()
 }
 
-/// The one advice that holds in every position, and the tail of every
-/// hint here.
 const COMMENT_HALF: &str = "put whitespace before the '#' to start a comment";
 
-/// The position-blind net's whole hint: it knows neither the token's
-/// bounds nor which quoted context the position takes, so it names both
-/// escapes and mints no spelling.
 const GENERIC_ADVICE: &str = "put whitespace before the '#' to start a comment, \
      or carry the '#' inside a quoted value (\"…\") or a backticked field name (`…`)";
 
-// ── the shapes that parse, and what they mean ────────────────────────
-
-/// A comment after whitespace is a comment, and only the comment.
 #[test]
 fn a_whitespace_preceded_hash_opens_a_comment() {
-    // `a=1 # note` — the filter survives, the comment does not reach the AST
     let query = ok("a=1 # note");
     assert_eq!(filters(&query), vec![&eq("a", "1")]);
     assert!(query.pipeline.is_empty());
 
-    // a comment ends at the newline, so the next line is grammar again
     let query = ok("status=200 # c\nhost=x");
     assert_eq!(
         filters(&query),
         vec![&eq("status", "200"), &eq("host", "x")]
     );
 
-    // …and a whole comment line between two stages leaves both stages
     let query = ok("* | stats count()\n# note\n| sort -count");
     assert_eq!(query.pipeline.len(), 2);
     assert!(matches!(query.pipeline[0].node, PipeStage::Stats(_)));
     assert!(matches!(query.pipeline[1].node, PipeStage::Sort(_)));
 
-    // start of input is the one comment site whitespace cannot precede
     let query = ok("# note\na=1");
     assert_eq!(filters(&query), vec![&eq("a", "1")]);
 
-    // comment-only and whitespace-only input behave exactly as empty input
     for dsl in ["", "   ", "# just a comment", "# a\n# b\n"] {
         let query = ok(dsl);
         assert!(query.search.groups.is_empty(), "{dsl:?}");
@@ -114,11 +94,8 @@ fn a_whitespace_preceded_hash_opens_a_comment() {
     }
 }
 
-/// The three quoted contexts carry `#` verbatim — they contain no
-/// whitespace-skip site, so the comment production cannot reach inside.
 #[test]
 fn quoted_contexts_carry_the_opener_verbatim() {
-    // `message=/a#b/` — the regex, not an equality on the literal "/a"
     let query = ok("message=/a#b/");
     assert_eq!(
         filters(&query),
@@ -129,17 +106,12 @@ fn quoted_contexts_carry_the_opener_verbatim() {
         }]
     );
 
-    // a backtick-quoted name (ADR-0013 ruling 7)
     let query = ok("`a#b`=1");
     assert_eq!(filters(&query), vec![&eq("a#b", "1")]);
 
-    // a double-quoted value
     let query = ok(r#"host="a#b""#);
     assert_eq!(filters(&query), vec![&eq("host", "a#b")]);
 
-    // …and a regex in expression position — the whole condition, because
-    // "it is a Where stage" would hold just as well for a stage that
-    // matched the literal "/foo".
     let query = ok("* | where message matches /foo#bar/");
     assert_eq!(query.pipeline.len(), 1);
     let PipeStage::Where(w) = &query.pipeline[0].node else {
@@ -156,8 +128,6 @@ fn quoted_contexts_carry_the_opener_verbatim() {
     );
 }
 
-/// `//` is ordinary data (ruling 3) in every value position, so a filter
-/// that follows one on the same line still parses.
 #[test]
 fn slashes_in_a_value_are_data() {
     for (dsl, want) in [
@@ -171,15 +141,12 @@ fn slashes_in_a_value_are_data() {
         assert_eq!(filters(&ok(dsl)), vec![&want], "{dsl:?}");
     }
 
-    // `referrer=https://a.b/c status=200` — both filters, correctly
     let query = ok("referrer=https://a.b/c status=200");
     assert_eq!(
         filters(&query),
         vec![&eq("referrer", "https://a.b/c"), &eq("status", "200")]
     );
 
-    // a `//` inside a bare term is fine too — only a term that opens
-    // with it is refused, and a negated one is never a comment
     let query = ok("-//cdn.example.com/x");
     assert_eq!(
         query.search.groups[0][0].node,
@@ -190,15 +157,6 @@ fn slashes_in_a_value_are_data() {
     );
 }
 
-// ── the shapes that error, and exactly how ───────────────────────────
-
-/// `foo#bar`, `color=#ff0000`, `a=1# note` — one error each, spanning
-/// the `#` byte, with a hint whose advice a user can follow (ruling 2).
-///
-/// The hint is position-aware because the working spelling is: quoting
-/// the whole of `color=#ff0000` produces a phrase search, which is a
-/// different query, and following a hint must never change what a query
-/// means.
 #[test]
 fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
     for (dsl, at, msg, hint_fragment) in [
@@ -234,9 +192,6 @@ fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
         );
     }
 
-    // …and every spelling those hints offer is a query the grammar reads
-    // back as the thing the hint claims it is — a term hint claims a text
-    // search, a value hint claims a filter on that value.
     assert_eq!(
         tokens(&ok("\"foo#bar\"")),
         vec![&SearchToken::QuotedSearch(QuotedSearch {
@@ -256,14 +211,6 @@ fn an_opener_inside_an_unquoted_token_is_a_loud_error() {
     );
 }
 
-/// The value hint names the value the production held, never a slice
-/// re-derived from the raw text.
-///
-/// `=`, `<`, `>` and `!` are all legal inside a bare value, so a left
-/// boundary found by scanning backwards for one of them would cut a URL
-/// at its own query string: `url=…?a=b#frag` would be hinted `quote the
-/// value ("b#frag")`, a different filter on a different value. The
-/// emitting production knows the exact bounds, so it sends them.
 #[test]
 fn the_value_hint_names_the_whole_value() {
     let dsl = "url=https://example.test/p?a=b#frag";
@@ -281,25 +228,12 @@ fn the_value_hint_names_the_whole_value() {
         ),
         "the value carries a '?', so quoting it is not operator-neutral"
     );
-    // …and the spelling it offers is the query the user meant, with the
-    // operator the hint claims
     assert_eq!(
         filters(&ok("url=\"https://example.test/p?a=b#frag\"")),
         vec![&eq("url", "https://example.test/p?a=b#frag")]
     );
 }
 
-/// A quoted value is never a pattern, so a hint that says "quote it" to a
-/// value carrying `*`/`?` is advising an operator change. The advice
-/// stands (the `#` leaves no unquoted spelling), and it says what it
-/// costs in the one wording that holds under every operator.
-///
-/// "match it exactly" does not hold: the typed operator is kept
-/// (ADR-0060), so the quoted rewrite of `f!=#a*` excludes the text and
-/// the one of `f>#a*` is a Gt comparison of it. The promise is lexical
-/// (the `#` reaches the value), never that the field's pin admits the
-/// result: `_severity="#warn*"` carries the `#` and is refused by the
-/// severity vocabulary at emission.
 #[test]
 fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
     for dsl in ["f=#a*", "f=#a?"] {
@@ -318,7 +252,6 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
             "{dsl:?}"
         );
 
-        // …and under `=` the rewrite is the exact match it always was
         assert_eq!(
             filters(&ok(&format!("f=\"{value}\""))),
             vec![&eq("f", value)],
@@ -326,12 +259,6 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
         );
     }
 
-    // …while under `!=` or an ordered operator the same hint's rewrite is
-    // that operator's comparison of the text, which is why the wording may
-    // not say "exactly". Unquoted, the value is a glob under the typed
-    // operator, and an ordered glob is itself an error (ADR-0060) — but a
-    // value that already reported its `#` gets no second error, so each
-    // of these still reports exactly one.
     for (dsl, op) in [
         ("f>#a*", FilterOp::Gt),
         ("f<=#a?", FilterOp::Lte),
@@ -365,8 +292,6 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
             "{quoted:?}: the advised rewrite keeps the typed operator"
         );
 
-        // …and without the `#`, the unquoted glob keeps the typed
-        // operator: `!=` excludes the pattern, an ordered one is refused
         let unhashed = dsl.replace('#', "");
         if op == FilterOp::Ne {
             assert_eq!(
@@ -387,8 +312,6 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
         }
     }
 
-    // …while a value with no wildcard keeps the plain wording, and its
-    // rewrite is Eq because the unquoted spelling was Eq too
     let err = one_error("f=#a");
     assert_eq!(
         err.hint.as_deref(),
@@ -397,11 +320,6 @@ fn a_value_hint_admits_that_quoting_a_glob_drops_the_pattern() {
     assert_eq!(filters(&ok("f=\"#a\"")), vec![&eq("f", "#a")]);
 }
 
-/// A `,` is a word byte in a bare term — nothing splits on it there — so
-/// the term hint quotes the whole of `foo,#bar`, where the value
-/// position's element bounding would cut at the comma and advise a term
-/// the user never wrote. `"foo,#bar"` is the quoted search that means the
-/// same thing.
 #[test]
 fn a_term_hint_admits_a_comma() {
     let dsl = "foo,#bar";
@@ -413,7 +331,6 @@ fn a_term_hint_admits_a_comma() {
         Some(format!("quote it (\"foo,#bar\") to search for it, or {COMMENT_HALF}").as_str())
     );
 
-    // …and the rewrite parses as the substring search the hint claims
     assert_eq!(
         tokens(&ok("\"foo,#bar\"")),
         vec![&SearchToken::QuotedSearch(QuotedSearch {
@@ -421,7 +338,6 @@ fn a_term_hint_admits_a_comma() {
         })]
     );
 
-    // …the same under `-`, whose working spelling is the `NOT` form
     let err = one_error("-foo,#bar");
     assert_eq!(err.message, MSG_OPENER_NEGATED);
     assert_eq!(
@@ -442,9 +358,6 @@ fn a_term_hint_admits_a_comma() {
     );
 }
 
-/// …and an IN list is hinted per element, because an element is its own
-/// value production: the comma bounding comes free with the exact slice,
-/// in every position of the list.
 #[test]
 fn an_in_list_is_hinted_one_element_at_a_time() {
     let dsl = "f=#a,#b,#c";
@@ -464,16 +377,12 @@ fn an_in_list_is_hinted_one_element_at_a_time() {
         ]
     );
 
-    // …and a sole element, and a middle one whose neighbours are clean
     for (dsl, value) in [("f=#a", "#a"), ("f=ok,#b,ok", "#b")] {
         let err = one_error(dsl);
         assert_eq!(err.message, MSG_OPENER_VALUE, "{dsl:?}");
         assert_eq!(err.hint.as_deref(), expected(value).as_deref(), "{dsl:?}");
     }
 
-    // …and quoting each element as advised gives back the IN list the
-    // user meant, element for element — the claim the per-element hint
-    // makes is that the list survives.
     let query = ok("f=\"#a\",\"#b\",\"#c\"");
     assert_eq!(
         filters(&query),
@@ -489,29 +398,12 @@ fn an_in_list_is_hinted_one_element_at_a_time() {
     );
 }
 
-/// A concrete rewrite is offered only where the emitting production held
-/// the slice and the rewrite means what the hint claims. Two shapes where
-/// it does not, and neither prints advice that cannot be followed:
-///
-/// * a token carrying a `"` or a `\` would need an escape the hint does
-///   not spell, so the pasted string would end at its own second quote;
-/// * the position-blind net knows only an offset — the run around it can
-///   span several grammar tokens, and each position escapes a `#`
-///   differently — so it names the escapes and spells none.
-///
-/// The whitespace half is always true, so it is what always remains.
 #[test]
 fn a_hint_drops_advice_the_grammar_cannot_read() {
-    // an embedded quote inside a value: the position is known, but no
-    // quoted spelling reads back unchanged, so only the true half remains
     let err = one_error("f=a\"b#c");
     assert_eq!(err.message, MSG_OPENER_VALUE);
     assert_eq!(err.hint.as_deref(), Some(COMMENT_HALF));
 
-    // …and the position-blind net mints no spelling at all. `"a#b"` does
-    // not parse as a sort key and quietly becomes a string literal in an
-    // expression, whose escape is a backticked name — so the net names
-    // both escapes and picks neither.
     for dsl in [
         "* | stats count(),# x",
         "* | sort a#b",
@@ -523,9 +415,6 @@ fn a_hint_drops_advice_the_grammar_cannot_read() {
         assert_eq!(err.hint.as_deref(), Some(GENERIC_ADVICE), "{dsl:?}");
     }
 
-    // …while a term the production held is quotable even when the text
-    // around it is not: the exact slice after a no-break space is the
-    // `#` alone, and `"#"` is a phrase search that parses.
     let dsl = "message=\"x\"\u{a0}# note";
     let err = one_error(dsl);
     assert_eq!(err.message, MSG_OPENER);
@@ -551,10 +440,6 @@ fn a_hint_drops_advice_the_grammar_cannot_read() {
     );
 }
 
-/// Quoting is no escape under `-`: `-"a#b"` is a bare negated term that
-/// spells literal quote characters, so a hint saying `quote it ("-"a#b"")`
-/// renders something the grammar cannot read at all. `NOT "a#b"` is the
-/// working form, and it parses.
 #[test]
 fn a_negated_term_is_pointed_at_the_not_spelling() {
     for (dsl, at, working) in [
@@ -571,8 +456,6 @@ fn a_negated_term_is_pointed_at_the_not_spelling() {
             format!("write it as {working}, or put whitespace before the '#' to start a comment"),
             "{dsl:?}"
         );
-        // …and the spelling the hint offers is one the grammar accepts,
-        // as the negated phrase search the hint claims it is
         let rewritten = ok(working);
         let advised = tokens(&rewritten);
         assert_eq!(advised.len(), 1, "{working:?}");
@@ -593,10 +476,6 @@ fn a_negated_term_is_pointed_at_the_not_spelling() {
     }
 }
 
-/// A `#` in a pipe stage name is the comment rule, not a typo. chumsky
-/// reports the start of the word (the stage word ends at the `#`), so
-/// without this rule the unknown-command diagnostic invents a command the
-/// user never wrote: `unknown command 'co'`, "did you mean 'top'?".
 #[test]
 fn an_opener_in_a_stage_name_is_not_an_unknown_command() {
     let err = one_error("* | co#unt()");
@@ -607,9 +486,6 @@ fn an_opener_in_a_stage_name_is_not_an_unknown_command() {
         Some("put whitespace before the '#' to start a comment")
     );
 
-    // …and the rule is narrow: the token holding the offset must be the
-    // stage word, so a shape whose real problem is the `,` keeps its own
-    // diagnostic on its own byte.
     let err = one_error("* | stats count(),# x");
     assert_eq!(err.message, MSG_OPENER);
     assert_eq!(err.span, 18..19);
@@ -617,15 +493,8 @@ fn an_opener_in_a_stage_name_is_not_an_unknown_command() {
     assert_eq!(err.message, "unknown command 'staats'");
 }
 
-/// A bare term opening with `//` is refused and names `#` as the comment
-/// character. `//` opens no comment (ruling 3), so the alternative is
-/// AND-ing the slashes into the search as text terms, which narrows the
-/// result set to nothing without saying why.
 #[test]
 fn a_term_opening_with_slashes_names_the_real_opener() {
-    // …in the search stage (the validator's own error) and in the
-    // pipeline (the generic net). Both slashes are the span in either
-    // lane: underlining one of two points at nothing the user can act on.
     for dsl in [
         "// note",
         "service=x // filter by service",
@@ -643,10 +512,6 @@ fn a_term_opening_with_slashes_names_the_real_opener() {
     }
 }
 
-/// The comment boundary is structural: whitespace or start of input, and
-/// nothing else. "After a delimiter" is deliberately not admitted — the
-/// delimiter set is unenumerable, and admitting `=` would stop
-/// `color=#ff0000` erroring. These are parse errors, not comments.
 #[test]
 fn a_delimiter_does_not_open_a_comment() {
     for dsl in ["count(),# x", "* | stats count(),# x"] {
@@ -654,10 +519,6 @@ fn a_delimiter_does_not_open_a_comment() {
     }
 }
 
-// ── spans index the original input ───────────────────────────────────
-
-/// Chumsky's spans index the real input text, so an error after a comment
-/// lands where the user can see it.
 #[test]
 fn a_span_after_a_comment_indexes_the_original_input() {
     let input = "# note\nfoo bar baz |";
@@ -668,14 +529,12 @@ fn a_span_after_a_comment_indexes_the_original_input() {
         "the dangling pipe is at end of input"
     );
 
-    // …and one inside the line the comment precedes
     let input = "# a longer note\nfoo#bar";
     let err = one_error(input);
     let at = input.find("foo#bar").expect("present") + 3;
     assert_eq!(err.span, at..at + 1);
     assert_eq!(&input[err.span.clone()], "#");
 
-    // …and a multi-line comment run before the offending token
     let input = "# one\n# two\ncolor=#ff0000";
     let err = one_error(input);
     let at = input.rfind('#').expect("present");
@@ -683,13 +542,6 @@ fn a_span_after_a_comment_indexes_the_original_input() {
     assert_eq!(err.message, MSG_OPENER_VALUE);
 }
 
-// ── the boundary is ASCII whitespace ─────────────────────────────────
-
-/// A comment opens after ASCII whitespace or at the start of input and
-/// after nothing else, because that is exactly where the unquoted token
-/// charsets end. A no-break space is an ordinary character inside a bare
-/// word or value, so a `#` behind one is inside a token, and the outcome
-/// is the token error: loud, never a silently different query.
 #[test]
 fn a_comment_opens_only_after_ascii_whitespace() {
     for ws in [" ", "\t", "\n", "\r\n"] {
@@ -698,11 +550,9 @@ fn a_comment_opens_only_after_ascii_whitespace() {
         assert_eq!(filters(&query), vec![&eq("a", "1")], "{dsl:?}");
     }
 
-    // …and a Unicode space is not a comment boundary in either lane.
     for (dsl, msg) in [
         ("message=\"x\"\u{a0}# note", MSG_OPENER),
         ("foo\u{a0}# note", MSG_OPENER),
-        // …inside the value, whose own escape quotes the value alone
         ("a=1\u{2003}# note", MSG_OPENER_VALUE),
     ] {
         let err = one_error(dsl);
@@ -710,20 +560,10 @@ fn a_comment_opens_only_after_ascii_whitespace() {
         assert_eq!(&dsl[err.span.clone()], "#", "{dsl:?}");
     }
 
-    // A no-break space separates nothing, so `a=1\u{a0}host=x` is one
-    // filter whose value carries the space.
     let query = ok("a=1\u{a0}host=x");
     assert_eq!(filters(&query), vec![&eq("a", "1\u{a0}host=x")]);
 }
 
-// ── diagnostics are bounded (parse-time, not just on the wire) ───────
-
-/// One query can carry unboundedly many independent violations, and each
-/// one renders a hint quoting the input. Both halves are bounded: the
-/// hint is cut to the comma-delimited element the user must quote, and
-/// the reported list is capped before anything is rendered — so a
-/// 64 KiB list of `#`-bearing elements costs a constant number of
-/// constant-sized diagnostics, not their product.
 #[test]
 fn a_pathological_query_reports_a_bounded_number_of_diagnostics() {
     /// Mirrors `parser::MAX_REPORTED_ERRORS`, which is private.
@@ -752,7 +592,6 @@ fn a_pathological_query_reports_a_bounded_number_of_diagnostics() {
         dsl.len()
     );
 
-    // …and the hint still names the element, not the rest of the list
     let err = &errors[0];
     assert_eq!(err.message, MSG_OPENER_VALUE);
     assert_eq!(
@@ -761,20 +600,11 @@ fn a_pathological_query_reports_a_bounded_number_of_diagnostics() {
     );
 }
 
-/// The cap keeps the error that ended the parse, whatever the emitted
-/// list does to the budget.
-///
-/// The list is not purely positional: chumsky appends the terminal
-/// failure last, so a plain truncation would keep eight value diagnostics
-/// and drop `unknown command 'bogus_stage'`, the one error the query
-/// cannot succeed without fixing. The report is the first `CAP - 1` plus
-/// that final one, whose message says how many were left out.
 #[test]
 fn the_cap_keeps_the_terminal_error() {
     /// Mirrors `parser::MAX_REPORTED_ERRORS`, which is private.
     const CAP: usize = 8;
 
-    // Eight value diagnostics ahead of a `#` in the stage name.
     let dsl = "f=#0,#1,#2,#3,#4,#5,#6,#7 | co#unt()";
     let errors = parse(dsl).expect_err("nine violations");
     assert_eq!(errors.len(), CAP);
@@ -789,8 +619,6 @@ fn the_cap_keeps_the_terminal_error() {
         Some("put whitespace before the '#' to start a comment")
     );
 
-    // …and twelve ahead of an unknown stage, whose message is the one a
-    // user must act on.
     let filters: Vec<String> = (0..12).map(|i| format!("f{i}=#a")).collect();
     let dsl = format!("{} | bogus_stage", filters.join(" "));
     let errors = parse(&dsl).expect_err("thirteen violations");
@@ -801,7 +629,6 @@ fn the_cap_keeps_the_terminal_error() {
     );
     assert_eq!(&dsl[errors[CAP - 1].span.clone()], "b");
 
-    // …and an uncapped list is untouched: no annotation, no reordering.
     let errors = parse("f=#a,#b | bogus_stage").expect_err("three violations");
     assert_eq!(errors.len(), 3);
     assert_eq!(errors[0].message, MSG_OPENER_VALUE);

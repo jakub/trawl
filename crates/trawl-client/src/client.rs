@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! HTTP client for communicating with trawld.
-
 use std::pin::Pin;
 
 use futures::Stream;
@@ -77,8 +75,6 @@ fn json_depth_exceeds(json: &[u8], max: usize) -> bool {
     false
 }
 
-/// Decode an ingest preview report as deep as the sample ingest accepts.
-///
 /// The report echoes each parsed input three containers in, so an event
 /// at ingest's deepest would trip `serde_json`'s default recursion limit
 /// here. The limit is lifted only after a scan bounds the nesting at
@@ -100,44 +96,30 @@ fn decode_preview(bytes: &[u8]) -> Result<PreviewResponse, ClientError> {
     Ok(report)
 }
 
-/// Outcome of `POST /api/v1/schema/repin` — the HTTP status decoded.
 #[derive(Debug, Clone)]
 pub enum RepinStart {
     /// 200 with a `succeeded` row: a dry-run report.
     Report(trawl_api::RepinJobResponse),
     /// 200 with a terminal row that is neither a report nor a
-    /// cancellation. Today that is `failed`, reached when the cancel
-    /// effect site could not record its request row and downgraded the
-    /// outcome (#109): the job stopped, the corpus is untouched, and the
-    /// row's own `status` is the verdict. A caller must render that status
-    /// and treat it as a failure — reading it as a report is how "dry run"
-    /// gets printed over a job that did nothing.
+    /// cancellation, such as `failed`: the job stopped, and the row's own
+    /// `status` is the verdict. A caller must render that status and treat
+    /// it as a failure.
     Failed(trawl_api::RepinJobResponse),
     /// 200 with a `cancelled` row: an operator stopped the job while this
-    /// request's own ladder was still running it (#109). The corpus is
+    /// request's own ladder was still running it. The corpus is
     /// untouched and the pin unchanged, so this is never a report.
     Cancelled(trawl_api::RepinJobResponse),
-    /// 202: the job is claimed; follow it with `schema_repin_job`. Usually
-    /// the rewrite, but a job whose decision is still pending at the
-    /// server's `[server] timeout_secs` answers 202 too, dry runs included
-    /// (usually the scan, but the corpus-gate wait, the plan write and the
-    /// pre-flight can also outlast it), and the plan or refusal is then read
-    /// by the job's id. The row is normally
-    /// `running`, but a job that finished as the answer was built can be
-    /// terminal already, and is then its own verdict.
+    /// 202: the job is claimed; follow it with `schema_repin_job`. A job whose
+    /// decision is still pending at the server's `[server] timeout_secs`
+    /// answers 202 too, dry runs included. The row is normally `running`, but
+    /// a job that finished as the answer was built can be terminal already,
+    /// and is then its own verdict.
     Started(trawl_api::RepinJobResponse),
     /// 409 with a job body: the scan projected nulled values and no force
     /// flag was passed — the job is the plan the refusal is based on.
     Refused(trawl_api::RepinJobResponse),
 }
 
-/// Outcome of `POST /api/v1/schema/repin/cancel` (#109) — the HTTP status
-/// decoded, with the body's own `outcome` checked against it.
-///
-/// Three variants for three status codes, because none of them is an error
-/// the caller should meet as an opaque `ClientError`: "too late" and
-/// "nothing running" are answers about the corpus, and a CLI has to print
-/// them before choosing an exit code.
 #[derive(Debug, Clone)]
 pub enum RepinCancel {
     /// 202: accepted; the job stops at its next file boundary.
@@ -148,29 +130,23 @@ pub enum RepinCancel {
     NoJobRunning(trawl_api::RepinCancelResponse),
 }
 
-/// The ceilings a repin request states, if any.
-///
 /// Both absent is the ordinary case: the server derives each number from
 /// the job's own scan. A stated ceiling beside `force: false` is a 400 —
 /// an unforced repin accepts no loss at all, so there is nothing to bound.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RepinCeilings {
-    /// The most rows the rewrite may null.
     pub max_nulled_rows: Option<u64>,
     /// The most dialect-ambiguous numerals it may carry.
     pub max_ambiguous_rows: Option<u64>,
 }
 
-/// How a client decides whether to trust the server's TLS certificate.
 #[derive(Clone, Default, PartialEq, Eq)]
 pub enum TlsTrust {
-    /// The platform trust store.
     #[default]
     System,
     /// Only the roots in this PEM bundle. The chain and the hostname are
     /// still verified; no platform or built-in root is trusted.
     PinnedCa(Vec<u8>),
-    /// No certificate verification at all.
     AcceptInvalid,
 }
 
@@ -185,7 +161,6 @@ impl std::fmt::Debug for TlsTrust {
     }
 }
 
-/// HTTP client for the trawl daemon API.
 #[derive(Clone)]
 pub struct HttpClient {
     base_url: String,
@@ -209,15 +184,10 @@ impl HttpClient {
     /// client-side network timeouts on slow connections.
     const DEFAULT_TIMEOUT: std::time::Duration = std::time::Duration::from_mins(2);
 
-    /// Create a new client targeting the given daemon URL with an API key.
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Result<Self, ClientError> {
         Self::build(base_url, token, &TlsTrust::System)
     }
 
-    /// Create a client that accepts self-signed / invalid TLS certificates.
-    ///
-    /// Use this for development or when connecting to a daemon with an
-    /// auto-generated self-signed cert.
     pub fn new_insecure(
         base_url: impl Into<String>,
         token: impl Into<String>,
@@ -225,8 +195,6 @@ impl HttpClient {
         Self::build(base_url, token, &TlsTrust::AcceptInvalid)
     }
 
-    /// Create a client that verifies the server against `trust`.
-    ///
     /// A [`TlsTrust::PinnedCa`] bundle that holds no parseable certificate
     /// fails here with [`ClientError::InvalidCa`], before any request.
     pub fn with_trust(
@@ -249,7 +217,6 @@ impl HttpClient {
         Ok(Self::with_client(base_url, token, client))
     }
 
-    /// Create a client with a pre-configured `reqwest::Client`.
     pub fn with_client(
         base_url: impl Into<String>,
         token: impl Into<String>,
@@ -275,13 +242,11 @@ impl HttpClient {
         Ok(Self::with_client(base_url, token, client))
     }
 
-    /// Build a full URL for an API endpoint.
     fn endpoint(&self, path: &str) -> String {
         format!("{}{path}", self.base_url)
     }
 
-    /// Execute a DSL query with optional pagination. Timestamps in the
-    /// response are UTC.
+    /// Timestamps in the response are UTC.
     pub async fn query_paginated(
         &self,
         dsl: &str,
@@ -345,7 +310,6 @@ impl HttpClient {
             .map(|health| (200, health))
     }
 
-    /// Fetch schema introspection from the daemon.
     pub async fn schema(&self) -> Result<SchemaResponse, ClientError> {
         let url = self.endpoint("/api/v1/schema");
         let req = self.client.get(&url);
@@ -362,11 +326,6 @@ impl HttpClient {
     /// Fetch what the daemon offers this key: version, DSL, bounds, quotas,
     /// admission, link origin and health (ADR-0058). Any key with a trawl
     /// grant may read it.
-    ///
-    /// No body is read past [`CAPABILITIES_BODY_CAP`], whatever the status:
-    /// a success body past it is [`ClientError::TooLarge`], and a failure
-    /// body past it is not judged, so the error keeps its status, request
-    /// id and `Retry-After` (see [`Self::send_capped`]).
     pub async fn capabilities(&self) -> Result<CapabilitiesResponse, ClientError> {
         let url = self.endpoint("/api/v1/capabilities");
         let req = self.client.get(&url);
@@ -402,7 +361,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch query history with pagination.
     pub async fn history(
         &self,
         limit: Option<usize>,
@@ -434,7 +392,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Create a new saved query.
     pub async fn create_saved(
         &self,
         name: &str,
@@ -446,7 +403,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Update an existing saved query's content.
     pub async fn update_saved(
         &self,
         id: i64,
@@ -458,7 +414,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Update a saved query's DSL and optionally rename it.
     pub async fn update_saved_with_name(
         &self,
         id: i64,
@@ -471,7 +426,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Delete a saved query.
     pub async fn delete_saved(&self, id: i64) -> Result<DeleteSavedResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{id}"));
         let req = self.client.delete(&url);
@@ -482,12 +436,7 @@ impl HttpClient {
     /// (`POST /api/v1/results`, needs `query`; ADR-0057).
     ///
     /// The bounds come from `request.window` or from the query's own time
-    /// clauses, never both. Refusals are [`ClientError::Server`]: 400 for
-    /// a bounds refusal, `capture_source_too_large` and `result_too_large`;
-    /// 429 for `capture_busy`, `capture_quota_exceeded` and the per-key
-    /// rate limit, each with
-    /// [`retry_after_secs`](ClientError::Server::retry_after_secs). The
-    /// response body is read whole, as the saved-query methods read theirs.
+    /// clauses, never both.
     pub async fn capture(&self, request: &CaptureRequest) -> Result<CaptureResponse, ClientError> {
         let url = self.endpoint("/api/v1/results");
         let req = self.client.post(&url).json(request);
@@ -500,12 +449,7 @@ impl HttpClient {
     /// The answer is a new capture whose rows are the strictly earlier,
     /// the equal-time and the strictly later groups, and whose
     /// `correlation` says where each group starts and what scope was
-    /// used. Refusals are [`ClientError::Server`]: 400 `focus_incomplete`
-    /// for a focus row lacking `_time` or a key the scope names,
-    /// `focus_ambiguous` for one holding two columns of such a name, and
-    /// the ones [`Self::capture`] names; 404, 410 and 409 for the focus
-    /// result as [`Self::result_page`] names them. The response body is
-    /// read whole, as [`Self::capture`] reads its.
+    /// used.
     pub async fn context(
         &self,
         request: &ContextRequest,
@@ -517,11 +461,6 @@ impl HttpClient {
 
     /// Capture where one literal occurs, with exact per-service counts
     /// (`POST /api/v1/results/sightings`, needs `query`; ADR-0058).
-    ///
-    /// Refusals are [`ClientError::Server`]: 400 `correlation_invalid` for
-    /// an empty, NUL-carrying or oversized literal, and the ones
-    /// [`Self::capture`] names. The response body is read whole, as
-    /// [`Self::capture`] reads its.
     pub async fn sightings(
         &self,
         request: &SightingsRequest,
@@ -534,12 +473,6 @@ impl HttpClient {
     /// Capture one filter's counts in a foreground and a baseline window,
     /// from one statement (`POST /api/v1/results/compare`, needs `query`;
     /// ADR-0058).
-    ///
-    /// Refusals are [`ClientError::Server`]: 400 `windows_overlap` for
-    /// overlapping windows, `correlation_invalid` for a filter that is not
-    /// search tokens alone or a refused group field, and the ones
-    /// [`Self::capture`] names. The response body is read whole, as
-    /// [`Self::capture`] reads its.
     pub async fn compare(
         &self,
         request: &CompareRequest,
@@ -551,9 +484,6 @@ impl HttpClient {
 
     /// List the caller's own unexpired captures, newest first
     /// (`GET /api/v1/results`, needs `query`; ADR-0057).
-    ///
-    /// The way back to a capture whose response was lost. The response
-    /// body is read whole, as the saved-query methods read theirs.
     pub async fn list_results(&self) -> Result<ResultList, ClientError> {
         let url = self.endpoint("/api/v1/results");
         let req = self.client.get(&url);
@@ -569,16 +499,6 @@ impl HttpClient {
     /// each name selects every column of that name, in stored order, and
     /// `None` reads every column. A name holding a comma cannot be named
     /// apart from its pieces.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 with the reason for a `limit` above
-    /// the server's `[capture] page_max_rows`, an `offset` past the
-    /// result's rows, or a `columns` name the result does not have; 404
-    /// for an unknown id or another key's result, 410 `result_gone` (expired or pruned), 409
-    /// `result_unavailable` (its file is missing) and 500 `result_corrupt`
-    /// (its file does not match its digest). No body is read past
-    /// [`RESULT_PAGE_BODY_CAP`].
     pub async fn result_page(
         &self,
         id: &str,
@@ -607,14 +527,6 @@ impl HttpClient {
     /// position. `offset` and `length` are sent only when given; the server
     /// cuts the range back to a UTF-8 boundary and names the next offset
     /// until the text ends.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are the
-    /// ones [`Self::result_page`] names for the id and the file (404, 410,
-    /// 409, 500), and 400 with the reason for a `row` or `column` past the
-    /// result, an `offset` past the cell's text or inside a character, or
-    /// a `length` above the server's `[capture] max_wire_bytes` or below 4
-    /// bytes. No body is read past [`RESULT_CELL_BODY_CAP`].
     pub async fn result_cell(
         &self,
         id: &str,
@@ -640,9 +552,6 @@ impl HttpClient {
     /// the rest, each group most recently changed first
     /// (`GET /api/v1/investigations`, needs `query` and
     /// `investigation_read`; ADR-0059).
-    ///
-    /// Refusals are [`ClientError::Server`]: 403 without the permissions.
-    /// No body is read past [`INVESTIGATION_LIST_BODY_CAP`].
     pub async fn list_investigations(&self) -> Result<InvestigationList, ClientError> {
         let url = self.endpoint("/api/v1/investigations");
         let req = self.client.get(&url);
@@ -656,13 +565,6 @@ impl HttpClient {
     /// (201) or found it already there with the same creator and fields
     /// (200), which is how a create whose response was lost is recovered:
     /// send it again.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 for a field out of bounds, 403 without
-    /// the permissions, 409 `investigation_exists` when the id is taken by
-    /// another creator or other fields. No body is read past
-    /// [`INVESTIGATION_BODY_CAP`].
     pub async fn create_investigation(
         &self,
         id: &str,
@@ -684,12 +586,6 @@ impl HttpClient {
     /// `since` 0 reads from the start. `limit` is sent only when given;
     /// the server answers 100 entries without one and at most 200, and its
     /// `more` says a read from `through_seq` has the rest.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 for a `limit` outside 1 to 200, 403
-    /// without the permissions, 404 for an unknown id. No body is read past
-    /// [`INVESTIGATION_READ_BODY_CAP`].
     pub async fn read_investigation(
         &self,
         id: &str,
@@ -711,13 +607,6 @@ impl HttpClient {
     /// `investigation_write` as well; ADR-0059). An append carries no
     /// expected sequence; one that carries a `seen_seq` is answered with
     /// the other actors' entries changed since it, in `activity`.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 for a field out of bounds or a citation
-    /// of a row the investigation does not keep, 403 without the
-    /// permissions, 404 for an unknown id, 409 `investigation_closed`. No
-    /// body is read past [`APPEND_BODY_CAP`].
     pub async fn append_entry(
         &self,
         id: &str,
@@ -736,15 +625,6 @@ impl HttpClient {
     /// is the investigation as the write left it, the entry written, and,
     /// when `request.seen_seq` is set, the other actors' entries changed
     /// since it, in `activity`.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 for no field, more than one, or one out
-    /// of bounds; 403 without the permissions; 404 for an unknown id; 409
-    /// `sequence_conflict`, whose envelope's `conflict` carries the
-    /// expected and the current sequence, and 409 `investigation_closed`
-    /// for anything but a reopen of a closed investigation. No body is read
-    /// past [`PATCH_BODY_CAP`].
     pub async fn patch_investigation(
         &self,
         id: &str,
@@ -763,13 +643,6 @@ impl HttpClient {
     /// `investigation_write` as well; ADR-0059). The answer is the
     /// `finding_status` entry written and, when `request.seen_seq` is set,
     /// the other actors' entries changed since it, in `activity`.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 403 without the permissions; 404 for an
-    /// unknown id or a `finding_seq` that names no finding of it; 409
-    /// `sequence_conflict` (with `conflict`) and `investigation_closed`. No
-    /// body is read past [`APPEND_BODY_CAP`].
     pub async fn set_finding_status(
         &self,
         id: &str,
@@ -791,14 +664,6 @@ impl HttpClient {
     /// (`PUT /api/v1/investigations/{id}/retention`, needs `server_manage`
     /// as well as `investigation_write`; ADR-0059). An extension never
     /// shortens retention.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 400 for a `retain_until` that does not read
-    /// as an RFC 3339 UTC instant, is past, or is before the current
-    /// deadline; 403 without the permissions; 404 for an unknown id; 409
-    /// `sequence_conflict` (with `conflict`). No body is read past
-    /// [`INVESTIGATION_BODY_CAP`].
     pub async fn extend_retention(
         &self,
         id: &str,
@@ -815,13 +680,6 @@ impl HttpClient {
     /// (`DELETE /api/v1/investigations/{id}`, needs `server_manage` as well
     /// as `investigation_write`; ADR-0059). The server answers 204 with no
     /// body.
-    ///
-    /// An `id` that is not 32 lowercase hex digits is
-    /// [`ClientError::InvalidUrl`] before any request. Refusals are
-    /// [`ClientError::Server`]: 403 without the permissions, 404 for an
-    /// unknown id, 409 while work attached to it still runs. A success
-    /// body is never read; no failure body is read past
-    /// [`INVESTIGATION_BODY_CAP`].
     pub async fn delete_investigation(&self, id: &str) -> Result<(), ClientError> {
         check_investigation_id(id)?;
         let url = self.endpoint(&format!("/api/v1/investigations/{id}"));
@@ -864,14 +722,12 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Get the schedule for a saved query.
     pub async fn get_schedule(&self, saved_id: i64) -> Result<ScheduleResponse, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/schedule"));
         let req = self.client.get(&url);
         self.send_authenticated(req).await
     }
 
-    /// Delete the schedule for a saved query.
     pub async fn delete_schedule(
         &self,
         saved_id: i64,
@@ -881,7 +737,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// List report runs for a saved query with pagination.
     pub async fn list_report_runs(
         &self,
         saved_id: i64,
@@ -899,7 +754,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Get a single report run with full result data.
     pub async fn get_report_run(
         &self,
         saved_id: i64,
@@ -914,18 +768,13 @@ impl HttpClient {
     /// (`POST /api/v1/saved/{id}/run`, needs `query` and `saved_query`).
     ///
     /// The request is sent once and never retried here. A busy refusal is
-    /// [`ClientError::Server`] with status 429 and code `manual_run_busy`:
-    /// the caller's key already holds a manual run, or the installation
-    /// runs as many as it may. Nothing was claimed, so pressing again is
-    /// safe, and [`retry_after_secs`](ClientError::Server::retry_after_secs)
-    /// carries the server's advisory wait.
+    /// [`ClientError::Server`] with status 429 and code `manual_run_busy`.
     pub async fn trigger_run(&self, saved_id: i64) -> Result<ReportRunSummary, ClientError> {
         let url = self.endpoint(&format!("/api/v1/saved/{saved_id}/run"));
         let req = self.client.post(&url);
         self.send_authenticated(req).await
     }
 
-    /// List all runs across all saved queries with pagination.
     pub async fn list_all_runs(
         &self,
         limit: Option<usize>,
@@ -942,7 +791,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Get aggregate run statistics.
     pub async fn runs_stats(&self) -> Result<RunsStatsResponse, ClientError> {
         let url = self.endpoint("/api/v1/runs/stats");
         let req = self.client.get(&url);
@@ -956,12 +804,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Fetch identity and permissions for the current token.
-    ///
-    /// The daemon answers exactly `200`; any other status, another `2xx`
-    /// included, is a [`ClientError::Server`]. No body is read past
-    /// [`WHOAMI_BODY_CAP`]: a body past it is [`ClientError::TooLarge`]
-    /// whatever the status, and an error envelope in it is never judged.
     pub async fn whoami(&self) -> Result<WhoAmIResponse, ClientError> {
         let url = self.endpoint("/api/v1/whoami");
         let resp = self
@@ -1014,12 +856,8 @@ impl HttpClient {
     /// Fetch one field's pin, one page of its observations, and its
     /// conflict evidence (`GET /api/v1/schema/field?name=`).
     ///
-    /// The name travels as a query parameter — `req.query` percent-encodes
-    /// it, so names containing `/`, `?`, or `%` survive intact.
-    ///
-    /// The service axis is client-chosen and unpruned, so observations are
-    /// paged: `limit` is clamped server-side, and `after` takes the previous
-    /// response's `services_cursor` to fetch the next page.
+    /// `after` takes the previous response's `services_cursor` to fetch the
+    /// next page.
     pub async fn catalog_field(
         &self,
         name: &str,
@@ -1039,12 +877,6 @@ impl HttpClient {
 
     /// Acknowledge a degraded verdict
     /// (`POST /api/v1/schema/field/ack?name=`).
-    ///
-    /// The ack covers the conflict evidence that exists at the moment the
-    /// server writes it and nothing beyond, so the badge returns as soon as
-    /// the pin shelves another batch. 404 (no such pin) and 409 (the field
-    /// is not degraded, so there is no verdict to acknowledge) both surface
-    /// as [`ClientError::Server`] carrying the server's own sentence.
     pub async fn schema_field_ack(
         &self,
         name: &str,
@@ -1061,11 +893,6 @@ impl HttpClient {
 
     /// Withdraw an acknowledgement
     /// (`DELETE /api/v1/schema/field/ack?name=`).
-    ///
-    /// Idempotent by design: the server answers 204 whether or not a row
-    /// was there, since "this field is not acknowledged" is the state the
-    /// caller asked for either way. Only an unpinned field refuses (404).
-    /// There is no body to decode, so nothing is returned.
     pub async fn schema_field_ack_clear(&self, name: &str) -> Result<(), ClientError> {
         let url = self.endpoint("/api/v1/schema/field/ack");
         let resp = self
@@ -1189,9 +1016,6 @@ impl HttpClient {
         let status = resp.status().as_u16();
         let headers = ErrorHeaders::of(&resp);
         if !matches!(status, 202 | 409 | 404) {
-            // Turns any failure status into a `Server` error; a success
-            // status this endpoint never sends falls through as a protocol
-            // complaint rather than being guessed at.
             check_status(resp).await?;
             return Err(ClientError::Parse {
                 message: format!("repin cancel: unexpected HTTP {status}"),
@@ -1225,7 +1049,6 @@ impl HttpClient {
     /// The way to follow a job a trigger answered 202 for: no newer job can
     /// stand in for it, and the server accepts `schema_write` as well as
     /// `schema_read` here, so the key that started the job can follow it.
-    /// An id the server does not know is a [`ClientError::Server`] 404.
     pub async fn schema_repin_job(
         &self,
         id: i64,
@@ -1240,13 +1063,6 @@ impl HttpClient {
 
     /// Reclaim pin slots held by dead fields
     /// (`POST /api/v1/schema/gc-pins`).
-    ///
-    /// A dry run and a real one both answer 200 with the same report, so
-    /// there is one return type: `dry_run` and `deleted` on the body say
-    /// which happened. Every refusal is the ordinary error envelope, so a
-    /// 409 (a repin owns the data root, or the corpus could not be read)
-    /// arrives as [`ClientError::Server`] with the server's message and
-    /// the caller renders it.
     ///
     /// `older_than_secs` is the requested window; the server floors it at
     /// the retention window and reports both numbers back.
@@ -1265,8 +1081,6 @@ impl HttpClient {
     }
 
     /// Fetch distinct values for a schema field (for autocomplete).
-    ///
-    /// When `service` is `Some`, values are scoped to that service's files only.
     pub async fn field_values(
         &self,
         field: &str,
@@ -1284,7 +1098,6 @@ impl HttpClient {
         self.send_authenticated(req).await
     }
 
-    /// Ingest log records in ndjson format.
     pub async fn ingest(
         &self,
         records: &[serde_json::Value],
@@ -1318,14 +1131,9 @@ impl HttpClient {
     /// `body` goes out exactly as given: NDJSON or a JSON array, never
     /// parsed, split, re-encoded or compressed here, so the server reads
     /// the bytes a sender would post. No `Content-Type` is claimed: the
-    /// server tells NDJSON from an array by the bytes themselves. `peer_ip` is the sender's address as
-    /// trawld would see it; left out, the server canonicalizes against its
-    /// documentation placeholder and says so in the report.
-    ///
-    /// The route answers exactly `200`; any other status is a
-    /// [`ClientError::Server`]. A body that does not decode as a report is
-    /// a [`ClientError::Parse`] that never quotes the body: it carries
-    /// sample values.
+    /// server tells NDJSON from an array by the bytes themselves.
+    /// `peer_ip` is the sender's address as trawld would see it; left out,
+    /// the server canonicalizes against its documentation placeholder.
     pub async fn ingest_preview(
         &self,
         body: Vec<u8>,
@@ -1354,8 +1162,6 @@ impl HttpClient {
     }
 
     /// Export query results in the specified format.
-    ///
-    /// Returns raw bytes suitable for writing to a file.
     pub async fn export(
         &self,
         query: &str,
@@ -1385,12 +1191,9 @@ impl HttpClient {
 
     /// Stream live query results as typed events.
     ///
-    /// Returns a stream of [`StreamEvent`] values parsed from the SSE
-    /// connection. Handles event framing and decodes each result frame
-    /// through the result wire's codec. A `data`, `snapshot` or `lagged`
-    /// frame that does not decode ends the stream with
-    /// [`ClientError::Parse`], since its rows would otherwise vanish
-    /// without a trace.
+    /// A `data`, `snapshot` or `lagged` frame that does not decode ends the
+    /// stream with [`ClientError::Parse`], since its rows would otherwise
+    /// vanish without a trace.
     pub async fn stream_events(
         &self,
         query: &str,
@@ -1462,7 +1265,6 @@ impl HttpClient {
         Ok(Box::pin(event_stream))
     }
 
-    /// Raw SSE stream connection (internal — use [`stream_events`](Self::stream_events) instead).
     async fn stream(&self, query: &str) -> Result<reqwest::Response, ClientError> {
         let url = self.endpoint("/api/v1/stream");
 
@@ -1479,12 +1281,10 @@ impl HttpClient {
         Ok(resp)
     }
 
-    /// Build the Authorization header value for authenticated requests.
     fn auth_header_value(&self) -> String {
         format!("Bearer {}", self.token.as_str())
     }
 
-    /// Send an authenticated request, check for errors, and deserialize the response.
     async fn send_authenticated<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
@@ -1496,14 +1296,10 @@ impl HttpClient {
     /// [`Self::send_authenticated`], reading at most `cap` body bytes
     /// whatever the status.
     ///
-    /// A success body is decoded through [`read_json_capped`]: past the cap
-    /// it is [`ClientError::TooLarge`]. A failure body is read under the
-    /// same cap through [`read_bounded`], and one that cannot be judged
-    /// (over the cap, or cut off) falls back to the `unknown error`
-    /// envelope as [`check_status`] does for an unreadable one. It is never
-    /// `TooLarge`: that would hide the status, request id and `Retry-After`
-    /// the headers already gave. Unlike [`check_status`], which buffers a
-    /// failure body whole, no more than `cap` bytes are ever read.
+    /// A failure body that cannot be judged (over the cap, or cut off) falls
+    /// back to the `unknown error` envelope. It is never `TooLarge`: that
+    /// would hide the status, request id and `Retry-After` the headers
+    /// already gave.
     async fn send_capped<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
@@ -1520,9 +1316,6 @@ impl HttpClient {
         Err(server_error(status, headers, &body))
     }
 
-    /// [`Self::send_capped`], handing back the success status beside the
-    /// decoded body, for a route whose status carries meaning (201 against
-    /// 200).
     async fn send_capped_with_status<T: serde::de::DeserializeOwned>(
         &self,
         req: reqwest::RequestBuilder,
@@ -1539,8 +1332,6 @@ impl HttpClient {
         Err(server_error(status.as_u16(), headers, &body))
     }
 
-    /// Send an authenticated request and hand back a success response,
-    /// its body unread; a failure status is a [`ClientError::Server`].
     async fn execute_authenticated(
         &self,
         req: reqwest::RequestBuilder,
@@ -1548,9 +1339,6 @@ impl HttpClient {
         check_status(self.execute_unchecked(req).await?).await
     }
 
-    /// Send an authenticated request and hand back the response whatever
-    /// its status, its body unread.
-    ///
     /// The request is built before it is sent so its body decides how a
     /// send failure reads: only a request that uploads something can have
     /// its upload cut off (see [`sanitize_upload_error`]).
@@ -1571,9 +1359,6 @@ impl HttpClient {
     }
 }
 
-/// Deserialize a success response's whole body as JSON. A body that does
-/// not decode is a [`ClientError::Parse`] carrying the response's request
-/// id.
 async fn read_json<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
 ) -> Result<T, ClientError> {
@@ -1587,11 +1372,9 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 /// 26-character ULID trawld mints, or a 36-character UUID.
 pub const MAX_REQUEST_ID_BYTES: usize = 64;
 
-/// The response's `X-Request-Id`: the server's correlation token for its
-/// own logs (ADR-0040). Only 1 to [`MAX_REQUEST_ID_BYTES`] visible ASCII
-/// bytes (`!` to `~`) are an id; any other value, which an endpoint that is
-/// not trawld or a proxy rewriting the header can send, reads as absent,
-/// so a caller that prints the id prints at most that many bytes.
+/// Only 1 to [`MAX_REQUEST_ID_BYTES`] visible ASCII bytes are an id; any
+/// other value, which an endpoint that is not trawld or a proxy rewriting
+/// the header can send, reads as absent.
 fn request_id_of(resp: &reqwest::Response) -> Option<String> {
     let value = resp.headers().get("x-request-id")?.to_str().ok()?;
     let is_id = (1..=MAX_REQUEST_ID_BYTES).contains(&value.len())
@@ -1599,9 +1382,6 @@ fn request_id_of(resp: &reqwest::Response) -> Option<String> {
     is_id.then(|| value.to_owned())
 }
 
-/// The response's `Retry-After` in whole seconds. Only the delay-seconds
-/// form (digits alone) is read; the HTTP-date form, a value past
-/// `u32::MAX`, or anything else, is `None`.
 fn retry_after_of(resp: &reqwest::Response) -> Option<u32> {
     let value = resp
         .headers()
@@ -1615,11 +1395,8 @@ fn retry_after_of(resp: &reqwest::Response) -> Option<u32> {
     value.parse().ok()
 }
 
-/// What an answering response's headers add to an error built from it.
 struct ErrorHeaders {
-    /// See [`request_id_of`].
     request_id: Option<String>,
-    /// See [`retry_after_of`].
     retry_after_secs: Option<u32>,
 }
 
@@ -1632,9 +1409,6 @@ impl ErrorHeaders {
     }
 }
 
-/// Decode one SSE frame's `data` payload, naming the frame `what` when it
-/// is missing or does not decode. A failure carries the stream response's
-/// `request_id`.
 fn decode_frame<T: serde::de::DeserializeOwned>(
     what: &str,
     data: Option<&str>,
@@ -1649,11 +1423,7 @@ fn decode_frame<T: serde::de::DeserializeOwned>(
 }
 
 /// reqwest reports every failure collecting a body as a decode error, a
-/// stall past the request's deadline included. A timeout is a transport
-/// failure, not a malformed answer, so it is a [`NetworkKind::BodyTimeout`]
-/// with the same sanitized message as a timeout before the headers, and the
-/// answering response's `request_id`. Anything else stays
-/// [`ClientError::Parse`], carrying the same id.
+/// stall past the request's deadline included.
 #[allow(clippy::needless_pass_by_value)] // the error is consumed on the timeout path
 fn body_read_error(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     if e.is_timeout() {
@@ -1666,12 +1436,6 @@ fn body_read_error(e: reqwest::Error, request_id: Option<String>) -> ClientError
     }
 }
 
-/// Classify a failure reading one chunk of a response body: a stall past
-/// the deadline is a [`NetworkKind::BodyTimeout`], anything else is a
-/// [`NetworkKind::BodyRead`]. Either way the headers arrived, so the
-/// server answered; the connection itself is not in doubt. The message
-/// names the origin at most, never the transport library's reason. Both
-/// carry the answering response's `request_id`.
 fn body_chunk_error(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     if e.is_timeout() {
         return body_timeout(e, request_id);
@@ -1688,9 +1452,6 @@ fn body_chunk_error(e: reqwest::Error, request_id: Option<String>) -> ClientErro
     ClientError::Network(NetworkError::new(NetworkKind::BodyRead, message).answered_by(request_id))
 }
 
-/// A timeout that struck after the headers arrived: the sanitized timeout,
-/// retyped as [`NetworkKind::BodyTimeout`] so a caller can tell that the
-/// server answered. It carries that response's `request_id`.
 fn body_timeout(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     match sanitize_reqwest_error(e) {
         ClientError::Network(error) if error.kind == NetworkKind::Timeout => ClientError::Network(
@@ -1700,9 +1461,6 @@ fn body_timeout(e: reqwest::Error, request_id: Option<String>) -> ClientError {
     }
 }
 
-/// Check HTTP response status and return a `Server` error on failure. A
-/// failure body that cannot be read is an envelope that cannot be judged,
-/// so the error falls back to `unknown error`.
 async fn check_status(resp: reqwest::Response) -> Result<reqwest::Response, ClientError> {
     if !resp.status().is_success() {
         let status = resp.status().as_u16();
@@ -1760,27 +1518,14 @@ const READ_MAX_ENTRIES: usize = 200;
 /// answers: the server's `ACTIVITY_LIMIT`.
 const ACTIVITY_MAX_ENTRIES: usize = 50;
 
-/// The most an investigation read body may hold: the investigation and
-/// [`READ_MAX_ENTRIES`] entries, each at most [`ENTRY_PAYLOAD_MAX_BYTES`]
-/// and [`ENTRY_FRAMING_BYTES`]: 200 × 516 KiB + 64 KiB, about 101 MiB.
-/// A real page is a few kilobytes; the cap only refuses a body no trawld
-/// writes.
 pub const INVESTIGATION_READ_BODY_CAP: usize =
     READ_MAX_ENTRIES * (ENTRY_PAYLOAD_MAX_BYTES + ENTRY_FRAMING_BYTES) + INVESTIGATION_BODY_CAP;
 
-/// The most an append or finding-status body may hold: the entry written
-/// and [`ACTIVITY_MAX_ENTRIES`] entries of activity, each at most
-/// [`ENTRY_PAYLOAD_MAX_BYTES`] and [`ENTRY_FRAMING_BYTES`], with a
-/// kilobyte for the activity's own members: 51 × 516 KiB + 1 KiB, about
-/// 26 MiB.
 pub const APPEND_BODY_CAP: usize =
     (ACTIVITY_MAX_ENTRIES + 1) * (ENTRY_PAYLOAD_MAX_BYTES + ENTRY_FRAMING_BYTES) + 1024;
 
-/// The most a `PATCH` body may hold: the investigation as the write left
-/// it, plus what an append's answer holds (the entry written and
-/// [`ACTIVITY_MAX_ENTRIES`] entries of activity), about 26 MiB. At
-/// [`INVESTIGATION_BODY_CAP`] alone, an overwrite that committed with full
-/// activity would read as too large.
+/// At [`INVESTIGATION_BODY_CAP`] alone, an overwrite that committed with
+/// full activity would read as too large.
 pub const PATCH_BODY_CAP: usize = INVESTIGATION_BODY_CAP + APPEND_BODY_CAP;
 
 /// The most an investigation list body may hold: the server's 200 rows,
@@ -1788,8 +1533,6 @@ pub const PATCH_BODY_CAP: usize = INVESTIGATION_BODY_CAP + APPEND_BODY_CAP;
 /// timestamps and two actors): 800 KiB, rounded up to 1 MiB.
 pub const INVESTIGATION_LIST_BODY_CAP: usize = 1024 * 1024;
 
-/// Refuse an investigation id that is not 32 lowercase hex digits before
-/// it enters a path. The reason never quotes the id.
 fn check_investigation_id(id: &str) -> Result<(), ClientError> {
     if trawl_api::investigations::InvestigationId::parse(id).is_ok() {
         Ok(())
@@ -1800,15 +1543,11 @@ fn check_investigation_id(id: &str) -> Result<(), ClientError> {
     }
 }
 
-/// Whether `id` has the shape trawld mints result ids in: 32 lowercase hex
-/// digits. An id of any other shape names no result a read can page.
 #[must_use]
 pub fn is_result_id(id: &str) -> bool {
     id.len() == 32 && id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Refuse a result id that is not 32 lowercase hex digits before it
-/// enters a path. The reason never quotes the id.
 fn check_result_id(id: &str) -> Result<(), ClientError> {
     if is_result_id(id) {
         Ok(())
@@ -1819,9 +1558,6 @@ fn check_result_id(id: &str) -> Result<(), ClientError> {
     }
 }
 
-/// Read a success body of at most `cap` bytes and parse it as JSON. A body
-/// past the cap is [`ClientError::TooLarge`], and the rest is never read.
-///
 /// A body that does not decode is a [`ClientError::Parse`] naming only
 /// `what`, never serde's reason: that reason quotes the offending value
 /// (``unknown variant `…` ``), and the value is whatever the server sent,
@@ -1839,8 +1575,6 @@ async fn read_json_capped<T: serde::de::DeserializeOwned>(
     })
 }
 
-/// A `Server` error for `status`, carrying the body's error envelope when
-/// it holds one and what the response's headers said.
 fn server_error(status: u16, headers: ErrorHeaders, body: &[u8]) -> ClientError {
     let error = serde_json::from_slice::<ErrorResponse>(body).map_or_else(
         |_| trawl_api::ErrorEnvelope::simple(trawl_api::ErrorCode::InternalError, "unknown error"),
@@ -1854,9 +1588,6 @@ fn server_error(status: u16, headers: ErrorHeaders, body: &[u8]) -> ClientError 
     }
 }
 
-/// Read a whole response body of at most `cap` bytes. A body that holds
-/// more is [`ClientError::TooLarge`], and the rest is never read.
-///
 /// This is the only way the client reads a capped body, and it never hands
 /// back a prefix: whatever the status, a caller that judges the bytes (an
 /// error envelope, a health body, a probe answer) judges all of them or
@@ -1880,15 +1611,11 @@ async fn read_bounded(mut resp: reqwest::Response, cap: usize) -> Result<Vec<u8>
     Ok(body)
 }
 
-/// Build the `reqwest` client for `trust`, with `timeout` bounding each
-/// request and `redirect` deciding what a 3xx does.
 fn reqwest_client(
     trust: &TlsTrust,
     timeout: std::time::Duration,
     redirect: reqwest::redirect::Policy,
 ) -> Result<Client, ClientError> {
-    // Ensure ring is available as the rustls crypto provider.
-    // Idempotent — returns Err if already installed, which we ignore.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
     let mut builder = Client::builder().redirect(redirect).timeout(timeout);
@@ -1923,21 +1650,15 @@ fn reqwest_client(
     })
 }
 
-/// A status and a capped body from an [`OriginProbe`] request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProbeResponse {
-    /// HTTP status code.
     pub status: u16,
-    /// The whole body, at most [`OriginProbe::BODY_CAP`] bytes.
     pub body: Vec<u8>,
 }
 
 /// Unauthenticated probes of a browser origin, the address `trawl-web`
 /// serves (ADR-0047).
 ///
-/// It holds no key and has no way to send one: a doctor probes the browser
-/// origin precisely when that address may be wrong. Redirects are refused
-/// as [`NetworkKind::Redirect`], so a probe reaches only the origin named.
 /// An origin carrying userinfo is refused at construction, because the
 /// HTTP client would send it as an `Authorization: Basic` header.
 #[derive(Clone)]
@@ -1962,10 +1683,6 @@ impl OriginProbe {
 
     /// A probe of `origin` (`scheme://host[:port]`, a trailing `/` allowed),
     /// verifying TLS under `trust`, with `timeout` bounding each request.
-    ///
-    /// Refused with [`ClientError::InvalidUrl`], naming none of the input:
-    /// any userinfo (a user name alone included), a scheme other than
-    /// `http` or `https`, and a path, query or fragment.
     pub fn new(
         origin: &str,
         trust: &TlsTrust,
@@ -1995,7 +1712,6 @@ impl OriginProbe {
         })
     }
 
-    /// `GET /healthz`: `trawl-web` answers a static `ok`.
     pub async fn healthz(&self) -> Result<ProbeResponse, ClientError> {
         let req = self.client.get(format!("{}/healthz", self.origin));
         Self::send(req).await
@@ -2025,7 +1741,6 @@ impl OriginProbe {
     }
 }
 
-/// Strip trailing slashes so `endpoint()` can simply concatenate.
 fn normalize_base_url(url: String) -> String {
     let trimmed = url.trim_end_matches('/');
     if trimmed.len() == url.len() {
@@ -2035,10 +1750,6 @@ fn normalize_base_url(url: String) -> String {
     }
 }
 
-/// Categorize a reqwest error without exposing raw details or URL secrets.
-/// Connection diagnostics identify only the API origin, never URL userinfo,
-/// paths, query parameters, or fragments. A certificate rustls refused is
-/// named as such, without the certificate or the verifier's reason.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_reqwest_error)`
 fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     let (kind, message) = if e.is_connect() && rejected_certificate(&e) {
@@ -2076,33 +1787,23 @@ fn sanitize_reqwest_error(e: reqwest::Error) -> ClientError {
     ClientError::Network(NetworkError::new(kind, message))
 }
 
-/// What a send failure of a request that carries a body says when the
-/// server reset or closed the connection under it. A reset proves nothing
-/// about why: trawld hangs up on an oversized body (413) and on a request
-/// refused at its request limit (503) without draining the upload. The text
-/// names both possibilities, claims neither a 413 nor a 503 it did not read,
-/// and names no URL or transport internals.
+/// A reset proves nothing about why: trawld hangs up on an oversized body
+/// (413) and on a request refused at its request limit (503) without
+/// draining the upload.
 const UPLOAD_CUT_OFF: &str = "the server closed the connection before the upload finished; \
                               the request may exceed the server's request size limit, \
                               or the server may be at its request limit";
 
-/// Categorize a send failure of a request that carries a body.
-///
-/// trawld refuses an oversized body with a 413 and hangs up without
-/// draining the rest, so a client still writing the body can meet the
-/// reset before it reads the answer. That failure becomes
-/// [`NetworkKind::UploadCutOff`]; everything else reads as
-/// [`sanitize_reqwest_error`] has it. An untrusted certificate, a timeout
-/// and a failed connect come first, so a reset during the TLS handshake
-/// stays a connect failure.
+/// A reset while a body is sent reads as [`NetworkKind::UploadCutOff`]. An
+/// untrusted certificate, a timeout and a failed connect come first, so a
+/// reset during the TLS handshake stays a connect failure.
 ///
 /// Whether the reset came while the body was being written cannot be told
 /// from the error: hyper's `Kind::BodyWrite` is private, and a reset the
-/// read side sees mid-upload is a plain I/O error. So the request carrying
-/// a body stands in for it, and callers pick this sanitizer only at sites
-/// that send one. A body-carrying request reset after a complete upload
-/// reads the same, which is why the message says the size "may" be the
-/// cause.
+/// read side sees mid-upload is a plain I/O error. So callers pick this
+/// sanitizer only at sites that send a body, and a reset after a complete
+/// upload reads the same, which is why the message says the size "may" be
+/// the cause.
 #[allow(clippy::needless_pass_by_value)] // used as `.map_err(sanitize_upload_error)`
 fn sanitize_upload_error(e: reqwest::Error) -> ClientError {
     if !e.is_timeout() && !e.is_connect() && connection_cut(&e) {
@@ -2111,11 +1812,8 @@ fn sanitize_upload_error(e: reqwest::Error) -> ClientError {
     sanitize_reqwest_error(e)
 }
 
-/// The source chain of `e`, `e` first.
-///
 /// `io::Error::source` skips the error an `io::Error` wraps, so an
-/// `io::Error` is stepped into with `get_ref` instead: the TLS connector
-/// and hyper both report a failure inside one or more of them.
+/// `io::Error` is stepped into with `get_ref` instead.
 fn source_chain<'a>(
     e: &'a (dyn std::error::Error + 'static),
 ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
@@ -2125,13 +1823,7 @@ fn source_chain<'a>(
     })
 }
 
-/// Whether `e` failed because rustls did not accept the server's
-/// certificate: an unknown issuer, a name it does not cover, an expired
-/// certificate, and the like.
-///
-/// A typed check over the source chain, never the Display text. The TLS
-/// connector reports a handshake failure as a [`rustls::Error`] inside one
-/// or more [`std::io::Error`]s.
+/// A typed check over the source chain, never the Display text.
 fn rejected_certificate(e: &reqwest::Error) -> bool {
     source_chain(e).any(|err| {
         matches!(
@@ -2141,9 +1833,6 @@ fn rejected_certificate(e: &reqwest::Error) -> bool {
     })
 }
 
-/// Whether `e` failed because the peer reset or closed the connection: an
-/// [`std::io::Error`] of kind `ConnectionReset` or `BrokenPipe` somewhere in
-/// the source chain. A typed check, never the Display text.
 fn connection_cut(e: &(dyn std::error::Error + 'static)) -> bool {
     source_chain(e).any(|err| {
         err.downcast_ref::<std::io::Error>().is_some_and(|io| {
@@ -2155,28 +1844,9 @@ fn connection_cut(e: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-/// Decode a successful repin trigger response: the status code plus the
-/// job row's own status.
-///
-/// The status code alone is not the verdict on this route. A 200 carries
-/// either a dry-run report or a job an operator cancelled mid-ladder
-/// (#109), and those are opposite answers: one describes work that was
-/// measured, the other work that never happened. Reading the row's status
-/// is what tells them apart.
-///
-/// A 200 naming a `running` job contradicts the route's contract — both
-/// 200 shapes are terminal rows — so it is a protocol error rather than a
-/// report a caller would print as a plan. A 202 is left alone: the server
-/// reads the row back after spawning the rewrite, or once its answer bound
-/// passed mid-scan, so a fast job can legitimately be terminal by the time
-/// it is serialised.
-///
-/// Every success arm names the status it decodes, and there is no wildcard
-/// into `Report`. There used to be, and a `failed` row fell through it: a
-/// cancel whose request row could not be written downgrades the job to
-/// `failed` and the route still answers 200, which the CLI then printed as
-/// "dry run" and exited 0 over. An unrecognised status is
-/// [`RepinStart::Failed`], which no caller can read as success.
+/// A 202 is left alone: the server reads the row back after spawning the
+/// rewrite, or once its answer bound passed mid-scan, so a fast job can
+/// legitimately be terminal by the time it is serialised.
 fn decode_repin_start(
     status: u16,
     job: trawl_api::RepinJobResponse,
@@ -2193,13 +1863,9 @@ fn decode_repin_start(
     }
 }
 
-/// The job a read by id answered with, checked against the id asked for.
-///
-/// The server answers that one job or a 404, so an empty body or another
-/// job's row did not come from a server honouring the id (a server that
-/// predates it answers the unscoped read). Either would hand the caller a
-/// job it did not ask about, which is the stand-in the id exists to
-/// prevent, so both are protocol errors.
+/// A read by id is answered with that job or a 404, so an empty body or
+/// another job's row did not come from a server honouring the id (a server
+/// that predates it answers the unscoped read).
 fn decode_repin_job(
     id: i64,
     body: RepinStatusResponse,
@@ -2216,13 +1882,9 @@ fn decode_repin_job(
     }
 }
 
-/// Pair the cancel endpoint's status code with the body's own `outcome`.
-///
-/// The server writes both from one table, so a disagreement means the
-/// response did not come from a server that shares this table — a proxy
-/// rewriting a status, or a version skew. Trusting either half silently
-/// would let a "202 accepted" be printed over a body that says nothing was
-/// running, so the mismatch is a protocol error instead.
+/// The server writes the status and the body's `outcome` from one table, so
+/// a disagreement means the response did not come from a server that shares
+/// this table: a proxy rewriting a status, or a version skew.
 fn decode_repin_cancel(
     status: u16,
     body: trawl_api::RepinCancelResponse,
@@ -2247,8 +1909,6 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
     }
 
-    /// A pinned bundle that yields no trust anchor must fail at build time,
-    /// never fall back to another store or reach the network.
     #[test]
     fn pinned_ca_without_a_usable_certificate_is_refused() {
         let key_only = b"-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
@@ -2333,7 +1993,6 @@ mod tests {
         assert_eq!(error.network_kind(), Some(NetworkKind::Timeout));
     }
 
-    /// Nothing listening is `Connect`, not a timeout or a certificate.
     #[tokio::test]
     async fn refused_connection_is_connect_kind() {
         init();
@@ -2363,7 +2022,6 @@ mod tests {
         drop(socket);
     }
 
-    /// `with_trust_timeout` bounds each request by its own timeout.
     #[tokio::test]
     async fn with_trust_timeout_bounds_the_request() {
         init();
@@ -2376,7 +2034,6 @@ mod tests {
             std::time::Duration::from_millis(100),
         )
         .unwrap();
-        // Accept the connection and never answer.
         let (result, _socket) =
             tokio::join!(client.health(), async { listener.accept().await.unwrap() });
         let error = result.unwrap_err();
@@ -2387,10 +2044,7 @@ mod tests {
         );
     }
 
-    /// Accept one connection, read the request head, send `200` headers
-    /// promising a body plus its first byte, then hold the connection open
-    /// without sending the rest. Hands back the socket so it stays open
-    /// until the caller drops it.
+    /// Hands back the socket so it stays open until the caller drops it.
     async fn stall_after_headers(listener: tokio::net::TcpListener) -> tokio::net::TcpStream {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -2411,10 +2065,6 @@ mod tests {
         socket
     }
 
-    /// A body that stalls after the headers is a body timeout: the same
-    /// message as a stall before them, not a malformed answer, and a kind
-    /// of its own, because the server did answer. Both body readers the
-    /// doctor uses are covered: the unkeyed health and the keyed whoami.
     #[tokio::test]
     async fn body_stall_after_headers_is_a_timeout() {
         init();
@@ -2450,15 +2100,8 @@ mod tests {
         }
     }
 
-    /// Headers that declare 100 bytes of body, then 10 of them, then the
-    /// connection closes.
     const CUT_SHORT: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 100\r\nconnection: close\r\n\r\n{\"status\":";
 
-    /// A body the peer cuts short after the headers is a body read
-    /// failure, a kind of its own: the server answered, so it is neither a
-    /// failed connection nor a timeout. Every capped reader is covered: the
-    /// unkeyed health, the keyed whoami, and both origin probes. The
-    /// message names the origin and nothing the server sent.
     #[tokio::test]
     async fn body_cut_short_after_headers_is_a_body_read_failure() {
         init();
@@ -2496,7 +2139,6 @@ mod tests {
         }
     }
 
-    /// A complete body that is not the expected JSON is still a parse error.
     #[tokio::test]
     async fn complete_foreign_body_stays_a_parse_error() {
         let err = health_answered_with(http_response("200 OK", "text/html", b"<html>hi</html>"))
@@ -2505,11 +2147,6 @@ mod tests {
         assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
     }
 
-    // ── real listeners ──────────────────────────────────────────────────
-
-    /// Accept one connection on `listener`, read one request (head and a
-    /// `content-length` body), answer with `response`, and hand back the
-    /// raw request.
     async fn serve_once(listener: tokio::net::TcpListener, response: Vec<u8>) -> String {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let (mut socket, _) = listener.accept().await.unwrap();
@@ -2564,7 +2201,6 @@ mod tests {
         result
     }
 
-    /// Every frame `stream_events` reads from one SSE body, in order.
     async fn stream_answered_with(body: &str) -> Vec<Result<StreamEvent, ClientError>> {
         use futures::StreamExt as _;
 
@@ -2590,8 +2226,6 @@ mod tests {
         events.expect("the stream opens")
     }
 
-    /// A snapshot frame lands as a typed result, and its `capped` reaches
-    /// the event; a frame without it reads as nothing dropped.
     #[tokio::test]
     async fn snapshot_event_carries_capped() {
         use trawl_api::stream::{SnapshotCap, SnapshotCapKind};
@@ -2650,8 +2284,6 @@ mod tests {
         );
     }
 
-    /// A `data` frame is a one-row typed result: an integer past `i64`
-    /// lands as the exact `UInt` it was, and a lag notice its count.
     #[tokio::test]
     async fn data_frames_land_typed_cells() {
         use trawl_api::value::{Column, ColumnType, QueryResult, Value};
@@ -2690,12 +2322,9 @@ mod tests {
         );
     }
 
-    /// A known frame that does not decode ends the stream with a parse
-    /// error naming the frame, rather than vanishing.
     #[tokio::test]
     async fn malformed_frames_are_parse_errors() {
         for (body, named) in [
-            // A JSON number under `integer`: the old untyped wire.
             (
                 concat!(
                     "event: data\n",
@@ -2704,7 +2333,6 @@ mod tests {
                 ),
                 r#"invalid stream event: column "status""#,
             ),
-            // The old snapshot shape: bare column names, rows as maps.
             (
                 concat!(
                     "event: snapshot\n",
@@ -2727,8 +2355,6 @@ mod tests {
         }
     }
 
-    /// An unavailable daemon answers 503 with its per-check body. That body
-    /// is the answer, so it survives instead of becoming an opaque error.
     #[tokio::test]
     async fn health_503_keeps_check_body() {
         let body = br#"{"status":"unavailable","checks":{"duckdb":"error","corpus":"recovering"},"version":"0.9.0"}"#;
@@ -2750,8 +2376,6 @@ mod tests {
         assert_eq!(health.version.as_deref(), Some("0.9.0"));
     }
 
-    /// trawld answers health with exactly 200 or 503, so another 2xx is an
-    /// error even when its body is a valid health body.
     #[tokio::test]
     async fn health_other_2xx_is_an_error() {
         let body = br#"{"status":"ok","checks":{"duckdb":"ok"},"version":"0.9.0"}"#;
@@ -2789,8 +2413,6 @@ mod tests {
 
     const PREVIEW_BODY: &[u8] = br#"{"producer":"http","peer":{"ip":"10.0.0.7","given":true,"trusted_relay":false},"arrival":"2026-10-01T00:00:00.000000Z","derivation":{"time_from":["_time"],"severity_from":[]},"accepted":0,"rejected":1,"events":[{"outcome":"rejected","index":0,"reason":"invalid_json","message":"invalid JSON","host_depends_on_sender":false}]}"#;
 
-    /// The sample leaves byte for byte, blank lines, a bad line and the
-    /// missing final newline included, and the peer rides the query string.
     #[tokio::test]
     async fn ingest_preview_sends_the_sample_unmodified() {
         let sample = b"{\"service\":\"api\"}\n\n  not json\r\n{\"b\":1}".to_vec();
@@ -2815,9 +2437,6 @@ mod tests {
         assert_eq!(&request.as_bytes()[head_end..], &sample[..]);
     }
 
-    /// Without a peer the query string is absent, not empty: the server
-    /// refuses an empty `peer_ip` and uses its placeholder only when the
-    /// parameter is missing.
     #[tokio::test]
     async fn ingest_preview_without_a_peer_sends_no_query() {
         let (result, request) = preview_answered_with(
@@ -2833,8 +2452,6 @@ mod tests {
         );
     }
 
-    /// A non-200 is a server error carrying the status; the 404 a server
-    /// without ingest answers is how the CLI tells that case apart.
     #[tokio::test]
     async fn ingest_preview_non_200_is_a_server_error() {
         let envelope = br#"{"error":{"code":"forbidden","message":"insufficient permissions"}}"#;
@@ -2857,8 +2474,6 @@ mod tests {
         }
     }
 
-    /// A 200 that is not a report never quotes the body: it carries the
-    /// sample's values.
     #[tokio::test]
     async fn ingest_preview_undecodable_report_is_a_quiet_parse_error() {
         let (result, _) = preview_answered_with(
@@ -2876,13 +2491,10 @@ mod tests {
         assert!(!err.to_string().contains("canary"), "{err}");
     }
 
-    /// `depth` nested JSON arrays around a `1`.
     fn nested_arrays(depth: usize) -> String {
         format!("{}1{}", "[".repeat(depth), "]".repeat(depth))
     }
 
-    /// An NDJSON event `depth` containers deep: the object and the arrays
-    /// nested inside its `payload`.
     fn event_of_depth(depth: usize) -> String {
         format!(
             r#"{{"service":"api","payload":{}}}"#,
@@ -2890,9 +2502,6 @@ mod tests {
         )
     }
 
-    /// A complete report echoing `input` in an accepted event and
-    /// `rejected_input` in a rejected one (an NDJSON line that parsed but
-    /// is not an object).
     fn report_echoing(input: &str, rejected_input: &str) -> Vec<u8> {
         format!(
             r#"{{"producer":"http","peer":{{"ip":"192.0.2.1","given":false,"trusted_relay":false}},"arrival":"2026-10-01T00:00:00.000000Z","derivation":{{"time_from":["_time"],"severity_from":[]}},"accepted":1,"rejected":1,"events":[{{"outcome":"accepted","index":0,"input":{input},"event":{{"service":"api","payload":"[]"}},"repairs":[],"lineage":{{"time":{{"from":"arrival"}},"severity":{{"from":"missing"}},"fields":[{{"field":"payload","change":"stringified"}}]}},"host_depends_on_sender":true}},{{"outcome":"rejected","index":1,"input":{rejected_input},"reason":"not_object","message":"expected JSON object","host_depends_on_sender":false}}]}}"#
@@ -2900,11 +2509,6 @@ mod tests {
         .into_bytes()
     }
 
-    /// Ingest parses each event with `serde_json`'s default recursion
-    /// limit, so the deepest event it accepts is [`INGEST_EVENT_MAX_DEPTH`]
-    /// containers. The report echoes that event three containers further
-    /// in, and the client still decodes it: a preview never fails for an
-    /// event real ingest would take.
     #[tokio::test]
     async fn ingest_preview_decodes_the_deepest_event_ingest_accepts() {
         let deepest = event_of_depth(INGEST_EVENT_MAX_DEPTH);
@@ -2936,9 +2540,6 @@ mod tests {
         );
     }
 
-    /// The bound is ingest's own plus the report's wrapper, not unbounded:
-    /// an echoed input one container deeper than ingest accepts is a quiet
-    /// parse error, never a stack overflow or a quoted body.
     #[tokio::test]
     async fn ingest_preview_refuses_an_input_deeper_than_ingest_accepts() {
         let too_deep = format!(
@@ -2980,8 +2581,6 @@ mod tests {
         );
     }
 
-    /// Brackets inside strings, escaped quotes included, are text, not
-    /// nesting.
     #[test]
     fn brackets_inside_strings_do_not_count_as_depth() {
         let text = format!(r#"{{"a":"{}\"{}","b":[["\\"]]}}"#, "[{".repeat(500), "]}");
@@ -2992,10 +2591,6 @@ mod tests {
         assert!(!json_depth_exceeds(b"\"[[\"", 0));
     }
 
-    /// Only a 503 carrying a health body is kept. A 502 is an error whatever
-    /// its body says, and a 503 from something else (a proxy's page, the
-    /// error envelope) stays an error too. A 503 body past the cap is
-    /// too large: its status never decides, because none of it was judged.
     #[tokio::test]
     async fn health_foreign_bodies_still_error() {
         let health = br#"{"status":"ok","checks":{"duckdb":"ok"}}"#;
@@ -3046,7 +2641,6 @@ mod tests {
             Some("shutting down")
         );
 
-        // A health body padded past the cap is not read as one.
         let mut oversized =
             br#"{"status":"unavailable","checks":{"duckdb":"error"},"pad":""#.to_vec();
         oversized.extend(std::iter::repeat_n(b'x', HEALTH_BODY_CAP));
@@ -3080,10 +2674,6 @@ mod tests {
         result
     }
 
-    /// A busy run-now refusal reaches the caller as one 429 `manual_run_busy`
-    /// with its `Retry-After`, and the client never sends the request a
-    /// second time: the listener answers every connection with the same
-    /// refusal and counts them.
     #[tokio::test]
     async fn run_now_busy_carries_retry_after_and_is_not_retried() {
         use std::sync::Arc;
@@ -3162,7 +2752,6 @@ mod tests {
         body
     }
 
-    /// A 200 health body past the cap is refused as too large, not parsed.
     #[tokio::test]
     async fn health_200_past_the_cap_is_too_large() {
         let body = padded(
@@ -3194,9 +2783,6 @@ mod tests {
         body
     }
 
-    /// A non-success health body past the cap is too large, whatever its
-    /// status: the error envelope in its first bytes is never judged, so an
-    /// oversized 429 is not read as rate limiting.
     #[tokio::test]
     async fn health_error_past_the_cap_is_too_large() {
         for (status, code) in [
@@ -3215,8 +2801,6 @@ mod tests {
         }
     }
 
-    /// A non-200 whoami body past the cap is too large, whatever its
-    /// status, and its error envelope is never judged.
     #[tokio::test]
     async fn whoami_error_past_the_cap_is_too_large() {
         for (status, code) in [
@@ -3238,8 +2822,6 @@ mod tests {
     const WHOAMI: &[u8] =
         br#"{"prefix":"abcd1234","name":"ops","kind":"service","roles":[],"permissions":["query"]}"#;
 
-    /// A 200 whoami body past the cap is refused as too large, not parsed;
-    /// one within it parses.
     #[tokio::test]
     async fn whoami_200_past_the_cap_is_too_large() {
         let who = whoami_answered_with(http_response("200 OK", "application/json", WHOAMI))
@@ -3280,8 +2862,6 @@ mod tests {
 
     const CAPABILITIES: &[u8] = br#"{"version":"0.9.3","dsl":{"stages":["stats"],"functions":["count"],"max_query_bytes":65536,"max_pipeline_stages":128},"bounds":{"default_window_secs":900,"max_span_secs":604800,"deadline_secs":15,"max_rows":5000,"max_wire_bytes":4194304,"page_max_rows":500,"ttl_secs":3600,"query_timeout_secs":30,"max_result_rows":10000},"quotas":{"per_key_results":64,"per_key_bytes":67108864,"installation_results":512,"installation_bytes":536870912},"admission":{"per_key_running":1,"installation_running":2,"queue_depth":4,"rate_rpm":null},"evidence":{"idle_secs":604800,"ceiling_secs":2592000,"per_investigation_bytes":67108864,"installation_bytes":1073741824},"link_origin":null,"health":{"status":"ok"}}"#;
 
-    /// A capabilities body within the cap still decodes through the
-    /// bounded read; one padded past it is refused as too large, not parsed.
     #[tokio::test]
     async fn capabilities_200_past_the_cap_is_too_large() {
         let caps =
@@ -3305,11 +2885,6 @@ mod tests {
         );
     }
 
-    /// A non-success capabilities body past the cap is never judged: its
-    /// error envelope, valid JSON and padded to size, is not read, so the
-    /// error carries the `unknown error` fallback, not the envelope's
-    /// message, and keeps the status, request id and `Retry-After` the
-    /// headers gave. Under the unbounded read the envelope would parse.
     #[tokio::test]
     async fn capabilities_error_past_the_cap_is_not_judged() {
         for (status, code) in [
@@ -3347,11 +2922,6 @@ mod tests {
         }
     }
 
-    /// An `X-Request-Id` is an id only as 1 to [`MAX_REQUEST_ID_BYTES`]
-    /// visible ASCII bytes. An endpoint that is not trawld, or a proxy that
-    /// rewrites the header, can send kilobytes, which no refusal trailer
-    /// carries whole; such a header is read as absent, and the status and
-    /// the `Retry-After` wait stay.
     #[tokio::test]
     async fn a_request_id_is_at_most_64_visible_ascii_bytes() {
         let longest = "r".repeat(MAX_REQUEST_ID_BYTES);
@@ -3391,7 +2961,6 @@ mod tests {
         }
     }
 
-    /// A capabilities error within the cap keeps its envelope.
     #[tokio::test]
     async fn capabilities_error_within_the_cap_keeps_its_envelope() {
         let envelope = br#"{"error":{"code":"forbidden","message":"no grant","details":[]}}"#;
@@ -3408,11 +2977,6 @@ mod tests {
         );
     }
 
-    /// A body that does not decode names only the endpoint. serde's reason
-    /// quotes the offending value, so a server that echoes the bearer key
-    /// into a typed field (here `kind`) would otherwise put it in the
-    /// error, and from there into the TUI's log and the trial's failure
-    /// message, which both render this error.
     #[tokio::test]
     async fn parse_errors_never_quote_the_response() {
         const KEY: &str = "flt_Ab3dEf9hIjKlMnOpQrStUvWxYz0123456789";
@@ -3448,8 +3012,6 @@ mod tests {
         );
     }
 
-    /// whoami answers exactly 200: another 2xx carrying a valid body is a
-    /// server error that keeps its status.
     #[tokio::test]
     async fn whoami_other_2xx_is_an_error() {
         for status in ["201 Created", "202 Accepted"] {
@@ -3464,9 +3026,6 @@ mod tests {
         }
     }
 
-    /// A keyed whoami does not follow a redirect: the 3xx is a server
-    /// error that keeps its status, and its target never sees a
-    /// connection, so the key never travels to it.
     #[tokio::test]
     async fn whoami_refuses_redirects() {
         init();
@@ -3510,8 +3069,6 @@ mod tests {
         .unwrap()
     }
 
-    /// Neither probe carries a key: no `Authorization` header, no cookie,
-    /// and the login body's `api_key` is empty.
     #[tokio::test]
     async fn origin_probe_sends_no_authorization_header() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3566,8 +3123,6 @@ mod tests {
         assert!(request.ends_with("\r\n\r\n{\"api_key\":\"\"}"), "{request}");
     }
 
-    /// Wait up to `wait` for a connection on `listener`, and return its
-    /// request head if one arrives.
     async fn head_within(
         listener: &tokio::net::TcpListener,
         wait: std::time::Duration,
@@ -3589,10 +3144,6 @@ mod tests {
         Some(String::from_utf8_lossy(&head).into_owned())
     }
 
-    /// URL userinfo becomes an `Authorization: Basic` header, so a probe
-    /// refuses any: a user name alone as much as a user and password. The
-    /// refusal quotes none of it, the probe's `Debug` shows the origin at
-    /// most, and the listener never sees a request.
     #[tokio::test]
     async fn origin_probe_refuses_userinfo() {
         init();
@@ -3649,7 +3200,6 @@ mod tests {
             "a refused probe reached the listener"
         );
 
-        // A probe of a clean origin shows only the origin in its Debug.
         let web = OriginProbe::new(
             &format!("http://{address}/"),
             &TlsTrust::System,
@@ -3663,8 +3213,6 @@ mod tests {
         );
     }
 
-    /// Only an origin is accepted: another scheme, a path, a query or a
-    /// fragment is refused before anything is built.
     #[test]
     fn origin_probe_accepts_only_an_origin() {
         init();
@@ -3688,10 +3236,6 @@ mod tests {
         }
     }
 
-    /// A probe reads at most `BODY_CAP` bytes. A body past it is too
-    /// large, never its prefix: a prefix of a foreign body can be exactly
-    /// the answer a caller matches. A body of exactly `BODY_CAP` bytes is
-    /// whole.
     #[tokio::test]
     async fn origin_probe_caps_the_body() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3724,8 +3268,6 @@ mod tests {
         assert_eq!(response.body.len(), OriginProbe::BODY_CAP);
     }
 
-    /// A redirect is refused as `Redirect`, and its target never sees a
-    /// connection.
     #[tokio::test]
     async fn origin_probe_refuses_redirects() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -3763,8 +3305,6 @@ mod tests {
         );
     }
 
-    /// An error that is not an `io::Error`, with a chosen Display and an
-    /// optional source: the shape of the hyper and reqwest layers.
     #[derive(Debug)]
     struct Layer {
         text: &'static str,
@@ -3783,10 +3323,8 @@ mod tests {
         }
     }
 
-    /// `kind` as the OS reports it, inside an `io::Error` wrapper, inside a
-    /// library layer, inside another `io::Error` wrapper. Each wrapper's
-    /// `source` skips the error it wraps, so a walk by `source` alone never
-    /// reaches `kind`; only `get_ref` does.
+    /// Each `io::Error` wrapper's `source` skips the error it wraps, so a walk
+    /// by `source` alone never reaches `kind`; only `get_ref` does.
     fn nested(kind: std::io::ErrorKind) -> std::io::Error {
         let inner = std::io::Error::other(std::io::Error::from(kind));
         std::io::Error::other(Layer {
@@ -3795,8 +3333,6 @@ mod tests {
         })
     }
 
-    /// A reset or a broken pipe is found through nested `io::Error`
-    /// wrappers and library layers alike.
     #[test]
     fn connection_cut_finds_a_reset_or_broken_pipe_in_the_chain() {
         for kind in [
@@ -3823,8 +3359,6 @@ mod tests {
         }
     }
 
-    /// Other I/O failures are not a cut connection: a timeout, or a peer
-    /// that closed without a reset.
     #[test]
     fn connection_cut_ignores_other_io_kinds() {
         for kind in [
@@ -3836,8 +3370,6 @@ mod tests {
         }
     }
 
-    /// The check reads kinds, never text: an error that only says
-    /// "connection reset" is not one.
     #[test]
     fn connection_cut_ignores_display_text() {
         let layer = Layer {
@@ -3853,8 +3385,6 @@ mod tests {
         });
         assert!(!connection_cut(&broken));
     }
-
-    // ── endpoint URL construction ───────────────────────────────────────
 
     #[test]
     fn endpoint_no_trailing_slash() {
@@ -3886,8 +3416,6 @@ mod tests {
         );
     }
 
-    // ── debug redaction ─────────────────────────────────────────────────
-
     #[test]
     fn debug_redacts_token() {
         init();
@@ -3901,8 +3429,6 @@ mod tests {
         assert!(!debug.contains("secrettoken"));
         assert!(!debug.contains("flt_"));
     }
-
-    // ── serde: QueryRequest ────────────────────────────────────────────
 
     #[test]
     fn query_request_serializes() {
@@ -3931,8 +3457,6 @@ mod tests {
         assert!(json.get("limit").is_none());
         assert!(json.get("offset").is_none());
     }
-
-    // ── serde: HealthResponse ────────────────────────────────────────────
 
     #[test]
     fn health_response_deserializes_ok() {
@@ -3982,8 +3506,6 @@ mod tests {
         );
     }
 
-    // ── serde: SchemaResponse ───────────────────────────────────────────
-
     #[test]
     fn schema_response_deserializes() {
         let json = r#"{
@@ -4001,8 +3523,6 @@ mod tests {
         assert_eq!(resp.file_count, 42);
         assert!(resp.cached);
     }
-
-    // ── serde: QueriesResponse ──────────────────────────────────────────
 
     #[test]
     fn queries_response_deserializes() {
@@ -4035,8 +3555,6 @@ mod tests {
         assert_eq!(resp.recent[0].snapshot.rows, Some(100));
         assert!(!resp.recent[0].snapshot.timed_out);
     }
-
-    // ── repin start decode (#109) ───────────────────────────────────────
 
     fn start_job(status: &str) -> trawl_api::RepinJobResponse {
         trawl_api::RepinJobResponse {
@@ -4075,10 +3593,6 @@ mod tests {
         }
     }
 
-    /// A 200 carrying a cancelled job is not a report. The two shapes share
-    /// a status code on purpose (409 already means refused-needs-force to a
-    /// body-sniffing decoder), so the row's own status is what separates
-    /// "here is your plan" from "somebody stopped this".
     #[test]
     fn a_cancelled_job_decodes_as_cancelled_not_as_a_report() {
         assert!(matches!(
@@ -4095,13 +3609,8 @@ mod tests {
         ));
     }
 
-    /// A 200 carrying a `failed` row is not a report either.
-    ///
-    /// The path is real: a cancel whose request row cannot be written
-    /// downgrades the job to `failed`, and that row still rides out on the
-    /// original POST's 200. Under the old wildcard arm the CLI printed
-    /// "dry run" and exited 0 over a repin that never ran (#109 review
-    /// R2-3).
+    /// A cancel whose request row cannot be written downgrades the job to
+    /// `failed`, and that row still rides out on the original POST's 200.
     #[test]
     fn a_failed_job_under_a_200_never_decodes_as_a_report() {
         for status in ["failed", "blocked", "refused_needs_force"] {
@@ -4113,9 +3622,6 @@ mod tests {
         }
     }
 
-    /// Both 200 shapes are terminal rows, so a 200 naming a running job is
-    /// a contract violation and stays an error instead of being printed as
-    /// a plan.
     #[test]
     fn a_running_job_under_a_200_is_a_protocol_error() {
         let err = decode_repin_start(200, start_job("running"))
@@ -4123,10 +3629,6 @@ mod tests {
         assert!(matches!(err, ClientError::Parse { .. }), "{err:?}");
     }
 
-    /// A read by id answers the job asked about or nothing a caller may
-    /// use. Another job's row is the stand-in the id exists to prevent, and
-    /// an empty body is no answer about the job either; both are protocol
-    /// errors that name the id asked for.
     #[test]
     fn a_repin_read_by_id_accepts_only_the_job_it_asked_for() {
         let ours = decode_repin_job(
@@ -4155,8 +3657,6 @@ mod tests {
         );
     }
 
-    // ── repin cancel decode (#109) ──────────────────────────────────────
-
     fn cancel_body(outcome: trawl_api::RepinCancelOutcome) -> trawl_api::RepinCancelResponse {
         trawl_api::RepinCancelResponse {
             outcome,
@@ -4165,10 +3665,6 @@ mod tests {
         }
     }
 
-    /// The three status codes the server sends decode into the three
-    /// variants, one for one. Asserted from this end as well as from the
-    /// server's `CancelVerdict::wire` table, so the two cannot drift apart
-    /// without one of the two tests failing.
     #[test]
     fn repin_cancel_status_codes_decode_to_their_variants() {
         use trawl_api::RepinCancelOutcome as O;
@@ -4186,9 +3682,6 @@ mod tests {
         ));
     }
 
-    /// A status code and a body discriminant that disagree are a protocol
-    /// error. Printing "accepted" over a body saying nothing was running
-    /// would tell an operator a job is stopping when none exists.
     #[test]
     fn repin_cancel_refuses_a_status_the_body_contradicts() {
         use trawl_api::RepinCancelOutcome as O;
@@ -4208,7 +3701,6 @@ mod tests {
         }
     }
 
-    /// `snake_case` on the wire, and the outcome round-trips.
     #[test]
     fn repin_cancel_outcome_spells_snake_case() {
         let json = serde_json::to_value(cancel_body(
@@ -4223,8 +3715,6 @@ mod tests {
             trawl_api::RepinCancelOutcome::PastPointOfNoReturn
         );
     }
-
-    // ── serde: gc-pins ──────────────────────────────────────────────────
 
     #[test]
     fn gc_pins_request_omits_an_unset_window() {
@@ -4244,8 +3734,6 @@ mod tests {
             older_than_secs: Some(0),
         };
         let json = serde_json::to_value(&req).unwrap();
-        // Zero is a request, not an absence: the footer axis is the other
-        // half of the proof, so it is accepted literally.
         assert_eq!(json["older_than_secs"], 0);
     }
 
@@ -4268,8 +3756,6 @@ mod tests {
             resp.candidates[0].last_seen.as_deref(),
             Some("2026-01-02T03:04:05Z")
         );
-        // A never-observed pin is a candidate with no observation instant,
-        // and the wire omits the field rather than sending null.
         assert!(resp.candidates[1].last_seen.is_none());
     }
 
@@ -4288,8 +3774,6 @@ mod tests {
         assert_eq!(resp.effective_older_than_secs, 2_592_000);
     }
 
-    /// A gc refusal has one body shape, the error envelope, so the client
-    /// hands the caller the server's own sentence to render.
     #[test]
     fn gc_pins_conflict_decodes_to_a_server_error() {
         let body = r#"{"error":{"code":"internal_error",
@@ -4309,7 +3793,6 @@ mod tests {
         assert!(err.to_string().contains("HTTP 409"), "{err}");
     }
 
-    /// Only the shape trawld mints is a result id: 32 lowercase hex digits.
     #[test]
     fn a_result_id_is_32_lowercase_hex_digits() {
         assert!(is_result_id("0123456789abcdef0123456789abcdef"));

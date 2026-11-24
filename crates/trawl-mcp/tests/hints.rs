@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The search URL and the computed hints (ADR-0058, #308 AC11, AC12,
-//! AC13): the link round-trips through the codec to exactly the captured
-//! bounds, each of the four reasons for no link, and each hint firing and
-//! not firing at its threshold.
+//! The search URL and the computed hints (ADR-0058).
 
 mod support;
 
@@ -44,8 +41,6 @@ fn result(query: &str) -> trawl_client::CapturedResult {
         0,
     )
 }
-
-// -- the search URL -----------------------------------------------------------
 
 #[test]
 fn the_search_url_round_trips_to_exactly_the_captured_bounds() {
@@ -197,20 +192,16 @@ fn a_link_over_32_kib_with_its_origin_is_not_built() {
     let overhead = search_bytes(0);
     let mut long = result("service=api");
     long.executed_query = "a".repeat(MAX_SEARCH_BYTES - overhead);
-    // The reader would take the query string, but not the whole link.
     assert_eq!(search_bytes(long.executed_query.len()), MAX_SEARCH_BYTES);
     let link = search_link(Some(ORIGIN), &long);
     assert_eq!(link.url, None);
     assert_eq!(link.reason.as_deref(), Some(TOO_LONG));
 
-    // Short enough with the origin, the same text links.
     let origin_and_path = ORIGIN.len() + "/search?".len();
     long.executed_query = "a".repeat(MAX_LINK_BYTES - overhead - origin_and_path);
     let link = search_link(Some(ORIGIN), &long);
     assert_eq!(link.url.map(|url| url.len()), Some(MAX_LINK_BYTES));
 }
-
-// -- dominance ----------------------------------------------------------------
 
 fn dominated(top: u64, rest: u64, distinct_capped: bool) -> trawl_client::CapturedResult {
     let mut facts = values(&[(s("api"), top), (s("db"), rest)]);
@@ -251,8 +242,6 @@ fn one_value_alone_is_not_dominance() {
     assert!(hints::dominance(&only).is_empty());
 }
 
-// -- lag ----------------------------------------------------------------------
-
 fn lag_page(lag_secs: i64) -> QueryResult {
     let time = at("2026-03-14T03:00:00Z");
     let ingested = time + chrono::TimeDelta::seconds(lag_secs);
@@ -292,8 +281,6 @@ fn lag_needs_both_time_columns() {
     }
     assert_eq!(hints::lag(&page), None);
 }
-
-// -- not in the catalog -------------------------------------------------------
 
 fn observed_in(services: &[&str]) -> CatalogFieldResponse {
     serde_json::from_value(serde_json::json!({
@@ -355,9 +342,7 @@ async fn without_a_named_service_only_an_unknown_field_is_named() {
     assert_eq!(found, [r#"the catalog has no pin for field "nope""#]);
 }
 
-/// Both hints read a stored capture's query whatever its patterns hold: a
-/// piped query with regexes still gets its fields checked and its search
-/// widened. That they build no regex is `hints::tests` in the library: the
+/// That the hints build no regex is `hints::tests` in the library: the
 /// build count is per thread and the hints parse on the blocking pool.
 #[tokio::test]
 async fn hints_read_stored_text_with_patterns() {
@@ -375,7 +360,6 @@ async fn hints_read_stored_text_with_patterns() {
     let observed = hints::never_observed(&backend, &piped).await;
     let nearest =
         hints::nearest_bounds(&backend, &result(search), at("2026-03-14T10:00:00Z")).await;
-    // Both hints read the text: one checked its fields, one widened it.
     assert!(observed.is_empty(), "{observed:?}");
     assert!(
         nearest.starts_with("nearest bounds over events"),
@@ -384,10 +368,6 @@ async fn hints_read_stored_text_with_patterns() {
     assert_eq!(backend.calls().len(), 2, "{:?}", backend.calls());
 }
 
-/// The fields `never_observed` asked the catalog about, in order, over a
-/// catalog that holds no pin at all. Every query must parse under the
-/// parser the hints use, so a parse failure cannot pass a test vacuously,
-/// and no hint may say "absent".
 async fn checked(query: &str) -> Vec<String> {
     trawl_core::parser::parse_unbuilt(query)
         .unwrap_or_else(|errors| panic!("{query} does not parse: {errors:?}"));
@@ -519,8 +499,6 @@ async fn a_made_name_matches_under_the_ascii_case_fold() {
     );
 }
 
-// -- nearest bounds -----------------------------------------------------------
-
 fn nearest_answer() -> trawl_client::QueryResponse {
     query_response(
         vec![
@@ -564,9 +542,6 @@ async fn a_zero_row_search_reports_the_nearest_events_for_the_same_search() {
          2026-03-14T05:30:00.000000Z (3 events from 2026-03-14T04:00:00.750000Z to \
          2026-03-14T10:00:00.000000Z)"
     );
-    // The time clause is gone, the widened bounds clipped at now open
-    // the search, as formatted text prints them, and the rest of the
-    // search is the caller's.
     assert_eq!(
         backend.calls(),
         [
@@ -637,7 +612,6 @@ async fn nothing_on_either_side_says_so() {
     );
 }
 
-/// The one query `nearest_bounds` submitted, parsed back.
 fn submitted_query(backend: &Fake) -> trawl_core::ast::Query {
     let calls = backend.calls();
     assert_eq!(calls.len(), 1, "{calls:?}");
@@ -647,7 +621,6 @@ fn submitted_query(backend: &Fake) -> trawl_core::ast::Query {
     trawl_core::parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl:?}: {e:?}"))
 }
 
-/// The search terms of a parsed query's groups, spans aside.
 fn search_terms(query: &trawl_core::ast::Query) -> Vec<Vec<SearchToken>> {
     query
         .search
@@ -670,9 +643,6 @@ fn phrase_and_service(phrase: &str) -> Vec<Vec<SearchToken>> {
     ]]
 }
 
-/// A phrase holding quotes and the word OR stays one phrase in the
-/// widened query: it must not split into three groups that also match
-/// `service=other`.
 #[tokio::test]
 async fn nearest_preserves_escaped_phrase_filters() {
     let backend = Fake {
@@ -690,8 +660,6 @@ async fn nearest_preserves_escaped_phrase_filters() {
     assert_eq!(submitted.pipeline.len(), 2);
 }
 
-/// Escaped backslashes, including one that ends the phrase, keep their
-/// meaning in the widened query.
 #[tokio::test]
 async fn nearest_preserves_escaped_backslashes() {
     let backend = Fake {
@@ -707,11 +675,6 @@ async fn nearest_preserves_escaped_backslashes() {
     );
 }
 
-// -- advice on the query text -------------------------------------------------
-
-/// The advice hints are one line per finding, its message then its hint,
-/// then one line counting the findings past the cap; a text that does not
-/// parse, or has nothing to advise, gets none.
 #[test]
 fn query_advice_is_one_line_per_finding_then_the_count_left_out() {
     assert_eq!(

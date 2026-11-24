@@ -42,8 +42,6 @@ parking_lot = { workspace = true }
 rand = { workspace = true }
 hyper-util = { workspace = true }
 rcgen = { workspace = true }
-# `trawld --doctor` probes its own listener. The workspace build carries no
-# TLS provider; the doctor installs ring and pins the leaf itself.
 reqwest = { workspace = true }
 rustls = { workspace = true }
 rustls-pki-types = { workspace = true }
@@ -73,58 +71,25 @@ zstd = { workspace = true }
 [target.'cfg(target_os = "linux")'.dependencies]
 metrics-process = { workspace = true }
 
-# `ingest::no_follow` opens WAL files and markers with `O_NOFOLLOW |
-# O_NONBLOCK` on every Unix host. The Linux-only paths (the `statx` mount
-# root) take the same `fs` feature. `process` for `geteuid`, because trawld's
-# generated TLS directories must be its own, and for `getrlimit`/`setrlimit`,
-# which raise the soft descriptor limit at startup; with `fs` it also gives
-# `umask`, which trawld sets to 077 first thing (ADR-0052). `trawld
-# --doctor` reads its files and checks access (`accessat`) through the same
-# `fs` feature, and names the user it ran as through nix's `user` feature
-# (`getpwuid_r`).
 [target.'cfg(unix)'.dependencies]
 rustix = { workspace = true, features = ["process"] }
 nix = { workspace = true }
 
 [features]
-# Exposes the pool's query-delay hook (`pool::TEST_QUERY_DELAY_MS`) to this
-# crate's own integration tests via the self-dev-dependency below, and the
-# engine's phase-clock hold hook (`PhaseClock::hold_on_enter`) to the pool's
-# timing tests, its parquet footer surgery (`parquet_stats::fixture`) to
-# the source tests, and the shared wait helpers (`test_timing`) to the
-# integration tests. No production consumer enables it, so release builds
-# never carry any of them.
 test-support = ["trawl-engine/test-support"]
 
 [dev-dependencies]
-# Self-dependency: enables the test-support hook for this crate's own
-# integration tests. Keep production feature selection independent of
-# the test-support hook.
 trawl-server = { path = ".", default-features = false, features = ["test-support"] }
-# `parser::thread_parses`, which `admission_reuses_the_parsed_query` counts.
 trawl-core = { workspace = true, features = ["test-support"] }
 tokio = { workspace = true, features = ["test-util"] }
 fleet-auth = { workspace = true, features = ["axum", "fast-hash"] }
 trawl-client = { workspace = true }
-# `tests/results_abort.rs` asserts its test-only listener negotiates HTTP/2.
-# A dev-dependency feature reaches only this crate's test builds (resolver
-# 3), never the `trawld` binary, which stays HTTP/1.1 (ADR-0054).
 reqwest = { workspace = true, features = ["http2"] }
-# The CLI's catalog read commands are driven against a real booted server in
-# `tests/catalog_surface.rs`. The workspace dependency disables optional
-# CLI features, including clipboard support, for this server-side test.
 trawl-cli = { workspace = true }
 insta = { workspace = true }
-# `tests/span_context.rs` probes the `log` bridge the way sqlx's statement
-# logger does. Already in the graph through sqlx and tracing-log.
 log = { workspace = true }
-# `tests/vector_service_gate_contract.rs` runs the shipped Vector configs'
-# service gate through the meta engine under the `regex` crate VRL `match`
-# uses. Already in the graph, through trawl-core.
 regex-automata = { workspace = true }
 
-# Tests that lock a directory with mode bits drop the DAC capabilities
-# from the test thread, so the lock binds when the suite runs as root.
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { workspace = true, features = ["thread"] }
 
@@ -137,11 +102,8 @@ section = "net"
 priority = "optional"
 conf-files = ["/etc/trawl/trawld.toml", "/etc/default/trawld", "/etc/default/trawl-web"]
 maintainer-scripts = "debian/"
-# Installed disabled and stopped: the shipped trawld.toml holds CHANGE_ME
-# database URLs, so a started unit could only fail and restart. postinst tells
-# the operator to set the URLs and run `systemctl enable --now trawld trawl-web`.
 # With these flags cargo-deb still restarts, on upgrade, a unit the operator
-# has already started (see debian/tests/packaging.sh).
+# has already started.
 systemd-units = [
     { unit-name = "trawld", enable = false, start = false },
     { unit-name = "trawl-web", enable = false, start = false },
@@ -151,23 +113,18 @@ assets = [
     ["target/release/fleet-admin", "usr/bin/", "755"],
     ["target/release/trawl-web", "usr/bin/", "755"],
     # 0640: these two carry the fleet-auth Postgres DSN (keystore credential).
-    # postinst chowns them root:trawl so trawld (User/Group=trawl) can read them
-    # while unprivileged local users cannot. See debian/postinst.
     ["debian/trawld.toml", "etc/trawl/", "640"],
     ["debian/trawld.default", "etc/default/trawld", "640"],
     ["debian/trawl-web.default", "etc/default/trawl-web", "644"],
     # The source name has to be the destination name with `.sysusers` in place
     # of `.conf`: cargo-deb >= 3.8.0 generates a `systemd-sysusers <name>` call
     # in postinst, and it derives <name> from THIS path via with_extension("conf"),
-    # not from the destination. Spell it `trawl.sysusers.conf` and the generated
-    # call asks for a file that was never installed, so dpkg leaves the package
-    # half-configured. See debian/tests/crashdump-harness.sh.
+    # not from the destination.
     ["debian/trawl.sysusers", "usr/lib/sysusers.d/trawl.conf", "644"],
     # Same naming rule, same reason: cargo-deb runs with_extension("conf") over
     # the source path for tmpfiles.d assets too.
     ["debian/trawl.tmpfiles", "usr/lib/tmpfiles.d/trawl.conf", "644"],
     ["debian/crashdump.conf", "usr/share/doc/trawl-server/examples/crashdump.conf", "644"],
-    # The Vector sender files the guide copies (getting-started/vector-integration).
     # One line each: scripts/release/test-installed-debian.sh lists the same names.
     ["../../config/vector/debian/apache.toml", "usr/share/doc/trawl-server/examples/vector/apache.toml", "644"],
     ["../../config/vector/debian/base.toml", "usr/share/doc/trawl-server/examples/vector/base.toml", "644"],

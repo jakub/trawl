@@ -2,15 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The trial's TLS certificate, generated in process.
-//!
-//! `up` generates one self-signed pair the first time it finds the trawld
-//! volume without a certificate, and never again for that trial (ADR-0045).
-//! The private key PEM lives in a buffer that is zeroed on drop, inside a
-//! [`TrialPair`] whose `Debug` shows none of it. It leaves the process only
-//! through [`super::secrets::put_file`]. rcgen and its crypto backend make
-//! copies of their own while generating and encoding the key, and those are
-//! not wiped.
+//! The trial's TLS certificate, generated in process (ADR-0045).
+//! rcgen and its crypto backend make copies of their own while generating and
+//! encoding the key, and those are not wiped.
 
 use std::fmt;
 
@@ -18,24 +12,16 @@ use zeroize::Zeroizing;
 
 use super::TrialError;
 
-/// The names trawld answers to: `trawld` for trawl-web on the trial
-/// network, and loopback for the host CLI. rcgen makes the two addresses
-/// IP SANs.
 pub const SUBJECT_ALT_NAMES: [&str; 4] = ["trawld", "localhost", "127.0.0.1", "::1"];
 
-/// How long the certificate is valid. A trial is disposable, and `up`
-/// never rotates its certificate.
 pub const VALIDITY_DAYS: i64 = 730;
 
-/// A generated certificate and its private key, both PEM.
 pub struct TrialPair {
     cert_pem: String,
     key_pem: Zeroizing<String>,
 }
 
 impl TrialPair {
-    /// Generate a self-signed ECDSA P-256 certificate for
-    /// [`SUBJECT_ALT_NAMES`], valid from now for [`VALIDITY_DAYS`].
     pub fn generate() -> Result<Self, TrialError> {
         // rcgen's errors name what failed, never the key, but the reason
         // stays generic so no future variant can carry one.
@@ -59,18 +45,15 @@ impl TrialPair {
         })
     }
 
-    /// The private key: PKCS#8, PEM.
     pub fn key_pem(&self) -> &str {
         &self.key_pem
     }
 
-    /// The certificate, PEM.
     #[cfg(test)]
     pub fn cert_pem(&self) -> &str {
         &self.cert_pem
     }
 
-    /// The certificate, dropping the key, which is zeroed.
     pub fn into_cert_pem(self) -> String {
         self.cert_pem
     }
@@ -95,10 +78,6 @@ mod tests {
 
     use super::*;
 
-    /// The generated pair is the certificate trawld serves and both
-    /// clients pin: exactly the four names, P-256, a validity window of
-    /// exactly 730 days that starts now, and a key that rustls loads with
-    /// it. `Debug` shows no key byte.
     #[test]
     fn trial_certificate_policy() {
         let started = time::OffsetDateTime::now_utc().unix_timestamp();

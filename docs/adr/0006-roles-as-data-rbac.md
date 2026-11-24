@@ -1,6 +1,6 @@
 # fleet-auth moves to roles-as-data RBAC; static role enums retire
 
-status: accepted (2026-07-21); amended (2026-10-22) by ADR-0059: two investigation permissions
+status: accepted (2026-07-21); amended (2026-10-22) by ADR-0059: two investigation permissions; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Replaces the static `(key, app, role)` grant model (ADR-0004) with data-defined
 RBAC: a role becomes a named, cross-app bundle of permission strings stored in
@@ -172,3 +172,10 @@ Companion coastwatch arc is prepped separately in that repo after slice 1.
 ## Amendment: two investigation permissions, 2026-10-22
 
 [ADR-0059](0059-an-investigation-is-grant-visible-and-its-evidence-outlives-the-corpus.md) adds `trawl:investigation_read` and `trawl:investigation_write`. They follow this ADR's path exactly: enum variants mirrored in `PERMISSION_NAMES`, vocabulary registered by an appended fleet-auth migration, and granted to a role only by an explicit `fleet-admin roles add-perm`. No existing role gains them at upgrade. The documented agent role holds them with `query`, `schema_read` and `validate`, and a `rate_rpm` of its own; `kind` stays informational and grants nothing. The 429 answer gains a `Retry-After` header rounded up from the limiter's wait, which the limiter computed and discarded before.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **`verify_key` resolves a key's roles and permissions from Postgres on every call, and `VerificationCache` never stores them.** The cache skips only the argon2id check. A role mutation, an unassigned role, or a revoked key therefore takes effect on the key's next request, including a request that carries a session cookie issued before the change, because `require_session` calls `verify_key` too.
+- **App namespaces, role names, and permission strings are lowercase ASCII letters, digits, and underscores, with a hyphen allowed only in role names.** These identifiers go into log fields, file paths, and SQL string literals without escaping. `validation.rs` enforces the charset at the application boundary, and the CHECK constraints on `roles`, `role_permissions`, and `app_permissions` enforce the same rules in the database.

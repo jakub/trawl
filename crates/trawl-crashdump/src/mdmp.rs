@@ -62,7 +62,6 @@ fn malformed(what: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, what)
 }
 
-/// Count the threads and memory regions a dump captured.
 pub(crate) fn counts<R: ReadAt + ?Sized>(src: &R) -> io::Result<MdmpCounts> {
     let mut header = [0u8; 16];
     src.read_exact_at(&mut header, 0)?;
@@ -140,8 +139,6 @@ mod tests {
 
     #[test]
     fn counts_the_denied_signature() {
-        // The shape a refused PTRACE_ATTACH leaves behind: a valid file that
-        // captured nothing.
         let bytes = dump(&[(THREAD_LIST_STREAM, 0), (MEMORY_LIST_STREAM, 0)]);
         assert_eq!(
             counts(bytes.as_slice()).unwrap(),

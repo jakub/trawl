@@ -2,22 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Follow the browser steps of getting-started/first-query.md in real
-// Chromium against a running `trawl trial`, once at each ORIGIN, each in a
-// fresh browser context: sign in with the operator key, select the 7d range,
-// run the documented query with Haul, and open the Health page.
-// test-trial.sh runs it at http://localhost:<web-port>, the acceptance
-// criterion's address, and at http://127.0.0.1:<web-port>, the address
-// `trawl trial up`, `status`, and the tutorial print.
-//
-// Usage: node trial-browser.mjs TOKEN-FILE OUTPUT QUERY ROW ORIGIN...
-//
 // The token is read from TOKEN-FILE and typed into the sign-in form; it is
 // never logged. The browser records no trace, HAR, or video, and no storage
 // state is saved: the only files written to OUTPUT are screenshots taken
 // after sign-in, named after the origin's host, and a JSON report of the
 // phases that passed.
-// TRIAL_E2E_DIR names the directory whose node_modules holds @playwright/test.
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import assert from 'node:assert/strict';
@@ -36,10 +25,7 @@ const browser = await chromium.launch({ headless: true });
 const phases = [];
 const errors = [];
 
-// The result-column vocabulary (reference/api.md, Result columns). A column
-// or a mixed cell's tag is a descriptor `{type, items}`, where only `list`
-// carries `items`, itself a descriptor. Checked before any cell is read, so
-// a response with no rows still has to name known types.
+// The result-column vocabulary (reference/api.md, Result columns).
 const SCALARS = new Set(['integer', 'float', 'boolean', 'string', 'timestamp', 'date', 'time', 'mixed']);
 function descriptor({ type, items } = {}) {
   if (type === 'list') {
@@ -51,10 +37,6 @@ function descriptor({ type, items } = {}) {
   return { type };
 }
 
-// The wire shapes of the cells that are strings: a canonical decimal
-// integer within the 64-bit ranges, RFC 3339 with six fraction digits and
-// an offset (or a signed expanded year outside 0000..9999, or an
-// infinity), a date, a time with any fraction.
 const INTEGER = /^(0|-?[1-9][0-9]*)$/;
 const INTEGER_MIN = -(2n ** 63n);
 const INTEGER_MAX = 2n ** 64n - 1n;
@@ -62,11 +44,8 @@ const TIMESTAMP = /^(?:(?:\d{4}|-\d{4,}|\+\d{5,})-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\
 const DATE = /^\d{4}-\d{2}-\d{2}$/;
 const TIME = /^\d{2}:\d{2}:\d{2}(?:\.\d+)?$/;
 
-// One result cell as a JavaScript value, read under a checked descriptor.
 // An `integer` cell is a decimal string on the wire; the documented rows
-// hold small counts, so Number() is exact. A cell outside the contract is
-// an error, so an old or malformed response cannot produce the documented
-// row by accident.
+// hold small counts, so Number() is exact.
 function cell({ type, items }, value) {
   if (value === null) return null;
   const shaped = (ok, what) => assert.ok(ok, `${what} cell ${JSON.stringify(value)} is not on the wire contract`);
@@ -106,8 +85,8 @@ function cell({ type, items }, value) {
   }
 }
 
-// One query response as an object per row, keyed by column name. Every
-// column descriptor is checked first, rows or no rows.
+// Every column descriptor is checked first, so a response with no rows
+// still has to name known types.
 async function rows(response) {
   assert.equal(response.status(), 200);
   const body = await response.json();
@@ -115,8 +94,6 @@ async function rows(response) {
   return body.rows.map(values => Object.fromEntries(columns.map((c, i) => [c.name, cell(c, values[i])])));
 }
 
-// The whole tutorial at one origin, in a context that shares nothing with
-// another origin's run.
 async function tutorial(origin) {
   const host = new URL(origin).hostname;
   const passed = phase => phases.push(`${host}: ${phase}`);

@@ -4,39 +4,20 @@
 
 //! Syslog message parsing: RFC 3164 (BSD) and RFC 5424.
 //!
-//! Wraps [`syslog_loose`] to provide lenient parsing suitable for network
-//! appliances that often emit slightly non-conformant syslog.
-//!
 //! A zone-less RFC 3164 timestamp is read in the peer's configured zone,
-//! never the host's (ADR-0050). `syslog_loose` is always handed UTC, so the
-//! wall-clock fields come back unshifted, and this module reads them in
-//! the zone. Whether a timestamp was zone-less is decided from the form
-//! that parsed, never from the parsed offset: a wire `Z` and a supplied
-//! UTC look identical once parsed.
+//! never the host's (ADR-0050).
 
 use chrono::{DateTime, Datelike, NaiveDate, NaiveDateTime, Utc};
 use syslog_loose::{Message, ProcId, Protocol, SyslogFacility, Variant};
 
 use super::zone::{Resolved, SyslogZone};
 
-/// A parsed frame and the zone its timestamp was read in.
 #[derive(Debug)]
 pub struct ParsedFrame<'a> {
-    /// The parsed message. A zone-less timestamp has been read in the zone
-    /// already; one in a spring-forward gap is `None`.
     pub msg: Message<&'a str>,
-    /// The zone a zone-less timestamp was read in, gap included. `None`
-    /// when the timestamp carried its own offset or did not parse.
     pub read_in: Option<SyslogZone>,
 }
 
-/// Parse a raw syslog message string, reading a zone-less timestamp in
-/// `zone`. Auto-detects RFC 3164 vs RFC 5424 format.
-///
-/// A year-less RFC 3164 timestamp takes the year nearest `arrival` on the
-/// calendar of `zone` ([`resolve_year`]). A wall time in a fall-back
-/// overlap takes the instant nearer `arrival`, and one in a spring-forward
-/// gap leaves the timestamp `None` while every other field stays parsed.
 pub fn parse_syslog(raw: &str, arrival: DateTime<Utc>, zone: SyslogZone) -> ParsedFrame<'_> {
     let mut msg = syslog_loose::parse_message_with_year_tz(
         raw,
@@ -84,12 +65,6 @@ fn zone_less_3164(raw: &str) -> bool {
         .is_some_and(|word| MONTHS.iter().any(|month| month.eq_ignore_ascii_case(word)))
 }
 
-/// The year of a year-less timestamp: the previous, current or next year
-/// of `arrival` as it reads on `zone`'s wall clock, whichever puts the
-/// wall time nearest that wall clock on the calendar. Only a date the
-/// calendar rejects (Feb 29 outside a leap year) drops out; a DST gap does
-/// not. An exact tie goes to the past. With no valid candidate the
-/// arrival year comes back and the timestamp stays unparsed.
 fn resolve_year(
     (month, day, hour, minute, second): syslog_loose::IncompleteDate,
     arrival: DateTime<Utc>,
@@ -110,7 +85,6 @@ fn resolve_year(
         .map_or(arrival_year, |(_, _, year)| year)
 }
 
-/// Map a syslog facility to its conventional name (`kern`, `local0`, …).
 pub fn facility_to_str(facility: Option<SyslogFacility>) -> Option<&'static str> {
     Some(match facility? {
         SyslogFacility::LOG_KERN => "kern",
@@ -222,9 +196,6 @@ mod tests {
         assert_eq!(parsed.read_in, None, "nothing was read in a zone");
     }
 
-    /// The year is chosen on the calendar, by wall-clock distance from
-    /// arrival as arrival reads in the peer's zone (ADR-0050), not by the
-    /// distance between candidate instants. Here the two disagree.
     #[test]
     fn year_ranks_by_calendar_wall_time() {
         let chicago = zone("America/Chicago");
@@ -239,8 +210,6 @@ mod tests {
         assert_eq!(parsed.read_in, Some(chicago));
     }
 
-    /// Under the old instant rule a gap wall time dropped its own year:
-    /// `Mar  8 02:30` arriving on 2026-03-08 in Chicago resolved to 2027.
     #[test]
     fn gap_wall_time_does_not_skip_a_year() {
         let chicago = zone("America/Chicago");
@@ -259,9 +228,6 @@ mod tests {
         assert_eq!(parsed.msg.msg, "x");
     }
 
-    /// With a zone supplied, `syslog_loose` reads the `MMM DD YYYY` form's
-    /// wall clock as UTC. trawld supplies UTC and re-reads the wall clock
-    /// in the peer's zone, so the defect cannot shift the instant.
     #[test]
     fn with_year_3164_is_not_shifted() {
         let arrival = utc(2026, 1, 15, 20, 0);
@@ -284,10 +250,6 @@ mod tests {
         assert_eq!(instant(&parsed), Some(utc(2026, 7, 15, 17, 0)));
     }
 
-    /// RFC 5424 requires an offset. A frame without one fails the RFC 3339
-    /// parse and loses its whole header, as before ADR-0050. That salvage
-    /// is a separate design; this pins the behavior so a change is
-    /// deliberate.
     #[test]
     fn offsetless_rfc5424_remains_unsalvaged() {
         let raw = "<165>1 2026-03-12T10:00:00 host app - - - msg";
@@ -300,10 +262,7 @@ mod tests {
         assert_eq!(parsed.read_in, None);
     }
 
-    /// The zone-less decision comes from the form that parsed, through the
-    /// real parser: every 3164 form that starts with a month name takes the
-    /// zone, and every form carrying an offset keeps it. A `syslog_loose`
-    /// grammar change that breaks the prefix scan fails here.
+    /// A `syslog_loose` grammar change that breaks the prefix scan fails here.
     #[test]
     fn zone_less_is_decided_by_the_timestamp_form() {
         let india = zone("+05:30");
@@ -407,7 +366,6 @@ mod tests {
 
     #[test]
     fn parse_minimal_bsd() {
-        // Some appliances send very minimal syslog
         let msg = "<13>test message without hostname";
         let parsed = parse_syslog(msg, utc(2026, 3, 12, 10, 0), SyslogZone::UTC).msg;
         assert!(parsed.msg.contains("test message"));

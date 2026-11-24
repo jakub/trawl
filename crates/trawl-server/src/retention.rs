@@ -2,42 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Background data retention task.
-//!
-//! Periodically scans the data directory for date-partitioned directories
-//! and enforces two independent retention policies (ADR-0018 §1-5):
-//!
-//! 1. **Age-based**: deletes a date directory once it is older than its
-//!    env's effective `max_age_days` — the `[retention.env.<name>]`
-//!    override when one exists, else the global value
-//!    ([`RetentionConfig::max_age_days_for`]). 0 keeps that env's data
-//!    forever as far as age goes.
-//! 2. **Disk pressure**: if free disk space drops below
-//!    `min_free_disk_bytes`, deletes by expiry ratio — a directory's age
-//!    over its env's effective `max_age_days`, highest ratio first — until
-//!    the threshold clears. A keep-forever env ranks last but stays
-//!    eligible: nothing is exempt from pressure, because a sweep that
-//!    cannot reach the floor is a wedged daemon. Age is a maximum, never a
-//!    guaranteed minimum.
+//! Background data retention task (ADR-0018).
 //!
 //! Today's directory is never deleted (compaction writes there actively).
-//! Disk-pressure retention is disabled by setting its threshold to 0.
-//!
-//! A repin in flight suppresses both sweeps (marker or either staging sibling).
-//! A date directory that a pending publication marker claims (ADR-0041) is
-//! kept, and a WAL root whose markers cannot be read suppresses both sweeps.
-//!
-//! Each tick records its evidence in [`RetentionEvidence`] (ADR-0042):
-//! confirmed removals by trigger, pressure attempts, and the tick's
-//! [`SweepOutcome`]. The evidence states what happened; it never changes
-//! what a sweep deletes or in which order.
-//!
-//! The field catalog's `field_services` observations are ever-observed:
-//! retention deleting a partition deliberately never reconciles them, and
-//! nothing else removes a row either (ADR-0009 — "which services ever
-//! carried this field" is historical fact, not an index over live files).
-//! Consumers window on `last_seen`; the field axis is bounded by the pin
-//! cap ([`crate::store::MAX_PINNED_FIELDS`]).
 
 use std::cmp::Ordering;
 use std::num::NonZeroU64;
@@ -54,19 +21,15 @@ use trawl_api::SweepOutcome;
 
 use crate::config::RetentionConfig;
 
-/// What made retention remove a date directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RemovalTrigger {
-    /// The directory was older than its env's effective `max_age_days`.
     Age,
-    /// Free space was below `min_free_disk_bytes`.
     DiskPressure,
 }
 
 impl RemovalTrigger {
     pub const ALL: [Self; 2] = [Self::Age, Self::DiskPressure];
 
-    /// The `trigger` label on [`crate::metrics::RETENTION_DELETIONS_TOTAL`].
     #[must_use]
     pub const fn label(self) -> &'static str {
         match self {
@@ -77,12 +40,6 @@ impl RemovalTrigger {
 }
 
 /// Retention's record of what it did since process start (ADR-0042).
-///
-/// Every record method bumps its `/metrics` counter in the same call as
-/// the in-process tally, so the dashboard and a scrape can never disagree
-/// about a count. Nothing here is a bytes-freed figure: the deletion size
-/// walk skips errors and sums logical lengths, so it cannot prove released
-/// blocks.
 #[derive(Debug, Default)]
 pub struct RetentionEvidence {
     removals_age: AtomicU64,
@@ -92,7 +49,6 @@ pub struct RetentionEvidence {
 }
 
 impl RetentionEvidence {
-    /// One date directory whose removal returned success.
     pub fn record_removal(&self, trigger: RemovalTrigger) {
         let tally = match trigger {
             RemovalTrigger::Age => &self.removals_age,
@@ -103,27 +59,19 @@ impl RetentionEvidence {
             .increment(1);
     }
 
-    /// One tick whose first free-space check found the data filesystem
-    /// below the floor.
     pub fn record_pressure_attempt(&self) {
         self.pressure_attempts.fetch_add(1, AtomicOrdering::Relaxed);
         metrics::counter!(crate::metrics::RETENTION_PRESSURE_ATTEMPTS_TOTAL).increment(1);
     }
 
-    /// How the latest tick ended, stamped now on the monotonic clock.
     pub fn record_sweep(&self, outcome: SweepOutcome) {
         *self.last_sweep.lock() = Some((outcome, Instant::now()));
     }
 
-    /// The evidence as the dashboard reports it, with the last sweep's age
-    /// evaluated at `now`.
-    ///
     /// The last sweep is read first, under its lock, and the counters after.
-    /// A tick bumps its counters before it records its outcome, and taking
-    /// the lock orders this read after that record, so the counters read
-    /// next include every removal and attempt of the sweep reported. They
-    /// only grow, so they may also include a later tick's, which is still
-    /// true. Reading the counters first could pair a new outcome, such as
+    /// A tick bumps its counters before it records its outcome, so the counters
+    /// read next include every removal and attempt of the sweep reported.
+    /// Reading the counters first could pair a new outcome, such as
     /// `exhausted_below_floor`, with a pressure attempt count from before
     /// its tick.
     #[must_use]
@@ -144,8 +92,6 @@ impl RetentionEvidence {
     }
 }
 
-/// What the retention loop and the dashboard share: the process's fixed
-/// retention config and the evidence the loop records.
 #[derive(Debug)]
 pub struct RetentionShared {
     pub config: RetentionConfig,
@@ -162,19 +108,14 @@ impl RetentionShared {
     }
 }
 
-/// What one tick saw that decides its [`SweepOutcome`].
 #[derive(Debug, Default)]
 struct TickRecord {
-    /// A deletion returned an error.
     delete_failed: bool,
-    /// A repin or unreadable publication markers stood the sweep down.
     suppressed: bool,
-    /// Pressure deletion ran out of candidates still below the floor.
     exhausted_below_floor: bool,
 }
 
 impl TickRecord {
-    /// Failed, then suppressed, then exhausted below floor, then completed.
     fn outcome(&self) -> SweepOutcome {
         if self.delete_failed {
             SweepOutcome::Failed
@@ -188,11 +129,6 @@ impl TickRecord {
     }
 }
 
-/// Spawn the retention background loop.
-///
-/// Runs every `retention_interval_secs`, scanning `data_dir` for date
-/// directories eligible for deletion, and records each tick into the
-/// shared evidence. Stops when `shutdown_rx` fires.
 pub fn spawn_retention(
     data_dir: PathBuf,
     wal_dir: PathBuf,
@@ -270,31 +206,13 @@ pub fn spawn_retention(
 /// The longest age this install still keeps data for, in seconds, or
 /// `None` when any env keeps its data forever.
 ///
-/// The set is the global `max_age_days` plus every `[retention.env.*]`
-/// entry. The global always participates: an env with no entry inherits
-/// it, and an install always has envs the config never names. A single 0
-/// anywhere is `None` — that env keeps everything, so no finite span
-/// bounds what the corpus still holds. Otherwise the answer is the
-/// maximum, never the minimum: the shortest-lived env says nothing about
-/// data a longer-lived one still stores.
-///
 /// Config domain only. Which env directories exist on disk never enters
 /// it: a horizon that read the filesystem would move as data landed and
 /// aged out, and both callers want a per-process constant.
 ///
-/// Two callers ask the same question. `/api/v1/schema` windows catalog
-/// fields on `last_seen` against it, so autocomplete stops offering
-/// fields whose data has aged out everywhere. Pin garbage collection
-/// ([`crate::catalog::gc`]) floors its dead window here: calling a field
-/// dead over a span shorter than the corpus trawl still stores would
-/// reclaim a pin whose data is right there on disk. Disk-pressure
-/// retention contributes nothing: it deletes by free space rather than by
-/// age, so it names no window a pin could be judged against.
-///
 /// `max_age_days` is an unvalidated operator `u64`, so the multiply
 /// saturates; an "effectively never" setting floors the window at
-/// "effectively never", which refuses every candidate. That is the right
-/// answer for an install that keeps everything.
+/// "effectively never", which refuses every candidate.
 #[must_use]
 pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
     const SECS_PER_DAY: u64 = 86_400;
@@ -311,8 +229,6 @@ pub fn maximum_enabled_age_secs(config: &RetentionConfig) -> Option<u64> {
     Some(longest.saturating_mul(SECS_PER_DAY))
 }
 
-/// One deletion candidate: a date directory under an env directory
-/// (`data/{env}/{date}/`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DateDir {
     env: String,
@@ -320,9 +236,6 @@ struct DateDir {
     path: PathBuf,
 }
 
-/// Calendar days from a directory's date to `today`; a future-dated
-/// directory is 0 days old, never negative.
-///
 /// The one age numerator. Phase 1's cutoff and phase 2's rank both read
 /// it, against the one `today` the tick sampled, so the two phases can
 /// never disagree about how old a directory is. Neither this nor anything
@@ -333,13 +246,9 @@ fn candidate_age_days(today: NaiveDate, date: NaiveDate) -> u64 {
     u64::try_from((today - date).num_days()).unwrap_or(0)
 }
 
-/// Whether `dir` is older than its env's effective age limit.
-///
-/// Reads the limit through [`RetentionConfig::max_age_days_for`], the one
-/// fallback lookup, so an env without an entry inherits the global. A 0 —
-/// global or override — never expires anything. No `chrono::Duration` is
-/// built from the limit: a "keep for 10^12 days" setting is legal config,
-/// and subtracting it from a date panics inside chrono.
+/// No `chrono::Duration` is built from the limit: a "keep for 10^12 days"
+/// setting is legal config, and subtracting it from a date panics inside
+/// chrono.
 fn is_age_expired(dir: &DateDir, today: NaiveDate, config: &RetentionConfig) -> bool {
     let max = config.max_age_days_for(&dir.env);
     max != 0 && candidate_age_days(today, dir.date) > max
@@ -348,20 +257,13 @@ fn is_age_expired(dir: &DateDir, today: NaiveDate, config: &RetentionConfig) -> 
 /// Where a candidate stands in the disk-pressure order (ADR-0018 §2-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ExpiryRank {
-    /// The env has a finite age limit; the candidate has spent
-    /// `age_days / max_age_days` of it.
     Expiring {
         age_days: u64,
         max_age_days: NonZeroU64,
     },
-    /// The env's effective age is 0. Ranked after every `Expiring`
-    /// candidate, still a candidate: keep-forever is a rank, never a
-    /// filter.
     KeepForever,
 }
 
-/// Rank `dir` for the pressure sweep, reading the same effective age and
-/// the same age numerator phase 1 read.
 fn expiry_rank(dir: &DateDir, config: &RetentionConfig, today: NaiveDate) -> ExpiryRank {
     match NonZeroU64::new(config.max_age_days_for(&dir.env)) {
         Some(max_age_days) => ExpiryRank::Expiring {
@@ -372,15 +274,9 @@ fn expiry_rank(dir: &DateDir, config: &RetentionConfig, today: NaiveDate) -> Exp
     }
 }
 
-/// Compare two candidates by deletion priority: `Less` deletes first.
-///
-/// `Expiring` always precedes `KeepForever`; two `KeepForever` are equal
-/// and the date/path keys decide. Two `Expiring` compare by expiry ratio,
-/// highest first: `a` deletes first iff `a.age / a.max > b.age / b.max`,
-/// evaluated as `a.age * b.max > b.age * a.max` in `u128`. Cross-
-/// multiplication keeps the comparison exact at every magnitude a `u64`
-/// can hold (the product of two `u64::MAX` fits `u128`), where an `f64`
-/// division would tie candidates that differ by one day.
+/// Two `Expiring` compare by expiry ratio `age / max`, cross-multiplied in
+/// `u128`, where an `f64` division would tie candidates that differ by one
+/// day.
 fn cmp_priority(a: ExpiryRank, b: ExpiryRank) -> Ordering {
     use ExpiryRank::{Expiring, KeepForever};
     match (a, b) {
@@ -406,7 +302,6 @@ fn cmp_priority(a: ExpiryRank, b: ExpiryRank) -> Ordering {
     }
 }
 
-/// A single retention tick. Samples `today` once and sweeps against it.
 fn retention_tick(
     data_dir: &Path,
     wal_dir: &Path,
@@ -426,19 +321,10 @@ fn retention_tick(
     )
 }
 
-/// One tick, with the clock and the deletion injected.
-///
 /// `today` is threaded into both phases and never resampled: the age
 /// cutoff and the pressure rank must agree on how old every directory is,
 /// and a midnight rollover between the phases would otherwise rank a
-/// directory that survived phase 1 as if it had expired. `delete_fn` is
-/// [`delete_date_dir`] in production; a test injects it to plant a repin
-/// or publication marker after a specific deletion, which no filesystem
-/// arrangement can do on its own (deleting a directory can only make
-/// evidence vanish).
-///
-/// Records the tick's [`SweepOutcome`] into `evidence` exactly once: an
-/// `Err` is `failed`, otherwise the precedence in [`TickRecord::outcome`].
+/// directory that survived phase 1 as if it had expired.
 fn retention_tick_at(
     data_dir: &Path,
     wal_dir: &Path,
@@ -466,8 +352,6 @@ fn retention_tick_at(
     result
 }
 
-/// The tick body: both phases, recording removals, pressure attempts and
-/// what decides the outcome as they happen.
 // The tick's seams are threaded unchanged, and its gates read top to
 // bottom in the order they run.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
@@ -481,19 +365,10 @@ fn sweep(
     free_space_fn: impl Fn(&Path) -> std::io::Result<u64>,
     delete_fn: impl Fn(&Path) -> std::io::Result<u64>,
 ) -> std::io::Result<()> {
-    // A repin in flight — marker, shadow sibling, or aside sibling —
-    // suppresses both sweeps, not just pressure (ADR-0011). Age deletion
-    // would remove affected files out from under the shadow build (the
-    // catch-up diff treats disappearance as an operator act, not a normal
-    // event), and pressure deletion can never reclaim the bytes the job is
-    // deliberately double-holding. The job's own free-space pre-flight is
-    // what keeps this suppression affordable.
     if let Some(what) = repin_in_flight(data_dir) {
         // Alertable, because "suppressed" is not always "a job is
         // running": staging whose sweep keeps failing holds this at 1
-        // across boots with no job to explain it, and the archive grows
-        // the whole time. An info line per tick is not something an
-        // operator can page on; a gauge held high is.
+        // across boots with no job to explain it.
         metrics::gauge!(crate::metrics::RETENTION_SUPPRESSED).set(1.0);
         tracing::info!(
             event_type = "retention_repin_suppressed",
@@ -506,31 +381,11 @@ fn sweep(
         return Ok(());
     }
 
-    // A pending publication marker (ADR-0041) names a canonical output, its
-    // temporary output, or both, by identity. Deleting either turns the
-    // marker into a contradiction that blocks its service until an operator
-    // acts, so a claimed date directory is kept. Markers that cannot be
-    // read may claim anything, so, as with unreadable repin evidence, the
-    // sweep stands down rather than delete under them.
-    //
-    // This scan decides which directories the tick considers at all, and
-    // each deletion re-scans just before it runs (see
+    // Markers that cannot be read may claim anything, so, as with unreadable
+    // repin evidence, the sweep stands down rather than delete under them.
+    // Each deletion re-scans just before it runs (see
     // `publication_claimed_mid_sweep`). There is no lock against
-    // compaction. A publish names the hour compaction read from the clock,
-    // and this tick never deletes the date it reads as today, so a marker
-    // written during the tick normally names a directory the tick keeps
-    // anyway. The exception is a publish that straddles midnight while a
-    // sweep reaches yesterday: compaction reads the old date and this tick
-    // reads the new one. The re-scan keeps that directory if the marker
-    // exists when the re-scan runs. What remains is the window between the
-    // re-scan and the `remove_dir_all`: a marker written there names a
-    // directory the sweep then deletes. Each of that publish's rows is
-    // then either still in the WAL or was published into the deleted date:
-    // none is counted twice, and none is lost that retention was not
-    // already deleting with its date. The marker can outlive its output;
-    // recovery then reports it as contradictory,
-    // `TrawlPublicationRecoveryBlocked` fires, and the service stays
-    // blocked until an operator resolves the marker.
+    // compaction.
     let claims = match crate::ingest::publication_marker::scan_claims(wal_dir) {
         Ok(claims) => claims,
         Err(e) => {
@@ -570,12 +425,8 @@ fn sweep(
     let mut total_bytes_freed: u64 = 0;
     let mut total_dirs_deleted: u64 = 0;
 
-    // Phase 1: age-based retention, decided per candidate against its own
-    // env's effective age. There is no global on/off switch: a global 0
-    // with a finite override still sweeps that env, and a finite global
-    // with a 0 override spares it. The partition hands phase 2 exactly
-    // what age retention did not attempt — a failed age deletion is not
-    // retried under pressure in the same tick.
+    // The partition hands phase 2 exactly what age retention did not attempt
+    // — a failed age deletion is not retried under pressure in the same tick.
     let (age_targets, candidates): (Vec<DateDir>, Vec<DateDir>) = candidates
         .into_iter()
         .partition(|dir| is_age_expired(dir, today, config));
@@ -626,8 +477,6 @@ fn sweep(
         }
     }
 
-    // Phase 2: disk-pressure retention, install-wide over what phase 1
-    // left alone.
     if config.min_free_disk_bytes > 0 {
         let (bytes, dirs) = disk_pressure_sweep(
             data_dir,
@@ -656,13 +505,6 @@ fn sweep(
     Ok(())
 }
 
-/// Delete by expiry ratio until free space clears `min_free_disk_bytes`
-/// or there is nothing left to delete. Returns `(bytes_freed,
-/// dirs_deleted)`.
-///
-/// The first free-space check that finds space below the floor records
-/// one pressure attempt for the tick; later checks in the same loop do
-/// not.
 #[allow(clippy::too_many_arguments)] // the tick's seams, threaded unchanged
 fn disk_pressure_sweep(
     data_dir: &Path,
@@ -680,9 +522,7 @@ fn disk_pressure_sweep(
 
     // Rank once, before the loop. The order is a pure function of the
     // config, the candidate set and the tick's `today`, none of which
-    // moves while the loop runs: highest expiry ratio first, keep-forever
-    // last, then oldest date, then path. Three keys make it a total
-    // order, so a sweep over a given tree is reproducible.
+    // moves while the loop runs.
     candidates.sort_by(|a, b| {
         cmp_priority(expiry_rank(a, config, today), expiry_rank(b, config, today))
             .then_with(|| a.date.cmp(&b.date))
@@ -720,8 +560,6 @@ fn disk_pressure_sweep(
             break;
         }
 
-        // Delete the highest-ranked remaining dir, unless a publication
-        // marker has claimed it since the tick's scan.
         let dir = candidates.remove(0);
         match publication_claimed_mid_sweep(wal_dir, &dir) {
             MidSweepClaim::None => {}
@@ -761,7 +599,6 @@ fn disk_pressure_sweep(
                     "failed to delete date directory under disk pressure"
                 );
                 tick.delete_failed = true;
-                // Continue trying other dirs.
             }
         }
     }
@@ -769,15 +606,6 @@ fn disk_pressure_sweep(
     Ok((total_bytes_freed, total_dirs_deleted))
 }
 
-/// Re-read the repin claim immediately before a deletion, and say so if
-/// it has appeared since the tick opened.
-///
-/// The tick-opening check only says that no job owned the data root when
-/// the tick started. A job admitted mid-tick writes its marker before it
-/// touches anything and keeps it until it is completely done, so re-reading
-/// it here means a `remove_dir_all` can only overlap a shadow build or a
-/// swap if that single directory removal outlives the whole job — as
-/// opposed to any sweep that merely started before the marker landed.
 fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
     let Some(what) = repin_in_flight(data_dir) else {
         return false;
@@ -793,26 +621,16 @@ fn repin_claimed_mid_sweep(data_dir: &Path) -> bool {
     true
 }
 
-/// What a publication-claim re-scan found for one date directory.
 enum MidSweepClaim {
-    /// No pending marker claims the directory.
     None,
-    /// A marker written since the tick's scan claims it: keep it and move
-    /// on to the next candidate.
     Claimed,
-    /// The markers could not be read: stand the sweep down.
     Unreadable,
 }
 
-/// Re-scan the publication markers immediately before deleting `dir`.
-///
-/// The tick's own scan only covers markers that existed when the tick
-/// started. Compaction can publish into yesterday's directory after that
-/// scan when its clock read falls before midnight and this tick's falls
-/// after it. Re-scanning here narrows that race to the time between this
-/// call and the deletion that follows it. An unreadable scan stands the
-/// sweep down and raises the suppression gauge, as the tick's own scan
-/// does.
+/// Compaction can publish into yesterday's directory after the tick's scan
+/// when its clock read falls before midnight and this tick's falls after
+/// it. Re-scanning here narrows that race to the time between this call
+/// and the deletion that follows it.
 fn publication_claimed_mid_sweep(wal_dir: &Path, dir: &DateDir) -> MidSweepClaim {
     match crate::ingest::publication_marker::scan_claims(wal_dir) {
         Ok(claims) if claims.claims_date(&dir.env, dir.date) => {
@@ -847,13 +665,9 @@ fn publication_claimed_mid_sweep(wal_dir: &Path, dir: &DateDir) -> MidSweepClaim
     }
 }
 
-/// Evidence that a repin job owns this data root right now, if any.
-///
-/// One line of policy over [`crate::repin::in_flight_evidence`], the shared
-/// authority: an unreadable answer counts as evidence and suppresses the
-/// sweep. Retention deletes files, so "I could not tell" has to fall on the
-/// side of not deleting them, and the tick that follows would fail reading
-/// the same directory anyway.
+/// An unreadable answer counts as evidence and suppresses the sweep.
+/// Retention deletes files, so "I could not tell" has to fall on the
+/// side of not deleting them.
 fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
     crate::repin::in_flight_evidence(data_dir).unwrap_or_else(|e| {
         tracing::debug!(
@@ -871,17 +685,6 @@ fn repin_in_flight(data_dir: &Path) -> Option<&'static str> {
     })
 }
 
-/// Enumerate date-formatted directories across every env directory in
-/// `data_dir` (ADR-0009 layout: `data/{env}/{date}/`), excluding today
-/// and non-date directories. Env directories are recognised by the env
-/// charset with `wal`/`scheduled` reserved — anything else at the top
-/// level (a stray file, the EPOCH marker, a set-aside dir) is skipped.
-/// [`crate::env_dirs::date_partition`] is the recognition rule, shared
-/// with the storage scan's per-date byte buckets.
-/// Candidates are merged across envs and sorted by (date, path): a
-/// deterministic base order for phase 1, which deletes in it, and for
-/// phase 2, which re-sorts by expiry ratio with these two as tie-breaks.
-/// Deleting one env's date dir stays O(1) and never touches other envs.
 fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> std::io::Result<Vec<DateDir>> {
     let entries = std::fs::read_dir(data_dir).map_err(|e| {
         std::io::Error::new(
@@ -927,14 +730,12 @@ fn enumerate_date_dirs(data_dir: &Path, today: NaiveDate) -> std::io::Result<Vec
     Ok(dirs)
 }
 
-/// Delete a date directory and return the bytes freed.
 fn delete_date_dir(path: &Path) -> std::io::Result<u64> {
     let size = dir_size(path);
     std::fs::remove_dir_all(path)?;
     Ok(size)
 }
 
-/// Recursively compute the total size of a directory in bytes.
 fn dir_size(path: &Path) -> u64 {
     let mut total: u64 = 0;
     if let Ok(entries) = std::fs::read_dir(path) {
@@ -968,9 +769,6 @@ mod tests {
         }
     }
 
-    /// A config with a global age and `[retention.env.*]` overrides.
-    /// Disk pressure is off; a test that wants it sets
-    /// `min_free_disk_bytes` through struct update.
     fn config_with_envs(max_age_days: u64, envs: &[(&str, u64)]) -> RetentionConfig {
         RetentionConfig {
             env: envs
@@ -988,8 +786,6 @@ mod tests {
         }
     }
 
-    /// A `today` the sweep is handed, so a tree's ages are fixed by the
-    /// test and not by the wall clock.
     fn fixed_today() -> NaiveDate {
         NaiveDate::from_ymd_opt(2026, 9, 4).unwrap()
     }
@@ -998,13 +794,10 @@ mod tests {
         today - chrono::Duration::days(days)
     }
 
-    /// A WAL root with no publication markers: a missing root has none.
     fn no_wal() -> PathBuf {
         PathBuf::from("/nonexistent/trawl-retention-test/wal")
     }
 
-    /// Plant a pending publication marker, through the real writer, that
-    /// claims `svc`'s hour 07 output on `date` in `env`.
     fn plant_publication_marker(wal_dir: &Path, env: &str, date: NaiveDate) -> PathBuf {
         use crate::ingest::publication_marker::{OutputIdentity, ValidatedMarker, write_marker};
         let marker = ValidatedMarker::new(
@@ -1024,7 +817,6 @@ mod tests {
         marker.marker_path(wal_dir)
     }
 
-    /// Create `data_dir/{env}/{date}/svc.parquet` and return the date dir.
     fn plant(data_dir: &Path, env: &str, date: NaiveDate) -> PathBuf {
         let dir = data_dir.join(env).join(date.format("%Y-%m-%d").to_string());
         std::fs::create_dir_all(&dir).unwrap();
@@ -1032,7 +824,6 @@ mod tests {
         dir
     }
 
-    /// A deletion that records the order in which the sweep asked for it.
     fn recording_delete(log: &Mutex<Vec<PathBuf>>) -> impl Fn(&Path) -> std::io::Result<u64> {
         move |path| {
             log.lock().unwrap().push(path.to_path_buf());
@@ -1040,15 +831,10 @@ mod tests {
         }
     }
 
-    /// A free-space probe that stays below a 1 MB threshold forever.
     fn always_pressured() -> impl Fn(&Path) -> std::io::Result<u64> {
         |_| Ok(500_000)
     }
 
-    /// The horizon is the LONGEST age anything still keeps, and a single
-    /// keep-forever setting lifts it entirely. A minimum would tell the
-    /// schema window and the pin-gc floor that data is gone while a
-    /// long-retention env still stores it.
     #[test]
     fn maximum_enabled_age_is_the_longest_age_any_env_keeps() {
         const DAY: u64 = 86_400;
@@ -1075,12 +861,6 @@ mod tests {
         );
     }
 
-    /// `max_age_days` is an unvalidated operator `u64` in the global and in
-    /// every override, and "effectively never" values are what an operator
-    /// reaches for. The multiply saturates rather than wrapping; the
-    /// `/api/v1/schema` end of the same value is covered by
-    /// `handlers::tests::since_from_secs_saturates_instead_of_panicking`,
-    /// which lands `u64::MAX` seconds on the unix epoch.
     #[test]
     fn maximum_enabled_age_saturates_instead_of_wrapping() {
         assert_eq!(
@@ -1107,10 +887,6 @@ mod tests {
         );
     }
 
-    /// Phase 1's cutoff and phase 2's rank read the same effective age
-    /// for the same env, through the one lookup. If they ever diverged, a
-    /// directory could survive age retention and still be ranked as
-    /// expired, or the reverse.
     #[test]
     fn age_cutoff_and_rank_read_one_effective_age() {
         let today = fixed_today();
@@ -1155,7 +931,6 @@ mod tests {
         );
     }
 
-    /// The comparator table. `Less` deletes first.
     #[test]
     fn cmp_priority_orders_by_exact_expiry_ratio() {
         use ExpiryRank::{Expiring, KeepForever};
@@ -1172,9 +947,6 @@ mod tests {
         assert_eq!(cmp_priority(lab, prod), Ordering::Less);
         assert_eq!(cmp_priority(prod, lab), Ordering::Greater);
 
-        // Keep-forever candidates are equal among themselves (date and
-        // path decide) and follow every finite candidate, even one that
-        // has spent none of its allowance.
         assert_eq!(cmp_priority(KeepForever, KeepForever), Ordering::Equal);
         let fresh = expiring(0, 7);
         assert_eq!(cmp_priority(fresh, KeepForever), Ordering::Less);
@@ -1195,8 +967,6 @@ mod tests {
         );
         assert_eq!(cmp_priority(full, full), Ordering::Equal);
 
-        // A ratio above 1 (an age target whose deletion failed is not
-        // here, but nothing forbids the value) still orders.
         assert_eq!(cmp_priority(expiring(2, 1), expiring(1, 1)), Ordering::Less);
     }
 
@@ -1204,13 +974,10 @@ mod tests {
     fn enumerate_excludes_wal_and_non_dates() {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("prod/2026-01-01")).unwrap();
-        // Reserved dirs and non-env top-level entries are skipped entirely.
         std::fs::create_dir_all(tmp.path().join("wal/2026-01-01")).unwrap();
         std::fs::create_dir_all(tmp.path().join("scheduled/2026-01-01")).unwrap();
         std::fs::create_dir(tmp.path().join("not-a-date")).unwrap();
-        // A legacy top-level date dir is not an env dir — skipped.
         std::fs::create_dir(tmp.path().join("2026-01-02")).unwrap();
-        // Also create a regular file — should be skipped.
         std::fs::write(tmp.path().join("stray.txt"), b"hi").unwrap();
 
         let dirs = enumerate_date_dirs(tmp.path(), fixed_today()).unwrap();
@@ -1220,9 +987,6 @@ mod tests {
         assert!(dirs[0].path.starts_with(tmp.path().join("prod")));
     }
 
-    /// Retention deletes only canonical calendar dates. An impossible date
-    /// and a padded spelling of a real one are left alone, whatever epoch's
-    /// owned-residue check says about them.
     #[test]
     fn noncalendar_date_dir_is_never_a_candidate() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1258,8 +1022,6 @@ mod tests {
         let lab_old = plant(tmp.path(), "lab", old_date);
         let prod_old = plant(tmp.path(), "prod", old_date);
 
-        // Both envs' old dates age out independently; deleting one is an
-        // O(1) directory remove that never touches the sibling env root.
         let config = make_config(90, 0);
         retention_tick(
             tmp.path(),
@@ -1349,9 +1111,6 @@ mod tests {
         assert!(old_dir.exists(), "nothing should be deleted when disabled");
     }
 
-    /// AC1: each env ages out against its own limit, an env without an
-    /// entry inherits the global, and the limit is exclusive (age must
-    /// exceed it).
     #[test]
     fn per_env_age_cutoffs_apply_per_env() {
         let today = fixed_today();
@@ -1388,8 +1147,6 @@ mod tests {
         assert!(!staging_91.exists(), "unlisted env inherits the global 90");
     }
 
-    /// The old phase-1 gate (`if max_age_days > 0`) is gone: a global 0
-    /// no longer switches off an env that asked for a finite limit.
     #[test]
     fn global_zero_with_a_finite_override_still_ages_that_env_out() {
         let today = fixed_today();
@@ -1419,8 +1176,6 @@ mod tests {
         assert!(lab_4000.exists(), "lab inherits the global 0: keep forever");
     }
 
-    /// The mirror image: an override of 0 spares that env from age
-    /// retention under a finite global.
     #[test]
     fn per_env_zero_under_a_finite_global_keeps_that_env() {
         let today = fixed_today();
@@ -1445,9 +1200,6 @@ mod tests {
         assert!(!prod_200.exists(), "prod inherits the global 90");
     }
 
-    /// An "effectively never" age is legal config. The previous sweep
-    /// built a `chrono::Duration` from it and panicked past ~1.07e11
-    /// days; the tick has to complete and delete nothing.
     #[test]
     fn huge_max_age_does_not_panic() {
         for huge in [u64::MAX, 999_999_999_999] {
@@ -1513,8 +1265,6 @@ mod tests {
             std::fs::write(dir.join("data.parquet"), b"some data").unwrap();
         }
 
-        // Simulate: first call reports low space, second call (after deletion)
-        // reports enough space.
         let call_count = AtomicU32::new(0);
         let config = make_config(0, 1_000_000);
         retention_tick(
@@ -1524,11 +1274,7 @@ mod tests {
             &RetentionEvidence::default(),
             |_| {
                 let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
-                if n == 0 {
-                    Ok(500_000) // below threshold
-                } else {
-                    Ok(2_000_000) // above threshold
-                }
+                if n == 0 { Ok(500_000) } else { Ok(2_000_000) }
             },
         )
         .unwrap();
@@ -1538,10 +1284,6 @@ mod tests {
         assert!(newest.exists(), "newest should survive");
     }
 
-    /// AC2: pressure deletes by expiry ratio, a keep-forever env goes
-    /// last, and "last" is not "never": once nothing else is left, the
-    /// sweep takes it too, because a sweep that cannot reach the floor
-    /// is a wedged daemon.
     #[test]
     fn disk_pressure_ranks_by_ratio_and_reaches_keep_forever_last() {
         let today = fixed_today();
@@ -1635,12 +1377,6 @@ mod tests {
         }
     }
 
-    /// Pressure deletion compares the filesystem's real available bytes
-    /// with the floor while the query scratch directory holds bytes
-    /// (ADR-0056). Scratch is ordinary headroom use: its bytes are not
-    /// counted back as free, so a large query can start pressure deletion
-    /// early, and the sweep never deletes from scratch itself.
-    ///
     /// The free-space probe models one filesystem holding the whole tree:
     /// its capacity less every byte under the root, scratch included. The
     /// floor sits between what is free with the scratch bytes and what
@@ -1652,7 +1388,6 @@ mod tests {
         const SCRATCH_BYTES: usize = 600_000;
         const FLOOR: u64 = 1_500_000;
 
-        /// Every byte stored under `dir`.
         fn used(dir: &Path) -> u64 {
             std::fs::read_dir(dir)
                 .unwrap()
@@ -1727,13 +1462,6 @@ mod tests {
         );
     }
 
-    /// While a repin job exists on this root — marker, shadow sibling, or
-    /// aside sibling — both sweeps stand down. Age deletion would yank
-    /// affected files out from under the shadow build (the catch-up diff
-    /// sees additions, not disappearances, as normal), and pressure
-    /// deletion could never reclaim the double-held bytes the job itself
-    /// is holding. A per-env override licenses nothing the gate denies
-    /// (ADR-0018 §4).
     #[test]
     fn both_sweeps_suppressed_while_a_repin_is_in_flight() {
         let today = fixed_today();
@@ -1755,7 +1483,6 @@ mod tests {
                 }
             }
 
-            // Age (global and per-env) and pressure all armed, all hungry.
             let config = RetentionConfig {
                 min_free_disk_bytes: 1_000_000,
                 ..config_with_envs(90, &[("lab", 7)])
@@ -1777,11 +1504,7 @@ mod tests {
         }
     }
 
-    /// A job admitted mid-tick stops the sweep too. The tick-opening check
-    /// only speaks for the moment the tick started; a sweep that got past
-    /// it would keep calling `remove_dir_all` right through the shadow
-    /// build and the swap. The claim is therefore re-read before every
-    /// deletion — here the marker appears (via the injected free-space
+    /// Here the marker appears (via the injected free-space
     /// probe) after the first directory is already gone.
     #[test]
     fn a_repin_admitted_mid_tick_stops_the_sweep_at_the_next_deletion() {
@@ -1808,7 +1531,6 @@ mod tests {
             |_| {
                 let n = call_count.fetch_add(1, AtomicOrdering::Relaxed);
                 if n == 1 {
-                    // A job claims the data root while the sweep is running.
                     std::fs::write(&marker, b"{}").unwrap();
                 }
                 Ok(500_000)
@@ -1865,11 +1587,6 @@ mod tests {
         );
     }
 
-    /// Suppression is alertable, not just loggable. `repin_running` is 0
-    /// for staging no job owns — a boot replay whose sweep keeps failing
-    /// — which is precisely the case that suppresses retention forever,
-    /// so the gauge has to key on the staging itself and clear on the
-    /// tick that sweeps again.
     #[test]
     fn suppression_raises_and_clears_the_alertable_gauge() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1919,9 +1636,6 @@ mod tests {
         );
     }
 
-    /// A date directory a pending publication marker claims survives both
-    /// sweeps, while an unclaimed one just as old goes. Once the marker is
-    /// resolved, the next tick deletes the directory too.
     #[test]
     fn a_date_a_publication_marker_claims_survives_both_sweeps() {
         let today = fixed_today();
@@ -1933,8 +1647,6 @@ mod tests {
         let other_env = plant(&data_dir, "lab", days_before(today, 200));
         let marker = plant_publication_marker(&wal_dir, "prod", days_before(today, 200));
 
-        // Age and pressure both armed: every candidate is expired and the
-        // disk stays full.
         let config = RetentionConfig {
             min_free_disk_bytes: 1_000_000,
             ..make_config(90, 0)
@@ -1967,11 +1679,8 @@ mod tests {
         assert!(!claimed.exists(), "a resolved marker no longer claims");
     }
 
-    /// A marker written after the tick's own scan still keeps its date: the
-    /// sweep re-scans just before each deletion. In the age phase the
-    /// injected deletion plants the marker right after the first target
-    /// goes, naming the second. The second survives and the third, which
-    /// no marker claims, is still deleted.
+    /// In the age phase the injected deletion plants the marker right after
+    /// the first target goes, naming the second.
     #[test]
     fn a_publication_marker_written_mid_age_sweep_keeps_its_date() {
         let today = fixed_today();
@@ -2048,8 +1757,6 @@ mod tests {
         );
     }
 
-    /// If the re-scan cannot read the markers, the sweep stops before the
-    /// next deletion and raises the suppression gauge.
     #[test]
     fn markers_unreadable_mid_sweep_stop_the_next_deletion() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -2097,9 +1804,6 @@ mod tests {
         );
     }
 
-    /// Markers that cannot be read may claim any date, so an unreadable WAL
-    /// root stands both sweeps down and raises the suppression gauge, as
-    /// unreadable repin evidence does.
     #[test]
     fn an_unreadable_wal_root_suppresses_both_sweeps() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -2136,7 +1840,6 @@ mod tests {
         );
     }
 
-    /// And both resume once the job's staging is gone.
     #[test]
     fn sweeps_resume_after_the_repin_ends() {
         let today = chrono::Utc::now().date_naive();
@@ -2184,7 +1887,6 @@ mod tests {
         std::fs::create_dir_all(&today_dir).unwrap();
         std::fs::write(today_dir.join("data.parquet"), b"today").unwrap();
 
-        // Disk pressure with only today's dir — should warn but not delete.
         let config = make_config(0, 1_000_000);
         retention_tick(
             tmp.path(),
@@ -2207,10 +1909,6 @@ mod tests {
         std::fs::create_dir_all(&dir_b).unwrap();
         std::fs::write(dir_b.join("data.parquet"), b"data").unwrap();
 
-        // Both dirs are old enough, so both are processed. Nothing here
-        // actually makes a deletion fail: `remove_dir_all` succeeds on an
-        // empty dir, and a permission-denied dir needs setup the suite
-        // cannot rely on.
         let config = make_config(30, 0);
         retention_tick(
             tmp.path(),
@@ -2243,7 +1941,6 @@ mod tests {
     fn empty_data_dir_is_noop() {
         let tmp = tempfile::tempdir().unwrap();
         let config = make_config(90, 1_000_000);
-        // Should succeed with no dirs to process.
         retention_tick(
             tmp.path(),
             &no_wal(),
@@ -2280,10 +1977,6 @@ mod tests {
         }
     }
 
-    /// The reference deletion order for a tree under permanent pressure:
-    /// phase 1's expired set in (date, env) order, then phase 2's
-    /// survivors by ratio descending with keep-forever last, then date,
-    /// then env (the path's only varying component).
     fn reference_order(planted: &[Planted]) -> Vec<PathBuf> {
         let mut expired: Vec<&Planted> = planted.iter().filter(|p| p.expired()).collect();
         expired.sort_by(|a, b| a.date.cmp(&b.date).then_with(|| a.env.cmp(b.env)));
@@ -2308,10 +2001,6 @@ mod tests {
             .collect()
     }
 
-    /// Build one random tree: 1-4 envs, each inheriting, keep-forever or
-    /// finite; 1-6 distinct dates per env from 30 days ahead to 800 days
-    /// back, never today itself (that one is planted separately and must
-    /// survive). Returns the config and the oracle's view of the tree.
     fn random_tree(
         rng: &mut impl rand::Rng,
         data_dir: &Path,
@@ -2374,10 +2063,6 @@ mod tests {
         out
     }
 
-    /// Under permanent pressure a tick drains every non-today directory
-    /// (keep-forever included), in exactly the order an independent
-    /// oracle computes, and the ratios pressure deletes at never rise
-    /// along the way. Seeded, so a failure names its tree.
     #[test]
     fn generative_full_sweep_drains_in_reference_order() {
         use rand::SeedableRng;
@@ -2443,9 +2128,6 @@ mod tests {
         }
     }
 
-    // -- capacity evidence (ADR-0042) ---------------------------------------
-
-    /// The evidence one tick left behind, read at the instant it finished.
     fn evidence_after(evidence: &RetentionEvidence) -> (u64, u64, u64, Option<SweepOutcome>) {
         let snapshot = evidence.snapshot(Instant::now());
         (
@@ -2456,8 +2138,6 @@ mod tests {
         )
     }
 
-    /// A free-space probe that is below a 1 MB floor for its first `below`
-    /// checks and clear after that.
     fn pressured_for(below: u32) -> impl Fn(&Path) -> std::io::Result<u64> {
         let checks = AtomicU32::new(0);
         move |_| {
@@ -2499,7 +2179,6 @@ mod tests {
             evidence_after(&evidence),
             (2, 0, 0, Some(SweepOutcome::Completed))
         );
-        // The scrape counts the same removals, under the same trigger.
         let deletions = crate::metrics::RETENTION_DELETIONS_TOTAL;
         assert_eq!(
             crate::metrics::test_support::sample(
@@ -2508,8 +2187,6 @@ mod tests {
             ),
             2
         );
-        // The idle trigger stays at its zero baseline: age removals never
-        // count as pressure deletions, and no attempt was made.
         assert_eq!(
             crate::metrics::test_support::sample(
                 &handle,
@@ -2852,8 +2529,6 @@ mod tests {
         );
     }
 
-    /// The last sweep's age runs on the monotonic clock from the moment the
-    /// tick recorded it.
     #[test]
     fn retention_capacity_last_sweep_ages_from_its_record() {
         let evidence = RetentionEvidence::default();
@@ -2869,12 +2544,10 @@ mod tests {
         );
     }
 
-    /// A snapshot never pairs a sweep outcome with counters older than the
-    /// tick that recorded it. The test holds the last-sweep lock while a
-    /// snapshot starts, then records a whole pressure tick (its attempt,
-    /// then its outcome) and releases the lock. A snapshot that read the
-    /// counters before waiting on the lock would report the tick's
-    /// `exhausted_below_floor` with no pressure attempt.
+    /// The test holds the last-sweep lock while a snapshot starts, then records
+    /// a whole pressure tick (its attempt, then its outcome) and releases the
+    /// lock. A snapshot that read the counters before waiting on the lock would
+    /// report the tick's `exhausted_below_floor` with no pressure attempt.
     #[test]
     fn retention_capacity_snapshot_counts_every_attempt_its_sweep_saw() {
         let evidence = Arc::new(RetentionEvidence::default());

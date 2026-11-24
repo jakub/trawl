@@ -3,18 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Every recursive walk a query reaches fits a quarter of a worker's
-//! stack when its tree is 64 levels deep (#447).
-//!
-//! The walks over a parsed query stay recursive: the parser bounds how
-//! deep a tree may be, and this test is the premise that bound rests on.
-//! Each shape is exactly 64 levels deep, counted as `context.md`'s
-//! **Tree depth** counts, and runs through every walk the batch and live
-//! lanes reach, on one thread with a 512 KiB stack in the debug build: a
-//! quarter of the 2 MiB a tokio worker or a blocking preparation job has.
-//!
-//! A step that refuses the query for what it means, as it does today,
-//! has still walked the tree, so it counts as done. The refusals are
-//! printed, so a run's log says which step refused which shape.
+//! stack when its tree is 64 levels deep.
 
 use std::fmt::Write as _;
 
@@ -32,10 +21,8 @@ use trawl_core::stream::{
     StreamPlan, accept_event, accept_event_into_aggregate, compile_stream_plan_with,
 };
 
-/// A quarter of a tokio worker's 2 MiB stack.
 const QUARTER_STACK: usize = 512 * 1024;
 
-/// The tree depth limit #447 sets.
 const LIMIT: usize = 64;
 
 /// Names the step about to run, so a stack overflow, which aborts the
@@ -49,8 +36,6 @@ fn phase(shape: &str, step: &str) {
 /// fails the test.
 const STREAM_REFUSALS: [&str; 4] = ["stats", "timechart", "eventstats", "pivot"];
 
-/// Records a step that refused the shape for what it means, and fails on
-/// a refusal [`STREAM_REFUSALS`] does not name.
 fn refused(shape: &str, step: &str, why: &dyn std::fmt::Display) {
     eprintln!("shape={shape} step={step} refused: {why}");
     assert!(
@@ -59,12 +44,10 @@ fn refused(shape: &str, step: &str, why: &dyn std::fmt::Display) {
     );
 }
 
-/// `n` terms joined by `+`: an operator chain `n - 1` levels deep.
 fn chain(n: usize) -> String {
     vec!["1"; n].join(" + ")
 }
 
-/// `a == 0 <op> a == 1 …`: `n` comparisons, `n` levels deep.
 fn comparisons(n: usize, op: &str) -> String {
     (0..n)
         .map(|i| format!("a == {i}"))
@@ -72,7 +55,6 @@ fn comparisons(n: usize, op: &str) -> String {
         .join(&format!(" {op} "))
 }
 
-/// `body` wrapped in `n` nested calls to `function`.
 fn calls(function: &str, n: usize, body: &str) -> String {
     format!(
         "{}{body}{}",
@@ -81,7 +63,6 @@ fn calls(function: &str, n: usize, body: &str) -> String {
     )
 }
 
-/// Every shape #447's first premise checkpoint names, each 64 deep.
 fn shapes() -> Vec<(&'static str, String)> {
     vec![
         ("plus chain", format!("* | where {} > 0", chain(LIMIT))),
@@ -95,7 +76,6 @@ fn shapes() -> Vec<(&'static str, String)> {
         ),
         (
             "minus run",
-            // `-` repeats with no space between
             format!("* | where {}a < 2", "-".repeat(LIMIT - 1)),
         ),
         (
@@ -153,11 +133,7 @@ fn shapes() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// The deepest root in `query`, counted as `context.md`'s **Tree depth**:
-/// a field, value, search word, filter or time clause is 0, and each
-/// operator, unary, call, `in` list, search `NOT` and bracket group adds
-/// one to its deepest child. An aggregation's call is no level; each of
-/// its arguments is a root.
+/// The deepest root in `query`, counted as `context.md`'s **Tree depth**.
 fn tree_depth(query: &Query) -> usize {
     let search = query
         .search
@@ -233,7 +209,6 @@ fn token_depth(token: &SearchToken) -> usize {
     }
 }
 
-/// Runs every walk a query reaches, in the order a run reaches them.
 fn walk(shape: &str, dsl: &str) {
     phase(shape, "parse");
     let query = trawl_core::parser::parse(dsl)

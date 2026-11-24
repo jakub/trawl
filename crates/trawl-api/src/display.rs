@@ -16,8 +16,6 @@ use crate::value::{ColumnType, QueryResult, Value};
 /// results grid shows it: each timestamp through [`timestamp_text`], a list
 /// the way `Value`'s `Display` writes one. The CLI table and the TUI use
 /// [`crate::zone::present_cell`].
-///
-/// `None` for any other cell, which each surface renders its own way.
 #[must_use]
 pub fn timestamp_cell_text(ty: &ColumnType, value: &Value) -> Option<String> {
     match (ty, value) {
@@ -37,8 +35,6 @@ fn holds_timestamps(ty: &ColumnType) -> bool {
     }
 }
 
-/// A list element the way `Value`'s `Display` writes one, with the
-/// timestamps in it shown through [`timestamp_text`].
 fn element_text(ty: &ColumnType, value: &Value) -> String {
     match (ty, value) {
         (ColumnType::Timestamp, Value::String(text)) => timestamp_text(text),
@@ -89,8 +85,6 @@ pub fn timestamp_text(text: &str) -> String {
     }
 }
 
-/// Convert a [`Value`] to a string for display.
-///
 /// Floats are rendered to 2 decimal places for readability; callers that
 /// need full precision (CSV export, etc.) should format the numeric
 /// variants themselves.
@@ -107,20 +101,12 @@ pub fn value_to_string(value: &Value) -> String {
     }
 }
 
-/// Detect if a query result came from a timechart/`time_bucket` query.
-///
-/// Timechart queries always produce a `_time` column. We check any
-/// position because `UNION ALL BY NAME` can reorder columns.
+/// We check any position because `UNION ALL BY NAME` can reorder columns.
 #[must_use]
 pub fn is_timechart_result(result: &QueryResult) -> bool {
     result.columns.iter().any(|col| col.name == "_time")
 }
 
-/// Downsample a series to fit within `target_width` buckets.
-///
-/// When there are more data points than buckets, groups points into
-/// buckets and takes the max of each bucket (preserving peaks).
-/// When data already fits, returns it as-is.
 #[must_use]
 #[allow(clippy::cast_precision_loss)] // typical target widths won't overflow f64
 pub fn downsample(values: &[u64], target_width: usize) -> Vec<u64> {
@@ -148,11 +134,6 @@ pub fn downsample(values: &[u64], target_width: usize) -> Vec<u64> {
     result
 }
 
-/// Convert a [`Value`] to `u64` for chart rendering.
-///
-/// Negative numbers clamp to 0; strings are parsed as floats (best
-/// effort); nulls, booleans, and arrays return 0. A [`Value::UInt`] is
-/// already this function's own width, so it passes through exactly.
 #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
 fn value_to_u64(value: &Value) -> u64 {
     match value {
@@ -164,23 +145,16 @@ fn value_to_u64(value: &Value) -> u64 {
     }
 }
 
-/// Whether a cell reads as a group label rather than a measurement.
-///
 /// Text is a label. A number is a measurement whatever its width, which
 /// is why an oversized unsigned carries the [`Value::UInt`] variant
-/// rather than its digits as a string: classified by variant, a 20-digit
-/// `VARCHAR` label and a 20-digit measurement never trade places.
+/// rather than its digits as a string.
 fn is_group_label(cell: Option<&Value>) -> bool {
     matches!(cell, Some(Value::String(_)))
 }
 
-/// A series' total, for ranking the top six only.
-///
 /// Wider than the points it adds: a metric column can hold values near
 /// `u64::MAX` (an id, a byte count), and two of them overflow a `u64`
-/// accumulator — a panic under overflow checks, and a wrap to zero
-/// without them, which ranks the largest series last and drops it. The
-/// total is never displayed, so its width costs nothing.
+/// accumulator.
 fn series_total(values: &[u64]) -> u128 {
     values.iter().copied().map(u128::from).sum()
 }
@@ -193,10 +167,6 @@ fn series_total(values: &[u64]) -> u128 {
 ///   distinct group label
 /// - **Multi-agg**: `[_time, metric_a, metric_b, ...]` (all numeric) →
 ///   one series per metric column
-///
-/// "Numeric" is decided by variant, so a [`Value::UInt`] measurement
-/// charts like any other number and a digit string of any width stays a
-/// label.
 ///
 /// Series are capped to the top 6 by total value, then sorted
 /// alphabetically by label for stable rendering. Returns
@@ -305,15 +275,6 @@ pub fn extract_series_labelled(
     }
 }
 
-/// Ranking the top six survives a series whose points sum past
-/// `u64::MAX`.
-///
-/// Seven metric columns force the cap, and two `UInt` points at
-/// `2^63` sum to `2^64` — one past what a `u64` accumulator holds. Under
-/// overflow checks that panicked; without them it wrapped to zero, so
-/// the largest series ranked last and was the one dropped. The ranking
-/// total is not a measurement anyone reads, so it is free to be wider
-/// than the values it adds up.
 #[cfg(test)]
 #[test]
 fn series_ranking_survives_unsigned_totals() {
@@ -326,7 +287,6 @@ fn series_ranking_survives_unsigned_totals() {
             crate::value::Column::new(format!("m{i}"), crate::value::ColumnType::Integer)
         }));
 
-    // Six small metrics and one enormous one, twice over.
     let row = |t: &str| {
         let mut cells = vec![Value::String(t.to_owned())];
         cells.extend((0..6).map(|i| Value::Integer(i64::from(i) + 1)));
@@ -352,13 +312,6 @@ fn series_ranking_survives_unsigned_totals() {
     );
 }
 
-/// An oversized unsigned measurement is still a measurement.
-///
-/// `| timechart first(request_id), count()` over a `request_id` past
-/// `i64::MAX` puts a [`Value::UInt`] in a measurement column. Classified
-/// as a label it would collapse the whole chart into one series named
-/// after the number and drop the second metric — a plausible chart of the
-/// wrong thing. The variant is what keeps that from happening.
 #[cfg(test)]
 #[test]
 fn uint_metric_is_not_a_group() {
@@ -383,11 +336,6 @@ fn uint_metric_is_not_a_group() {
     assert_eq!(series[1].1, vec![u64::MAX]);
 }
 
-/// A digit string is a genuine label whatever its width.
-///
-/// Text is text: a `VARCHAR` status code and a 20-digit `VARCHAR`
-/// identifier both group the chart. Reading either as a measurement — the
-/// heuristic a string landing forces — would silently drop the grouping.
 #[cfg(test)]
 #[test]
 fn digit_string_label_stays_a_group() {
@@ -419,8 +367,6 @@ fn digit_string_label_stays_a_group() {
     assert_eq!(series[0].0, "404");
     assert_eq!(series[0].1, vec![7, 9]);
 
-    // Twenty digits, past `i64::MAX`, and still a label — the case the
-    // variant settles and a digit-shape heuristic could not.
     let (series, total) = grouped_by("10000000000000000000");
     assert_eq!(total, 1, "a wide VARCHAR label is still a label");
     assert_eq!(series[0].0, "10000000000000000000");
@@ -668,9 +614,6 @@ mod tests {
         );
     }
 
-    /// The terminal shows a wire timestamp as the wall clock it carries,
-    /// the look it had before the wire spelled an offset: no `T`, no
-    /// offset, no trailing fraction zeros.
     #[test]
     fn timestamps_show_as_the_wall_clock() {
         for (wire, shown) in [
@@ -690,8 +633,6 @@ mod tests {
         }
     }
 
-    /// Only a `timestamp` cell, alone or in a list, has a timestamp look;
-    /// every other cell is left to the surface.
     #[test]
     fn timestamp_cells_are_picked_by_column_type() {
         let wire = Value::String("2024-01-15T10:00:00.000000Z".into());

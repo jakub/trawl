@@ -12,7 +12,6 @@ export interface ProbeOptions {
   changeDuringRegistration?: boolean;
 }
 
-/** Test-only browser API wrappers. No instrumentation is shipped by either app. */
 export async function installThemeProbe(page: Page, options: ProbeOptions = {}): Promise<void> {
   await page.addInitScript(options => {
     const key = options.key ?? 'trawl.ui';

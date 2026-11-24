@@ -4,32 +4,6 @@
 
 //! The drift guard between the rendering profiles and the real emitter
 //! (ADR-0024).
-//!
-//! `complexity::profile` states, per rendering, how many nodes translation
-//! adds on its own and how many times each child lands in the emitted
-//! expression. Those numbers are the whole admission check: understate a
-//! child copy and a refused query becomes admitted, so the numbers have to
-//! be held against the emitter rather than reasoned about.
-//!
-//! Two assertions per case, over SQL the real emitter produced:
-//!
-//! 1. **child copies.** Each child operand is a field named `__cN__`,
-//!    which quotes into the SQL as `"__cN__"` and appears nowhere else.
-//!    The emitted text must carry it exactly `copies[N]` times — unless
-//!    the rendering contains a simple `CASE`, in which case the text is
-//!    the WRONG side of the parser and the declared count is only an
-//!    upper bound here ([`Copies::NormalizedCase`]). What those
-//!    renderings actually cost is counted post-parse, in
-//!    `trawl-engine/tests/duckdb_probe.rs`, which serializes the same SQL
-//!    through `json_serialize_sql`.
-//! 2. **a one-sided node bound.** `fixed + Σ copies` must be at least
-//!    [`oracle::nodes`], an independent lexical counter that reads the SQL
-//!    and knows nothing about the profile table. A profile may overcount;
-//!    it may never undercount.
-//!
-//! The oracle FAILS on syntax it does not recognise. That is the point: a
-//! rendering that starts emitting a construct nobody taught it stops the
-//! suite instead of scoring zero for the new nodes.
 
 use trawl_core::complexity::{
     CompareKind, ConformShape, FunctionShape, RenderProfile, Rendering, profile,
@@ -39,20 +13,10 @@ use trawl_core::schema::{CanonicalType, FieldTypes};
 use trawl_core::severity::Dialect;
 use trawl_core::{compare, conform, parser};
 
-// ---------------------------------------------------------------------------
-// The independent node oracle
-// ---------------------------------------------------------------------------
-
 mod oracle {
-    /// An upper bound on the expression nodes in one SQL fragment.
-    ///
-    /// Deliberately dumb and deliberately independent: it reads tokens, not
-    /// profiles, so it cannot agree with a wrong profile by sharing its
-    /// mistake. Calls, operators, literals, parameters, references, `CASE`
-    /// heads and list indexing each count one; parentheses, commas, the
-    /// alias and type-name tails of a cast, `DISTINCT` and the
-    /// `WITHIN GROUP (ORDER BY …)` / `PARTITION BY` decoration count
-    /// nothing, because none of them is an expression node.
+    /// An upper bound on the expression nodes in one SQL fragment. It reads
+    /// tokens, not profiles, so it cannot agree with a wrong profile by
+    /// sharing its mistake.
     ///
     /// # Panics
     ///
@@ -71,7 +35,6 @@ mod oracle {
                 continue;
             }
             match c {
-                // A single-quoted string literal; `''` escapes one quote.
                 '\'' => {
                     i += 1;
                     while i < bytes.len() {
@@ -87,7 +50,6 @@ mod oracle {
                     }
                     count += 1;
                 }
-                // A quoted identifier.
                 '"' => {
                     i += 1;
                     while i < bytes.len() && bytes[i] != '"' {
@@ -119,8 +81,6 @@ mod oracle {
                     let _ = after;
                     count += word_nodes(&word);
                     if word.eq_ignore_ascii_case("AS") {
-                        // A cast's type tail: the name, and its precision
-                        // arguments if it has any. Not an expression node.
                         i = skip_type(&bytes, i);
                     }
                 }
@@ -131,7 +91,6 @@ mod oracle {
                 }
                 '+' | '-' | '*' | '/' | '%' | '=' | '<' | '>' => {
                     i += 1;
-                    // Two-character comparison operators.
                     if matches!(bytes.get(i), Some('=' | '>')) {
                         i += 1;
                     }
@@ -141,7 +100,6 @@ mod oracle {
                     i += 2;
                     count += 1;
                 }
-                // List indexing and list construction: one operation.
                 '[' => {
                     i += 1;
                     count += 1;
@@ -169,14 +127,9 @@ mod oracle {
         i
     }
 
-    /// How many expression nodes one bare word is worth.
-    ///
     /// A function name and a bare column reference are both one node, so
     /// the only distinction that matters is the structural vocabulary: a
-    /// word that decorates an expression rather than being one. That has
-    /// to be decided BEFORE any "is it followed by a paren" reasoning,
-    /// because `WITHIN GROUP (ORDER BY …)` puts a paren after a word that
-    /// is not a call.
+    /// word that decorates an expression rather than being one.
     #[allow(clippy::match_same_arms)]
     fn word_nodes(word: &str) -> u64 {
         match word.to_ascii_uppercase().as_str() {
@@ -192,9 +145,6 @@ mod oracle {
     }
 }
 
-/// The oracle, held against fragments counted by hand — including strings
-/// that carry SQL punctuation, which must be one node and not a nest of
-/// operators.
 #[test]
 fn the_node_oracle_agrees_with_hand_counting() {
     for (sql, expected) in [
@@ -217,12 +167,9 @@ fn the_node_oracle_agrees_with_hand_counting() {
         (r#"AVG("a") OVER (PARTITION BY "h")"#, 4),
         (r#"LIST(DISTINCT "a")"#, 2),
         (r#"STRING_SPLIT("a", "b")[2]"#, 5),
-        // A string literal is ONE node however much SQL punctuation it
-        // carries, and a doubled quote inside it does not end it.
         (r#"regexp_full_match("a", '(1 + 2) = ?')"#, 3),
         (r#"json_extract_string("r", '/a''b')"#, 3),
         (r"'[\p{Zs}\x{9}-\x{d}]+$'", 1),
-        // A lambda is a node; its parameter is a reference.
         (r#"list_transform(["a"], _v -> _v)"#, 6),
     ] {
         assert_eq!(oracle::nodes(sql), expected, "{sql}");
@@ -234,10 +181,6 @@ fn the_node_oracle_agrees_with_hand_counting() {
 fn the_node_oracle_refuses_syntax_it_has_not_been_taught() {
     let _ = oracle::nodes("a @> b");
 }
-
-// ---------------------------------------------------------------------------
-// Emission fixtures
-// ---------------------------------------------------------------------------
 
 fn anchor() -> EvalContext {
     EvalContext::at(
@@ -259,7 +202,6 @@ fn pins(entries: &[(usize, CanonicalType)]) -> FieldTypes {
     map
 }
 
-/// Emit `dsl` and return its SQL.
 fn emitted_sql(dsl: &str, pin_map: &FieldTypes) -> String {
     let query = parser::parse(dsl).unwrap_or_else(|e| panic!("{dsl}: {e:?}"));
     trawl_core::emitter::emit_with_pins(
@@ -273,8 +215,6 @@ fn emitted_sql(dsl: &str, pin_map: &FieldTypes) -> String {
     .sql
 }
 
-/// Emit `dsl` and return the one expression fragment it projects or
-/// filters on.
 fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     let sql = emitted_sql(dsl, pin_map);
     if let Some((_, tail)) = sql.split_once("NOT IN ('z')), ") {
@@ -289,8 +229,6 @@ fn fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     tail.trim().to_string()
 }
 
-/// Emit `dsl`, a `stats` stage whose one output is `z`, and return that
-/// output's expression.
 fn slot_fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     let sql = emitted_sql(dsl, pin_map);
     let (_, tail) = sql
@@ -302,11 +240,8 @@ fn slot_fragment(dsl: &str, pin_map: &FieldTypes) -> String {
     expr.trim().to_string()
 }
 
-/// How the emitted TEXT's copy count relates to the declared one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Copies {
-    /// The text is the whole story: what the emitter writes is what the
-    /// binder sees.
     Exact,
     /// The rendering carries a simple `CASE`, which `DuckDB`'s parser
     /// rewrites into one equality per arm — duplicating the subject —
@@ -315,7 +250,6 @@ enum Copies {
     NormalizedCase,
 }
 
-/// The two assertions, for one rendering against one emitted fragment.
 fn check(label: &str, rendering: &Rendering, sql: &str, children: usize, copies: Copies) {
     let p: RenderProfile = profile(rendering);
     for n in 0..children {
@@ -341,7 +275,6 @@ fn check(label: &str, rendering: &Rendering, sql: &str, children: usize, copies:
     );
 }
 
-/// One `let` projection whose operands are markers.
 fn check_let(
     label: &str,
     rendering: &Rendering,
@@ -353,7 +286,6 @@ fn check_let(
     check(label, rendering, &sql, children, Copies::Exact);
 }
 
-/// One `where` filter whose subject is a marker.
 fn check_where(
     label: &str,
     rendering: &Rendering,
@@ -376,12 +308,9 @@ fn check_where_as(
     check(label, rendering, &sql, children, copies);
 }
 
-// ── the structural renderings ─────────────────────────────────────────
-
 #[test]
 fn structural_renderings_match_their_emission() {
     let none = FieldTypes::new();
-    // A leaf is one node and has no children to copy.
     let sql = fragment("* | let z = `__c0__`", &none);
     assert_eq!(oracle::nodes(&sql), 1, "{sql}");
     assert_eq!(profile(&Rendering::Leaf).fixed, 1);
@@ -403,11 +332,8 @@ fn structural_renderings_match_their_emission() {
     );
 }
 
-// ── comparison forms, per pin ─────────────────────────────────────────
-
 #[test]
 fn every_comparison_form_matches_its_emission() {
-    // A typed pin binds one parameter, exactly as the unpinned path does.
     for pin in [
         CanonicalType::BigInt,
         CanonicalType::Double,
@@ -423,7 +349,6 @@ fn every_comparison_form_matches_its_emission() {
         );
     }
     let varchar = pins(&[(0, CanonicalType::Varchar)]);
-    // VARCHAR + non-numeric literal: plain text equality.
     check_where(
         "varchar text equality",
         &Rendering::Compare(CompareKind::Bound),
@@ -431,7 +356,6 @@ fn every_comparison_form_matches_its_emission() {
         &varchar,
         1,
     );
-    // VARCHAR + numeric literal: the subject is written twice.
     check_where(
         "varchar numeric equality",
         &Rendering::Compare(CompareKind::TextOrNumeric),
@@ -446,7 +370,6 @@ fn every_comparison_form_matches_its_emission() {
         &varchar,
         1,
     );
-    // VARCHAR + ordered numeric: both sides through the decimal space.
     check_where(
         "varchar ordered numeric",
         &Rendering::Compare(CompareKind::NumericOnText),
@@ -454,7 +377,6 @@ fn every_comparison_form_matches_its_emission() {
         &varchar,
         1,
     );
-    // A float literal keeps its source token and binds the same way.
     check_where(
         "varchar ordered float",
         &Rendering::Compare(CompareKind::NumericOnText),
@@ -462,8 +384,6 @@ fn every_comparison_form_matches_its_emission() {
         &varchar,
         1,
     );
-    // A negative literal folds into the comparison rather than emitting
-    // as arithmetic.
     check_where(
         "varchar ordered negative",
         &Rendering::Compare(CompareKind::NumericOnText),
@@ -471,7 +391,6 @@ fn every_comparison_form_matches_its_emission() {
         &varchar,
         1,
     );
-    // The SEVERITY pin's exact rung is one bound integer.
     check_where(
         "severity exact",
         &Rendering::Compare(CompareKind::Bound),
@@ -484,7 +403,6 @@ fn every_comparison_form_matches_its_emission() {
 #[test]
 fn every_in_list_shape_matches_its_emission() {
     let varchar = pins(&[(0, CanonicalType::Varchar)]);
-    // No element expands: the plain bound list, subject written once.
     check_where(
         "in list, all text",
         &Rendering::InListBound(3),
@@ -492,7 +410,6 @@ fn every_in_list_shape_matches_its_emission() {
         &varchar,
         1,
     );
-    // Two numeric elements expand, one does not.
     check_where(
         "in list, mixed expansion",
         &Rendering::InListExpanded(vec![
@@ -506,8 +423,6 @@ fn every_in_list_shape_matches_its_emission() {
     );
 }
 
-// ── pattern targets, per pin ──────────────────────────────────────────
-
 #[test]
 fn every_pattern_target_matches_its_emission() {
     for (pin, form) in [
@@ -520,9 +435,6 @@ fn every_pattern_target_matches_its_emission() {
     ] {
         assert_eq!(compare::pattern_form(Some(pin)), form, "{pin:?}");
         let map = pins(&[(0, pin)]);
-        // The SEVERITY target is the twenty-four-arm token table, a
-        // simple `CASE`: the text writes the subject once and the parsed
-        // tree twenty-four times.
         let copies = if form == compare::PatternForm::SeverityText {
             Copies::NormalizedCase
         } else {
@@ -541,12 +453,9 @@ fn every_pattern_target_matches_its_emission() {
     }
 }
 
-// ── the severity range classes ────────────────────────────────────────
-
 #[test]
 fn every_severity_range_class_matches_its_emission() {
     let sev = pins(&[(0, CanonicalType::Severity)]);
-    // One band, one run.
     check_where(
         "one band",
         &Rendering::SeverityRanges {
@@ -557,7 +466,6 @@ fn every_severity_range_class_matches_its_emission() {
         &sev,
         1,
     );
-    // The same band negated wraps the shape in `NOT`.
     check_where(
         "one band negated",
         &Rendering::SeverityRanges {
@@ -568,7 +476,6 @@ fn every_severity_range_class_matches_its_emission() {
         &sev,
         1,
     );
-    // Adjacent bands merge into one run; disjoint ones do not.
     check_where(
         "adjacent bands merge",
         &Rendering::SeverityRanges {
@@ -589,7 +496,6 @@ fn every_severity_range_class_matches_its_emission() {
         &sev,
         1,
     );
-    // The widest set the ladder admits: every odd point, twelve runs.
     let odd = (0..12)
         .map(|i| (i * 2 + 1).to_string())
         .collect::<Vec<_>>()
@@ -611,9 +517,6 @@ fn every_severity_range_class_matches_its_emission() {
     assert_eq!(compare::severity_ranges(&points).len(), 13);
 }
 
-/// The composition boundary the two helpers do not cover on their own: a
-/// `sev()` subject inside a severity set, which writes that whole
-/// kilobyte-long expression once per run.
 #[test]
 fn a_sev_subject_inside_a_severity_set_is_copied_per_run() {
     let odd = (0..12)
@@ -626,10 +529,8 @@ fn a_sev_subject_inside_a_severity_set_is_copied_per_run() {
         (Dialect::Syslog, "sev(`__c0__`, \"syslog\")".to_string()),
     ] {
         let sql = fragment(&format!("* | where {call} in ({odd})"), &FieldTypes::new());
-        // Twelve runs, each carrying one whole reading of the subject.
         assert_eq!(sql.matches("\"__c0__\"").count(), 12, "{call}");
 
-        // The composed profile: the set over the call's own weight.
         let call_profile = profile(&Rendering::Function(FunctionShape::Sev {
             dialect,
             argc: if call.contains(',') { 2 } else { 1 },
@@ -648,14 +549,6 @@ fn a_sev_subject_inside_a_severity_set_is_copied_per_run() {
     }
 }
 
-// ── the function inventory ────────────────────────────────────────────
-
-/// Every name in `KNOWN_FUNCTIONS` has an emission fixture, and every
-/// fixture's profile bounds what the emitter writes.
-///
-/// The table below is the inventory: a name missing from it fails here,
-/// which is the check that stops a new function from scoring as something
-/// cheaper than it emits.
 #[test]
 fn every_known_function_has_an_emission_fixture() {
     // (name, DSL arguments, how many leading arguments are markers)
@@ -711,8 +604,8 @@ fn every_known_function_has_an_emission_fixture() {
         ("strftime", "`__c0__`, \"%Y\"", 1),
         ("strptime", "`__c0__`, \"%Y\"", 1),
         ("case", "`__c0__`, `__c1__`", 2),
-        // The path must be a string literal (ADR-0017, amendment of
-        // 2026-11-13), so only the document is a marker.
+        // The path must be a string literal (ADR-0017), so only the document
+        // is a marker.
         ("json", "`__c0__`, \"$.k\"", 1),
         ("json_extract", "`__c0__`, \"$.k\"", 1),
         ("json_extract_string", "`__c0__`, \"$.k\"", 1),
@@ -730,9 +623,6 @@ fn every_known_function_has_an_emission_fixture() {
 
     let none = FieldTypes::new();
     for (name, args, markers) in fixtures {
-        // An aggregate stands only in an aggregation slot (ADR-0001,
-        // Amendment 2026-11-08), so its fixture is a `stats` output and
-        // every other function's a `let` projection.
         let sql = if trawl_core::emitter::is_aggregate_function(name) {
             slot_fragment(&format!("* | stats {name}({args}) as z"), &none)
         } else {
@@ -771,12 +661,9 @@ fn shape_of(name: &str, args: &str) -> Rendering {
     })
 }
 
-/// The shapes whose cost changes with the arity or the literal they were
-/// called with.
 #[test]
 fn arity_dependent_shapes_match_their_emission() {
     let none = FieldTypes::new();
-    // `CASE` grows one child per argument, with and without an `ELSE`.
     for argc in 2..=5 {
         let args = (0..argc)
             .map(|i| format!("`__c{i}__`"))
@@ -790,7 +677,6 @@ fn arity_dependent_shapes_match_their_emission() {
             argc,
         );
     }
-    // `coalesce` and `concat` are variadic in the same way.
     for name in ["coalesce", "concat"] {
         let args = (0..4)
             .map(|i| format!("`__c{i}__`"))
@@ -804,7 +690,6 @@ fn arity_dependent_shapes_match_their_emission() {
             4,
         );
     }
-    // `substr` takes an optional length.
     check_let(
         "substr/3",
         &Rendering::Function(FunctionShape::Plain(3)),
@@ -812,8 +697,6 @@ fn arity_dependent_shapes_match_their_emission() {
         &none,
         3,
     );
-    // `count(x)` is not `count()`. An aggregate stands only in an
-    // aggregation slot, so this one is a `stats` output.
     check(
         "count/1",
         &Rendering::Function(FunctionShape::Plain(1)),
@@ -821,7 +704,6 @@ fn arity_dependent_shapes_match_their_emission() {
         1,
         Copies::Exact,
     );
-    // `round`'s precision argument is inlined, never an operand.
     check_let(
         "round/2",
         &Rendering::Function(FunctionShape::RoundPrecision),
@@ -829,8 +711,6 @@ fn arity_dependent_shapes_match_their_emission() {
         &none,
         1,
     );
-    // Both `sev()` dialects, and the proof that the dialect token itself
-    // never reaches the SQL as an operand.
     for (dialect, call, argc) in [
         (Dialect::Otel, "sev(`__c0__`)", 1),
         (Dialect::Otel, "sev(`__c0__`, \"otel\")", 2),
@@ -855,8 +735,6 @@ fn arity_dependent_shapes_match_their_emission() {
     }
 }
 
-/// `eventstats` wraps every output in a window, and the stage's
-/// accounting has to cover it.
 #[test]
 fn the_eventstats_window_wrapper_is_covered() {
     let sql = fragment(
@@ -874,11 +752,6 @@ fn the_eventstats_window_wrapper_is_covered() {
     );
 }
 
-// ── the conform helpers ───────────────────────────────────────────────
-
-/// Every `conform.rs` expression helper, built directly and held against
-/// its own profile — including the two severity reading shapes, whose
-/// documented "up to five times" is asserted here as a number.
 #[test]
 fn every_conform_helper_matches_its_profile() {
     let subject = "\"__c0__\"";
@@ -910,9 +783,6 @@ fn every_conform_helper_matches_its_profile() {
         ),
     ];
     for (shape, sql) in cases {
-        // The token table and both reading shapes are built out of simple
-        // `CASE`s, so their declared copy counts describe the PARSED tree
-        // and are an upper bound on the text.
         check(
             &format!("{shape:?}"),
             &Rendering::Conform(shape),
@@ -925,8 +795,6 @@ fn every_conform_helper_matches_its_profile() {
     for pin in CanonicalType::ALL {
         for dialect in [Dialect::Otel, Dialect::Syslog] {
             let sql = conform::guarded_cast_in(subject, pin, dialect);
-            // Only the SEVERITY rung is the reading kernel; every other
-            // rung is a searched `CASE` or a bare cast, counted exactly.
             let copies = if pin == CanonicalType::Severity {
                 Copies::NormalizedCase
             } else {
@@ -942,14 +810,9 @@ fn every_conform_helper_matches_its_profile() {
         }
     }
 
-    // The counts `conform.rs` documents in prose, as numbers — these are
-    // TEXT counts, which is the number that matters for pushing bound
-    // parameters, and they are asserted against the emitted string.
     for (dialect, written) in [(Dialect::Otel, 5), (Dialect::Syslog, 4)] {
         let sql = conform::severity_reading_sql(subject, dialect);
         assert_eq!(sql.matches(subject).count(), written, "{dialect:?}");
-        // And the profile, which counts what the BINDER sees, is strictly
-        // larger: the parser has multiplied the subject by then.
         let declared = profile(&Rendering::Conform(ConformShape::SeverityReading(dialect)));
         assert!(declared.copies[0] > written as u64, "{declared:?}");
     }

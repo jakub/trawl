@@ -154,10 +154,6 @@ async fn docker_plan_is_secret_free_and_does_not_touch_commands_or_token_file() 
 
 #[tokio::test]
 async fn a_pinned_tailscale_profile_keeps_plan_offline() {
-    // Tailscale exposure needs the node's MagicDNS name and tailnet IPv4.
-    // Without overrides the controller asks the local daemon for both, so
-    // `plan` fails on a machine with no tailscaled. Pinning them keeps `plan`
-    // usable offline, which is what makes it safe for agents and CI.
     let temporary = tempfile::tempdir().unwrap();
     let profile_path = temporary.path().join("dev.toml");
     std::fs::write(
@@ -311,11 +307,6 @@ fn rendered_runtime_is_private_isolated_and_ephemeral() {
     assert!(!runtime_dir.exists());
 }
 
-/// The dev stack is what states trawl-web's CSRF allowlist (ADR-0016): the
-/// browser origin is a property of the exposure mode, so a committed
-/// `[web] public_origins` could only be wrong in one of the two modes.
-/// Pinned for both, because the tailscale value is the one nobody notices
-/// is broken until a login 403s on a tailnet.
 #[test]
 fn the_browser_origin_is_published_as_the_csrf_allowlist_in_both_modes() {
     let local = rendered_web_environment(&MachineProfile::default(), None);
@@ -337,18 +328,11 @@ fn the_browser_origin_is_published_as_the_csrf_allowlist_in_both_modes() {
         tailnet["FLEET_SESSION_PUBLIC_ORIGINS"], "https://fractal.example.ts.net:8444",
         "tailscale exposure publishes the Serve origin, scheme and port included"
     );
-    // The allowlist is compared whole, so the mode's cookie flag and its
-    // origin must agree: an https origin with a non-Secure cookie would be
-    // a stack that logs in and then drops the session.
     assert_eq!(tailnet["FLEET_SESSION_COOKIE_SECURE"], "true");
 }
 
-/// Render one app plan and hand back the `trawl-web` process environment.
-///
-/// Goes through the real `selection` -> `plan` -> `runtime` path rather
-/// than calling the topology directly: the thing under test is what lands
-/// in the mprocs file, and an env var can go missing anywhere along that
-/// route.
+/// Goes through the real `selection` -> `plan` -> `runtime` path: an env var
+/// can go missing anywhere along that route.
 fn rendered_web_environment(
     profile: &MachineProfile,
     tailscale: Option<&TailscaleNode>,

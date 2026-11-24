@@ -3,20 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The trial's two keys, minted by `fleet-admin` inside the image.
-//!
 //! The CLI does not link fleet-auth and never reaches PostgreSQL from the
 //! host, so every key and role operation is a `compose run` of the
-//! `fleet-admin` service. This module builds those argument vectors and
-//! parses what `fleet-admin` prints.
-//!
-//! The permission lists are literals (ADR-0045): a permission trawl adds
-//! later never widens a trial silently. A test reads trawl-server's policy
-//! and fails when the two lists stop covering every permission, so the
-//! author of a new permission decides where it belongs.
-//!
-//! A key prefix identifies a key for revocation. It is never printed: it
-//! has no `Display`, its `Debug` is redacted, and it enters an argument
-//! vector only as a withheld argument.
+//! `fleet-admin` service.
 
 use std::fmt;
 
@@ -25,11 +14,8 @@ use zeroize::Zeroizing;
 use super::compose::Service;
 use super::docker::Args;
 
-/// The app namespace of every trawl permission in a Fleet role.
 pub const APP: &str = "trawl";
 
-/// `trial-operator`: every permission except `ingest`, as ADR-0045 lists
-/// them.
 pub const OPERATOR_PERMISSIONS: [&str; 11] = [
     "query",
     "schema_read",
@@ -44,10 +30,8 @@ pub const OPERATOR_PERMISSIONS: [&str; 11] = [
     "investigation_write",
 ];
 
-/// `trial-ingest`: `ingest` only.
 pub const INGEST_PERMISSIONS: [&str; 1] = ["ingest"];
 
-/// The two trial keys. Each key holds one role of the same name.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrialKey {
     Operator,
@@ -57,7 +41,6 @@ pub enum TrialKey {
 impl TrialKey {
     pub const ALL: [Self; 2] = [Self::Operator, Self::Ingest];
 
-    /// The key's name, and its role's name.
     pub fn name(self) -> &'static str {
         match self {
             Self::Operator => "trial-operator",
@@ -65,7 +48,6 @@ impl TrialKey {
         }
     }
 
-    /// The `fleet-admin keys create --kind` value.
     pub fn kind(self) -> &'static str {
         match self {
             Self::Operator => "human",
@@ -81,8 +63,7 @@ impl TrialKey {
     }
 }
 
-/// `compose run` of the `fleet-admin` service with `rest` as its
-/// arguments. `--no-deps`: PostgreSQL is already up when a key step runs,
+/// `--no-deps`: PostgreSQL is already up when a key step runs,
 /// and a one-shot step must not start or recreate anything else.
 fn fleet_admin(rest: Args) -> Args {
     Args::new()
@@ -90,7 +71,6 @@ fn fleet_admin(rest: Args) -> Args {
         .then(rest)
 }
 
-/// `fleet-admin migrate`: the Fleet schema, before any key exists.
 pub fn migrate_args() -> Args {
     fleet_admin(Args::new().arg("migrate"))
 }
@@ -100,7 +80,6 @@ pub fn role_show_args(key: TrialKey) -> Args {
     fleet_admin(Args::new().args(["roles", "show", key.name()]))
 }
 
-/// `fleet-admin roles create` with the key's literal permissions.
 pub fn role_create_args(key: TrialKey) -> Args {
     let mut args = Args::new().args(["roles", "create", "--name", key.name()]);
     for permission in key.permissions() {
@@ -109,8 +88,7 @@ pub fn role_create_args(key: TrialKey) -> Args {
     fleet_admin(args)
 }
 
-/// `fleet-admin keys create`, with no `--expires`, so the key never
-/// expires. Run it sealed: stdout is the token.
+/// Run `keys create` sealed: stdout is the token.
 pub fn key_create_args(key: TrialKey) -> Args {
     fleet_admin(Args::new().args([
         "keys",
@@ -124,8 +102,7 @@ pub fn key_create_args(key: TrialKey) -> Args {
     ]))
 }
 
-/// `fleet-admin keys list`: the active keys, as [`parse_keys_table`]
-/// reads them. The table holds prefixes, so never show its stdout.
+/// The `keys list` table holds prefixes, so never show its stdout.
 pub fn keys_list_args() -> Args {
     fleet_admin(Args::new().args(["keys", "list"]))
 }
@@ -145,7 +122,6 @@ pub fn key_revoke_args(prefix: &KeyPrefix) -> Args {
     )
 }
 
-/// A key's operational prefix: 8 base64url characters.
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyPrefix(String);
 
@@ -158,7 +134,6 @@ impl KeyPrefix {
         .then(|| Self(text.to_owned()))
     }
 
-    /// For comparison with the recorded prefix and for the state file.
     /// Never print it.
     pub fn as_str(&self) -> &str {
         &self.0
@@ -184,12 +159,9 @@ impl fmt::Debug for MintedToken {
     }
 }
 
-/// The Fleet token shape: `flt_` and 43 base64url characters.
 const TOKEN_PREFIX: &str = "flt_";
 const TOKEN_BODY_LEN: usize = 43;
 
-/// The prefix of a token (`flt_` plus 43 base64url characters): the first
-/// 8 characters of its body. `None` for anything else.
 pub fn token_prefix(token: &str) -> Option<KeyPrefix> {
     let body = token.strip_prefix(TOKEN_PREFIX)?;
     let valid = body.len() == TOKEN_BODY_LEN
@@ -203,8 +175,6 @@ pub fn token_prefix(token: &str) -> Option<KeyPrefix> {
 }
 
 impl MintedToken {
-    /// Read `keys create` stdout, which must be one token and one newline.
-    /// `None` otherwise; the caller reports that without the bytes.
     pub fn parse(stdout: &[u8]) -> Option<Self> {
         let line = stdout.strip_suffix(b"\n")?;
         let token = std::str::from_utf8(line).ok()?;
@@ -216,7 +186,6 @@ impl MintedToken {
     }
 }
 
-/// One row of `fleet-admin keys list`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyRow {
     pub prefix: KeyPrefix,
@@ -226,8 +195,7 @@ pub struct KeyRow {
     pub active: bool,
 }
 
-/// Why a `keys list` table was refused. No variant quotes the table: its
-/// cells are prefixes.
+/// No variant quotes the table: its cells are prefixes.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum KeysTableError {
     #[error(
@@ -236,7 +204,6 @@ pub enum KeysTableError {
     Unrecognized { line: usize, reason: &'static str },
 }
 
-/// The header `fleet-admin keys list` prints, in order.
 const HEADER: [&str; 7] = [
     "prefix",
     "name",
@@ -249,9 +216,6 @@ const HEADER: [&str; 7] = [
 
 /// Parse the table `fleet-admin keys list` prints (comfy-table,
 /// `UTF8_FULL` with round corners).
-///
-/// Strict: the frame, the header, and every cell are checked, and a row
-/// that wrapped onto a second line is refused rather than guessed at.
 /// Empty output is no keys (`fleet-admin` says so on stderr).
 pub fn parse_keys_table(text: &str) -> Result<Vec<KeyRow>, KeysTableError> {
     let lines: Vec<&str> = text.lines().collect();
@@ -304,7 +268,6 @@ pub fn parse_keys_table(text: &str) -> Result<Vec<KeyRow>, KeysTableError> {
     Ok(rows)
 }
 
-/// The trimmed cells of `│ a ┆ b │`, or `None` when the line is not a row.
 fn cells(line: &str) -> Option<Vec<&str>> {
     let inner = line.strip_prefix('│')?.strip_suffix('│')?;
     Some(inner.split('┆').map(str::trim).collect())
@@ -352,8 +315,6 @@ fn key_row(cells: &[&str]) -> Result<KeyRow, &'static str> {
     })
 }
 
-/// The active keys named after `key`: the ones a rerun that lost the
-/// token's plaintext revokes before minting again.
 pub fn active_prefixes(rows: &[KeyRow], key: TrialKey) -> Vec<KeyPrefix> {
     rows.iter()
         .filter(|row| row.active && row.name == key.name())
@@ -367,13 +328,10 @@ mod tests {
 
     use super::*;
 
-    /// fleet-admin's own snapshot of `keys list --all`: the format this
-    /// parser must keep reading.
     const KEYS_TABLE_SNAPSHOT: &str = include_str!(
         "../../../fleet-admin/src/commands/snapshots/fleet_admin__commands__keys__tests__snapshot_keys_table_all.snap"
     );
 
-    /// The snapshot's body, after insta's front matter.
     fn snapshot_table() -> &'static str {
         let mut parts = KEYS_TABLE_SNAPSHOT.splitn(3, "---\n");
         parts.next();
@@ -621,8 +579,6 @@ mod tests {
         );
     }
 
-    /// Every permission literal in `Permission::as_str`, read from
-    /// trawl-server's policy source.
     fn server_permissions() -> BTreeSet<&'static str> {
         const POLICY: &str = include_str!("../../../trawl-server/src/policy.rs");
         let start = POLICY

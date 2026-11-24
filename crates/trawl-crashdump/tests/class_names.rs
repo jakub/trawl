@@ -6,16 +6,7 @@
 //!
 //! `ci/crashdump-image.sh` decides whether the image is correct by grepping
 //! trawld's own log line for `readiness="<class>"`. That coupling is invisible
-//! to the compiler: rename a class here and the script keeps passing, because
-//! every one of its assertions is a substring search that now searches for a
-//! string nothing prints. The failure mode is the bad one, a green job that
-//! checks nothing.
-//!
-//! So the class names are pinned twice. This test reads the script, collects
-//! every class it names, and requires each to be a member of [`Status::ALL`].
-//! It also pins `Status::ALL` itself, so a rename has to touch this file and
-//! cannot slip through by renaming both sides in lockstep with nobody looking
-//! at the CI script.
+//! to the compiler.
 
 use std::path::{Path, PathBuf};
 
@@ -24,7 +15,6 @@ use trawl_crashdump::Status;
 /// The CI script, relative to this crate's manifest directory.
 const SCRIPT: &str = "../../ci/crashdump-image.sh";
 
-/// What the script writes just before the class name.
 const MARKER: &str = "readiness=\"";
 
 fn script_path() -> PathBuf {
@@ -36,8 +26,7 @@ fn script_path() -> PathBuf {
 /// A `<word>` is a run of ASCII letters closed by the quote. An occurrence that
 /// continues with anything else, a shell variable or a `sed` capture group, is
 /// not a literal the script can be grepping for, so it is not a class name and
-/// is skipped. The script spells all four out on purpose, which is what keeps
-/// that leniency from hiding anything.
+/// is skipped.
 fn readiness_tokens(text: &str) -> Vec<(String, usize)> {
     let mut found = Vec::new();
     for (number, line) in text.lines().enumerate() {

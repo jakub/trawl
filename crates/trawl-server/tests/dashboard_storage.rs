@@ -2,16 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Dashboard storage configuration before the first metrics collection.
 //! Keep metrics scrapes out of this binary: they populate process-global caches.
 
 mod common;
 
 use std::time::Duration;
 
-/// One booted server's dashboard, read over GET and over the SSE stream.
 struct DashboardReads {
-    /// The data root's parent; no path under it may reach the wire.
     tmp: tempfile::TempDir,
     get: String,
     streamed: String,
@@ -19,8 +16,6 @@ struct DashboardReads {
 
 /// The fixture boots the real config and background snapshot collector. It does
 /// not run a metrics scrape or emitter, so configured sources remain unmeasured.
-/// This dedicated integration-test binary isolates the process-global storage
-/// caches from metrics scrapes in other suites under both Cargo test and Nextest.
 async fn read_dashboard(ingest_enabled: bool) -> DashboardReads {
     let tmp = tempfile::tempdir().unwrap();
     let server = common::setup_in_dir_with_ingest(tmp.path(), ingest_enabled).await;
@@ -107,7 +102,6 @@ async fn assert_dashboard_storage_configuration(ingest_enabled: bool) {
     assert_measurements(&snapshot);
     let streamed: trawl_api::DashboardSnapshot = serde_json::from_str(data).unwrap();
     assert_measurements(&streamed);
-    // GET and SSE serialize the same metadata objects and never filesystem paths.
     for payload in [get_data.as_str(), data] {
         let wire: serde_json::Value = serde_json::from_str(payload).unwrap();
         for field in ["wal_measurement", "parquet_measurement"] {
@@ -128,10 +122,6 @@ async fn dashboard_storage_with_ingest_disabled_reports_wal_not_configured() {
     assert_dashboard_storage_configuration(false).await;
 }
 
-/// Headroom follows ADR-0033 from boot: before any metrics collection it is
-/// `not_sampled` with no rows (which roles share a device is not yet
-/// known), no environment is listed, and retention has recorded nothing.
-/// GET and SSE carry the same object, and no filesystem path reaches it.
 #[tokio::test(flavor = "multi_thread")]
 async fn capacity_measurement_starts_not_sampled() {
     use trawl_api::StorageMeasurementStatus as Status;

@@ -4,13 +4,6 @@
 
 //! The one parse-and-canonicalize step for an HTTP ingest body (ADR-0049).
 //!
-//! `POST /api/v1/ingest` and the ingest preview both read a body here:
-//! [`HttpRequestContext`] builds the per-request canonicalization context
-//! once, and [`visit_events`] frames the body as a JSON array or NDJSON,
-//! parses every position and canonicalizes every object, handing each
-//! outcome to the caller in input order. What a consumer does with an
-//! outcome is its own business; nothing here stores, counts or logs one.
-//!
 //! Index rule, the one documented on `trawl_api::IngestEventError`: an
 //! NDJSON position is its physical line number, blank lines included; an
 //! array position is the element's place in the array.
@@ -26,16 +19,9 @@ use crate::ingest::envelope::{self, Canonical, EnvelopeContext, RejectReason, Re
 use crate::ingest::producer::{Derivation, Producer};
 use crate::state::IngestState;
 
-/// Everything one HTTP request's events are canonicalized against: one
-/// arrival instant, the canonical peer and its relay classification, and
-/// the configured envs and derivation lists.
-///
-/// Built once per request, so every event in it shares one arrival time
-/// and one peer reading.
 #[derive(Debug)]
 pub(crate) struct HttpRequestContext {
     arrival_instant: chrono::DateTime<chrono::Utc>,
-    /// `arrival_instant` as RFC 3339 UTC at microsecond precision.
     arrival: String,
     peer_host: String,
     peer_is_trusted_relay: bool,
@@ -45,9 +31,6 @@ pub(crate) struct HttpRequestContext {
 }
 
 impl HttpRequestContext {
-    /// Capture the arrival instant now and read the peer through
-    /// [`crate::syslog::canonical_peer`], so an IPv4-mapped IPv6 peer is
-    /// classified and stamped as the IPv4 address it is.
     pub(crate) fn new(ingest: &IngestState, peer: IpAddr) -> Self {
         let arrival_instant = chrono::Utc::now();
         let peer = crate::syslog::canonical_peer(peer);
@@ -62,7 +45,6 @@ impl HttpRequestContext {
         }
     }
 
-    /// The canonicalizer's view of this request.
     pub(crate) fn envelope(&self) -> EnvelopeContext<'_> {
         EnvelopeContext {
             arrival: self.arrival(),
@@ -77,36 +59,28 @@ impl HttpRequestContext {
         }
     }
 
-    /// The arrival time every event in the request shares, as stamped into
-    /// `_ingested`.
     pub(crate) fn arrival(&self) -> &str {
         &self.arrival
     }
 
-    /// The canonical peer address, as a `host` fill would spell it.
     pub(crate) fn peer_host(&self) -> &str {
         &self.peer_host
     }
 
-    /// Whether the peer sits inside a configured `trusted_relays` CIDR.
     pub(crate) const fn peer_is_trusted_relay(&self) -> bool {
         self.peer_is_trusted_relay
     }
 
-    /// The boot-resolved derivation lists.
     pub(crate) fn derivation(&self) -> &Derivation {
         &self.derivation
     }
 }
 
-/// What became of one input position.
 #[derive(Debug)]
 pub(crate) enum EventOutcome {
-    /// The position held an object the canonicalizer accepted.
     Accepted(Canonical),
-    /// The position was refused: invalid JSON, a non-object value, or an
-    /// object the canonicalizer rejected. `message` may quote a bounded
-    /// client value, so it belongs in a response to that client only.
+    /// `message` may quote a bounded client value, so it belongs in a response
+    /// to that client only.
     Rejected {
         reason: RejectReason,
         message: String,
@@ -126,11 +100,8 @@ impl From<Rejection> for EventOutcome {
     }
 }
 
-/// One input position and its outcome, handed to the visitor in input
-/// order.
 #[derive(Debug)]
 pub(crate) struct EventReport<'i> {
-    /// The position under the module's index rule.
     pub index: usize,
     /// The parsed value at this position. `None` when it was not valid
     /// JSON: the line text is never echoed.
@@ -138,15 +109,6 @@ pub(crate) struct EventReport<'i> {
     pub outcome: EventOutcome,
 }
 
-/// Frame, parse and canonicalize every position of `body`, calling `visit`
-/// once per non-blank position in input order until it breaks.
-///
-/// A body that is empty, not UTF-8, or a malformed, non-array or empty JSON
-/// array is refused as a whole. Any other body yields per-position
-/// outcomes, so one bad line never costs the rest of the request. A body of
-/// whitespace alone visits nothing.
-///
-/// Returns `Break` when the visitor stopped early.
 pub(crate) fn visit_events(
     body: &[u8],
     ctx: &EnvelopeContext<'_>,
@@ -158,7 +120,6 @@ pub(crate) fn visit_events(
     let text = std::str::from_utf8(body)
         .map_err(|e| ServerError::Ingest(format!("body is not valid UTF-8: {e}")))?;
 
-    // A JSON array (Vector's batch format) or line-delimited objects.
     let trimmed = text.trim_start();
     if trimmed.starts_with('[') {
         visit_json_array(trimmed, ctx, &mut visit)
@@ -168,8 +129,6 @@ pub(crate) fn visit_events(
     }
 }
 
-/// Visit the elements of a JSON array. The array must parse as a whole;
-/// its elements are then judged one by one.
 fn visit_json_array(
     text: &str,
     ctx: &EnvelopeContext<'_>,
@@ -191,8 +150,6 @@ fn visit_json_array(
     Ok(ControlFlow::Continue(()))
 }
 
-/// Visit the non-blank lines of an NDJSON body. A line that is not JSON is
-/// its own rejection.
 fn visit_ndjson(
     text: &str,
     ctx: &EnvelopeContext<'_>,
@@ -219,7 +176,6 @@ fn visit_ndjson(
     ControlFlow::Continue(())
 }
 
-/// Canonicalize one parsed position, or refuse it for not being an object.
 fn judge<'i>(index: usize, value: &'i Value, ctx: &EnvelopeContext<'_>) -> EventReport<'i> {
     let outcome = match value.as_object() {
         Some(obj) => match envelope::canonicalize(obj, ctx) {
@@ -245,12 +201,10 @@ mod tests {
 
     const ARRIVAL: &str = "2026-01-01T00:00:00.000000Z";
 
-    /// One visited position, owned, for assertions.
     #[derive(Debug, PartialEq)]
     struct Seen {
         index: usize,
         input: Option<Value>,
-        /// `Ok(service)` or `Err((reason, host_absent))`.
         outcome: Result<String, (RejectReason, bool)>,
     }
 
@@ -258,7 +212,6 @@ mod tests {
         visit_until(body, usize::MAX).map(|(seen, _)| seen)
     }
 
-    /// Visit, breaking after `limit` positions.
     fn visit_until(body: &[u8], limit: usize) -> Result<(Vec<Seen>, ControlFlow<()>), ServerError> {
         let envs = vec!["prod".to_owned()];
         let derivation = Derivation::defaults();

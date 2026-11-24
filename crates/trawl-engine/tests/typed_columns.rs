@@ -2,11 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Result columns are typed from execution (ADR-0035, amended
-//! 2026-10-22): `DuckDB`'s logical types for the SQL read, the emitted
-//! cells for the Rust tail. Each test runs a real query and reads the
-//! types off the result, then crosses the wire codec where the claim is
-//! about the wire.
+//! Result columns are typed from execution (ADR-0035): `DuckDB`'s logical
+//! types for the SQL read, the emitted cells for the Rust tail.
 
 use std::io::Write as _;
 
@@ -15,8 +12,6 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::Executor;
 use trawl_engine::value::{ColumnType, QueryResult, Value};
 
-/// A one-file parquet source `DuckDB` writes from `select`, so the column
-/// types are exactly the ones the `SELECT` names.
 fn parquet(select: &str) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.parquet");
@@ -31,7 +26,6 @@ fn parquet(select: &str) -> (tempfile::TempDir, String) {
     (dir, source)
 }
 
-/// An ndjson source, one row per line.
 fn ndjson(rows: &[&str]) -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("events.ndjson");
@@ -68,9 +62,6 @@ fn type_of(result: &QueryResult, name: &str) -> ColumnType {
         .clone()
 }
 
-/// AC 3: a `sum` past `u64::MAX` is a `HUGEINT` no wire integer holds,
-/// so the query is refused by the result column's name, never answered
-/// with digits as text or a rounded float.
 #[test]
 fn a_hugeint_past_u64_max_is_refused_by_column_name() {
     let (_dir, source) = parquet(
@@ -90,14 +81,11 @@ fn a_hugeint_past_u64_max_is_refused_by_column_name() {
          cast it explicitly with tonumber() or tostring()"
     );
 
-    // The same HUGEINT column inside the range narrows exactly.
     let fits = run("* | head 1 | stats sum(bytes) as total", &source).expect("one u64::MAX fits");
     assert_eq!(type_of(&fits, "total"), ColumnType::Integer);
     assert_eq!(fits.rows, vec![vec![Value::UInt(u64::MAX)]]);
 }
 
-/// AC 1: a query whose filter matches nothing still returns its columns,
-/// typed from `DuckDB`'s logical types before any row is read.
 #[test]
 fn a_zero_row_result_is_typed_from_execution() {
     let (_dir, source) = parquet(
@@ -123,15 +111,11 @@ fn a_zero_row_result_is_typed_from_execution() {
         ]
     );
 
-    // The types survive the wire with no row to infer them from.
     let wire = serde_json::to_value(&empty).unwrap();
     let back: QueryResult = serde_json::from_value(wire).unwrap();
     assert_eq!(back, empty);
 }
 
-/// A column the tail computes as all nulls carries no input column's
-/// type and has no evidence of its own: it is `string`, and its null cells
-/// encode under it.
 #[test]
 fn a_tail_column_with_no_evidence_is_string() {
     let (_dir, source) = parquet("SELECT 'k=v' AS message");
@@ -149,9 +133,6 @@ fn a_tail_column_with_no_evidence_is_string() {
     );
 }
 
-/// AC 8: an `extract kv` tail whose cells in one column are not one type
-/// makes a `mixed` column, and every tagged cell decodes back to exactly
-/// the variant it left as.
 #[test]
 fn a_kv_tail_with_mixed_cells_is_a_mixed_column_that_round_trips() {
     let (_dir, source) = ndjson(&[
@@ -202,10 +183,6 @@ fn a_kv_tail_with_mixed_cells_is_a_mixed_column_that_round_trips() {
     assert_eq!(back, result);
 }
 
-/// A timestamp a stage after `extract kv` computes is text in the shared
-/// value model, so a `mixed` column tags it `string`: the limit api.md
-/// names. A column holding only such timestamps is `timestamp`, because
-/// the column fold reads the pipeline cell, which is where the two part.
 #[test]
 fn a_computed_timestamp_in_a_mixed_column_is_tagged_string() {
     let (_dir, source) = ndjson(&[r#"{"message":"n=1"}"#, r#"{"message":"n=2"}"#]);
@@ -241,9 +218,6 @@ fn a_computed_timestamp_in_a_mixed_column_is_tagged_string() {
     assert_eq!(type_of(&alone, "x"), ColumnType::Timestamp);
 }
 
-/// The tail types its columns from the cells it emits, and a stored
-/// TIMESTAMP the tail passes through (renamed or not) stays `timestamp`,
-/// though the tail itself saw it as text.
 #[test]
 fn a_kv_tail_keeps_the_types_its_cells_and_lineage_carry() {
     let (_dir, source) = parquet(
@@ -272,10 +246,6 @@ fn a_kv_tail_keeps_the_types_its_cells_and_lineage_carry() {
     );
 }
 
-/// A Rust tail that filters every row away still answers with the
-/// columns its stages project: a filter removes rows, not the schema. The
-/// `latency` the input typed `float` keeps that type with no row left to
-/// show it.
 #[test]
 fn a_rust_tail_that_removes_every_row_keeps_the_projected_schema() {
     let (_dir, source) = parquet("SELECT 'n=1' AS message, 1.5::DOUBLE AS latency");
@@ -289,9 +259,6 @@ fn a_rust_tail_that_removes_every_row_keeps_the_projected_schema() {
     );
 }
 
-/// A stored `TIMESTAMP[]` the Rust tail passes through is still a list of
-/// timestamps: typed `list` of `timestamp`, each item in the display
-/// offset, exactly as the same query answers without the tail.
 #[test]
 fn a_timestamp_list_keeps_its_type_and_wire_text_through_a_rust_tail() {
     let (_dir, source) =
@@ -309,11 +276,6 @@ fn a_timestamp_list_keeps_its_type_and_wire_text_through_a_rust_tail() {
     );
 }
 
-/// A stored `BIGINT[]` whose every cell is empty or NULL has no item
-/// evidence of its own, and the carried input type fills the hole: the kv
-/// tail answers `list` of `integer`, as the same query without the tail
-/// does, never the no-evidence `list` of `string` a scheduled run would
-/// then store as `VARCHAR[]`.
 #[test]
 fn an_empty_integer_list_keeps_its_item_type_through_a_rust_tail() {
     let (_dir, source) = parquet(
@@ -335,8 +297,6 @@ fn an_empty_integer_list_keeps_its_item_type_through_a_rust_tail() {
     );
 }
 
-/// The same through an aggregate the SQL prefix computes: `list(_time)`
-/// is a `TIMESTAMP[]`, and a kv tail after it keeps it one.
 #[test]
 fn a_listed_aggregate_keeps_its_timestamp_items_through_kv() {
     let (_dir, source) =
@@ -348,9 +308,6 @@ fn a_listed_aggregate_keeps_its_timestamp_items_through_kv() {
     assert_eq!(tail, baseline);
 }
 
-/// With no row left the lineage still types the list: the tail's own
-/// schema says `list` of `string`, and the lineage says those strings are
-/// stored timestamps.
 #[test]
 fn a_timestamp_list_with_no_row_left_is_still_typed() {
     let (_dir, source) =

@@ -6,31 +6,9 @@
 //!
 //! fleet-auth's [`require_bearer`] deliberately authenticates keys from any
 //! fleet app — it authenticates, it does not authorise. This module is the
-//! mandatory policy layer behind it (ADR-0004, reshaped by ADR-0006):
-//!
-//! - [`Permission`]: trawl's compile-time permission vocabulary. Roles are
-//!   data (fleet keystore rows); permissions are code — a permission string
-//!   exists because a handler checks it. Unknown strings in a role are
-//!   ignored (fail closed, warn log).
-//! - [`TrawlAuthz`]: extension trait giving [`fleet_auth::VerifiedKey`] the
-//!   `has_permission()` surface every handler checks.
-//! - [`Authorized`]: the request-parts extractor a handler that reads a
-//!   body names its route's rule with, one of [`needs`], so the rule is
-//!   judged before the body is read.
-//! - [`require_trawl_grant`]: middleware that 403s keys resolving zero
-//!   recognized trawl permissions before anything else (rate limiter,
-//!   `/whoami`) sees them, and stamps [`TrawlPolicyApplied`] on every
-//!   response it passes so the envelope normalizer can tell trawl-shaped
-//!   bodies apart.
-//! - [`normalize_auth_errors`]: rewrites `require_bearer`'s flat
-//!   `{"error","detail"}` failure bodies into trawl's [`ErrorResponse`]
-//!   envelope so the wire contract at the trust boundary is unchanged.
-//! - [`wire_kind`]: maps fleet-auth's [`PrincipalKind`] twin onto the
-//!   `trawl_api` wire type.
+//! mandatory policy layer behind it (ADR-0004, reshaped by ADR-0006).
 //!
 //! [`require_bearer`]: fleet_auth::require_bearer
-//! [`PrincipalKind`]: fleet_auth::PrincipalKind
-//! [`ErrorResponse`]: trawl_api::ErrorResponse
 
 use std::future::{self, Future};
 use std::marker::PhantomData;
@@ -43,12 +21,6 @@ use fleet_auth::{TRAWL_APP, VerifiedKey};
 
 use crate::error::ServerError;
 
-// -- permissions --------------------------------------------------------------
-
-/// Discrete permissions trawl's handlers check.
-///
-/// A variant exists here because a handler checks it; a role is a keystore
-/// row bundling these strings (ADR-0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Permission {
     /// Execute search queries, view history and clear it, list running queries.
@@ -56,12 +28,8 @@ pub enum Permission {
     /// Read schema and field catalog.
     ///
     /// This grants more than names, types and counts: `/schema/field` and
-    /// `/schema/conflicts` carry the misfit samples compaction captured —
-    /// up to five values per conflict row, 256 bytes each, of raw
-    /// client-supplied event data — and a degraded field's verdict repeats
-    /// a bounded set of them. A role built as query-less schema-admin is
-    /// therefore a deliberate choice about who may see fragments of event
-    /// content, not only its shape.
+    /// `/schema/conflicts` carry the misfit samples compaction captured, of
+    /// raw client-supplied event data.
     SchemaRead,
     /// Validate DSL syntax without executing.
     Validate,
@@ -78,28 +46,12 @@ pub enum Permission {
     /// Write events via the ingest endpoint.
     Ingest,
     /// Mutate the field catalog — the repin trigger (ADR-0011).
-    /// Separate from [`Self::ServerManage`] so a schema-admin role can
-    /// exist without server administration, and read-only surfaces can
-    /// show repin state without offering the trigger.
-    ///
-    /// It also reads a repin job this key requested, by its id, so the
-    /// caller that started a job can follow it without
-    /// [`Self::SchemaRead`]. Its own jobs only: the rows are durable, carry
-    /// event values in `unmapped_samples` and name other operators, so a
-    /// job another key requested answers the 404 an unknown id answers, and
-    /// the grant alone cannot learn which jobs exist.
     SchemaWrite,
     /// List and read every investigation in the installation, its steps,
-    /// findings and kept evidence (ADR-0059). Effective only together with
-    /// [`Self::Query`]: kept evidence is event data, and `query` is already
-    /// flat over every environment.
+    /// findings and kept evidence (ADR-0059).
     InvestigationRead,
     /// Create investigations, attach work, keep rows, write findings and
-    /// notes, and close or reopen any investigation (ADR-0059). Effective
-    /// only together with [`Self::InvestigationRead`] and [`Self::Query`].
-    /// Creator identity is attribution, never a gate. Deleting an
-    /// investigation and extending its evidence past the ceiling also need
-    /// [`Self::ServerManage`].
+    /// notes, and close or reopen any investigation (ADR-0059).
     InvestigationWrite,
 }
 
@@ -122,7 +74,6 @@ impl Permission {
         Self::InvestigationWrite,
     ];
 
-    /// Snake-case string representation for wire formats and keystore rows.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Query => "query",
@@ -140,9 +91,8 @@ impl Permission {
         }
     }
 
-    /// Parse a keystore permission string. `None` for anything trawl does
-    /// not recognize — callers must treat unknown strings as absent
-    /// capability (fail closed), never as an error that blocks the key.
+    /// Callers must treat unknown strings as absent capability (fail closed),
+    /// never as an error that blocks the key.
     pub fn parse(s: &str) -> Option<Self> {
         match s {
             "query" => Some(Self::Query),
@@ -162,25 +112,11 @@ impl Permission {
     }
 }
 
-// -- authz extension trait ----------------------------------------------------
-
-/// Trawl-side authorization surface over a fleet-auth [`VerifiedKey`].
-///
-/// Handlers gate on it as `verified.has_permission(Permission::Export)`.
 pub trait TrawlAuthz {
-    /// Check whether this key's resolved trawl-namespace permission union
-    /// grants `perm`.
     fn has_permission(&self, perm: Permission) -> bool;
 
-    /// Whether the key resolves at least one recognized trawl permission —
-    /// the "may enter trawl at all" question. A key whose roles carry only
-    /// strings trawl doesn't recognize has nothing usable here (fail
-    /// closed).
     fn has_any_trawl_permission(&self) -> bool;
 
-    /// The key's recognized trawl permissions in canonical
-    /// [`Permission::ALL`] order. Unrecognized strings are dropped with a
-    /// warn log — they advertise no capability any handler checks.
     fn trawl_permissions(&self) -> Vec<Permission>;
 }
 
@@ -213,17 +149,9 @@ impl TrawlAuthz for VerifiedKey {
     }
 }
 
-// -- route authority ----------------------------------------------------------
-
-/// What a route needs of its caller: every permission in
-/// [`Self::PERMISSIONS`]. Each rule is a marker type in [`needs`], so a
-/// handler's permission reads at its signature, as
-/// `Authorized<needs::Export>`.
 pub trait Needs {
-    /// The permissions the route needs, every one of them.
     const PERMISSIONS: &'static [Permission];
 
-    /// Whether `verified` holds every permission the rule names.
     fn admits(verified: &VerifiedKey) -> bool {
         Self::PERMISSIONS
             .iter()
@@ -231,65 +159,51 @@ pub trait Needs {
     }
 }
 
-/// The rules authenticated routes judge, one marker type each. A route
-/// that reads a body names its rule with [`Authorized`].
 pub mod needs {
     use super::{Needs, Permission};
 
-    /// `query`.
     #[derive(Debug)]
     pub struct Query;
     impl Needs for Query {
         const PERMISSIONS: &'static [Permission] = &[Permission::Query];
     }
 
-    /// `validate`.
     #[derive(Debug)]
     pub struct Validate;
     impl Needs for Validate {
         const PERMISSIONS: &'static [Permission] = &[Permission::Validate];
     }
 
-    /// `saved_query`.
     #[derive(Debug)]
     pub struct SavedQuery;
     impl Needs for SavedQuery {
         const PERMISSIONS: &'static [Permission] = &[Permission::SavedQuery];
     }
 
-    /// `export`.
     #[derive(Debug)]
     pub struct Export;
     impl Needs for Export {
         const PERMISSIONS: &'static [Permission] = &[Permission::Export];
     }
 
-    /// `schema_write`.
     #[derive(Debug)]
     pub struct SchemaWrite;
     impl Needs for SchemaWrite {
         const PERMISSIONS: &'static [Permission] = &[Permission::SchemaWrite];
     }
 
-    /// `server_manage`.
     #[derive(Debug)]
     pub struct ServerManage;
     impl Needs for ServerManage {
         const PERMISSIONS: &'static [Permission] = &[Permission::ServerManage];
     }
 
-    /// Running a saved query now and reading a run's result rows
-    /// (ADR-0018): `query` and `saved_query`. Either alone would let a
-    /// `saved_query`-only key execute any query, or a `query`-only key run
-    /// another key's saved text.
     #[derive(Debug)]
     pub struct RunSavedQuery;
     impl Needs for RunSavedQuery {
         const PERMISSIONS: &'static [Permission] = &[Permission::Query, Permission::SavedQuery];
     }
 
-    /// Reading investigations and their kept evidence (ADR-0059): `query`
-    /// and `investigation_read`.
     #[derive(Debug)]
     pub struct InvestigationRead;
     impl Needs for InvestigationRead {
@@ -297,8 +211,6 @@ pub mod needs {
             &[Permission::Query, Permission::InvestigationRead];
     }
 
-    /// Writing to investigations: [`InvestigationRead`] and
-    /// `investigation_write`.
     #[derive(Debug)]
     pub struct InvestigationWrite;
     impl Needs for InvestigationWrite {
@@ -309,8 +221,6 @@ pub mod needs {
         ];
     }
 
-    /// Extending and deleting investigations: [`InvestigationWrite`] and
-    /// `server_manage`.
     #[derive(Debug)]
     pub struct InvestigationManage;
     impl Needs for InvestigationManage {
@@ -323,20 +233,9 @@ pub mod needs {
     }
 }
 
-/// The caller's key, holding every permission rule `N` names.
-///
 /// A request-parts extractor, because axum runs those before the body
 /// extractor: a key without the route's permission is refused on its
-/// request head, and trawld never reads its body (ADR-0059). A handler
-/// binds it ahead of its `Json` or `Bytes` parameter, which
-/// `tests/route_shape_guard.rs` requires. Extractors run inside the
-/// router's layers, so authentication, the trawl grant and the rate
-/// limiter see the request first. The refusal is the 403 `forbidden`
-/// [`ServerError`] a handler would return, so it keeps the envelope, and
-/// `failure::mark_handler`, which runs before every extractor, still
-/// classifies it as the handler's.
-///
-/// It dereferences to the [`VerifiedKey`] it holds.
+/// request head, and trawld never reads its body (ADR-0059).
 pub struct Authorized<N> {
     verified: VerifiedKey,
     rule: PhantomData<fn() -> N>,
@@ -358,7 +257,6 @@ impl<N> std::ops::Deref for Authorized<N> {
 }
 
 impl<N: Needs> Authorized<N> {
-    /// Admit `verified` by rule `N`, or refuse it with a 403.
     fn new(verified: VerifiedKey) -> Result<Self, ServerError> {
         if !N::admits(&verified) {
             return Err(ServerError::Forbidden("insufficient permissions".into()));
@@ -370,7 +268,6 @@ impl<N: Needs> Authorized<N> {
     }
 
     fn from_parts(parts: &Parts) -> Result<Self, ServerError> {
-        // The bearer layer inserts the key on every request it lets through.
         let verified = parts
             .extensions
             .get::<VerifiedKey>()
@@ -383,7 +280,6 @@ impl<N: Needs> Authorized<N> {
 impl<S: Sync, N: Needs> FromRequestParts<S> for Authorized<N> {
     type Rejection = ServerError;
 
-    // Not `async fn`: nothing here awaits.
     fn from_request_parts(
         parts: &mut Parts,
         _state: &S,
@@ -392,19 +288,12 @@ impl<S: Sync, N: Needs> FromRequestParts<S> for Authorized<N> {
     }
 }
 
-// -- wire shims ---------------------------------------------------------------
-
-/// Map fleet-auth's [`fleet_auth::PrincipalKind`] onto the `trawl_api` wire
-/// twin. The `/whoami` wire shape is owned by trawl-api; fleet-auth defines
-/// a nominally-distinct equivalent.
 pub fn wire_kind(kind: fleet_auth::PrincipalKind) -> trawl_api::PrincipalKind {
     match kind {
         fleet_auth::PrincipalKind::Human => trawl_api::PrincipalKind::Human,
         fleet_auth::PrincipalKind::Service => trawl_api::PrincipalKind::Service,
     }
 }
-
-// -- mandatory policy middleware ----------------------------------------------
 
 /// Response-extension marker: this response was produced behind trawl's
 /// policy layer (successful authn + either a policy verdict or a downstream
@@ -413,27 +302,10 @@ pub fn wire_kind(kind: fleet_auth::PrincipalKind) -> trawl_api::PrincipalKind {
 #[derive(Clone, Copy, Debug)]
 pub struct TrawlPolicyApplied;
 
-/// Axum middleware: reject authenticated keys that resolve no usable trawl
-/// capability (zero recognized trawl permissions across all their roles)
-/// with an opaque 403 — before the rate limiter, `/whoami`, or any handler
-/// sees them.
-///
 /// Must run after `fleet_auth::require_bearer_only` (needs [`VerifiedKey`] in
-/// request extensions). Mounted on both authenticated sub-routers (`/api/v1`
-/// tree and `/ingest`), so it is a mandatory layer, not a per-handler
-/// convention.
-///
-/// Because it sits outside the limiter, the rejection is unmetered: it is
-/// counted (`trawl_auth_failures_total{reason="no_trawl_grant"}` — a closed
-/// label set) and logged on [`crate::telemetry::UNMETERED_POLICY_TARGET`],
-/// which the WAL layer refuses. A valid fleet key with zero trawl
-/// permissions is a supported thing to hold (the keystore is shared across
-/// fleet apps), so a persisted event here would be a durable-write
-/// amplifier that no rate limit can slow.
+/// request extensions).
 pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
     let Some(verified) = req.extensions().get::<VerifiedKey>() else {
-        // require_bearer_only always inserts the key; missing means mis-mounted
-        // middleware — fail closed and loudly.
         tracing::error!("policy: VerifiedKey missing from request extensions (mis-mounted layer?)");
         return mark(
             ServerError::Internal("verified key not in extensions".into()).into_response(),
@@ -442,9 +314,9 @@ pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
 
     if !verified.has_any_trawl_permission() {
         count_auth_failure("no_trawl_grant");
-        // Unmetered target: this 403 is decided outside the rate limiter
-        // (see below), so the event is stdout-only — a grantless key must
-        // not be able to write one durable record per request.
+        // Unmetered target: this 403 is decided outside the rate limiter, so
+        // the event is stdout-only — a grantless key must not be able to write
+        // one durable record per request.
         tracing::info!(
             target: crate::telemetry::UNMETERED_POLICY_TARGET,
             event_type = "auth_failure",
@@ -460,23 +332,11 @@ pub async fn require_trawl_grant(req: Request, next: Next) -> Response {
     mark(next.run(req).await)
 }
 
-/// Stamp [`TrawlPolicyApplied`] on a response.
 fn mark(mut resp: Response) -> Response {
     resp.extensions_mut().insert(TrawlPolicyApplied);
     resp
 }
 
-/// Count one rejected request against `trawl_auth_failures_total{reason}`.
-///
-/// This is the only in-product signal for a failed authentication. The
-/// events behind a 401/503 come from fleet-auth's bearer shell, and the one
-/// behind a grantless 403 from [`require_trawl_grant`] — all decided
-/// outside the rate limiter, so [`crate::telemetry::UNMETERED_TARGETS`]
-/// keeps them off the WAL: a flood nothing meters must not become durable
-/// corpus growth. A counter has no such problem, because `reason` is a
-/// closed, code-defined set: the series count is fixed however hard the
-/// endpoint is hammered, and credential stuffing, token brute force or a
-/// revoked key still in use stay alarmable on `/metrics`.
 fn count_auth_failure(reason: &'static str) {
     metrics::counter!(crate::metrics::AUTH_FAILURES_TOTAL, "reason" => reason).increment(1);
 }
@@ -484,23 +344,7 @@ fn count_auth_failure(reason: &'static str) {
 /// Axum middleware: keep trawl's [`trawl_api::ErrorResponse`] envelope at the
 /// trust boundary (ADR-0004).
 ///
-/// Mounted directly outside `fleet_auth::require_bearer_only`. Responses that
-/// carry the [`TrawlPolicyApplied`] marker passed authn and are already
-/// trawl-shaped; anything else with an auth-relevant status was
-/// short-circuited by the bearer shell (fleet-auth's flat
-/// `{"error","detail"}` bodies) and is rewritten to a fixed opaque envelope:
-///
-/// - 401 → opaque `auth_error` (missing/malformed/invalid/revoked/expired —
-///   indistinguishable by design)
-/// - 403 → opaque `forbidden` (defensive; policy 403s are already marked)
-/// - 500 → `internal_error`
-/// - 503 → `service_unavailable` "auth backend unavailable" — never
-///   postgres detail
-///
-/// Every rewritten response is also counted under
-/// `trawl_auth_failures_total{reason}` ([`count_auth_failure`]): the
-/// underlying fleet-auth events are stdout-only, so without this counter a
-/// 401 storm would leave no in-product trace at all.
+/// Mounted directly outside `fleet_auth::require_bearer_only`.
 pub async fn normalize_auth_errors(req: Request, next: Next) -> Response {
     use axum::http::StatusCode;
     use trawl_api::ErrorCode;
@@ -582,8 +426,6 @@ mod tests {
         VerifiedKey::from_roles(1, "abcd1234", "k", PrincipalKind::Human, roles)
     }
 
-    // -- permission parsing ---------------------------------------------------
-
     #[test]
     fn parse_roundtrips_every_permission() {
         for &perm in Permission::ALL {
@@ -591,9 +433,6 @@ mod tests {
         }
     }
 
-    /// trawl-api's `PERMISSION_NAMES` is what clients show; it must be this
-    /// enum's wire names, in this enum's order, or a client hides a real
-    /// permission or shows one no handler checks.
     #[test]
     fn api_permission_names_match_the_enum() {
         let names: Vec<&str> = Permission::ALL.iter().map(|p| p.as_str()).collect();
@@ -609,8 +448,6 @@ mod tests {
             "key_manage is dead — no handler checks it"
         );
     }
-
-    // -- TrawlAuthz over fleet-auth VerifiedKey ------------------------------
 
     #[test]
     fn authz_resolves_permissions_from_roles() {
@@ -641,8 +478,6 @@ mod tests {
 
     #[test]
     fn authz_unrecognized_strings_dropped_fail_closed() {
-        // Unknown permission strings in a role are ignored: the recognized
-        // remainder survives, the unknown advertises nothing.
         let key = key_with(vec![role(
             "future",
             &[
@@ -675,8 +510,6 @@ mod tests {
         );
     }
 
-    // -- wire shims -----------------------------------------------------------
-
     #[test]
     fn wire_kind_maps_both_variants() {
         assert_eq!(
@@ -689,10 +522,6 @@ mod tests {
         );
     }
 
-    // -- middleware -----------------------------------------------------------
-
-    /// Router with the policy layer and a trivial handler, plus a request
-    /// extension carrying the given key (simulating `require_bearer`).
     async fn run_policy(key: Option<VerifiedKey>) -> Response {
         let app = Router::new()
             .route("/x", get(|| async { "ok" }))
@@ -770,19 +599,12 @@ mod tests {
         assert_eq!(json["error"]["code"], "forbidden");
     }
 
-    /// The grantless 403 is decided outside the rate limiter (mounted that
-    /// way on purpose — see `require_trawl_grant`), so its event must be
-    /// stdout-only: a valid fleet key resolving zero trawl permissions is a
-    /// supported thing to hold, and a persisted event would let its holder
-    /// grow the corpus one durable record per request, unmetered. Drives the
-    /// real middleware through the subscriber `trawld` installs.
     #[tokio::test]
     async fn grantless_403_event_is_logged_but_never_persisted() {
         use std::sync::{Arc, Mutex};
 
         use crate::telemetry::{LogSinks, WalHandle, WalLayer, build_subscriber};
 
-        /// Stdout, captured.
         #[derive(Clone, Default)]
         struct Capture(Arc<Mutex<Vec<u8>>>);
 
@@ -894,9 +716,6 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    // -- route authority ------------------------------------------------------
-
-    /// A request body that records whether anything polled it.
     struct PollRecorder(std::sync::Arc<std::sync::atomic::AtomicBool>);
 
     impl tokio_stream::Stream for PollRecorder {
@@ -911,8 +730,6 @@ mod tests {
         }
     }
 
-    /// A body-reading route behind `Authorized<needs::Query>`, called with
-    /// `key`: the response, and whether the body was polled.
     async fn run_authorized(key: Option<VerifiedKey>) -> (Response, bool) {
         use axum::extract::rejection::BytesRejection;
 
@@ -941,8 +758,6 @@ mod tests {
         (resp, polled.load(std::sync::atomic::Ordering::SeqCst))
     }
 
-    /// A key without the route's rule gets the handler's 403 envelope, and
-    /// the body extractor never runs: nothing polls the body.
     #[tokio::test]
     async fn authorized_refuses_before_the_body_is_polled() {
         let (resp, polled) = run_authorized(Some(key_with(vec![role(
@@ -961,7 +776,6 @@ mod tests {
         assert!(!polled, "the body of a request with no key was polled");
     }
 
-    /// A key that holds the rule reaches the body.
     #[tokio::test]
     async fn authorized_admits_the_rule_and_the_body_is_read() {
         let (resp, polled) = run_authorized(Some(key_with(vec![role(
@@ -973,8 +787,6 @@ mod tests {
         assert!(polled, "the admitted request's body was never read");
     }
 
-    /// The investigation rules are cumulative: each needs every permission
-    /// of the one before it.
     #[test]
     fn investigation_rules_need_every_permission_they_name() {
         let key = |perms: &[&str]| {
@@ -1001,7 +813,6 @@ mod tests {
         ])));
     }
 
-    /// Running a saved query needs both `query` and `saved_query`.
     #[test]
     fn run_saved_query_needs_query_and_saved_query() {
         let key = |perms: &[&str]| {
@@ -1017,7 +828,6 @@ mod tests {
         assert!(!needs::RunSavedQuery::admits(&key(&[])));
     }
 
-    /// Simulated bearer shell: short-circuits with a fleet-auth-flat body.
     async fn run_normalizer(inner_status: StatusCode, marked: bool) -> Response {
         let app = Router::new()
             .route(
@@ -1101,10 +911,6 @@ mod tests {
         assert_eq!(json["detail"], "fleet-flat body", "429 passes through");
     }
 
-    /// The pre-authn events are stdout-only, so `/metrics` is the only
-    /// in-product signal a failed authentication leaves. A local recorder
-    /// (not the global one — `telemetry.rs` already installs that) proves
-    /// each reason lands, and that pass-through statuses do not inflate it.
     #[test]
     fn auth_failures_counter_records_every_rejection_reason() {
         let recorder = metrics_exporter_prometheus::PrometheusBuilder::new().build_recorder();
@@ -1128,7 +934,6 @@ mod tests {
                     &[("coastwatch", "stories_read")],
                 )])))
                 .await;
-                // Neither of these is an auth rejection.
                 run_normalizer(StatusCode::TOO_MANY_REQUESTS, false).await;
                 run_policy(Some(key_with(vec![role(
                     "trawl-reader",

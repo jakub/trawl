@@ -5,14 +5,6 @@
 //! Every cookie-authenticated route answers the same origin verdict
 //! (ADR-0016).
 //!
-//! The guard used to be a call each handler made for itself, which is a
-//! rule you have to remember. Both SSE routes had forgotten it: they take
-//! the shared `fleet_session` cookie like every other route, and a page on
-//! any origin could open an `EventSource` against `/api/v1/stream` and read
-//! the victim's logs. So the shape of this file is the point. One table of
-//! routes crossed with one table of `Origin` values, and a new route is one
-//! line here rather than a call site somewhere else.
-//!
 //! What each rejection row asserts is deliberately more than the status:
 //! a 403 that still emitted `Set-Cookie` would let a foreign page clear the
 //! session it cannot read, and a 403 issued after the proxy already called
@@ -45,36 +37,23 @@ mod test_support;
 
 use test_support::TlsUpstream;
 
-/// The deployment's configured `public_origins`: a public HTTPS origin, a
-/// loopback bind by name, and that bind's IPv6 spelling. Three entries, so
-/// "allowed" cannot be an accident of a one-element list.
 const ALLOWED: [&str; 3] = [
     "https://trawl.example.com",
     "http://localhost:8090",
     "http://[::1]:8090",
 ];
 
-/// The token both the cookie session and the bearer client carry, so the
-/// upstream mocks never need to tell them apart.
 const TOKEN: &str = "flt_token";
 
-/// Which door a route's auth comes through. It decides what a request must
-/// carry, and it is exactly the axis the guard must not vary along.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gate {
-    /// `login`/`logout`: there is no session to extract, so the handler
-    /// asks the guard itself before it mints or clears a cookie.
     Handler,
     /// `/api/auth/me`: the `Session` extractor. Cookies only, so a bearer
     /// client gets a 401 here and is not part of the bearer row.
     Session,
-    /// The proxied routes and both SSE streams: the `Auth` extractor,
-    /// cookie or bearer.
     Auth,
 }
 
-/// One browser-reachable route. Adding a route to the proxy should mean
-/// adding a line here.
 struct Route {
     name: &'static str,
     method: &'static str,
@@ -84,23 +63,9 @@ struct Route {
     /// runs before the handler and would 415 first.
     body: &'static str,
     gate: Gate,
-    /// What the route answers when the guard lets the request through.
     ok: StatusCode,
     /// Upstream requests one passing request on this route makes against
-    /// the mock below. A rejected row must add zero of these, and an
-    /// accepted row must add exactly this many:
-    ///
-    /// | route                    | calls | why                              |
-    /// |--------------------------|-------|----------------------------------|
-    /// | login                    | 1     | `/whoami` validates the key      |
-    /// | logout                   | 0     | it only builds a clear directive |
-    /// | me                       | 1     | `/whoami` on every request       |
-    /// | proxied read, write      | 1     | the forward itself               |
-    /// | stream, dashboard stream | 1     | opening the upstream SSE body    |
-    ///
-    /// Logout's zero is the reason the old `calls <= ROUTES.len()` bound
-    /// was worthless: it left exactly one call of slack, so a rejected row
-    /// could have forwarded the victim's token upstream and still passed.
+    /// the mock below.
     upstream_on_pass: usize,
 }
 
@@ -170,7 +135,6 @@ const ROUTES: &[Route] = &[
     },
 ];
 
-/// `Origin` values that must be refused, and why each one matters.
 const REFUSED: &[(&str, &str)] = &[
     (
         "https://coastwatch.example.com",
@@ -198,8 +162,6 @@ const REFUSED: &[(&str, &str)] = &[
     ),
 ];
 
-/// `Origin` values a real browser sends for a configured origin. A wrong
-/// refusal here is a 403 the operator cannot explain.
 const ACCEPTED: &[(&str, &str)] = &[
     (
         "https://trawl.example.com",
@@ -216,8 +178,6 @@ const ACCEPTED: &[(&str, &str)] = &[
     ("http://[::1]:8090", "the configured IPv6 loopback"),
 ];
 
-/// Headers a reverse proxy writes and anyone who can reach the port can
-/// forge. None of them may move a verdict in either direction.
 const FORGED: &[(&str, &str)] = &[
     ("x-forwarded-host", "coastwatch.example.com"),
     ("x-forwarded-proto", "http"),
@@ -225,7 +185,6 @@ const FORGED: &[(&str, &str)] = &[
     ("forwarded", "host=coastwatch.example.com;proto=http"),
 ];
 
-/// What a request carries to authenticate.
 enum Credential<'a> {
     None,
     Cookie(&'a str),
@@ -233,7 +192,6 @@ enum Credential<'a> {
 }
 
 impl Route {
-    /// The credential this route normally travels with.
     fn credential<'a>(&self, cookie: &'a str) -> Credential<'a> {
         match self.gate {
             Gate::Handler => Credential::None,
@@ -242,9 +200,6 @@ impl Route {
     }
 }
 
-/// An upstream that answers every path the routes above reach. It exists
-/// so a passing request has somewhere to land; the rejection rows assert
-/// it was never called at all.
 async fn upstream_server() -> TlsUpstream {
     let upstream = TlsUpstream::start().await;
     let whoami = json!({
@@ -319,8 +274,6 @@ fn expired_cookie(state: &AppState) -> String {
     cookie_with_expiry(state, chrono::Utc::now().timestamp() - 60)
 }
 
-/// A valid cookie with one ciphertext byte changed, so AEAD verification
-/// fails rather than the cookie merely being absent.
 fn tampered_cookie(state: &AppState) -> String {
     let mut cookie = valid_cookie(state);
     let mid = cookie.len() / 2;
@@ -348,10 +301,6 @@ fn request(route: &Route, origin: Option<&str>, credential: &Credential<'_>) -> 
         .expect("request builds from a static table")
 }
 
-/// How many requests the upstream has seen. Zero is the load-bearing
-/// assertion on every rejection: the proxy attaches the session's bearer
-/// token to what it forwards, so a call made before the verdict has
-/// already handed the attacker's request the victim's credential.
 async fn upstream_calls(upstream: &TlsUpstream) -> usize {
     upstream
         .mock()
@@ -361,11 +310,6 @@ async fn upstream_calls(upstream: &TlsUpstream) -> usize {
         .len()
 }
 
-/// The upstream call count, read one row at a time.
-///
-/// Each `delta` call answers how many requests the upstream received since
-/// the previous one, so a row's assertion is about that row and cannot be
-/// satisfied by what its neighbours did or did not spend.
 struct UpstreamLedger<'a> {
     upstream: &'a TlsUpstream,
     seen: usize,
@@ -450,9 +394,6 @@ async fn a_configured_origin_reaches_the_handler() {
 
 #[tokio::test]
 async fn an_absent_origin_passes_every_route() {
-    // Present-only semantics: this is a browser CSRF control, not client
-    // authentication. curl, the CLI and every scripted client send no
-    // Origin and must keep working.
     let (upstream, state, app) = fixture().await;
     let cookie = valid_cookie(&state);
     let mut ledger = UpstreamLedger::new(&upstream);
@@ -480,9 +421,6 @@ async fn an_absent_origin_passes_every_route() {
 
 #[tokio::test]
 async fn two_origin_headers_are_refused_even_when_both_are_configured() {
-    // A browser sends at most one. Two mean something in between appended
-    // one, so there is no single origin to compare, and picking either
-    // copy answers about a request nobody sent.
     let (upstream, state, app) = fixture().await;
     let cookie = valid_cookie(&state);
 
@@ -516,10 +454,6 @@ async fn two_origin_headers_are_refused_even_when_both_are_configured() {
 
 #[tokio::test]
 async fn a_bearer_client_is_exempt_from_the_guard() {
-    // A bearer client holds no cookie, so it is not a CSRF target: nothing
-    // a foreign page can do makes a browser send someone else's
-    // Authorization header. The CLI posting from a machine that also has a
-    // browser tab open must not start 403ing.
     let (upstream, _state, app) = fixture().await;
     let mut ledger = UpstreamLedger::new(&upstream);
 
@@ -600,10 +534,6 @@ async fn a_refused_origin_outranks_every_cookie_state() {
 
 #[tokio::test]
 async fn an_allowed_origin_keeps_the_existing_cookie_answers() {
-    // The other half of the ordering claim: with the guard satisfied, the
-    // 401s and the expiry clear behave exactly as they did before it
-    // existed. A guard that also changed these would be a second auth
-    // rule wearing a CSRF hat.
     let (upstream, state, app) = fixture().await;
     let expired = expired_cookie(&state);
     let tampered = tampered_cookie(&state);
@@ -643,9 +573,6 @@ async fn an_allowed_origin_keeps_the_existing_cookie_answers() {
                 "{}: a {label} cookie's clear directive",
                 route.name
             );
-            // A 401 is a rejection too: it must be answered before the
-            // proxy forwards anything, since there is no session token to
-            // forward with.
             assert_eq!(
                 ledger.delta().await,
                 0,
@@ -702,11 +629,6 @@ async fn a_rooted_origin_is_its_own_spelling_end_to_end() {
 
 #[tokio::test]
 async fn forged_forwarding_headers_move_no_verdict() {
-    // `Host`, `Forwarded` and `X-Forwarded-*` are free text to anyone who
-    // can reach the port. Under the old host-comparison rule they decided
-    // the answer; now they are inert in both directions, so a deployment
-    // behind a proxy that rewrites them gets the same verdict as one
-    // without.
     let (upstream, state, app) = fixture().await;
     let cookie = valid_cookie(&state);
     let mut ledger = UpstreamLedger::new(&upstream);
@@ -741,10 +663,6 @@ async fn forged_forwarding_headers_move_no_verdict() {
                 "{}: a refused {origin} must not touch the cookie, forged headers or not",
                 route.name
             );
-            // Taken here, per row, not summed at the end of the loop: the
-            // allowed half of this table includes logout, which spends no
-            // upstream call, so any total-based bound has room in it for a
-            // refused row to have forwarded the victim's token.
             assert_eq!(
                 ledger.delta().await,
                 if refused { 0 } else { route.upstream_on_pass },

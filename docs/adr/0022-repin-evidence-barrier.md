@@ -1,6 +1,6 @@
 # Repin terminal `succeeded` is an evidence barrier
 
-status: accepted (2026-08-25) — prep ruling record for #125's sibling (repin evidence contract)
+status: accepted (2026-08-25) — prep ruling record for #125's sibling (repin evidence contract); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 `finish_cutover` commits the pin flip, the job's `succeeded` status, and
 the CLEAR of the field's old degraded evidence in one transaction
@@ -80,3 +80,14 @@ repin at once can get 409 because the previous repin is still cleaning up.
 The caller retries. Ruling 4 stands: the wire gains no `finalizing` state,
 and the 409 is the only signal. `repin --wait` still returns at the
 terminal row.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **The engine stages the five final counts and the per-service null tallies in one `UPDATE`, before the force gate and before the Cutover marker, and staging is not best-effort.** The counts and the tallies are one reading of the finished shadow. A row that carries totals from one pass beside tallies from another describes a corpus that never existed. Staging replaces the final progress write, so a failed staging aborts the job while the corpus still stands at its pre-repin generation.
+- **`stage_cutover_input` that updates no row is an error, and the engine stops before it writes the Cutover marker.** The `WHERE` matches the job's `id` only when that job is `running` and is not a dry run. No match means the job row is missing, the job is already terminal, or the job is a dry run. In each case the engine must not write a marker for a job that postgres does not record as running. Restaging a job that is still `running` overwrites the same row, so a retry is safe.
+- **`staged_tallies` orders services by rows nulled, highest first, then by service name, and keeps the first `MAX_CONFLICTS_PER_FIELD`.** The per-field conflict trim drops the overflow anyway. Cutting it here decides which rows survive: the services that lost the most. The accepted residual is that a repin lossy across more than 100 services records evidence for the worst 100 only.
+- **NULL staged tally columns mean staging never ran. Empty arrays mean the rewrite proved the repin lossless.** `finish_cutover` tells the two apart. On NULL it still completes the job, invents no evidence and emits a `repin_evidence_unstaged` warning. The caller is past the Cutover marker, the corpus is already the new generation, and the shadow that counted the losses is gone. The engine stages before it writes the marker, so this case is a fallback and not a normal path. It is the one exception to ruling 1.
+- **The call that completes the job clears the repinned field's old conflict evidence and its `field_degraded_ack` row, under the same gate as the new evidence.** The old evidence describes a pin that no longer exists. The analyzer's degraded gate is span-based, so evidence left in place would keep the field degraded after the operator applied the remedy. An ack suppresses a verdict about a pin, and that pin is gone too. A replay of an already-succeeded job gets no row back from the completing `UPDATE`, so it deletes neither the evidence this flip recorded for the new pin nor an ack that an operator wrote after the flip. Other fields are untouched.
+- **The `field_degraded_ack_cleared` audit event is one line per observed clear, not one per clear.** `CutoverOutcome::cleared_ack` is true only on the call that completed the job, so a boot replay of a finished cutover never repeats the line. The engine and boot recovery emit the line after `finish_cutover` commits. A crash between the commit and the emit loses the line, and nothing is left to replay it from. Closing that gap needs a durable outbox, and ADR-0019 ruling 12 rejects a general receipts table. The ack is gone either way, so the residual is accepted: the audit trail can be one line short.

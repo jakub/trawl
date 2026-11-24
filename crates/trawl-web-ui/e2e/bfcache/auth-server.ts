@@ -75,8 +75,6 @@ export const test = base.extend<{ authServer: AuthServer }>({
       }, response => {
         const headers = { ...response.headers };
         if (headers['content-type']?.includes('text/html')) {
-          // Match the BFCache-enabled reproduction's document policy. The
-          // shared harness still owns all asset bytes and its request cap.
           headers['cache-control'] = 'no-cache';
           headers['content-security-policy'] = "default-src 'self'; script-src 'self' 'wasm-unsafe-eval' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; font-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'";
           headers['x-content-type-options'] = 'nosniff';

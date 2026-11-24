@@ -24,12 +24,8 @@ use std::time::{Duration, Instant};
 
 const WAITING: &str = "trawl trial: waiting for another `trawl trial` command to finish";
 
-/// Generous: a step only has to start a process and take a free lock.
 const STEP: Duration = Duration::from_secs(60);
 
-/// A `docker` that answers preflight as Docker 29 with Compose 5.5.1, and
-/// lists no resources. `ps` logs its start and end with the calling
-/// process's pid, and blocks until `release` exists.
 fn stub_docker(dir: &Path) {
     let script = format!(
         r#"#!/bin/sh
@@ -108,7 +104,6 @@ fn wait_for(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// Wait for `child` and return whether it succeeded, with its stderr.
 fn finish(mut child: Child, lines: &mpsc::Receiver<String>) -> (bool, Vec<String>) {
     let status = child.wait().unwrap();
     let stderr: Vec<String> = lines.iter().collect();
@@ -118,9 +113,6 @@ fn finish(mut child: Child, lines: &mpsc::Receiver<String>) -> (bool, Vec<String
 const DOWN: &[&str] = &["down", "--yes"];
 const UP: &[&str] = &["up"];
 
-/// Start `first`, hold it in its listing, start `second`, and check that
-/// `second` waits for the lock and lists only after `first` has finished.
-/// Returns the two results, first then second.
 fn race(first: &[&str], second: &[&str]) -> [(bool, Vec<String>); 2] {
     let tmp = tempfile::tempdir().unwrap();
     let stub = tmp.path().join("stub");
@@ -173,8 +165,6 @@ fn race(first: &[&str], second: &[&str]) -> [(bool, Vec<String>); 2] {
     [first, second]
 }
 
-/// `up` passed its listing and stopped at the stub's first unanswered
-/// call, the image check, having created nothing.
 fn assert_up_stopped_after_listing((ok, stderr): &(bool, Vec<String>)) {
     assert!(!ok, "up cannot succeed against the stub: {stderr:?}");
     assert!(

@@ -8,9 +8,6 @@ const DUPLICATE = 'A net with this name already exists. Choose another name.';
 const generic = (status: number) => `Could not save the net (server returned ${status}).`;
 const HOSTILE = '<img src=x onerror="window.__netNamePwned=1">';
 
-// Fixed copy keys on the pair of status and code, whatever the message
-// says (ADR-0066). Any other pair, and trawld's old `bad_request` with its
-// old text, is generic copy that quotes nothing the server wrote.
 const REFUSALS: Array<[string, number, string, string, (status: number) => string]> = [
   ['invalid name', 400, 'invalid_name', 'name must not be blank or contain control or invisible formatting characters', () => INVALID],
   ['duplicate name', 409, 'duplicate_name', 'a saved query with this name already exists', () => DUPLICATE],
@@ -22,8 +19,7 @@ const REFUSALS: Array<[string, number, string, string, (status: number) => strin
   ['old bad_request duplicate text', 409, 'bad_request', 'a saved query with this name already exists', generic],
 ];
 
-/** The n-th error toast says `copy`. Error toasts persist, so each
- * refusal adds one at the end of the stack. */
+/** Error toasts persist, so each refusal adds one at the end of the stack. */
 async function expectRefusal(page: Page, title: string, copy: string, label: string) {
   const toasts = page.locator(SEL.toastAny);
   const index = REFUSALS.findIndex(([name]) => name === label);
@@ -32,7 +28,6 @@ async function expectRefusal(page: Page, title: string, copy: string, label: str
   await expect(toasts.nth(index).locator('.detail'), label).toHaveText(copy);
 }
 
-/** The hostile message was never rendered as markup or as text. */
 async function expectNothingHostile(page: Page) {
   await expect(page.locator('img[src="x"]')).toHaveCount(0);
   expect(await page.evaluate(() => (window as unknown as { __netNamePwned?: number }).__netNamePwned)).toBeUndefined();
@@ -77,7 +72,6 @@ test('readable net names preserve punctuation and key refusal copy on status and
   for (const [label, status, , , copy] of REFUSALS) {
     await save.click();
     await expectRefusal(page, "Couldn't save", copy(status), label);
-    // The draft survives every refusal, and the dialog stays open on it.
     await expect(dialog).toBeVisible();
     await expect(input).toHaveValue(`  ${name}  `);
   }

@@ -4,66 +4,15 @@
 
 //! The one menu contract: the panel both fleet-ui menus mount
 //! (ADR-0028).
-//!
-//! The topbar's account menu and a table row's `ActionsMenu` are the
-//! same widget with different content, so they are the same component
-//! here — the trigger, the entries and the panel class are props, and
-//! everything a menu must get right lives in one place.
-//!
-//! The invariants this module owns:
-//!
-//! - **One tab stop.** Commands and radio choices are native buttons with true
-//!   roving tabindex: exactly one at `0`, the rest at `-1`. Arrows,
-//!   Home and End walk the queried command and radio list by index
-//!   ([`crate::roving`]), so a node that is not an item — the account
-//!   menu's identity header — can never take focus. Tab and Shift+Tab close the menu and return to the trigger:
-//!   one deterministic keypress beats scanning the document for the
-//!   trigger's successor across a panel that unmounts on a microtask.
-//! - **The panel is a [`FocusPolicy::None`](crate::overlay::FocusPolicy)
-//!   layer**, mounted only while open, and it gates BOTH window
-//!   listeners — Escape and outside mousedown — on
-//!   [`is_topmost`](crate::overlay::OverlayLayer::is_topmost). `Capture`
-//!   would make an open menu the topmost focus owner, and a menu inside
-//!   a modal would then switch the modal's Tab trap off while trapping
-//!   nothing itself. Initial focus goes through the shared
-//!   [`overlay::focus_initial`](crate::overlay::focus_initial) scan
-//!   under a once-per-mount latch this component owns, because the
-//!   overlay hook's own latch belongs to the focus-owning policies.
-//! - **Restore is by cause** ([`restores_trigger`]). Escape, Tab and an
-//!   item activation return focus to the trigger; an outside pointer
-//!   dismissal restores nothing, because focus belongs to whatever was
-//!   clicked. Activation restores BEFORE running the callback, so a
-//!   callback that opens a dialog captures the trigger as that dialog's
-//!   opener rather than `<body>`.
-//! - **The header sits before and outside `role="menu"`.** It is a
-//!   separate slot the component renders in the panel wrapper, so the
-//!   identity block cannot land among the items — structurally, not by
-//!   convention.
-//!
-//! The panel's roving index follows FOCUS, which is the menu half of
-//! the asymmetry [`crate::roving`] documents: a tab strip's follows
-//! selection.
 
-/// Why a menu closed. The cause decides where focus goes, so it is
-/// named rather than implied by which handler fired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum MenuClose {
-    /// Escape while the menu is the topmost layer.
     Escape,
-    /// An item was activated (click, Enter or Space on the button).
     Activate,
-    /// Tab or Shift+Tab inside the menu.
     Tab,
-    /// A pointer went down outside the trigger-plus-panel wrapper.
     Outside,
 }
 
-/// Whether closing for this cause returns focus to the trigger.
-///
-/// Every keyboard cause does: the user is in the keyboard's world and
-/// dropping focus to `<body>` would lose their place. An outside
-/// mousedown does not: focus belongs to whatever the user pressed, and
-/// yanking it back would fight the browser's own focus move.
 pub(crate) const fn restores_trigger(cause: MenuClose) -> bool {
     !matches!(cause, MenuClose::Outside)
 }
@@ -80,7 +29,6 @@ mod component {
     use super::{MenuClose, restores_trigger};
     use crate::roving::{next_index, vertical_nav};
 
-    /// One command in a menu. `danger` renders the destructive treatment.
     #[derive(Clone)]
     pub(crate) struct MenuItem {
         pub label: Signal<String>,
@@ -96,10 +44,6 @@ mod component {
         pub on_activate: Callback<()>,
     }
 
-    /// What a menu renders, in order: commands, named radio groups and rules.
-    /// A separator or group label is never focusable and never counts
-    /// toward the roving index, because the walk indexes the queried
-    /// command/radio list and a separator is not in it.
     #[derive(Clone)]
     pub(crate) enum MenuEntry {
         Item(MenuItem),
@@ -110,8 +54,6 @@ mod component {
         Separator,
     }
 
-    /// The checked radio is the initial tab stop. Menus containing commands
-    /// alone retain their first-item initial focus.
     fn initial_index(entries: &[MenuEntry]) -> usize {
         let mut index = 0;
         for entry in entries {
@@ -131,18 +73,11 @@ mod component {
         0
     }
 
-    /// The open menu panel. Mounted only while `open` is true — a
-    /// closed menu must not sit on the overlay stack shadowing Escape
-    /// for the layers beneath it.
-    ///
-    /// `panel_class` is the caller's positioning/skin class
-    /// (`user-menu`, `actions-menu`) and lands on the wrapper, so the
-    /// existing `.user-menu .item` / `.actions-menu .item` rules keep
-    /// matching; the `role="menu"` node inside carries no class of its
-    /// own. `wrap_ref` is the trigger-plus-panel wrapper the
-    /// outside-mousedown check contains against, which is what keeps a
-    /// trigger re-click a clean toggle instead of a close-then-reopen.
-    /// `stop_click_propagation` is for menus nested in a clickable row.
+    /// `panel_class` lands on the wrapper, so the `.user-menu .item` /
+    /// `.actions-menu .item` rules keep matching. `wrap_ref` is the
+    /// trigger-plus-panel wrapper the outside-mousedown check contains
+    /// against, which is what keeps a trigger re-click a clean toggle instead
+    /// of a close-then-reopen.
     #[component]
     pub(crate) fn MenuPanel(
         panel_class: &'static str,
@@ -169,9 +104,6 @@ mod component {
             }
         };
 
-        // Initial focus, once per mount: the panel's first tabbable
-        // descendant is the one item at tabindex="0"; a menu with no
-        // items falls back to the panel's own tabindex="-1".
         let focused_once = StoredValue::new(false);
         Effect::new(move |_| {
             if focused_once.get_value() {
@@ -185,16 +117,11 @@ mod component {
 
         install_dismissal(layer, wrap_ref, close);
 
-        // Keydown bubbles from the focused item up to the panel
-        // wrapper. It is bound on the WRAPPER, not the role="menu"
-        // node, because an empty menu's fallback focus parks on the
-        // wrapper's own tabindex="-1" and a Tab pressed there must
-        // still close the menu rather than walk off it (shadow review
-        // 1, #159). Every key handled here stops propagation as well
-        // as the default: a containing modal's window-level Tab trap
-        // must not also see the Tab that just closed this menu. Escape
-        // is deliberately NOT handled here — it belongs to the window
-        // listener above, which is the one that knows about topmost.
+        // Bound on the WRAPPER, not the role="menu" node, because an empty
+        // menu's fallback focus parks on the wrapper's own tabindex="-1" and
+        // a Tab pressed there must still close the menu. Every key handled
+        // here stops propagation: a containing modal's window-level Tab trap
+        // must not also see the Tab that just closed this menu.
         let on_keydown = move |e: web_sys::KeyboardEvent| {
             let key = e.key();
             if key == "Tab" {
@@ -242,11 +169,8 @@ mod component {
         }
     }
 
-    /// The two window-level dismissal listeners, both gated on the
-    /// menu being the topmost layer. Escape belongs here rather than on
-    /// the menu node so it fires wherever focus is; mousedown rather
-    /// than click so a drag-select that ends outside doesn't dismiss,
-    /// the same reason Modal's scrim uses mousedown.
+    /// mousedown rather than click so a drag-select that ends outside
+    /// doesn't dismiss.
     fn install_dismissal(
         layer: crate::overlay::OverlayLayer,
         wrap_ref: NodeRef<Div>,
@@ -283,13 +207,6 @@ mod component {
         );
     }
 
-    /// The panel's entries. Item buttons carry the roving tabindex (one
-    /// `0`, the rest `-1`) and sync the index on focus, so a pointer
-    /// landing on an item leaves the arrows walking from where the user
-    /// actually is. Only items are counted: these indices are the
-    /// indices of the queried command/radio list the walk reads,
-    /// which is why a separator can neither be focused nor be skipped
-    /// past by an off-by-one.
     fn render_entries(
         entries: Vec<MenuEntry>,
         focused: RwSignal<usize>,
@@ -382,8 +299,6 @@ mod tests {
 
     #[test]
     fn every_keyboard_cause_restores_the_trigger_and_an_outside_press_does_not() {
-        // The whole table, so a new cause has to state its answer here
-        // rather than inheriting one.
         assert!(restores_trigger(MenuClose::Escape));
         assert!(restores_trigger(MenuClose::Activate));
         assert!(restores_trigger(MenuClose::Tab));

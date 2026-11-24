@@ -4,242 +4,9 @@
 
 //! The captured-results capability (ADR-0057), transport-free.
 //!
-//! [`capture`] runs one query and keeps its answer as an immutable,
-//! typed, expiring result; the correlation reads of ADR-0058 run through
-//! the same core, `run`. [`list`] names the caller's own live captures,
-//! [`page`] reads a capture's rows and [`cell`] reads one cell by byte
-//! range. Each takes the verified key and answers a wire type or a
-//! [`ServerError`]. `routes` adapts them to HTTP; an in-process
-//! host calls them as they are.
-//!
-//! # A capture
-//!
-//! Every capture, of every kind, runs through one core, `run`, which takes
-//! a `Spec`: the kind it records, the text it runs as sent, the request's
-//! window, a shape imposed instead of the one `bounds::classify` decides,
-//! and a `Selection` the lane applies around the cut. [`capture`], the
-//! search, is the spec of kind `search` with the caller's text and window,
-//! no imposed shape and a selection that selects nothing. The correlation
-//! reads (`context`, `sightings`, `compare`) differ only in their spec:
-//! the same guards in the same order, the same lane and the same commit.
-//!
-//! `run` applies `/query`'s guards in `/query`'s order and calls the same
-//! functions, with two capture steps before the query is tracked:
-//!
-//! 1. The trawl `query` permission, else 403. Then request-shape
-//!    validation: a `query` holding U+0000 is a 400, since the store's TEXT
-//!    columns refuse it. It opens no timing account.
-//! 2. One deadline for the whole capture: `[capture] deadline_secs`,
-//!    capped by the server's query timeout.
-//! 3. The query id and the timing account of the spec's kind (`capture`
-//!    for a search, else `context`, `sightings` or `compare`), opened
-//!    before `dsl_check` as `/query` opens its own (ADR-0046): every
-//!    capture that reaches the check writes one `query_timing` event,
-//!    refusals included.
-//! 4. **Bounds**, booked as `dsl_check`, as one preparation job on the
-//!    blocking pool behind the preparation allowance (ADR-0063). The text
-//!    as sent passes the admission check, so a parse error points into
-//!    the text the caller wrote. Then `bounds::resolve_as` fixes the
-//!    window at the results clock's instant, splices it in and decides
-//!    the shape, or
-//!    takes the one the spec imposes, and the executed text passes the
-//!    same check; a failure there is the server's own splice, so a 500.
-//!    Only the `eventstats` form takes an imposed event shape, and a text
-//!    outside it is the server's own composition, so a 500 too. An
-//!    event-shaped query leaves one stage of the cap for the order the
-//!    server appends, so one at the cap is the bounds' 400. A
-//!    `from saved` capture resolves its stored run here, booked as
-//!    `saved_lookup`, refuses a run whose file is gone, and measures the
-//!    run's files against `source_max_bytes`, as a window's selection is
-//!    measured inside the lane. A refusal ends the account with
-//!    `outcome=error`. No preparation slot free before the deadline is
-//!    503 `query_resource_exhausted`. A deadline that passes during the
-//!    resolution or the lookup refuses the capture before admission, 503
-//!    with `outcome=capacity_refused`, as `/query` refuses work its
-//!    deadline never let start.
-//! 5. **Admission** ([`super::charge::CaptureGate::admit`]), booked as
-//!    `pool_wait`: the key's lane, the installation's slots and the quota
-//!    reservation, else 429 with `Retry-After` and the account ended with
-//!    `outcome=capacity_refused` and `work_started=false`.
-//! 6. The tracker and `query_start`, over the executed text. A capture
-//!    refused in steps 1, 4 or 5 took no permit and no publication guard,
-//!    and appears in its timing event, if it opened one, but in neither
-//!    `/queries` nor history. Every refusal of the input itself, a read's
-//!    own validation included, comes before step 5, so it takes nothing.
-//! 7. The capture lane ([`crate::pool::ExecutorPool::capture`]) executes
-//!    the text under `RowCap::Refuse(max_result_rows)` and UTC, and inside
-//!    the slot applies the spec's selection around the cut, counts the
-//!    column facts, writes the parquet file and publishes it under the
-//!    result's id. The admission rides the slot, so the lane slot, the
-//!    installation slot and the reservation stay charged until the work
-//!    physically stops. A window whose selection is over `source_max_bytes`
-//!    is refused inside the lane, before the engine scans: the permit is
-//!    held for the measurement only and returned before the work starts.
-//! 8. A `from saved` capture's vanished-run post-check, then the timing
-//!    event.
-//! 9. **Commit.** The row, with the spec's kind and the facts its
-//!    selection computed, is inserted in a task of its own, which the
-//!    request awaits, and only then are the tracker, history and the
-//!    response told the capture succeeded. The same task records the
-//!    outcome, so a client that goes away cuts neither the commit nor its
-//!    record short. A capture dropped at an earlier await closes its tracker
-//!    entry as abandoned ([`crate::tracker::Tracked`]).
-//!
-//! The file reaches its final name before its row commits, ADR-0057's
-//! order. From before the publish until the insert is decided the capture
-//! is in flight ([`super::InFlight`]), and the sweep leaves its file
-//! alone however long the insert takes. A capture that ends before its
-//! first insert unlinks the file it published (`Uncommitted`). From that
-//! insert on, a row may commit whatever the capture learns. A taken id on
-//! the first insert committed nothing, so the file goes. A grace that
-//! finds no row removes it too, and a row that commits after that grace
-//! reads as `file_missing` (see [`COMMIT_GRACE`]). A commit task cut
-//! short, as when trawld shuts down while an insert is pending, leaves the
-//! file to boot, which keeps it if its row has committed by then and
-//! removes it otherwise ([`super::sweep::reconcile_at_boot`]).
-//!
-//! An insert that answers an error may still commit. The connection can
-//! die after the statement reached the backend, which finishes it anyway,
-//! and a read on another connection can run before that commit is
-//! visible. So an insert's error is settled by a fence: the same insert
-//! again, on another connection. The id is the table's primary key, so at
-//! most one of the two commits a row. A first insert whose transaction is
-//! still open makes the fence wait until it ends. One that committed
-//! leaves the fence the taken id, and one that never arrived leaves the
-//! fence to insert the row. In each case the row is committed, and the
-//! capture keeps its file and answers 200.
-//!
-//! A fence that fails too leaves the commit in doubt. The capture answers
-//! the first insert's error, and a task of its own keeps the file in
-//! flight and the reservation charged for [`COMMIT_GRACE`], then reads the
-//! row. A row found then keeps its file. A row still absent loses it. A
-//! read that fails leaves the file to the sweep, which removes it once no
-//! live row names it ([`super::sweep`]).
-//!
-//! # An attached capture
-//!
-//! A capture whose request names an investigation (ADR-0059) is recorded
-//! there as a step, whatever its kind: a search, or a `context`,
-//! `sightings` or `compare` read. Its authority, `investigation_write`
-//! with `investigation_read` and `query`, is checked with the request's
-//! shape, before anything is looked up, and its purpose against its bound
-//! ([`authorize`]); a correlation read checks both before it judges the
-//! rest of its request, whose refusals then record no step. Once step 4
-//! has fixed the executed text and its bounds, and before step 5 takes
-//! any slot, the step is appended with no outcome: an unknown
-//! investigation is 404, a closed one 409 `investigation_closed`. The
-//! append first takes a place in its key's share of the step writer's,
-//! which bounds the key's outcomes not yet written
-//! ([`crate::investigations::step`]), and a capture whose key's share is
-//! full is 429 `capture_busy` at once, with no wait for a place. A refusal
-//! in step 4 records no step, since nothing would run.
-//!
-//! Step 5 admits it against the evidence budgets instead of the temporary
-//! quota ([`super::charge::CaptureGate::admit_attached`]): the result is
-//! the investigation's from birth, so `max_file_bytes` is reserved against
-//! the investigation's and the installation's evidence, and a full budget
-//! is 409 `evidence_budget_exceeded`.
-//!
-//! Step 9 commits it kept ([`commit_kept`]): the row `kept` with no
-//! deadline, the step's `success` and the investigation's next sequence in
-//! one transaction that locks the investigation first, through the store's
-//! due-write rule ([`crate::store::ResultsStore::insert_kept`]). The fence
-//! and the grace work as for a temporary capture. A request with
-//! `seen_seq` reads, after the commit, what other keys wrote since then
-//! ([`crate::investigations::service::ACTIVITY_LIMIT`] entries at most); a
-//! capture that fails carries none.
-//!
-//! From the step on, its completion ([`crate::investigations::step`])
-//! writes how the capture ended: `refused` with the code of an admission
-//! refusal, `timeout`, `failed` with the error's code, `success` inside the
-//! kept transaction, and `aborted` when the client goes away before the
-//! commit task takes over. One handle rides the executor slot beside the
-//! admission, so the outcome is written no sooner than the work stops.
-//!
-//! # The cut
-//!
-//! A capture keeps at most `max_rows` rows and `max_wire_bytes` of cells,
-//! each cell measured as the #214 wire encodes it
-//! ([`trawl_api::value::wire_cell_len`]), with no framing. An event-shaped
-//! result, already ordered `_time DESC, _ingested DESC` by the executed
-//! text, keeps the rows before the first one that does not fit; a first
-//! row too large keeps none. `total_rows` is every row the cut saw. A
-//! search's selection passes every row the execution produced, so for a
-//! search it is every row the execution produced.
-//!
-//! The spec's selection runs on both sides of the cut, under the `post`
-//! phase with it: before, over every executed row, where a read may
-//! reorder or drop rows but never change the columns; after, over the kept
-//! rows, where it computes the facts the row records as `correlation`. A
-//! read's facts name their own denominators. A whole-shaped result that
-//! does not fit is refused with `result_too_large`: a prefix of an
-//! aggregate answers a different question. A result that the bounds call
-//! event-shaped but that lacks `_time` or `_ingested` is whole-shaped
-//! (ADR-0057, D9).
-//!
-//! The facts are encoded once, right after the selection computes them and
-//! before anything is staged, and that text is what the row stores. A
-//! document over [`CORRELATION_MAX_BYTES`] is refused with
-//! `result_too_large`. Its length counts in the capture's bytes with the
-//! file's, as the row's `metadata_bytes`, so the file and the document
-//! together must fit `max_file_bytes`, the size the reservation holds; a
-//! capture that does not is refused too.
-//!
-//! # Column facts
-//!
-//! Counted in the lane over the kept rows: nulls, distinct non-null values
-//! up to [`DISTINCT_CAP`], and, for a column of at most
-//! [`LISTED_VALUES_MAX`] distinct values, each value with its count, most
-//! frequent first. Values are listed only when every one is at most
-//! [`VALUE_TEXT_MAX`] bytes as its self-tagged cell, so a list answer
-//! stays bounded at 64 results × columns × five values; a longer value is
-//! never cut, because a cut value would pass for a real one. `_time` also
-//! gets its earliest and latest instant.
-//!
-//! # Reads
-//!
-//! Every read needs the `query` permission and ownership, and checks, in
-//! order: the id's shape, the caller's row (else 404), a pruned or expired
-//! row (410 `result_gone`; a temporary row past its deadline is marked
-//! expired and its file unlinked on the spot, and a kept row whose
-//! investigation's `retain_until` passed has that investigation's evidence
-//! pruned under its lock and its files unlinked, answering the
-//! `RetentionEnded` reason, as a pruned evidence row does; when a write
-//! moved that deadline, or deleted the investigation, before the lock was
-//! taken, the row is read again and judged as the write left it), a
-//! tombstone past
-//! `tombstone_secs` (404; never for an investigation's pruned evidence,
-//! which reads as pruned for as long as its investigation exists), a row
-//! whose file is missing (409
-//! `result_unavailable`), the file's blake3 digest (500 `result_corrupt`),
-//! then the read itself on a connection outside the executor permits.
-//! A capture with no columns has no file and answers its rows, all empty,
-//! without touching disk.
-//!
-//! Kept evidence is the one exception to ownership (ADR-0059): a key that
-//! holds `investigation_read` as well as `query` reads every investigation's
-//! kept results, and its pruned ones as 410, whoever captured them. Another
-//! key's temporary result stays as absent to it as to anyone, with the same
-//! 404 as an id no row has.
-//!
-//! A read can lose its file between those checks and the engine's open:
-//! the deadline passes, and another read, the sweep or a capture's
-//! admission expires the row and unlinks the file. The read path relies on
-//! one rule. The server unlinks a committed capture's file only after the
-//! store marked its row expired or pruned: `expire_now` marks, then
-//! unlinks, and the sweep, boot and the gate unlink only the ids the
-//! store's expiry or prune returned, or files no live row names. A
-//! capture's own commit unlinks its file for a taken id on the first
-//! insert, which committed nothing, and after a grace that found no row;
-//! a row that commits after that grace reads as `file_missing` (see
-//! [`COMMIT_GRACE`]). A task cut short preserves the file. A gone row
-//! never lives again. So a read that finds its file missing, or whose
-//! engine fails on the file, reads the row again under the caller's key
-//! and answers from the store. A row gone by then answers 410 or 404 as
-//! above. Only a row still live lost its file out of band: it is marked
-//! `file_missing` and answers 409. For a live row whose file is there, the
-//! digest decides: a changed file answers 500 `result_corrupt`, an intact
-//! one the engine's own failure.
+//! A column's facts list its values only when every one is at most
+//! [`VALUE_TEXT_MAX`] bytes as its self-tagged cell; a longer value is
+//! never cut, because a cut value would pass for a real one.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -299,10 +66,8 @@ pub const VALUE_TEXT_MAX: usize = 256;
 /// so every range holds at least one character and moves forward.
 pub const CELL_LENGTH_MIN: u64 = trawl_config::CAPTURE_MAX_WIRE_BYTES_MIN;
 
-/// Why a captured result can no longer be read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GoneReason {
-    /// It passed its deadline.
     Expired,
     /// Boot pruned it to bring its key within a lowered quota.
     Pruned,
@@ -316,7 +81,6 @@ pub enum GoneReason {
 }
 
 impl GoneReason {
-    /// The `result_gone` answer for this reason.
     #[must_use]
     pub const fn message(self) -> &'static str {
         match self {
@@ -340,21 +104,7 @@ impl GoneReason {
 pub const CORRELATION_MAX_GROUPS: u64 = 5000;
 
 /// The largest correlation facts document a capture stores, in bytes of
-/// its JSON text (module docs, "The cut").
-///
-/// It holds the largest document the producers make from names ingest
-/// accepts. `context` and `compare` facts are fixed-size apart from the
-/// names they quote. `sightings` lists at most [`CORRELATION_MAX_GROUPS`]
-/// groups, each a 32-byte `env`, a 128-byte `service`, a count and two
-/// timestamps, under 300 bytes; at most 256 listed fields of at most 255
-/// bytes, the rest counted as `fields_omitted` (a request's at most 16
-/// `fields` name fewer); and a literal of at most 1 KiB, quoted in it and
-/// in two follow-up queries. That is about 1.6 MB (1,584,714 bytes),
-/// measured by the `the_facts_bound_holds_the_largest_ordinary_sightings`
-/// test. The bound
-/// exists for names no ingest path made: 5000 groups of 1 KiB names would
-/// be a 10 MB document, stored and sent with every answer about the
-/// capture, so it is refused instead.
+/// its JSON text.
 pub const CORRELATION_MAX_BYTES: u64 = 2 << 20;
 
 /// What made a capture impossible to keep (`result_too_large`).
@@ -381,10 +131,7 @@ pub enum CaptureOverflow {
         max_wire_bytes: u64,
     },
     /// A correlation read whose facts would list more groups than
-    /// [`CORRELATION_MAX_GROUPS`]: the facts document is stored beside the
-    /// file and sent with every answer about the capture, so the groups
-    /// are bounded where they are counted, before
-    /// [`CORRELATION_MAX_BYTES`] bounds the encoded document.
+    /// [`CORRELATION_MAX_GROUPS`].
     #[error("the {read} read found {groups} groups, above the limit of {max_groups}; {hint}")]
     Groups {
         /// The read: `sightings` or `compare`.
@@ -422,10 +169,8 @@ pub enum CaptureOverflow {
     },
 }
 
-// -- capture -----------------------------------------------------------------
-
-/// Capture one query's result (module docs, "A capture"): a search,
-/// recorded with the kind `search` and no correlation facts.
+/// Capture one query's result: a search, recorded with the kind `search`
+/// and no correlation facts.
 ///
 /// `request_id` is the request's ULID, the timing event's correlation.
 ///
@@ -456,7 +201,7 @@ pub async fn capture(
 }
 
 /// What one capture runs and records: everything by which the four kinds
-/// differ (module docs, "A capture").
+/// differ.
 pub(crate) struct Spec {
     /// The read that makes the capture: recorded on its row, and its
     /// ADR-0046 timing kind.
@@ -464,22 +209,20 @@ pub(crate) struct Spec {
     /// The text as sent: checked, resolved, recorded as `query`, and
     /// shown back. A correlation read sends the text its builder composed.
     pub(crate) query: String,
-    /// The request's structured window, if it carries one.
     pub(crate) window: Option<WindowInput>,
     /// A shape imposed instead of the one [`bounds::classify`] decides
     /// ([`bounds::resolve_as`]).
     pub(crate) shape: Option<Shape>,
     /// What the lane selects from the executed rows around the cut.
     pub(crate) selection: Box<dyn Selection>,
-    /// The investigation the capture attaches to (ADR-0059, module docs,
-    /// "An attached capture"), whatever its kind; `None` for a temporary
-    /// capture.
+    /// The investigation the capture attaches to (ADR-0059), whatever its
+    /// kind; `None` for a temporary capture.
     pub(crate) investigation: Option<Attach>,
 }
 
-/// A read's own step inside the capture lane, around the cut (module docs,
-/// "The cut"). Both methods run on the worker, inside the slot, while the
-/// query's [`QueryPhase::Post`] is active on its clock.
+/// A read's own step inside the capture lane, around the cut. Both methods
+/// run on the worker, inside the slot, while the query's
+/// [`QueryPhase::Post`] is active on its clock.
 pub(crate) trait Selection: Send {
     /// Sees every row the executed pipeline produced, uncut. It may reorder
     /// or drop rows and must leave the column list as it is; a selection
@@ -509,8 +252,6 @@ pub(crate) trait Selection: Send {
     ) -> Result<Option<Correlation>, ServerError>;
 }
 
-/// A search's selection: every row goes to the cut, and the capture has
-/// no correlation facts.
 pub(crate) struct NoSelection;
 
 impl Selection for NoSelection {
@@ -527,8 +268,6 @@ impl Selection for NoSelection {
     }
 }
 
-/// The ADR-0046 timing kind of a capture made by `kind`. The lane is the
-/// capture lane for every kind ([`WorkKind::Capture`]).
 const fn timing_kind(kind: CaptureKind) -> TimingKind {
     match kind {
         CaptureKind::Search => TimingKind::Capture,
@@ -538,13 +277,10 @@ const fn timing_kind(kind: CaptureKind) -> TimingKind {
     }
 }
 
-/// Run one capture of any kind (module docs, "A capture").
-///
 /// Everything that can refuse the capture for its input runs before the
 /// admission, so a refused capture takes no permit, no lane slot and no
-/// reservation: the request-shape check, then [`plan`]'s bounds. A read
-/// that validates more of its input does so before calling this, or in
-/// [`plan`], never after the admission.
+/// reservation. A read that validates more of its input does so before
+/// calling this, or in [`plan`], never after the admission.
 ///
 /// # Errors
 /// As [`capture`].
@@ -581,7 +317,7 @@ pub(crate) async fn run(
     let pool = &state.query.pool;
 
     // One absolute budget for resolution, admission, execution and the
-    // file write together (ADR-0057), stamped before anything waits.
+    // file write together, stamped before anything waits.
     let deadline = Deadline::after(Duration::from_secs(
         limits.deadline_secs.min(state.query.timeout_secs),
     ));
@@ -601,7 +337,6 @@ pub(crate) async fn run(
     let step_request_id = investigation.as_ref().map(|_| request_id.clone());
     let timing = TimingGuard::for_request(query_id, request_id, timing_kind(kind), start);
 
-    // Every refusal of the input happens here, before the admission below.
     let planned = plan(
         state,
         verified,
@@ -619,10 +354,6 @@ pub(crate) async fn run(
             return Err(e);
         }
     };
-    // The step is appended at admission, once the text and the bounds are
-    // known and before any slot is taken; a plan refusal records nothing.
-    // From here the completion writes the step's outcome however the
-    // capture ends (`step`'s module docs).
     let step = match (&investigation, step_request_id) {
         (Some(attach), Some(request_id)) => {
             let bounds = match plan.resolved.source {
@@ -689,15 +420,10 @@ pub(crate) async fn run(
     // the executor slot.
     let reservation = admission.reservation().clone();
 
-    // The entry closes with `tracked`: through the outcome the capture
-    // reaches, or as abandoned if the transport drops this future at an
-    // await before the commit task takes it over.
-    //
     // `_pending` puts the id in the pool's registry before the entry
     // opens, so a cancel by id reaches the capture while it waits for a
-    // permit or a window's publication guard (ADR-0024, Amendment
-    // 2026-11-09). The plan, the step and the gate's admission above run
-    // before it, outside a cancel's reach.
+    // permit or a window's publication guard (ADR-0024). The plan, the step
+    // and the gate's admission above run before it, outside a cancel's reach.
     let executed = plan.resolved.executed.as_str();
     let _pending = pool.pend(query_id, WorkKind::Capture);
     let tracked = state.query.tracker.start(query_id, verified, executed);
@@ -856,10 +582,8 @@ pub(crate) async fn run(
     }
 }
 
-/// Step 9's record of how a capture ended: its tracker entry, its history
-/// row, its log line and its metrics. Owned, so the commit task carries it
-/// and a capture whose client went away during the commit is recorded as
-/// the capture it is.
+/// Owned, so the commit task carries it and a capture whose client went
+/// away during the commit is recorded as the capture it is.
 struct Record {
     tracked: Tracked,
     history: HistoryStore,
@@ -876,7 +600,6 @@ struct Record {
 }
 
 impl Record {
-    /// Record `committed` and answer it.
     #[allow(clippy::too_many_lines)]
     async fn finish(
         self,
@@ -1012,8 +735,6 @@ impl Record {
     }
 }
 
-/// The deadline a capture runs under, in whole seconds: `[capture]
-/// deadline_secs`, capped by `[server] timeout_secs`.
 pub(crate) fn deadline_secs(state: &AppState) -> u64 {
     state
         .results
@@ -1022,8 +743,6 @@ pub(crate) fn deadline_secs(state: &AppState) -> u64 {
         .min(state.query.timeout_secs)
 }
 
-/// Whether `/query` logs this failure as the caller's (WARN), not the
-/// server's (ERROR). The capture's own refusals join the engine's.
 fn is_callers_mistake(error: &ServerError) -> bool {
     matches!(
         error,
@@ -1034,23 +753,15 @@ fn is_callers_mistake(error: &ServerError) -> bool {
     )
 }
 
-/// What step 3 decided: the text to record and run, and where the lane
-/// reads from.
 struct Plan {
     resolved: bounds::Resolved,
     /// The text the lane executes: the executed text, or for `from saved`
     /// the stages after the `from saved` stage.
     lane_dsl: String,
     lane_source: CaptureSource,
-    /// A `from saved` capture's run files, for the post-check.
     run_files: Vec<RunFile>,
 }
 
-/// Step 4: check `query`, resolve the bounds from it and `window` under
-/// the imposed `shape`, if any, and, for `from saved`, the stored run and
-/// its budget, booking the work on `timing`. Takes nothing a refusal must
-/// give back.
-///
 /// Writes the account itself only when the deadline passed during the
 /// resolution or the lookup, which is a capacity refusal; every other
 /// refusal is the caller's to write.
@@ -1171,9 +882,8 @@ async fn plan(
     }
 }
 
-/// Step 4's checks and bounds, as one preparation job on the blocking
-/// pool behind the preparation allowance (ADR-0063): [`admit_capture_with`]
-/// under the job's stop. The wait for a slot spends `deadline`.
+/// [`admit_capture_with`] as one preparation job on the blocking pool,
+/// behind the preparation allowance (ADR-0063).
 ///
 /// # Errors
 ///
@@ -1219,7 +929,6 @@ pub(crate) fn admit_capture_with(
     Ok((resolved, executed))
 }
 
-/// Check the executed text a capture's resolution made.
 fn admit_executed(
     executed: &str,
     stop: &trawl_core::cancel::Stop,
@@ -1278,9 +987,6 @@ fn stored_bytes(files: &[RunFile]) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// An admission refusal as the request's answer, with the outcome its
-/// timing account ends with: a full lane, installation, quota or evidence
-/// budget is a capacity refusal, a store failure an error.
 fn refused(refusal: Refusal) -> (Outcome, ServerError) {
     let (reason, retry_after_secs, error) = match refusal {
         Refusal::EvidenceBudgetExceeded { scope, used, limit } => {
@@ -1322,11 +1028,7 @@ fn refused(refusal: Refusal) -> (Outcome, ServerError) {
 }
 
 /// `/query`'s vanished-run post-check ([`crate::handlers`]'s
-/// `guard_vanished_run_result`) over a capture's outcome: a `from saved`
-/// read that came back with no columns, or with an engine error, asks its
-/// run files once more: a file now confirmed absent is the named 409, and
-/// one whose absence cannot be established is a redacted I/O error. A
-/// capture dropped here unlinks the file it published.
+/// `guard_vanished_run_result`) over a capture's outcome.
 fn guard_vanished_run(
     outcome: Result<Captured, ServerError>,
     run_files: &[RunFile],
@@ -1361,8 +1063,6 @@ fn new_result_id() -> String {
     id
 }
 
-/// What the lane's `finish` needs: where the file goes, the read's
-/// selection and the cap.
 struct Keep {
     root: Arc<ResultsRoot>,
     in_flight: Arc<InFlight>,
@@ -1374,7 +1074,6 @@ struct Keep {
     max_file_bytes: u64,
 }
 
-/// What a capture kept, out of the slot.
 struct Captured {
     columns: Vec<ResultColumn>,
     facts: Vec<ColumnFacts>,
@@ -1391,8 +1090,6 @@ struct Captured {
 }
 
 impl Keep {
-    /// The lane's `finish`: select, cut, select again, count the facts,
-    /// write and publish, all on the worker inside the slot.
     fn run(self, input: CaptureInput<'_>) -> Result<Captured, ServerError> {
         #[cfg(any(test, feature = "test-support"))]
         let seams = input.seams;
@@ -1501,8 +1198,6 @@ impl Keep {
     }
 }
 
-/// Encode a read's facts once, as the row stores them, refusing a document
-/// over [`CORRELATION_MAX_BYTES`] (module docs, "The cut").
 pub(super) fn encode_facts(facts: Correlation) -> Result<FactsDocument, ServerError> {
     let document = FactsDocument::encode(facts).map_err(|e| {
         tracing::debug!(
@@ -1521,14 +1216,11 @@ pub(super) fn encode_facts(facts: Correlation) -> Result<FactsDocument, ServerEr
     Ok(document)
 }
 
-/// Whether the result carries both columns the event order sorts by.
 fn has_event_columns(result: &QueryResult) -> bool {
     let has = |name: &str| result.columns.iter().any(|column| column.name == name);
     has(trawl_core::schema::TIME) && has(trawl_core::schema::INGESTED)
 }
 
-/// How many leading rows a capture keeps, and their wire bytes (module
-/// docs, "The cut").
 fn cut(
     result: &QueryResult,
     shape: ResultShape,
@@ -1585,7 +1277,6 @@ fn cell_fault(e: &serde_json::Error) -> ServerError {
     ServerError::Internal(format!("a result cell does not encode: {e}"))
 }
 
-/// Facts per column over `result`'s rows (module docs, "Column facts").
 fn column_facts(result: &QueryResult) -> Result<Vec<ColumnFacts>, ServerError> {
     result
         .columns
@@ -1606,7 +1297,6 @@ struct Seen {
     count: u64,
 }
 
-/// The facts of one column over `cells`.
 fn facts_of<'a>(
     column: &Column,
     cells: impl Iterator<Item = &'a Value>,
@@ -1712,7 +1402,6 @@ fn listable(seen: &[Seen]) -> Result<bool, ServerError> {
     Ok(true)
 }
 
-/// The engine's storage flag as the wire spells it.
 const fn wire_stored_as(stored_as: FileStoredAs) -> StoredAs {
     match stored_as {
         FileStoredAs::Native => StoredAs::Native,
@@ -1720,7 +1409,6 @@ const fn wire_stored_as(stored_as: FileStoredAs) -> StoredAs {
     }
 }
 
-/// The wire's storage flag as the engine's reader takes it.
 const fn file_stored_as(stored_as: StoredAs) -> FileStoredAs {
     match stored_as {
         StoredAs::Native => FileStoredAs::Native,
@@ -1728,9 +1416,6 @@ const fn file_stored_as(stored_as: StoredAs) -> FileStoredAs {
     }
 }
 
-/// The row key `key_id`'s capture commits, and the file it names: `query`
-/// is the text as sent, `kind` the read that made it, `investigation_id`
-/// the investigation an attached capture is kept for.
 #[allow(clippy::too_many_arguments)]
 fn new_capture(
     results: &ResultsState,
@@ -1866,14 +1551,6 @@ impl Drop for Uncommitted {
 ///   fence failing too leaves the commit in doubt: the answer is the first
 ///   insert's error, and the file and the reservation go to a task that
 ///   holds both for [`COMMIT_GRACE`] and then reads the row ([`in_doubt`]).
-///
-/// The file is disarmed before the first insert can reach the store: from
-/// then on a row may commit whatever this task learns. A task dropped at
-/// either await, as when trawld shuts down with the commit pending, leaves
-/// the file for boot and the sweep. The taken id, which committed nothing,
-/// removes it here, and so does a grace that finds no row ([`in_doubt`]);
-/// a row that commits after that grace reads as `file_missing`, as
-/// [`COMMIT_GRACE`] states.
 async fn commit(
     results: Arc<ResultsState>,
     new: NewCapture,
@@ -1927,13 +1604,6 @@ async fn commit(
     Ok(committed_row(new))
 }
 
-/// Commit an attached capture kept from birth (module docs, "An attached
-/// capture"): its row `kept` in the investigation, the step's success and
-/// the investigation's next sequence, in the one transaction of
-/// [`crate::store::ResultsStore::insert_kept`]. Then settle its evidence
-/// reservation, keep its file, and unlink the evidence the due-write rule
-/// pruned.
-///
 /// The decisions are [`commit`]'s. A fence runs the same transaction: the
 /// primary key orders it after the first, so a taken id there means the
 /// first committed, its step fill included, and the fence wrote nothing.
@@ -2035,9 +1705,6 @@ async fn commit_kept(
     read_back(&results, row, fenced_taken).await
 }
 
-/// The warning of a committed capture whose history write for `key_id`
-/// failed. The error goes in by its closed class only, as
-/// [`log_fenced`]'s does.
 fn log_history_failed(key_id: i64, error: &StoreError) {
     tracing::warn!(
         event_type = "history_error",
@@ -2061,8 +1728,6 @@ fn log_fenced(result_id: &str, fence: &'static str, insert: &StoreError, message
     );
 }
 
-/// Read the row a kept insert committed, when only the stored row can say
-/// its state, and unlink its file if a fenced commit pruned it.
 async fn read_back(
     results: &ResultsState,
     row: CaptureRow,
@@ -2110,8 +1775,6 @@ async fn read_back(
     }
 }
 
-/// An attached capture whose investigation was gone at its commit: discard
-/// the file, log the investigation, and answer a 500 that names nothing.
 fn orphaned(file: Option<Uncommitted>, new: &NewCapture) -> ServerError {
     if let Some(file) = file {
         file.discard();
@@ -2128,53 +1791,14 @@ fn orphaned(file: Option<Uncommitted>, new: &NewCapture) -> ServerError {
 }
 
 /// How long a capture whose commit is in doubt keeps its file in flight and
-/// its reservation charged before its row is read (module docs, "A
-/// capture"). The fallback for a double fault: the insert and its fence
-/// both failed.
+/// its reservation charged before its row is read. The fallback for a
+/// double fault: the insert and its fence both failed. The grace is twice
+/// [`crate::store::PURGE_COMMIT_BOUND`].
 ///
-/// The wait covers a backend still finishing either insert after its
-/// client saw the connection fail. Such a backend learns that its client
-/// is gone when it next writes to it, after the commit, so it finishes the
-/// statement; `client_connection_check_interval`, when an operator sets
-/// it, only abandons the statement sooner, which commits nothing. A
-/// temporary capture's first insert waits on no other session: it names
-/// no investigation, so its foreign key checks nothing, the id is fresh,
-/// and trawld takes the only conflicting table locks for migrations, at
-/// boot. An attached capture's transaction first waits for its
-/// investigation's row lock ([`commit_kept`]), which other sessions hold
-/// only for an investigation write or the evidence prune: short
-/// transactions that wait on nothing slow in turn. A fence waits on the
-/// first insert's row alone, and only until that insert's transaction
-/// ends. What remains is I/O: the
-/// heap and index pages, and the commit's WAL flush, which postgres does
-/// not bound.
-/// [`crate::store::PURGE_COMMIT_BOUND`] judges that a commit behind an
-/// ordinary busy checkpoint finishes within thirty seconds. Missing here
-/// costs more than there: a row that lands after its file was unlinked is
-/// listed as the owner's and answers 409 until it expires. Waiting longer
-/// holds one reservation and one file of at most `max_file_bytes` for the
-/// grace, and only after two store failures. So the grace is twice that
-/// bound.
-///
-/// No wait covers a commit stalled past it, as on a wedged volume, after a
-/// fence that failed. Its row lands without its file and reads as
-/// `file_missing`, a named outcome.
-///
-/// A promotion whose transaction answers a store failure holds its
-/// evidence charge for the same grace
-/// ([`crate::investigations::service`]). Its transaction locks the
-/// investigation and then the results it promotes, rows that other
-/// sessions hold only for the same short writes, so the same bound covers
-/// it.
+/// No wait covers a commit stalled past it, after a fence that failed. Its
+/// row lands without its file and reads as `file_missing`, a named outcome.
 pub const COMMIT_GRACE: Duration = Duration::from_secs(60);
 
-/// Settle a capture whose insert and fence both failed, in a task of its
-/// own: keep `file` in flight, disarmed, and `reservation` charged for
-/// [`COMMIT_GRACE`], then read the row. Found, one of the inserts landed:
-/// settle and keep the file. Absent, neither did: unlink the file, and the
-/// reservation lapses. A read that fails leaves the file to the sweep and
-/// lets the reservation lapse; by then the grace has passed.
-///
 /// The reservation stays charged through the grace because the store's
 /// usage cannot count a commit still on its way: released early, it would
 /// admit a capture past the quota if the row lands. Held, it can refuse
@@ -2259,7 +1883,6 @@ fn in_doubt(
     });
 }
 
-/// The row an insert of `new` committed.
 fn committed_row(new: NewCapture) -> CaptureRow {
     let metadata_bytes = new.metadata_bytes();
     let kept = new.investigation_id.is_some();
@@ -2297,8 +1920,6 @@ fn committed_row(new: NewCapture) -> CaptureRow {
     }
 }
 
-// -- reads -------------------------------------------------------------------
-
 /// The caller's live captures, newest first.
 ///
 /// # Errors
@@ -2313,14 +1934,7 @@ pub async fn list(state: &AppState, verified: &VerifiedKey) -> Result<ResultList
 }
 
 /// One page of capture `id`: rows `offset` up to `offset + limit` of the
-/// columns `columns` names (module docs, "Reads").
-///
-/// `limit` defaults to and may not pass `[capture] page_max_rows`;
-/// `offset` defaults to 0 and may not pass the captured rows. `columns`
-/// is display names separated by commas; each selects every column with
-/// that name, and the page carries the selected columns in stored order,
-/// with their positions. A name that holds a comma cannot be selected
-/// alone; leave `columns` out to read every column.
+/// columns `columns` names.
 ///
 /// # Errors
 /// 403, 404, 410, 409 and 500 as the lifecycle decides; 400 for a limit,
@@ -2352,7 +1966,6 @@ pub async fn page(
     let positions = project(&row.columns, columns)?;
 
     let rows = if row.columns.is_empty() {
-        // No columns, no file: each row is empty.
         let returned = limit.min(row.captured_rows - offset);
         vec![Vec::new(); usize::try_from(returned).unwrap_or(usize::MAX)]
     } else {
@@ -2405,12 +2018,6 @@ pub async fn page(
 
 /// A byte range of one cell of capture `id`: row `row`, the column at
 /// 0-based position `column`, over the cell's #214 wire JSON text.
-///
-/// `offset` defaults to 0 and must sit on a character boundary, as every
-/// `next_offset` does. `length` defaults to and may not pass
-/// `[capture] max_wire_bytes`, which holds any captured cell whole, and is
-/// at least [`CELL_LENGTH_MIN`]. The range is cut back to a character
-/// boundary, so it can be shorter than asked for.
 ///
 /// # Errors
 /// 403, 404, 410, 409 and 500 as the lifecycle decides; 400 for a row, a
@@ -2475,8 +2082,6 @@ pub async fn cell(
     cell_range(meta.ty, &text, offset.unwrap_or(0), length)
 }
 
-/// `[offset, offset + length)` of `text`, the end cut back to a character
-/// boundary.
 fn cell_range(
     ty: ColumnType,
     text: &str,
@@ -2511,8 +2116,6 @@ fn cell_range(
     })
 }
 
-/// The positions `names` selects, ascending; every position when `names`
-/// is absent.
 fn project(columns: &[ResultColumn], names: Option<&str>) -> Result<Vec<usize>, ServerError> {
     let Some(names) = names else {
         return Ok((0..columns.len()).collect());
@@ -2536,9 +2139,8 @@ fn project(columns: &[ResultColumn], names: Option<&str>) -> Result<Vec<usize>, 
     Ok(positions.into_iter().collect())
 }
 
-/// Capture `id`, if the caller may read it now (module docs, "Reads"):
-/// its own, or kept evidence for an investigation reader. Everything but
-/// the file's own checks.
+/// Capture `id`, if the caller may read it now: its own, or kept evidence
+/// for an investigation reader. Everything but the file's own checks.
 async fn readable(
     results: &ResultsState,
     verified: &VerifiedKey,
@@ -2595,11 +2197,8 @@ where
     }
 }
 
-/// What a read finds when it judges a row ([`judge`]).
 enum Judged {
-    /// The capture can be read as the row says.
     Live,
-    /// The capture can no longer be read: the answer.
     Gone(ServerError),
     /// The row is out of date. Its investigation's retention had passed
     /// when the row was read, but under the investigation's lock it had
@@ -2608,20 +2207,12 @@ enum Judged {
     Stale,
 }
 
-/// What a read of `row` at `now` finds when the row alone says the capture
-/// can no longer be read: 410 `result_gone` for a pruned or expired row, or
-/// a temporary one past its deadline, which is expired on the spot, or a
-/// kept one whose investigation's `retain_until` passed, whose evidence is
-/// pruned on the spot ([`end_evidence_now`]); 404 once its tombstone is
-/// past `tombstone_secs`, unless it is an investigation's evidence.
-/// [`Judged::Stale`] when that prune finds the retention moved, and
-/// [`Judged::Live`] for a live row. A pruned row still attached to its
-/// investigation was pruned by its retention, since quota prunes take only
-/// temporary rows. A pruned row attached to none whose `expires_at` equals
-/// its `gone_at` was evidence of an investigation since deleted: the
-/// delete and the retention prune stamp both with one instant, and a quota
-/// prune takes only live temporary rows, so it leaves a deadline after
-/// `gone_at`.
+/// A pruned row still attached to its investigation was pruned by its
+/// retention, since quota prunes take only temporary rows. A pruned row
+/// attached to none whose `expires_at` equals its `gone_at` was evidence of
+/// an investigation since deleted: the delete and the retention prune stamp
+/// both with one instant, and a quota prune takes only live temporary rows,
+/// so it leaves a deadline after `gone_at`.
 async fn judge(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>) -> Judged {
     let (reason, gone_at) = match row.state {
         ResultState::Pruned if row.investigation_id.is_some() => {
@@ -2679,13 +2270,6 @@ async fn still_live(results: &ResultsState, row: &CaptureRow) -> Result<(), Serv
         .map(drop)
 }
 
-/// A kept result a read found past its investigation's `retain_until`:
-/// prune that investigation's evidence now, not at the next sweep, under
-/// the investigation's lock as a write's due-write rule does, and unlink
-/// the files. Returns whether the retention has ended under the lock: a
-/// write that slid the deadline after the row was read, or a delete, means
-/// it has not, and the read judges the row again as the store now holds it
-/// ([`current`]). A failure to unlink is logged and left to the sweep.
 async fn end_evidence_now(
     results: &ResultsState,
     investigation: &InvestigationId,
@@ -2703,8 +2287,6 @@ async fn end_evidence_now(
     Ok(true)
 }
 
-/// The warning of a read that could not mark a capture expired. The error
-/// goes in by its closed class only, as [`log_fenced`]'s does.
 fn log_expire_failed(error: &StoreError) {
     tracing::warn!(
         event_type = "results_expire_failed",
@@ -2713,10 +2295,6 @@ fn log_expire_failed(error: &StoreError) {
     );
 }
 
-/// A temporary capture a read found past its deadline: mark it expired and
-/// unlink its file now, not at the next sweep. A failure is logged and
-/// left to the sweep, which retries both; the read answers 410 either way.
-///
 /// The file goes only when this call marked the row. A row that changed
 /// since the read is not this call's to unlink: one promoted into an
 /// investigation meanwhile is kept evidence whose file must stay, and one
@@ -2757,10 +2335,6 @@ async fn expire_now(results: &ResultsState, row: &CaptureRow, now: DateTime<Utc>
     }
 }
 
-/// The path of `row`'s file once its digest matches: 409 when the file is
-/// gone, which marks the row, and 500 `result_corrupt` when it differs. A
-/// file the server removed because the capture expired or was pruned meanwhile
-/// answers what a read of the capture answers now ([`missing_file`]).
 async fn checked_file(
     state: &AppState,
     row: &CaptureRow,
@@ -2777,7 +2351,6 @@ async fn checked_file(
     }
 }
 
-/// `row`'s file checked against its recorded digest, on the blocking pool.
 async fn verify(state: &AppState, row: &CaptureRow) -> Result<Verified, ServerError> {
     let digest = row.digest.ok_or_else(|| {
         ServerError::Internal("a captured result with columns has no digest".into())
@@ -2813,9 +2386,6 @@ async fn missing_file(results: &ResultsState, row: &CaptureRow) -> ServerError {
     ServerError::ResultUnavailable
 }
 
-/// The warning of a read that could not mark a capture whose file is
-/// missing. The error goes in by its closed class only, as
-/// [`log_fenced`]'s does.
 fn log_mark_missing_failed(error: &StoreError) {
     tracing::warn!(
         event_type = "results_mark_missing_failed",
@@ -2824,12 +2394,6 @@ fn log_mark_missing_failed(error: &StoreError) {
     );
 }
 
-/// What a read answers when the engine could not read `row`'s file, which
-/// passed its digest check: the store and the file say why, never the
-/// engine's text. A row gone since answers as gone; for a live row the file
-/// is checked again, and a missing or changed file answers as
-/// [`checked_file`] does. A file still intact leaves the engine's own
-/// failure.
 async fn read_failed(state: &AppState, row: &CaptureRow, error: EngineError) -> ServerError {
     if let Err(refusal) = still_live(&state.results, row).await {
         return refusal;
@@ -2842,7 +2406,6 @@ async fn read_failed(state: &AppState, row: &CaptureRow, error: EngineError) -> 
     }
 }
 
-/// 500 `result_corrupt` for `row`, whose file does not match its digest.
 fn corrupt(row: &CaptureRow) -> ServerError {
     // The id lets an operator find the file; the request's own failure
     // event carries the route and the request id.
@@ -2854,16 +2417,10 @@ fn corrupt(row: &CaptureRow) -> ServerError {
     ServerError::ResultCorrupt
 }
 
-/// The authority a capture of any kind needs, and its attachment's own
-/// bounds (module docs, "An attached capture"): the `query` permission;
-/// then, when the request names an investigation, the write authority the
-/// investigation routes require, the same 403 they answer; then the
-/// purpose's bound. A capture and each correlation read call it before
-/// they judge anything else in the request, so a key that may not attach
-/// is refused before any cap, lookup or window, and a purpose over its
-/// bound before anything is looked up. It is the one grant checked after
-/// the body is read, since the intent to attach is in the body (ADR-0059,
-/// #310 final sweep).
+/// The authority a capture of any kind needs: the `query` permission;
+/// then, when the request names an investigation, the write authority
+/// and the purpose's bound. A capture and each correlation read call it
+/// before they judge anything else in the request (ADR-0059).
 ///
 /// # Errors
 /// 403 without `query`, or attached without write authority on
@@ -2880,9 +2437,6 @@ pub(crate) fn authorize(
     Ok(())
 }
 
-/// 403 without the trawl `query` permission. The routes call it before they
-/// look at the request, so a refusal of the request's shape never comes
-/// first.
 pub(crate) fn require_query(verified: &VerifiedKey) -> Result<(), ServerError> {
     if verified.has_permission(Permission::Query) {
         Ok(())
@@ -2946,9 +2500,6 @@ mod tests {
         assert_eq!(built, 2, "{parses:?}");
     }
 
-    /// A capture preparation whose stop was requested ends cancelled,
-    /// whichever check it reached: never the caller's 400 and never the
-    /// server's splice failure (R15).
     #[test]
     fn a_cancelled_capture_preparation_is_never_a_diagnostic() {
         use axum::response::IntoResponse as _;
@@ -3031,7 +2582,6 @@ mod tests {
             cut(&result, ResultShape::Events, 100, u64::MAX).unwrap(),
             (10, per_row * 10)
         );
-        // A first row too large keeps none.
         assert_eq!(
             cut(&result, ResultShape::Events, 100, per_row - 1).unwrap(),
             (0, 0)
@@ -3280,10 +2830,6 @@ mod tests {
         })
     }
 
-    /// The bound holds the widest sightings document that names ingest
-    /// accepts can make (a 32-byte env, a 128-byte service), which a
-    /// 1 MiB bound would not, and refuses the same document over 1 KiB
-    /// names (module docs, "The cut").
     #[test]
     fn the_facts_bound_holds_the_largest_ordinary_sightings() {
         let ordinary = encode_facts(widest_sightings(
@@ -3308,9 +2854,6 @@ mod tests {
         );
     }
 
-    /// An imposed shape the text does not take is the server's fault, a
-    /// 500 with a fixed message; every other bounds refusal stays the
-    /// caller's 400.
     #[test]
     fn an_unimposable_shape_is_the_servers_fault() {
         let limits = bounds::Limits {
@@ -3344,8 +2887,6 @@ mod tests {
         assert_ne!(a, b);
     }
 
-    /// A committed capture's failed history write is logged by the
-    /// error's closed class only.
     #[test]
     fn the_history_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
@@ -3354,8 +2895,6 @@ mod tests {
         assert!(logged.contains("key_id=7"), "{logged}");
     }
 
-    /// A read's failed expiry mark is logged by the error's closed class
-    /// only.
     #[test]
     fn the_expiry_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
@@ -3363,8 +2902,6 @@ mod tests {
         assert_class_only(&logged, "results_expire_failed", &error);
     }
 
-    /// A read's failed missing-file mark is logged by the error's closed
-    /// class only.
     #[test]
     fn the_missing_file_warning_logs_the_errors_class_and_not_its_text() {
         let error = sentinel();
@@ -3372,9 +2909,6 @@ mod tests {
         assert_class_only(&logged, "results_mark_missing_failed", &error);
     }
 
-    /// The fence's warning names the insert error's closed class and
-    /// nothing else of it: a backend diagnostic inside the error never
-    /// reaches the log.
     #[test]
     fn the_fence_warning_logs_the_insert_errors_class_and_not_its_text() {
         let insert = sentinel();
@@ -3389,8 +2923,6 @@ mod pg_tests {
     use super::*;
     use crate::pool::ExecutorPool;
 
-    /// A selection that keeps every other row before the cut and reports,
-    /// after it, how many rows it saw and the messages the cut kept.
     struct EveryOther {
         kept: Arc<parking_lot::Mutex<Vec<String>>>,
         seen: u64,
@@ -3433,7 +2965,6 @@ mod pg_tests {
         }
     }
 
-    /// A selection that renames a column, which no selection may do.
     struct Renames;
 
     impl Selection for Renames {
@@ -3486,7 +3017,6 @@ mod pg_tests {
         )
     }
 
-    /// [`lane_fixture`] under `capture`'s limits and quotas.
     fn lane_fixture_with(
         db: sqlx::PgPool,
         capture: crate::config::CaptureConfig,
@@ -3543,7 +3073,6 @@ mod pg_tests {
         (dir, pool, results)
     }
 
-    /// The bounds a capture of the fixture's events resolves to.
     fn fixture_bounds() -> bounds::Resolved {
         bounds::Resolved {
             executed: "* | sort -_time, -_ingested".into(),
@@ -3555,7 +3084,6 @@ mod pg_tests {
         }
     }
 
-    /// Run the fixture's capture through the real lane with `selection`.
     async fn through_the_lane(
         pool: &ExecutorPool,
         results: &ResultsState,
@@ -3565,12 +3093,10 @@ mod pg_tests {
         through_the_lane_as(pool, results, id, selection, key_7()).await
     }
 
-    /// Key 7's capture work, with no timing account and no holds.
     fn key_7() -> WorkContext {
         WorkContext::key(WorkKind::Capture, 7)
     }
 
-    /// [`through_the_lane`] as `work`.
     async fn through_the_lane_as(
         pool: &ExecutorPool,
         results: &ResultsState,
@@ -3608,7 +3134,6 @@ mod pg_tests {
         .await
     }
 
-    /// Commit `captured` as key 7's capture of `kind` and read it back.
     async fn stored(
         results: &ResultsState,
         id: &str,
@@ -3638,7 +3163,6 @@ mod pg_tests {
         row
     }
 
-    /// The messages of a stored capture's file, in stored order.
     fn stored_messages(
         pool: &ExecutorPool,
         results: &ResultsState,
@@ -3671,11 +3195,6 @@ mod pg_tests {
             .collect()
     }
 
-    /// A selection runs inside the real lane around the cut: before it,
-    /// over every executed row, newest first; after it, over the rows the
-    /// cut kept, which are the rows the file holds. Its facts reach the
-    /// row with the capture's kind, and a search's wire is spelled as it
-    /// was before the correlation reads.
     #[sqlx::test]
     async fn a_selection_runs_around_the_cut_and_its_facts_are_stored(db: sqlx::PgPool) {
         let (_dir, pool, results) = lane_fixture(db);
@@ -3751,8 +3270,6 @@ mod pg_tests {
         );
     }
 
-    /// A selection that changes the columns fails the capture as the
-    /// server's fault, and nothing is published.
     #[sqlx::test]
     async fn a_selection_that_changes_the_columns_fails_the_capture(db: sqlx::PgPool) {
         let (_dir, pool, results) = lane_fixture(db);
@@ -3767,7 +3284,6 @@ mod pg_tests {
         assert!(results.in_flight.snapshot().is_empty());
     }
 
-    /// A selection that answers fixed facts.
     struct Fixed(Option<Correlation>);
 
     impl Selection for Fixed {
@@ -3784,8 +3300,6 @@ mod pg_tests {
         }
     }
 
-    /// Facts of exactly `bytes` bytes of JSON: [`sightings`] with a literal
-    /// padded to fit.
     fn facts_of_len(bytes: u64) -> Correlation {
         let with = |literal: String| {
             let Correlation::Sightings(mut facts) = sightings(6, 2) else {
@@ -3800,12 +3314,6 @@ mod pg_tests {
         facts
     }
 
-    /// Facts at [`CORRELATION_MAX_BYTES`] are stored, and their bytes are
-    /// the row's `metadata_bytes`, counted in the key's usage with the
-    /// file's. One byte over fails the capture as `result_too_large` before
-    /// anything is staged: no file, nothing in flight, and the reservation
-    /// is released with the work, so the key's one-result quota admits the
-    /// next capture.
     #[sqlx::test]
     async fn facts_over_the_bound_refuse_the_capture_and_at_it_are_counted(db: sqlx::PgPool) {
         let (_dir, pool, results) = lane_fixture_with(
@@ -3875,8 +3383,6 @@ mod pg_tests {
         assert_eq!(usage.bytes, file_bytes + CORRELATION_MAX_BYTES);
     }
 
-    /// A file and facts that fit the reservation apart but not together
-    /// are refused: the reservation holds what the row will count.
     #[sqlx::test]
     async fn a_file_and_facts_over_the_reservation_together_are_refused(db: sqlx::PgPool) {
         let (_dir, pool, results) = lane_fixture_with(
@@ -3911,11 +3417,8 @@ mod pg_tests {
         assert!(results.in_flight.snapshot().is_empty());
     }
 
-    /// A selection that records the phase active when each of its steps
-    /// runs, and tries to enter another inside `before_cut`.
     struct PhaseProbe {
         seen: Arc<parking_lot::Mutex<Vec<Option<QueryPhase>>>>,
-        /// Whether entering a second phase panicked.
         nested_panicked: Arc<parking_lot::Mutex<Option<bool>>>,
     }
 
@@ -3956,11 +3459,6 @@ mod pg_tests {
         }
     }
 
-    /// Both steps of a selection run under `post`, on the query's own
-    /// clock. A selection that enters a phase of its own breaks the one
-    /// active phase the clock keeps, which a debug build asserts; a release
-    /// build has no assertion and would book the selection's time under
-    /// the phase it entered, so the contract is the trait's documentation.
     #[sqlx::test]
     async fn a_selection_runs_under_post_and_may_enter_no_phase(db: sqlx::PgPool) {
         let (_dir, pool, results) = lane_fixture(db);

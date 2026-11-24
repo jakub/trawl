@@ -17,16 +17,9 @@ use crate::pattern::Preparer;
 use crate::pattern::{MAX_REGEX_LEN, PatternError, PatternKind, price, re2};
 use crate::sanitize::is_unsafe_display_char;
 
-/// Shorthand for our parser type — `&str` input, `Rich` errors, and the
-/// regexes the parse recognised as its state ([`RegexSites`]).
 pub(crate) type ParserInput<'src> = &'src str;
 pub(crate) type ParserExtra<'src> = extra::Full<Rich<'src, char>, RegexSites, ()>;
 
-// ---------------------------------------------------------------------------
-// helpers
-// ---------------------------------------------------------------------------
-
-/// Wrap a value with its source span via `map_with`.
 pub(crate) fn spanned<'src, T: 'src>(
     p: impl Parser<'src, ParserInput<'src>, T, ParserExtra<'src>> + Clone,
 ) -> impl Parser<'src, ParserInput<'src>, Spanned<T>, ParserExtra<'src>> + Clone {
@@ -36,11 +29,6 @@ pub(crate) fn spanned<'src, T: 'src>(
     })
 }
 
-// ---------------------------------------------------------------------------
-// numbers
-// ---------------------------------------------------------------------------
-
-/// Parse an unsigned integer (sequence of digits).
 pub(crate) fn uint<'src>() -> impl Parser<'src, ParserInput<'src>, u64, ParserExtra<'src>> + Clone {
     text::int(10)
         .to_slice()
@@ -51,7 +39,6 @@ pub(crate) fn uint<'src>() -> impl Parser<'src, ParserInput<'src>, u64, ParserEx
         .labelled("integer")
 }
 
-/// Parse a signed integer.
 pub(crate) fn int<'src>() -> impl Parser<'src, ParserInput<'src>, i64, ParserExtra<'src>> + Clone {
     just('-')
         .or_not()
@@ -64,11 +51,6 @@ pub(crate) fn int<'src>() -> impl Parser<'src, ParserInput<'src>, i64, ParserExt
         .labelled("integer")
 }
 
-/// Parse a float (must contain a `.` to distinguish from int).
-///
-/// The token is kept beside the parsed double: `f64` is lossy past 53 bits
-/// and pin-aware pipeline comparison binds the literal's text, never the
-/// re-rendered double (ADR-0011 ruling #6, [`FloatLiteral`]).
 pub(crate) fn float<'src>()
 -> impl Parser<'src, ParserInput<'src>, FloatLiteral, ParserExtra<'src>> + Clone {
     just('-')
@@ -84,7 +66,6 @@ pub(crate) fn float<'src>()
         .labelled("float")
 }
 
-/// Parse a numeric literal — tries float first, then int.
 pub(crate) fn number_literal<'src>()
 -> impl Parser<'src, ParserInput<'src>, LiteralValue, ParserExtra<'src>> + Clone {
     float()
@@ -92,42 +73,27 @@ pub(crate) fn number_literal<'src>()
         .or(int().map(LiteralValue::Int))
 }
 
-// ---------------------------------------------------------------------------
-// strings
-// ---------------------------------------------------------------------------
-
-/// Parse a double-quoted string with basic escape support
-/// ([`quoted_string_reported`]).
-///
 /// Boxed: the expression grammar holds this lexer inside every recursive
 /// level, and chumsky inlines a combinator tower into the frame of each
-/// level that holds it. Boxed, the lexer's frames exist only while a
-/// string is being read, so a deep query's levels cost what they did
-/// before the unknown-escape arm (the stack premise
-/// `tests/tree_depth_stack.rs` checks, and the failure mode
-/// `crate::parser::comment::ws` and `expr.rs`'s `.boxed()` guard against).
+/// level that holds it (the stack premise `tests/tree_depth_stack.rs`
+/// checks).
 pub(crate) fn quoted_string<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     quoted_string_reported().map(|(s, _)| s).boxed()
 }
 
-/// The message head an unknown escape in a quoted string carries. A
-/// payload: the backslash pair rides along, and
-/// [`crate::parser::comment::message_for`] puts a display-safe rendering
-/// of it into the message.
+/// A payload's message: the backslash pair rides along, and
+/// [`crate::parser::comment::message_for`] splices a display-safe rendering
+/// of it in after the opening `unknown escape`.
 pub(crate) const MSG_UNKNOWN_ESCAPE: &str =
     "unknown escape: a quoted string decodes only \\\\, \\\", \\n, \\t and \\r";
 
-/// One piece of a quoted string's body: a decoded character, or an
-/// unknown escape kept as written.
 #[derive(Clone)]
 enum Chunk<'src> {
     Char(char),
     Unknown(&'src str),
 }
 
-/// [`quoted_string`], plus whether it emitted an unknown-escape error.
-///
 /// The five escapes decode. A backslash before any other character is an
 /// emitted error over the backslash and that whole character, and both
 /// are kept in the value as written, so the string still closes and no
@@ -196,12 +162,6 @@ pub(crate) fn raw_quoted_string<'src>()
         .labelled("quoted string")
 }
 
-// ---------------------------------------------------------------------------
-// identifiers and field names
-// ---------------------------------------------------------------------------
-
-/// Parse a bare identifier: `[a-zA-Z_][a-zA-Z0-9_]*`
-/// Also handles dot-separated field names like `host.name`.
 pub(crate) fn ident<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     let segment = any()
@@ -220,8 +180,6 @@ pub(crate) fn ident<'src>()
         .labelled("identifier")
 }
 
-/// Parse an `@`-prefixed name like `@timestamp`. The `@` is spelling
-/// only: the name is ordinary sender vocabulary, not a trawl slot.
 pub(crate) fn system_field<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     just('@')
@@ -231,28 +189,11 @@ pub(crate) fn system_field<'src>()
         .labelled("system field")
 }
 
-/// Parse a name in a position that is not a field: a function name, a
-/// stage name, a saved-query name. These take no backticks (ADR-0013
-/// ruling 7), since `` `lower`(x) `` must not be a call, so this is the
-/// unquoted production: `field_name()` minus the backtick arm.
 pub(crate) fn plain_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     system_field().or(ident())
 }
 
-/// Parse a backtick-quoted name: `` `request id` ``.
-///
-/// Backticks change how a name is lexed, never what a name may be
-/// (ADR-0013 ruling 7). Content is any character except a backtick; a
-/// doubled backtick escapes one. Empty names and names carrying a
-/// character that cannot be rendered as itself ([`is_unsafe_display_char`]:
-/// controls, the line and paragraph separators, bidi and zero-width format
-/// characters, the soft hyphen) are
-/// parse errors, and they are the only two refusals, because this is
-/// lexing, not policy: the ASCII fold ([`crate::schema::catalog_key`]) and
-/// the sealed `_` namespace ([`crate::schema::is_reserved_name`]) apply to
-/// the result exactly as they do to a bare name. A dot inside the quotes
-/// is a literal character, not a nested-name segment.
 pub(crate) fn quoted_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     choice((just("``").to('`'), none_of('`')))
@@ -278,16 +219,10 @@ pub(crate) fn quoted_name<'src>()
         .labelled("backtick-quoted field name")
 }
 
-/// Parse a field name: a backtick-quoted name, an `@`-prefixed name, or
-/// a regular identifier.
 pub(crate) fn field_name<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     choice((quoted_name(), system_field(), ident()))
 }
-
-// ---------------------------------------------------------------------------
-// filter operators (for field:op value syntax)
-// ---------------------------------------------------------------------------
 
 /// Parse a search-stage filter operator, ordered longest-first to avoid
 /// prefix ambiguity (`>=` before `>`, etc.).
@@ -304,11 +239,6 @@ pub(crate) fn filter_op<'src>()
     .labelled("filter operator")
 }
 
-// ---------------------------------------------------------------------------
-// durations
-// ---------------------------------------------------------------------------
-
-/// Parse a time unit suffix.
 pub(crate) fn time_unit<'src>()
 -> impl Parser<'src, ParserInput<'src>, TimeUnit, ParserExtra<'src>> + Clone {
     choice((
@@ -321,10 +251,6 @@ pub(crate) fn time_unit<'src>()
     .labelled("time unit")
 }
 
-/// Parse a duration like `2h`, `5m`, `30s`.
-///
-/// Rejects zero-duration values and durations large enough to overflow
-/// `u64` when converted to seconds.
 pub(crate) fn duration<'src>()
 -> impl Parser<'src, ParserInput<'src>, TrawlDuration, ParserExtra<'src>> + Clone {
     uint()
@@ -348,12 +274,6 @@ pub(crate) fn duration<'src>()
         .labelled("duration")
 }
 
-// ---------------------------------------------------------------------------
-// keywords with word boundary checks
-// ---------------------------------------------------------------------------
-
-/// Parse a keyword that must not be followed by an alphanumeric char or `_`.
-/// This prevents `android` from matching as `and`.
 pub(crate) fn keyword<'src>(
     kw: &'static str,
 ) -> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
@@ -367,7 +287,6 @@ pub(crate) fn keyword<'src>(
         .labelled(kw)
 }
 
-/// Parse `true` or `false` as a boolean literal.
 pub(crate) fn bool_literal<'src>()
 -> impl Parser<'src, ParserInput<'src>, LiteralValue, ParserExtra<'src>> + Clone {
     keyword("true")
@@ -375,13 +294,11 @@ pub(crate) fn bool_literal<'src>()
         .or(keyword("false").to(LiteralValue::Bool(false)))
 }
 
-/// Parse `null`.
 pub(crate) fn null_literal<'src>()
 -> impl Parser<'src, ParserInput<'src>, LiteralValue, ParserExtra<'src>> + Clone {
     keyword("null").to(LiteralValue::Null)
 }
 
-/// Parse any literal value: bool, null, float, int, or quoted string.
 pub(crate) fn literal<'src>()
 -> impl Parser<'src, ParserInput<'src>, LiteralValue, ParserExtra<'src>> + Clone {
     choice((
@@ -393,49 +310,15 @@ pub(crate) fn literal<'src>()
     .labelled("literal")
 }
 
-// ---------------------------------------------------------------------------
-// bare filter values (for search stage field=value)
-// ---------------------------------------------------------------------------
-
-/// Whether `c` ends an unquoted field-filter value: ASCII whitespace, `|`,
-/// the list separator `,`, a parenthesis or a backtick. A regex ends at
-/// the same bytes (ADR-0060), so the two cannot drift apart.
 pub(crate) fn ends_bare_value(c: char) -> bool {
     c.is_ascii_whitespace() || matches!(c, '|' | ',' | ')' | '(' | '`')
 }
 
-/// Parse a bare (unquoted) value in a field filter — stops at a byte
-/// [`ends_bare_value`] names.
-///
-/// A backtick ends a bare value, the same exclusion the search stage's bare
-/// word makes and for the same reason (ADR-0013 ruling 7): a backticked
-/// name is a field reference in every field position, so no unquoted
-/// position may absorb one. A value that genuinely contains a backtick is
-/// written double-quoted (`` host="a`b" ``).
-///
-/// A comment opener inside the value is a parse error, not data and not a
-/// comment (ADR-0014 ruling 2): `color=#ff0000` names its own `#` instead
-/// of quietly becoming a text search for `color=`. It carries the
-/// value-position message, whose hint quotes the value alone
-/// (`color="#ff0000"`), because quoting the whole token would turn a field
-/// filter into a phrase search, and a hint that changes what the query
-/// means is worse than none. The value is still produced, so the
-/// diagnostic is emitted rather than returned: a structurally-successful
+/// A comment opener (ADR-0014 ruling 2) or an opening `"` (ADR-0061
+/// ruling 3) is emitted rather than returned: a structurally-successful
 /// branch keeps chumsky's alternative selection from ranking a worse error
 /// from a later arm ahead of this one, while `into_result()` is still
 /// `Err`.
-///
-/// A value that opens with `"` and reaches this production is an error
-/// too ([`MSG_QUOTE_OPENS_BARE_VALUE`], ADR-0061 ruling 3): the quoted
-/// arm tried it first and found no complete string, so the author left a
-/// quote open. Read bare it would be a value carrying a literal quote, and
-/// a glob such as `host="*` has no spelling at all, since quoting makes a
-/// glob exact. It takes precedence over the opener error, one error per
-/// value.
-///
-/// This is the single bare-RHS production — single values, comma-separated
-/// IN lists and glob detection all route through it — so every exclusion
-/// covers every unquoted value shape at once.
 pub(crate) fn bare_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, String, ParserExtra<'src>> + Clone {
     any()
@@ -451,11 +334,8 @@ pub(crate) fn bare_value<'src>()
                 let start = span.start + at;
                 emitter.emit(Rich::custom(
                     (start..start + crate::parser::comment::OPENER.len_utf8()).into(),
-                    // The exact value slice rides along: this production
-                    // is the one place its bounds are known, and an IN
-                    // list's element is its own `bare_value`, so the hint
-                    // names the element the user can act on without
-                    // re-deriving a boundary from the raw text.
+                    // The exact value slice rides along: an IN list's element is its own
+                    // `bare_value`, so the hint names the element the user can act on.
                     crate::parser::comment::payload(crate::parser::comment::MSG_OPENER_IN_VALUE, s),
                 ));
             }
@@ -465,24 +345,17 @@ pub(crate) fn bare_value<'src>()
         .labelled("value")
 }
 
-/// The message a bare value opening with `"` carries (ADR-0061 ruling 3).
 pub(crate) const MSG_QUOTE_OPENS_BARE_VALUE: &str =
     "a value that opens with '\"' must be a complete quoted string";
 
-/// What cuts a `/…/` run so it cannot be a regex (ADR-0061 ruling 1). A
-/// regex body holds no raw line break and no `|` after whitespace.
+/// What cuts a `/…/` run so it cannot be a regex (ADR-0061 ruling 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RegexCut {
-    /// A raw `\n` or `\r` that no `|` follows. A regex spells it `\n`.
     LineBreak,
-    /// A run of ASCII whitespace, line breaks included, and then `|`. A
-    /// new pipe stage always ends what came before it, so this is a stage
-    /// boundary even inside what would otherwise be a regex body.
     PipeStage,
 }
 
 impl RegexCut {
-    /// The message a regex position that holds this cut carries.
     pub(crate) fn message(self) -> &'static str {
         match self {
             Self::LineBreak => MSG_REGEX_LINE_BREAK,
@@ -491,17 +364,11 @@ impl RegexCut {
     }
 }
 
-/// The message a regex cut by a raw line break carries.
 pub(crate) const MSG_REGEX_LINE_BREAK: &str = "a regex cannot hold a raw line break";
 
-/// The message a regex cut by `|` after whitespace carries.
 pub(crate) const MSG_REGEX_PIPE_STAGE: &str =
     "a regex cannot hold '|' after whitespace, which starts a new pipe stage";
 
-/// Every cut in `body`, in text order, each with the byte offset it
-/// starts at: a pipe-stage cut at the first byte of the whitespace before
-/// its `|`, a line-break cut at its `\n` or `\r`. One pass, so a long
-/// whitespace run costs its length once.
 fn cuts(body: &str) -> impl Iterator<Item = (usize, RegexCut)> + '_ {
     let bytes = body.as_bytes();
     let mut i = 0;
@@ -530,26 +397,17 @@ fn cuts(body: &str) -> impl Iterator<Item = (usize, RegexCut)> + '_ {
     })
 }
 
-/// The first cut in a regex body, with its byte offset, or `None` when
-/// the body rule admits it (ADR-0061 ruling 1).
-///
 /// The one owner of the rule. The grammar asks it in every regex
 /// position, and so does every text-level reader that has to agree with
 /// the grammar about where a regex ends: the splice scan
 /// ([`crate::parser::scan`]), the search-stage split in `trawl-search-url`
-/// and the formatter's `/body/` spelling. `body` is the text between the
-/// two slashes. Whitespace is ASCII whitespace, the set that ends an
-/// unquoted value ([`ends_bare_value`]), and a line break is `\n` or
-/// `\r`. Every byte the rule tests is ASCII, so each offset is a char
-/// boundary.
+/// and the formatter's `/body/` spelling. Every byte the rule tests is
+/// ASCII, so each offset is a char boundary.
 #[must_use]
 pub fn first_cut(body: &str) -> Option<(usize, RegexCut)> {
     cuts(body).next()
 }
 
-/// How a search value reads a `/…/` run that the rule before ruling 1
-/// would have closed: a pipe-stage cut anywhere in the body wins over a
-/// line break, since the stage ends the value whatever came before it.
 pub(crate) fn value_cut(body: &str) -> Option<RegexCut> {
     let mut found = None;
     for (_, cut) in cuts(body) {
@@ -561,9 +419,6 @@ pub(crate) fn value_cut(body: &str) -> Option<RegexCut> {
     found
 }
 
-/// Parse a `/`, a body of one or more bytes none of them `/`, and a `/`.
-/// Produces the body and judges nothing: this is the run each regex
-/// position reads before the body rule ([`first_cut`]) decides what it is.
 pub(crate) fn slash_run<'src>()
 -> impl Parser<'src, ParserInput<'src>, &'src str, ParserExtra<'src>> + Clone {
     none_of('/')
@@ -573,10 +428,6 @@ pub(crate) fn slash_run<'src>()
         .delimited_by(just('/'), just('/'))
 }
 
-/// Parse the shape of a regex delimited by `/`: `/body/`, where the body
-/// is one or more bytes, none of them `/`, and [`first_cut`] finds no cut
-/// in it. Produces the body and validates nothing else.
-///
 /// The shape alone does not make a regex. Each caller decides what may
 /// follow the closing `/` before it asks [`check_regex_body`], so a
 /// candidate its caller reads as something else is never validated
@@ -590,7 +441,6 @@ pub(crate) fn regex_shape<'src>()
         .labelled("regex pattern")
 }
 
-/// A pattern the parse recognised and checked, still to be built.
 #[derive(Debug, Clone)]
 pub(crate) struct RegexSite {
     /// What a build error covers: the whole `/…/`, quoted string or bare
@@ -605,14 +455,6 @@ pub(crate) struct RegexSite {
     pub(crate) units: u64,
 }
 
-/// The parse state: the patterns the parse recognised, in text order, and
-/// the `/…/` runs a pipe stage cut out of a search value.
-///
-/// The parser checks each pattern as it reads it ([`check_pattern`]) and
-/// builds nothing. Building waits until the query has parsed and holds no
-/// more than [`crate::parser::MAX_QUERY_PATTERNS`] patterns, because the
-/// count alone does not bound the work once building starts.
-///
 /// A site is dropped when the parse backtracks past it, as chumsky drops
 /// a diagnostic emitted there, so the sites left belong to the reading
 /// that parsed.
@@ -653,10 +495,6 @@ impl<'src, I: chumsky::input::Input<'src>> chumsky::inspector::Inspector<'src, I
     }
 }
 
-/// Check a pattern the grammar recognised, inside a `validate` step
-/// ([`pattern_refusal`]): a refusal is emitted over `span`, and a pattern
-/// that passes is recorded for building once the parse is done. Returns
-/// whether it emitted.
 pub(crate) fn check_pattern(
     kind: PatternKind,
     text: &str,
@@ -676,7 +514,6 @@ pub(crate) fn check_pattern(
     }
 }
 
-/// Check a recognised regex body: [`check_pattern`] for a regex.
 pub(crate) fn check_regex_body(
     body: &str,
     span: SimpleSpan,
@@ -686,31 +523,13 @@ pub(crate) fn check_regex_body(
     check_pattern(PatternKind::Regex, body, span, sites, emitter)
 }
 
-/// What [`pattern_refusal`] admits a pattern as.
 enum Checked {
-    /// Recorded, to be built once the query has parsed, with what
-    /// translating it costs.
     Recorded { units: u64 },
 }
 
-/// Why a pattern is refused before anything builds it, in the order every
-/// pattern site shares (ADR-0063): a regex body's syntax, then the length
-/// of the text as the query decodes it, delimiters excluded, then a regex
-/// body's class set syntax ([`re2::class_set_refusal`]), then the repeat
-/// budget ([`price::MAX_REPEAT_POSITIONS`]). One syntax parse serves the
-/// syntax check, the class check and the walk that prices the pattern
-/// ([`price::shape`]). Each step is linear in the text and builds
-/// nothing, so the parser asks it of every pattern it reads, however
-/// many. Invalid syntax is refused before it is priced, so it charges
-/// nothing.
-///
-/// A glob or `like` operand has no regex syntax of its own, and its length
-/// is the operand's: the regex it stands for is longer, and is not capped
-/// again, but it is priced like any regex. The class check is a regex
-/// body's alone: the batch lane runs a glob, `like` or `ilike` operand as
-/// `DuckDB`'s GLOB, LIKE or ILIKE, never RE2. Every glob and `like`
-/// translation parses: a malformed glob (`[z-a]*`) translates to a regex
-/// that matches nothing, and is priced and built like any other.
+/// The checks run in the order every pattern site shares (ADR-0063). The
+/// class check is a regex body's alone: the batch lane runs a glob, `like`
+/// or `ilike` operand as `DuckDB`'s GLOB, LIKE or ILIKE, never RE2.
 fn pattern_refusal(kind: PatternKind, text: &str) -> Result<Checked, String> {
     let body = match kind {
         PatternKind::Regex => Some(regex_syntax(text)?),
@@ -751,8 +570,6 @@ pub(crate) fn regex_syntax(body: &str) -> Result<Ast, String> {
         .map_err(|e| format!("invalid regex: {e}"))
 }
 
-/// The parse message for a regex body a ledger refused. A syntax error
-/// reads `invalid regex: …`, as the syntax check words it.
 pub(crate) fn regex_error_message(error: &PatternError) -> String {
     match error {
         PatternError::Syntax(_) => format!("invalid regex: {error}"),
@@ -760,8 +577,6 @@ pub(crate) fn regex_error_message(error: &PatternError) -> String {
     }
 }
 
-/// Why a regex body cannot be used, or `None` when the parser accepts it:
-/// the checks at its site, then a build of its own.
 #[cfg(test)]
 pub(crate) fn regex_body_error(body: &str) -> Option<String> {
     pattern_refusal(PatternKind::Regex, body)
@@ -769,8 +584,6 @@ pub(crate) fn regex_body_error(body: &str) -> Option<String> {
         .or_else(|| regex_build_error(body))
 }
 
-/// Why `body` does not build, from a checking ledger of its own, as
-/// `parse` checks it.
 #[cfg(test)]
 fn regex_build_error(body: &str) -> Option<String> {
     Preparer::check()
@@ -779,9 +592,6 @@ fn regex_build_error(body: &str) -> Option<String> {
         .map(|e| regex_error_message(&e))
 }
 
-/// Parse a regex `/body/` and check its body, for a position where the
-/// shape alone makes a regex (`matches /re/`).
-///
 /// A body that a cut refuses ([`first_cut`]) or that [`check_pattern`]
 /// refuses is emitted over the whole `/…/`, not returned:
 /// the branch still succeeds, so an enclosing choice cannot recover by
@@ -835,16 +645,10 @@ mod tests {
         assert_eq!(v.text(), "-0.5");
     }
 
-    /// The token survives the parse verbatim, trailing zeros and all:
-    /// `f64` is lossy past 53 bits and pin-aware comparison binds the text
-    /// (ADR-0011 ruling #6), so re-rendering the double would silently
-    /// answer for a different number.
     #[test]
     fn test_float_keeps_source_token() {
         let v = float().parse("9007199254740993.0").into_result().unwrap();
         assert_eq!(v.text(), "9007199254740993.0");
-        // …which the parsed double cannot express: it rounds to the
-        // adjacent even.
         assert_eq!(v.value().to_string(), "9007199254740992");
 
         let v = float().parse("1.50").into_result().unwrap();
@@ -899,11 +703,6 @@ mod tests {
         );
     }
 
-    // ── backtick-quoted names (ADR-0013 ruling 7) ──────────────────────
-
-    /// Backticks change how a name is lexed, never what a name may be:
-    /// the content is any character except a backtick, and the parse
-    /// yields the bare name with the quotes gone.
     #[test]
     fn backtick_name_lexes_any_content() {
         assert_eq!(
@@ -921,7 +720,6 @@ mod tests {
         assert_eq!(field_name().parse("`last`").into_result().unwrap(), "last");
     }
 
-    /// A doubled backtick escapes one.
     #[test]
     fn backtick_name_doubled_backtick_escapes() {
         assert_eq!(field_name().parse("`a``b`").into_result().unwrap(), "a`b");
@@ -929,8 +727,6 @@ mod tests {
         assert_eq!(field_name().parse("````").into_result().unwrap(), "`");
     }
 
-    /// A dot inside backticks is literal, not a nested-name segment —
-    /// a leading dot is unreachable for the bare production.
     #[test]
     fn backtick_name_dot_is_literal() {
         assert_eq!(
@@ -943,9 +739,6 @@ mod tests {
         );
     }
 
-    /// Empty and control-char names are parse errors (ruling 7): an empty
-    /// column name is unnameable and a control char would rewrite the
-    /// terminal line that renders it.
     #[test]
     fn backtick_name_empty_and_control_chars_rejected() {
         assert!(field_name().parse("``").into_result().is_err());
@@ -955,8 +748,6 @@ mod tests {
         assert!(field_name().parse("`\u{1b}[2J`").into_result().is_err());
     }
 
-    /// Function names, stage names and saved-query names are not fields,
-    /// so they take the unquoted production and no backticks.
     #[test]
     fn plain_name_takes_no_backticks() {
         assert!(plain_name().parse("`lower`").into_result().is_err());
@@ -1002,7 +793,6 @@ mod tests {
     fn test_keyword_boundary() {
         assert_eq!(keyword("and").parse("and").into_result().unwrap(), "and");
 
-        // "android" should not match as keyword "and"
         assert!(keyword("and").parse("android").into_result().is_err());
     }
 
@@ -1026,9 +816,6 @@ mod tests {
         );
     }
 
-    /// A raw string decodes nothing, so an `extract` body's length is its
-    /// written length: a backslash before the closing quote is a byte of
-    /// the body, not an escape.
     #[test]
     fn a_raw_string_decodes_nothing() {
         let raw = |input: &str| raw_quoted_string().parse(input).into_result().ok();
@@ -1105,8 +892,6 @@ mod tests {
         assert_eq!(d.to_seconds(), 86_400_000_000);
     }
 
-    /// The body rule (ADR-0061 ruling 1): a raw line break or `|` after
-    /// whitespace cuts a body, and nothing else does.
     #[test]
     fn first_cut_finds_a_line_break_or_a_pipe_stage() {
         for body in [
@@ -1129,20 +914,16 @@ mod tests {
             ("x |", (1, RegexCut::PipeStage)),
             ("a  \n  | b", (1, RegexCut::PipeStage)),
             ("tmp*\n| where x ", (4, RegexCut::PipeStage)),
-            // the first cut, in text order
             ("a\nb | c", (1, RegexCut::LineBreak)),
             ("é |", (2, RegexCut::PipeStage)),
         ] {
             assert_eq!(first_cut(body), Some(cut), "{body:?}");
         }
-        // …while a search value lets a pipe stage anywhere win
         assert_eq!(value_cut("a\nb | c"), Some(RegexCut::PipeStage));
         assert_eq!(value_cut("a\nb"), Some(RegexCut::LineBreak));
         assert_eq!(value_cut("a b"), None);
     }
 
-    /// The shape refuses a cut body without consuming, and `matches`
-    /// reports the cut over the whole run.
     #[test]
     fn a_cut_body_is_not_a_regex_shape() {
         assert_eq!(
@@ -1203,8 +984,6 @@ mod tests {
         assert_eq!(regex_body_error(&at_limit), None);
     }
 
-    /// The syntax check the parser runs gives the message compiling would:
-    /// both parse a body with the same defaults.
     #[test]
     fn the_syntax_check_reports_what_compiling_would() {
         let built = regex_build_error;
@@ -1238,8 +1017,6 @@ mod tests {
         }
     }
 
-    /// Log regexes an author writes compile under the limit, counted
-    /// Unicode repeats included.
     #[test]
     fn log_regexes_compile_under_the_size_limit() {
         for body in [
@@ -1261,10 +1038,6 @@ mod tests {
         }
     }
 
-    /// A count past [`price::MAX_REPEAT_POSITIONS`] is refused before it
-    /// builds, whether or not it would compile under the size limit: `.`
-    /// and `\d` would, `\w` would not. `.{256}` compiles under the size
-    /// limit and was admitted under a 256-position budget; 64 refuses it.
     #[test]
     fn a_long_counted_repeat_is_refused_before_it_builds() {
         let limit = price::MAX_REPEAT_POSITIONS;

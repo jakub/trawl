@@ -35,8 +35,6 @@ pub fn migrate(
         .args(["build", "--quiet", "-p", "fleet-admin"])
         .cwd(trawl_root)
         .environment(environment::sanitized_base())
-        // The build carries no secrets, so stream it: a cold compile outlasts
-        // the default deadline and its errors are worth reading.
         .timeout(crate::command::BUILD_TIMEOUT)
         .stream_output();
     let output = runner.output(&build_spec)?;
@@ -102,8 +100,7 @@ async fn reconcile_inner(
         {
             // The registry is deliberately warn-only: a companion app may
             // declare the permission before its deployed binary has
-            // registered the vocabulary. Manifest validation still pins the
-            // app namespace and frozen permission lists.
+            // registered the vocabulary.
             eprintln!(
                 "fleet-dev: warning: manifest permission {}:{} is not registered in the selected Fleet database",
                 permission.app, permission.permission

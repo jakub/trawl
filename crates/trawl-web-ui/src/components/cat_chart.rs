@@ -5,14 +5,6 @@
 //! `<CatChart/>` — a bar per group for a `stats <metric> by <field>`
 //! result.
 //!
-//! Plain divs, not uPlot. uPlot's category axis would need an
-//! `xLabels` callback plumbed through the opts bridge and a draw hook
-//! for the per-bar value labels. The Visualization tab draws the same
-//! shape as Column or Bar through uPlot instead (ADR-0038); this list
-//! stays beside the exact table because it is the table's companion,
-//! not a chart of its own. A list of divs costs no dependency and reads
-//! the same tokens.
-//!
 //! The chart is `aria-hidden`: every number in it is already in the
 //! exact table beside it, which is the accessible representation. A
 //! screen reader that read both would read the page twice.

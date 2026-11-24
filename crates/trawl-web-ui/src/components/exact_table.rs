@@ -4,17 +4,6 @@
 
 //! `<ExactTable/>` — the exact numbers behind an aggregate result.
 //!
-//! The same sortable `<table class="results-table">` the raw results
-//! use, minus two things an aggregation has no honest version of:
-//!
-//! - **No expansion column.** An aggregate row has no underlying event
-//!   to reveal; every value it holds is already on the row.
-//! - **No Include on a generated metric.** `count`, `avg(…)` and their
-//!   aliases name nothing the corpus holds, so a filter on one would
-//!   advertise a capability that does not exist (ADR-0025, functional
-//!   finding F02). Only the columns the query grouped by carry a
-//!   "search this group" control, because those name real fields.
-//!
 //! Which columns those are comes from [`crate::categorical::group_columns`],
 //! read off the query the response was executed for, never the editor
 //! or the URL, so a page that has moved on cannot relabel these rows.
@@ -47,8 +36,6 @@ pub fn ExactTable(
     /// cannot live privately in here.
     sort: RwSignal<Option<(usize, bool)>>,
     on_paginate: Callback<usize>,
-    /// Called by a group column's "search this group" control, with the
-    /// query the row came from.
     on_add_filter: Callback<(ExecutedQuery, Filter)>,
 ) -> impl IntoView {
     view! {
@@ -79,8 +66,6 @@ pub fn ExactTable(
 #[component]
 fn ExactTableBody(
     resp: QueryResponse,
-    /// The query this response was executed for: the only thing that
-    /// knows which columns were grouped and which were generated.
     executed_query: ExecutedQuery,
     page: Signal<usize>,
     busy: Signal<bool>,

@@ -3,25 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The JSON path grammar of `json`, `json_extract_string` and
-//! `json_extract`: [`parse`] reads a path into typed [`Step`]s, and
-//! [`select`] walks a `serde_json` document by them.
-//!
-//! The grammar is the subset of `DuckDB`'s that both lanes read the same
-//! way, as ADR-0017's amendment of 2026-11-13 lists it:
-//!
-//! - `$` or the empty string: the root;
-//! - `$` then a chain of `.member`, `."quoted member"`, `[n]`, `[-n]` and
-//!   `[#-n]` steps;
-//! - an RFC 6901 pointer that starts with `/`;
-//! - one bare key.
-//!
-//! Anything else is refused as [`PathErrorKind::Malformed`] (`DuckDB`
-//! refuses it too, or it has no reading) or [`PathErrorKind::Unsupported`]
-//! (`DuckDB` reads it in a way the evaluator does not copy). The parser
-//! reads the whole path or refuses it: it never trims, never keeps a
-//! parsed prefix, and never reads a failed rooted path as a bare key. It
-//! is one loop over the characters, so a long path cannot exhaust the
-//! stack.
+//! `json_extract` (ADR-0017).
 
 use std::iter::Peekable;
 use std::str::Chars;
@@ -61,7 +43,6 @@ pub enum PathErrorKind {
 /// Why [`parse`] refused a path.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PathError {
-    /// Malformed or unsupported.
     pub kind: PathErrorKind,
     /// The fault, in words: `expected an array index after [`.
     pub reason: &'static str,
@@ -125,9 +106,6 @@ pub fn select<'v>(steps: &[Step], doc: &'v Value) -> Option<&'v Value> {
     Some(at)
 }
 
-/// A pointer token as an array index: `0`, or digits without a leading
-/// zero that fit `usize`. `01`, `+1`, `-1`, `1e0` and the empty token
-/// are not indexes.
 fn canonical_index(token: &str) -> Option<usize> {
     let canonical = token == "0"
         || (token.starts_with(|c: char| matches!(c, '1'..='9'))
@@ -135,7 +113,6 @@ fn canonical_index(token: &str) -> Option<usize> {
     if canonical { token.parse().ok() } else { None }
 }
 
-/// The steps after a leading `$`.
 fn parse_rooted(rest: &str) -> Result<Vec<Step>, PathError> {
     let mut steps = Vec::new();
     let mut chars = rest.chars().peekable();
@@ -150,7 +127,6 @@ fn parse_rooted(rest: &str) -> Result<Vec<Step>, PathError> {
     Ok(steps)
 }
 
-/// A member after its `.`: quoted or unquoted.
 fn parse_member(chars: &mut Peekable<Chars<'_>>) -> Result<Step, PathError> {
     match chars.peek() {
         Some('.') => {
@@ -220,7 +196,6 @@ fn parse_member(chars: &mut Peekable<Chars<'_>>) -> Result<Step, PathError> {
     Ok(Step::Member(key))
 }
 
-/// A quoted member after its opening `"`, through its closing `"`.
 fn parse_quoted_member(chars: &mut Peekable<Chars<'_>>) -> Result<Step, PathError> {
     let mut key = String::new();
     loop {
@@ -258,7 +233,6 @@ fn parse_quoted_member(chars: &mut Peekable<Chars<'_>>) -> Result<Step, PathErro
     Ok(Step::Member(key))
 }
 
-/// An index after its `[`, through its `]`.
 fn parse_index(chars: &mut Peekable<Chars<'_>>) -> Result<Step, PathError> {
     let step = match chars.peek() {
         Some('*') => {
@@ -309,8 +283,6 @@ fn from_end(n: u64) -> Result<Step, PathError> {
     Ok(Step::FromEnd(n))
 }
 
-/// The ASCII digits of an index: one to 19 of them, leading zeros
-/// included, worth at most `i64::MAX`.
 fn parse_digits(chars: &mut Peekable<Chars<'_>>) -> Result<u64, PathError> {
     let mut digits = 0_usize;
     let mut value = 0_u64;
@@ -372,9 +344,6 @@ fn parse_pointer(rest: &str) -> Result<Vec<Step>, PathError> {
     Ok(steps)
 }
 
-/// One bare key: a path that starts with neither `$` nor `/`. A control
-/// character anywhere makes it malformed; otherwise the first character
-/// both lanes would read differently from a reader decides the refusal.
 fn parse_bare(path: &str) -> Result<String, PathError> {
     if path.chars().any(char::is_control) {
         return Err(malformed(
@@ -571,7 +540,6 @@ mod tests {
         }
     }
 
-    /// Each refused form that has a better spelling points to it.
     #[test]
     fn json_path_refusals_point_to_the_fix() {
         let cases: &[(&str, &str)] = &[
@@ -598,8 +566,6 @@ mod tests {
         }
     }
 
-    /// A rooted path that fails never falls back to a bare key, and a
-    /// path is never trimmed.
     #[test]
     fn json_path_never_recovers_or_trims() {
         for path in ["$x", "$k", "$[", " $.k", "$.k ", "/a~", "$ .k"] {
@@ -674,8 +640,6 @@ mod tests {
         }
     }
 
-    /// Steps built by hand, outside the parser, still miss rather than
-    /// wrap or panic.
     #[test]
     fn json_path_select_misses_on_out_of_grammar_steps() {
         let doc = json!([1, 2]);
@@ -684,9 +648,6 @@ mod tests {
         assert_eq!(select(&[Step::Index(u64::MAX)], &doc), None);
     }
 
-    /// Every string up to four characters over the grammar's alphabet:
-    /// the parser answers without panicking, and an accepted bare key is
-    /// exactly one member holding the whole input.
     #[test]
     fn json_path_parse_never_panics_on_short_inputs() {
         const ALPHABET: [char; 18] = [
@@ -728,8 +689,6 @@ mod tests {
         assert_eq!(parsed, 1 + 18 + 18 * 18 + 18 * 18 * 18 + 18 * 18 * 18 * 18);
     }
 
-    /// The parser is a loop, not a recursion: a path of 100 000 steps
-    /// parses and selects without growing the stack.
     #[test]
     fn json_path_long_paths_parse_iteratively() {
         let path = format!("${}", "[0]".repeat(100_000));

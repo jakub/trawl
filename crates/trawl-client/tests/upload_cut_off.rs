@@ -4,15 +4,9 @@
 
 //! An upload the server cuts off, observed through the real client.
 //!
-//! Each test serves one connection from a rustls listener on `127.0.0.1`
-//! whose self-signed certificate the client pins as its CA, the way a
-//! profile's `ca_cert` does. trawld refuses an oversized body with a 413
-//! and hangs up without draining it, so a client still uploading can meet
-//! the reset before it reads the answer. The resetting listener here never
-//! answers at all: a 413 written first is usually read, because the kernel
-//! hands over queued data before it reports the reset, so a test that
-//! wrote one would race. Answering nothing is what the client sees whenever
-//! the reset wins, and it makes every run the same.
+//! The resetting listener here never answers at all: a 413 written first is
+//! usually read, because the kernel hands over queued data before it reports
+//! the reset, so a test that wrote one would race.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,29 +21,21 @@ use trawl_client::{ClientError, ErrorCode, HttpClient, NetworkKind, TlsTrust};
 
 const TOKEN: &str = "flt_uploadcutofftesttoken";
 
-/// The whole rendered cut-off error: no origin, path or library text.
 const CUT_OFF: &str = "network error: the server closed the connection before the upload \
                        finished; the request may exceed the server's request size limit, \
                        or the server may be at its request limit";
 
-/// Bound on every exchange, so a hang fails the test instead of wedging CI.
 const EXCHANGE: Duration = Duration::from_secs(30);
 
 /// How much of a body the resetting listener reads before it hangs up:
 /// enough that an 8 MiB upload is under way, and all of a small one.
 const BODY_SEEN: usize = 16 * 1024;
 
-/// What the listener does once it has read a request.
 enum Answer {
-    /// Read the head and the first [`BODY_SEEN`] body bytes, then hang up
-    /// with a reset and no response.
     Reset,
-    /// Read the whole body, then write this response and close cleanly.
     Respond(Vec<u8>),
 }
 
-/// A self-signed certificate for `127.0.0.1`: its PEM, for the client to
-/// pin, and the server identity.
 fn self_signed() -> (
     Vec<u8>,
     Vec<CertificateDer<'static>>,
@@ -64,8 +50,6 @@ fn self_signed() -> (
     )
 }
 
-/// Serve one connection with `answer`. Returns a client that trusts the
-/// listener's certificate as its pinned CA, and the serving task.
 async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let (pem, chain, key) = self_signed();
@@ -102,8 +86,6 @@ async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
             body_read += n;
         }
         match answer {
-            // Dropping the stream closes the socket under the unread
-            // upload, which the zero linger makes a reset.
             Answer::Reset => drop(tls),
             Answer::Respond(response) => {
                 tls.write_all(&response).await.expect("response write");
@@ -120,8 +102,6 @@ async fn serve_one(answer: Answer) -> (HttpClient, JoinHandle<()>) {
     (client, served)
 }
 
-/// Read up to the end of the request head. Returns the head and how many
-/// body bytes arrived with it.
 async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, usize) {
     let mut bytes = Vec::new();
     let mut buf = [0u8; 4096];
@@ -136,7 +116,6 @@ async fn read_head<S: AsyncReadExt + Unpin>(stream: &mut S) -> (String, usize) {
     }
 }
 
-/// The request's declared body length; zero without one.
 fn content_length(head: &str) -> usize {
     head.lines()
         .filter_map(|line| line.split_once(':'))
@@ -146,7 +125,6 @@ fn content_length(head: &str) -> usize {
         })
 }
 
-/// Run `call` against the listener, both bounded by [`EXCHANGE`].
 async fn exchange<T>(
     call: impl std::future::Future<Output = Result<T, ClientError>>,
     served: JoinHandle<()>,
@@ -158,8 +136,6 @@ async fn exchange<T>(
     result
 }
 
-/// An 8 MiB preview the server resets mid-upload is a cut-off upload,
-/// never `request failed`.
 #[tokio::test]
 async fn a_reset_mid_upload_is_a_cut_off_upload() {
     let (client, served) = serve_one(Answer::Reset).await;
@@ -175,8 +151,6 @@ async fn a_reset_mid_upload_is_a_cut_off_upload() {
     assert_eq!(error.to_string(), CUT_OFF);
 }
 
-/// A JSON request through the shared authenticated path carries a body, so
-/// a reset before its answer reads the same way.
 #[tokio::test]
 async fn a_reset_json_request_is_a_cut_off_upload() {
     let (client, served) = serve_one(Answer::Reset).await;
@@ -191,8 +165,6 @@ async fn a_reset_json_request_is_a_cut_off_upload() {
     assert_eq!(error.to_string(), CUT_OFF);
 }
 
-/// The control: a request without a body uploads nothing, so the same
-/// reset stays `request failed`.
 #[tokio::test]
 async fn a_reset_bodyless_request_is_not_a_cut_off_upload() {
     let (client, served) = serve_one(Answer::Reset).await;
@@ -203,8 +175,6 @@ async fn a_reset_bodyless_request_is_not_a_cut_off_upload() {
     assert_eq!(error.to_string(), "network error: request failed");
 }
 
-/// A 413 the client does read is the server's refusal, with the server's
-/// own message, never a network error and never `unknown error`.
 #[tokio::test]
 async fn a_read_413_is_the_server_refusal() {
     let message = "request body exceeds [server] max_request_body_bytes (1024 bytes)";
@@ -226,9 +196,6 @@ async fn a_read_413_is_the_server_refusal() {
     assert_eq!(error.message, message);
 }
 
-/// The 503 counterpart of `a_read_413_is_the_server_refusal`: a refusal the
-/// client does read is the server's own error, never the cut-off message,
-/// and it names neither a 413 nor anything else the client did not read.
 #[tokio::test]
 async fn a_read_503_request_limit_is_the_server_refusal() {
     let message = "trawld is at its HTTP request limit ([server] max_concurrent_requests); \

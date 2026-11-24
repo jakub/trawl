@@ -1,6 +1,6 @@
 # Fleet development controller
 
-status: accepted (2026-07-30)
+status: accepted (2026-07-30); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Issue #54 replaces the Trawl and Coastwatch shell launchers with one
 Trawl-owned, local-only Rust controller. The goal is a convention-heavy
@@ -88,3 +88,12 @@ This ADR supersedes the `.fleet.localhost`, hand-written temporary Trunk file,
 manual key bootstrap, and joined-shell orchestration described by the retired
 Trawl `bin/dev` implementation. Production deployment and credential delivery
 are unchanged.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **The CSRF allowlist that fleet-dev publishes as `FLEET_SESSION_PUBLIC_ORIGINS` has exactly one entry: the `browser_origin` of the current topology.** The browser origin depends on the machine and the exposure mode, so a committed `[web] public_origins` would be wrong in at least one mode. With one published origin, a request whose `Origin` header names any other origin gets a 403 from login, logout and every route behind the session extractor. A request with no `Origin` header passes the check. The contract tests in `fleet-dev/tests/contracts.rs` check the published value in both modes, because a wrong Tailscale value shows up only as 403s once the operator browses over the tailnet.
+- **The child allowlist in `environment.rs` passes the proxy variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY` and their lowercase forms) to ordinary children, even though a proxy URL can embed credentials.** This is a deliberate exception to "ordinary children start from a small allowlist". `op`, `docker` and `cargo` fail behind a proxy without these variables, and the value is already in the controller's own environment.
+- **The Trawl development role holds every Trawl permission except `ingest`, listed literally in `TRAWL_DEV_PERMISSIONS` and in `fleet-dev.toml`.** This is the split ADR-0045 gives the trial operator key: the developer is a human user, and `ingest` belongs to a service key. Because the list is literal, a new Trawl permission reaches the development role only when someone adds it to both places. Manifest validation rejects any other set, and the test `the_dev_role_holds_every_trawl_permission_except_ingest` fails until the new permission is added.
+- **Correction.** The Tailscale paragraph under "Security boundaries" says the API listener binds the tailnet address because "the present-only guard requires that host to equal the browser Origin host". That guard no longer exists (ADR-0016). The live reason is that the generated Trunk proxy reaches the backend at `backend_authority`, the same MagicDNS name the browser uses, and that name resolves to the node's tailnet address, not to loopback. The exposure consequence in that paragraph is unchanged.

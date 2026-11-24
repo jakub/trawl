@@ -4,99 +4,13 @@
 
 //! Postgres-backed investigations and their sequenced logs (ADR-0059).
 //!
-//! An investigation is installation-owned. No statement here is scoped by
-//! a key id, the deliberate break from [`super::saved`]: the permissions
-//! decide who reads and writes, and the key ids stored here are attribution
-//! beside a name snapshot.
-//!
-//! Every write advances the investigation's `seq` by one inside one
-//! transaction that first locks the investigation row `FOR UPDATE`. The
-//! lock is what orders concurrent writers: two appends from two
-//! connections both commit, one at `seq + 1` and the next at `seq + 2`.
-//! Appends carry no expected sequence. Overwrites compare the sequence the
-//! caller observed with the locked row's and fail with
-//! [`StoreError::SequenceConflict`] when it moved. A closed investigation
-//! accepts nothing new ([`StoreError::InvestigationClosed`]) but a reopen,
-//! and work admitted before it closed still completes.
-//!
 //! A transaction that locks investigations and their results locks the
-//! investigations first, several in id order:
-//! [`InvestigationStore::delete`] its one,
-//! [`InvestigationStore::append_citing`] and
-//! [`super::ResultsStore::insert_kept`] the one their evidence joins, and
-//! [`super::ResultsStore::prune_evidence`] every one past its deadline, as
-//! the capture gate's [`super::ResultsStore::prune_evidence_until`] does
-//! with the same statements. So the evidence prune waits for a write that
-//! moves the deadline and sees the deadline it committed, and no evidence
-//! attaches behind a prune that could not see it.
-//!
-//! Every write a principal makes advances the sequence and slides the
-//! evidence clock: `retain_until = GREATEST(retain_until,
-//! LEAST(retain_ceiling, now + idle))`. Boot's interruptions advance the
-//! sequence and slide nothing, since no principal changed anything
-//! ([`InvestigationStore::interrupt_running_steps`]). Reads, refused writes
-//! and a replayed create slide nothing.
-//!
-//! A write never revives evidence its deadline already ended: the due-write
-//! rule. Each write locks through [`lock_for_write`], which prunes the
-//! investigation's kept results first when its `retain_until` is at or
-//! before `now`, exactly as the sweep would, and only then writes and
-//! slides. So a read that answered pruned stays consistent with any later
-//! write, and the sweep's hourly cadence never decides what survives. A
-//! pruned row is final: only a promotion makes a row kept, and only a
-//! temporary one. So evidence a prune ended at its `now` stays ended when
-//! a write that took an earlier `now` slides the deadline back past it;
-//! that write finds the rows pruned, as it would after the sweep.
-//! [`InvestigationStore::append`], [`InvestigationStore::append_citing`],
-//! [`InvestigationStore::begin_step`] and
-//! [`super::ResultsStore::insert_kept`] return the files of what they
-//! pruned, for the caller to unlink. The
-//! other writes leave those files to the sweep, which removes a file no
-//! live row names: the rows are pruned, so no read reaches them.
-//!
-//! The two writes that admit work, [`InvestigationStore::begin_step`] and
-//! [`InvestigationStore::append_citing`], run in tasks that outlive their
-//! request, and so does the `aborted` outcome such a task writes when the
-//! request is gone ([`InvestigationStore::complete_step_until`]). Their
-//! wait for a connection, their `BEGIN`, every statement before the commit
-//! and their rollback end at the caller's deadline, with nothing written
-//! ([`StoreError::WaitExpired`]), and both sides bound the statements.
-//! Postgres bounds each statement by a `statement_timeout` set from what
-//! remains of the deadline before each. The setting covers all of a
-//! statement's lock waits and the work between them, so a statement that
-//! waits on one row after another, or one that waits after an earlier
-//! statement did, still ends at the deadline. The client bounds every
-//! await of the write at the same deadline, the connection's, the
-//! `BEGIN`'s, each statement's and the rollback's, so an answer that never
-//! comes (a stalled socket, a paused backend) ends the write there too. A
-//! deadline that passed between two statements, as it does for a task
-//! descheduled there, refuses the next statement, or the commit, before
-//! anything is sent. A write's transaction is a [`WriteTx`], whose
-//! connection is reachable only one statement at a time, each bounded so
-//! ([`WriteTx::run`]); every other write runs the same code unbounded. The
-//! capture gate's evidence prune is bounded the same way, by its
-//! reservation's deadline ([`super::ResultsStore::prune_evidence_until`]).
-//!
-//! A write that Postgres stopped, or that does not commit, rolls back and
-//! waits for the rollback to be answered before it returns, and its
-//! session goes back to the pool; under the deadline that wait ends there
-//! too. A write the client cut short closes its session instead: the
-//! answer it stopped awaiting is still on the way, and a rollback would
-//! first have to read it. So does a write whose deadline passed before its
-//! rollback was sent, or whose rollback is not answered by the deadline.
-//! Postgres ends the transaction with the session ([`PooledTransaction`]),
-//! and its own wait at the deadline by the timeout. A session goes back to
-//! the pool only after an answered rollback or commit. Their commit is
-//! never cut short: the timeout is lifted first, and the deadline is
-//! checked again once the lift is answered, so a `COMMIT` is sent only
-//! before the deadline, and only a `COMMIT` already sent is awaited past
-//! it.
+//! investigations first, several in id order. So the evidence prune waits
+//! for a write that moves the deadline and sees the deadline it committed,
+//! and no evidence attaches behind a prune that could not see it.
 //!
 //! Every instant is a parameter from the caller's clock; no statement reads
-//! SQL `now()`. Payloads are the trawl-api JSON of [`EntryPayload`], stored
-//! as text (JSONB refuses `\u0000`). A row that does not decode is a
-//! [`StoreError::Unavailable`] carrying a [`sqlx::Error::ColumnDecode`]
-//! that names the column.
+//! SQL `now()`. Payloads are stored as text (JSONB refuses `\u0000`).
 
 use chrono::{DateTime, Duration, Utc};
 use sqlx::postgres::{PgConnection, PgRow};
@@ -115,14 +29,12 @@ use super::pooled::PooledTransaction;
 use super::results::{ExpiredFile, drop_facts, wire_time};
 use crate::deadline::{Deadline, Expired};
 
-/// Most investigations [`InvestigationStore::list`] answers.
 pub const MAX_LIST: u64 = 200;
 
 /// How many times a create retries when the id it conflicted on vanished
 /// before it could be read: an operator deleted it in between.
 const CREATE_ATTEMPTS: usize = 3;
 
-/// Every column of `investigations` but `creation`, as a row decodes.
 macro_rules! investigation_columns {
     () => {
         "id, title, question, scope, status, seq, created_at, updated_at, retain_until, \
@@ -131,8 +43,6 @@ macro_rules! investigation_columns {
     };
 }
 
-/// `SELECT` [`investigation_columns`] from `investigations`, followed by
-/// `$tail`.
 macro_rules! select_investigation {
     ($tail:expr) => {
         concat!(
@@ -144,7 +54,6 @@ macro_rules! select_investigation {
     };
 }
 
-/// `SELECT` the columns a [`LogEntry`] decodes from, followed by `$tail`.
 macro_rules! select_entries {
     ($tail:expr) => {
         concat!(
@@ -155,30 +64,20 @@ macro_rules! select_entries {
     };
 }
 
-/// How far a change slides the evidence clock (ADR-0059, amending
-/// ADR-0018): `retain_until` moves to `now + idle`, never past the
-/// investigation's `retain_ceiling` and never back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RetentionRule {
-    /// How long evidence lives after the investigation's last change.
     pub idle: Duration,
 }
 
 impl RetentionRule {
-    /// The deadline a change at `now` slides toward, before the ceiling.
     fn slid(self, now: DateTime<Utc>) -> DateTime<Utc> {
         now.checked_add_signed(self.idle)
             .unwrap_or(DateTime::<Utc>::MAX_UTC)
     }
 }
 
-/// Who a write is attributed to, as the store records it: the verified
-/// key's id for ownership and the replay check, and snapshots of its prefix
-/// and name for attribution. The id stays server side; [`Self::to_wire`] is
-/// the only form that leaves the store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoreActor {
-    /// The fleet key id. Never serialized.
     pub key_id: i64,
     /// The key's stable 8-character prefix.
     pub prefix: String,
@@ -187,7 +86,6 @@ pub struct StoreActor {
 }
 
 impl StoreActor {
-    /// The attribution the wire carries: prefix and name, never the key id.
     #[must_use]
     pub fn to_wire(&self) -> Actor {
         Actor {
@@ -197,55 +95,36 @@ impl StoreActor {
     }
 }
 
-/// An investigation to create if its id is free.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewInvestigation {
-    /// The id the MCP server minted.
     pub id: InvestigationId,
-    /// The creator.
     pub actor: StoreActor,
-    /// The request as sent. Stored apart from the mutable fields and
-    /// compared on a replay.
     pub creation: CreateInvestigation,
-    /// When it is created.
     pub now: DateTime<Utc>,
     /// The first evidence deadline, at most `retain_ceiling`.
     pub retain_until: DateTime<Utc>,
-    /// The latest the evidence deadline can slide to.
     pub retain_ceiling: DateTime<Utc>,
 }
 
-/// One `investigations` row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InvestigationRow {
-    /// The id.
     pub id: InvestigationId,
-    /// The title.
     pub title: String,
-    /// The question.
     pub question: String,
     /// The scope text; empty when none was given.
     pub scope: String,
-    /// Open or closed.
     pub status: InvestigationStatus,
     /// The sequence of the latest write; 0 at creation.
     pub seq: u64,
-    /// When it was created.
     pub created_at: DateTime<Utc>,
-    /// When it last changed.
     pub updated_at: DateTime<Utc>,
-    /// When its evidence is pruned unless it changes again.
     pub retain_until: DateTime<Utc>,
-    /// The latest `retain_until` can slide to.
     pub retain_ceiling: DateTime<Utc>,
-    /// Who created it.
     pub created_by: StoreActor,
-    /// Who changed it last.
     pub updated_by: StoreActor,
 }
 
 impl InvestigationRow {
-    /// The row as the wire spells it.
     #[must_use]
     pub fn to_wire(&self) -> Investigation {
         Investigation {
@@ -264,7 +143,6 @@ impl InvestigationRow {
         }
     }
 
-    /// The row as a list entry.
     #[must_use]
     pub fn to_summary(&self) -> InvestigationSummary {
         InvestigationSummary {
@@ -280,117 +158,82 @@ impl InvestigationRow {
     }
 }
 
-/// What [`InvestigationStore::create_if_absent`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CreateOutcome {
-    /// The investigation is new.
     Created(InvestigationRow),
     /// The same creator already created it with the same request: a
     /// replay. Nothing changed, the sequence and the clock included.
     Existing(InvestigationRow),
-    /// The id is taken by another creator or another request.
     Mismatch,
 }
 
-/// An investigation and the entries changed after a sequence, read from
-/// one snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LogPage {
-    /// The investigation as of the snapshot.
     pub investigation: InvestigationRow,
-    /// The entries, in `updated_seq` order.
     pub entries: Vec<LogEntry>,
     /// The sequence the page reaches: the last entry's `updated_seq` when
     /// more remain, the investigation's `seq` otherwise.
     pub through_seq: u64,
-    /// Whether entries past `through_seq` remain.
     pub more: bool,
 }
 
-/// An overwrite of one of the investigation's own fields.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Overwrite {
-    /// A new title.
     Title(String),
-    /// A new question.
     Question(String),
-    /// Close or reopen.
     Status(InvestigationStatus),
 }
 
-/// What [`InvestigationStore::delete`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeleteOutcome {
     /// The investigation and its log are gone. Its kept results are pruned
     /// and their files are these, for the caller to unlink.
     Deleted(Vec<ExpiredFile>),
-    /// No investigation has the id.
     NotFound,
-    /// A step's work is still running; nothing changed.
     StepsRunning,
 }
 
-/// What [`InvestigationStore::append_citing`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Citing {
-    /// The entry is appended and every result it promotes is kept.
     Appended(Box<Appended>),
-    /// The named result is kept by another investigation; nothing was
-    /// written.
     KeptElsewhere(String),
     /// The named result can no longer be promoted: it is gone, past its
     /// deadline, or no longer the caller's to promote. Nothing was written.
     NotCitable(String),
 }
 
-/// The locked head of an investigation inside a write transaction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Locked {
-    /// Open or closed.
     pub(crate) status: InvestigationStatus,
-    /// The sequence of the latest write.
     pub(crate) seq: u64,
 }
 
-/// What [`InvestigationStore::append`] and
-/// [`InvestigationStore::begin_step`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Appended {
-    /// The new entry.
     pub entry: LogEntry,
     /// The kept results the due-write rule pruned before the write, for
     /// the caller to unlink once the write committed.
     pub pruned: Vec<ExpiredFile>,
 }
 
-/// What [`InvestigationStore::overwrite`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Overwritten {
-    /// The new entry.
     pub entry: LogEntry,
     /// The investigation as the write's own transaction left it, read
     /// after the sequence advanced: its `seq` is the entry's.
     pub investigation: InvestigationRow,
 }
 
-/// Postgres-backed storage for investigations. Cheap to clone (shared
-/// pool).
 #[derive(Debug, Clone)]
 pub struct InvestigationStore {
     pool: PgPool,
-    /// Faults a test injected ([`super::results::fault`]), shared with the
-    /// results store this one was made from.
     #[cfg(any(test, feature = "test-support"))]
     faults: std::sync::Arc<super::results::fault::Faults>,
-    /// The bounded statements' budgets a test reads, this store's own and
-    /// shared by its clones ([`StatementRecord`]).
     #[cfg(any(test, feature = "test-support"))]
     statements: std::sync::Arc<StatementRecord>,
 }
 
 impl InvestigationStore {
-    /// Wrap the shared app-state pool, which must point at a migrated trawl
-    /// app-state database.
     pub fn new(pool: PgPool) -> Self {
         Self {
             pool,
@@ -401,9 +244,7 @@ impl InvestigationStore {
         }
     }
 
-    /// [`Self::new`], reading `faults`: the results store's table
-    /// ([`super::ResultsStore::investigations`]). Test-support code, gated
-    /// on the feature alone: a `cfg(test)` item whose signature names
+    /// Gated on the feature alone: a `cfg(test)` item whose signature names
     /// `PgPool` reads as a test region to the pg-admission guard, which
     /// would then want every unit test of this crate in the postgres group.
     #[cfg(feature = "test-support")]
@@ -418,27 +259,17 @@ impl InvestigationStore {
         }
     }
 
-    /// This store's [`StatementRecord`], shared by its clones.
-    /// Test-support code.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub fn statement_record(&self) -> &StatementRecord {
         &self.statements
     }
 
-    /// Create the investigation unless its id is taken.
-    ///
-    /// A taken id is read back and compared: the same creator key with the
-    /// same request, byte for byte as this store encodes it, is a replay
-    /// and answers [`CreateOutcome::Existing`] without advancing anything;
-    /// anything else is [`CreateOutcome::Mismatch`].
     pub async fn create_if_absent(
         &self,
         new: &NewInvestigation,
     ) -> Result<CreateOutcome, StoreError> {
         let creation = serde_json::to_string(&new.creation).map_err(|e| {
-            // A public message names no serde_json text (ADR-0040,
-            // amendment of 2026-11-08).
             tracing::debug!(error = %e, "an investigation create request did not encode");
             StoreError::Validation("the create request does not encode".to_owned())
         })?;
@@ -482,7 +313,6 @@ impl InvestigationStore {
             .fetch_optional(&self.pool)
             .await?;
             let Some(row) = existing else {
-                // Deleted between the conflict and the read: try again.
                 continue;
             };
             let stored: String = row.try_get("creation")?;
@@ -500,7 +330,6 @@ impl InvestigationStore {
         )))
     }
 
-    /// The investigation `id`, if it exists.
     pub async fn get(&self, id: &InvestigationId) -> Result<Option<InvestigationRow>, StoreError> {
         let row = sqlx::query(select_investigation!("WHERE id = $1"))
             .bind(id.as_str())
@@ -509,8 +338,6 @@ impl InvestigationStore {
         Ok(row.as_ref().map(decode_investigation).transpose()?)
     }
 
-    /// At most `limit` investigations, capped at [`MAX_LIST`]: open ones
-    /// first, then closed ones, each group most recently changed first.
     pub async fn list(&self, limit: u64) -> Result<Vec<InvestigationRow>, StoreError> {
         // 'open' sorts after 'closed', so descending puts it first.
         let rows = sqlx::query(select_investigation!(
@@ -525,10 +352,6 @@ impl InvestigationStore {
             .collect::<Result<_, _>>()?)
     }
 
-    /// The investigation and at most `limit` entries with `updated_seq`
-    /// past `since`, in `updated_seq` order, read from one snapshot so the
-    /// head and the entries describe one state. `None` when the
-    /// investigation does not exist.
     pub async fn read_since(
         &self,
         id: &InvestigationId,
@@ -538,9 +361,6 @@ impl InvestigationStore {
         self.read_page(id, since, None, limit).await
     }
 
-    /// [`Self::read_since`] limited to the entries written by keys other
-    /// than `except_key_id`: what other actors did since the caller last
-    /// looked. `None` when the investigation does not exist.
     pub async fn activity(
         &self,
         id: &InvestigationId,
@@ -609,12 +429,6 @@ impl InvestigationStore {
         }))
     }
 
-    /// Append a keep, a finding or a note: no expected sequence. The
-    /// investigation must be open.
-    ///
-    /// Other kinds are refused with [`StoreError::Validation`]: a step
-    /// goes through [`Self::begin_step`], and the overwrites through
-    /// [`Self::overwrite`] and [`Self::set_finding_status`].
     pub async fn append(
         &self,
         id: &InvestigationId,
@@ -635,34 +449,15 @@ impl InvestigationStore {
         self.append_open(id, actor, payload, now, retention).await
     }
 
-    /// Append a keep or a finding that promotes the caller's own live
-    /// temporary results `promote` into the investigation (ADR-0059), in
-    /// one transaction: the investigation locked first, through the
-    /// due-write rule, then each promotion ([`super::results::promote_in`]),
-    /// then the entry. The investigation must be open.
-    ///
     /// The promotions run once per result, in ascending id order whatever
     /// the order of `promote`, so two appends into different
     /// investigations that cite the same results lock them in one order:
     /// the second waits for the first rather than closing a deadlock with
     /// it, and then finds them kept elsewhere.
     ///
-    /// A promotion that changes no row is classified under the lock: a
-    /// result already kept by this investigation is fine, one kept by
-    /// another is [`Citing::KeptElsewhere`], and anything else
-    /// [`Citing::NotCitable`]; either refusal names the first such result
-    /// in that order and writes nothing. An
-    /// investigation whose deadline is pinned at its ceiling stays due
-    /// after the write slides it, and the rule prunes again, the promoted
-    /// results included. Other kinds are refused with
-    /// [`StoreError::Validation`].
-    ///
-    /// The [`super::results::fault`] table's
-    /// [`super::results::fault::Faults::fail_next_citing`] applies.
-    ///
-    /// The wait before the commit ends at `deadline`
-    /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`WriteTx`]).
+    /// An investigation whose deadline is pinned at its ceiling stays due
+    /// after the write slides it, and the due-write rule prunes again, the
+    /// promoted results included.
     #[allow(clippy::too_many_arguments)] // one append, each part named
     pub async fn append_citing(
         &self,
@@ -727,13 +522,6 @@ impl InvestigationStore {
         Ok(cited)
     }
 
-    /// Append a step at admission, with no outcome yet. The investigation
-    /// must be open. The returned entry's `seq` names the step for
-    /// [`Self::complete_step_until`].
-    ///
-    /// The wait before the commit ends at `deadline`
-    /// ([`StoreError::WaitExpired`], nothing written); the commit itself is
-    /// never cut short ([`WriteTx`]).
     pub async fn begin_step(
         &self,
         id: &InvestigationId,
@@ -770,12 +558,6 @@ impl InvestigationStore {
         tx.finish(appended).await
     }
 
-    /// Overwrite the title, the question or the status, if the
-    /// investigation's sequence is still `expected_seq`, and record the
-    /// matching entry. A closed investigation takes only a reopen: another
-    /// close, like any other change, is [`StoreError::InvestigationClosed`]
-    /// and records nothing.
-    ///
     /// The investigation comes back from inside the same transaction, so
     /// no read after the commit can fail, or find it deleted, for a write
     /// that landed (ADR-0059).
@@ -855,11 +637,6 @@ impl InvestigationStore {
         })
     }
 
-    /// Overwrite the status of the finding whose entry is `finding_seq`, if
-    /// the investigation's sequence is still `expected_seq`, by appending a
-    /// `finding_status` entry. The investigation must be open. A
-    /// `finding_seq` that names no finding of this investigation is
-    /// [`StoreError::NotFound`] for a `finding`.
     #[allow(clippy::too_many_arguments)] // one overwrite, each part named
     pub async fn set_finding_status(
         &self,
@@ -932,22 +709,9 @@ impl InvestigationStore {
         })
     }
 
-    /// Write the terminal outcome of step `step_seq`, once, waiting for a
-    /// connection and the locks no later than `deadline` (ADR-0059). Returns
-    /// whether this call wrote it: a step that already has an outcome, or a
-    /// `seq` that names no step, changes nothing and answers `false`. Past
-    /// the deadline, [`StoreError::WaitExpired`] with nothing written,
-    /// whatever the write awaited then; the commit itself is never cut
-    /// short ([`WriteTx`]). Every step outcome is written so, bounded,
-    /// and only boot's interruptions wait unbounded
-    /// ([`Self::interrupt_running_steps`]).
-    ///
-    /// The step's `updated_seq` becomes the investigation's next sequence,
-    /// so a reader since its admission sees it again with its outcome, and
-    /// the clock slides. A closed investigation still takes it: the work
-    /// was admitted while it was open. The investigation's `updated_by`
-    /// becomes the step's actor, whose request admitted the work. Evidence
-    /// the due-write rule prunes here is left to the sweep (module docs).
+    /// A closed investigation still takes the step's outcome: the work was
+    /// admitted while it was open. Evidence the due-write rule prunes here is left
+    /// to the sweep.
     pub async fn complete_step_until(
         &self,
         id: &InvestigationId,
@@ -968,8 +732,6 @@ impl InvestigationStore {
         .await
     }
 
-    /// [`Self::complete_step_until`], sliding the evidence clock by `slide`,
-    /// or leaving it for `None`, and waiting as `wait` allows.
     async fn fill_step(
         &self,
         id: &InvestigationId,
@@ -1002,14 +764,6 @@ impl InvestigationStore {
         }
     }
 
-    /// At boot, record `interrupted` on every step whose work never
-    /// recorded an outcome: the process that ran it is gone. Each is the
-    /// one-shot fill of [`Self::complete_step_until`], with one difference: an
-    /// interruption is bookkeeping, not a principal's change, so it writes
-    /// the outcome and advances the sequence but leaves `retain_until` and
-    /// `retain_ceiling` where the last change put them (ADR-0059). A boot
-    /// long after the crash must not hand the evidence a fresh week.
-    /// Returns how many steps changed.
     pub async fn interrupt_running_steps(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
         let running: Vec<(String, i64)> = sqlx::query_as(
             "SELECT investigation_id, seq FROM investigation_log
@@ -1041,16 +795,6 @@ impl InvestigationStore {
         Ok(changed)
     }
 
-    /// End the evidence of investigation `id` if its `retain_until` is at or
-    /// before `now`: lock it, as every write does, and prune its kept
-    /// results as the due-write rule would ([`prune_if_due`]). Returns the
-    /// files to unlink, empty when the sweep or a write pruned them first,
-    /// or `None` when the retention has not ended under the lock (a write
-    /// slid it after the caller looked) or the investigation is gone. The
-    /// door a read of a kept row past its deadline takes (ADR-0059).
-    ///
-    /// The [`super::results::fault`] table's
-    /// [`super::results::fault::Faults::hold_next_evidence_end`] applies.
     pub async fn end_evidence_if_due(
         &self,
         id: &InvestigationId,
@@ -1096,10 +840,7 @@ impl InvestigationStore {
     }
 
     /// Keep the evidence until at least `retain_until`, raising the
-    /// ceiling to it if need be (`server_manage`, checked by the caller),
-    /// if the sequence is still `expected_seq`. Never shortens either
-    /// deadline. Advances the sequence and records no entry: the read
-    /// carries the new deadlines.
+    /// ceiling to it if need be (`server_manage`, checked by the caller).
     pub async fn extend(
         &self,
         id: &InvestigationId,
@@ -1146,15 +887,8 @@ impl InvestigationStore {
         tx.finish(extended).await
     }
 
-    /// Delete the investigation and its log, unless a step's work is still
-    /// running. Its kept results are pruned in the same transaction, with
-    /// `expires_at` and `gone_at` at `now`, and lose their investigation
-    /// id with it, so they age out as tombstones; their files are returned
-    /// for the caller to unlink.
-    ///
-    /// The investigation row is locked first, as every write into it locks
-    /// it first, kept inserts and promotions included, so none lands
-    /// between the prune and the delete.
+    /// The investigation's kept results are pruned in the deleting transaction and
+    /// lose their investigation id, so they age out as tombstones.
     pub async fn delete(
         &self,
         id: &InvestigationId,
@@ -1220,14 +954,6 @@ impl InvestigationStore {
         }
     }
 
-    /// The stored bytes of the investigation's kept evidence: each file and
-    /// its facts document, of every kept row, whatever its deadline. Each
-    /// result is one row holding one file and at most one facts document,
-    /// so each counts once. The capture gate's binding evidence pass reads
-    /// this after it prunes every investigation past its deadline
-    /// ([`crate::results::charge`], "Evidence"), so a kept row it counts is
-    /// live, or one the prune could not reach and that still holds its
-    /// bytes.
     pub async fn evidence_usage(&self, id: &InvestigationId) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint FROM captured_results
@@ -1241,8 +967,6 @@ impl InvestigationStore {
         })
     }
 
-    /// The stored bytes of every investigation's kept evidence, as
-    /// [`Self::evidence_usage`] counts them.
     pub async fn installation_evidence_usage(&self) -> Result<u64, StoreError> {
         let bytes: i64 = sqlx::query_scalar(
             "SELECT COALESCE(sum(file_bytes + metadata_bytes), 0)::bigint FROM captured_results
@@ -1255,15 +979,10 @@ impl InvestigationStore {
         })
     }
 
-    /// The stored bytes of the investigation's live evidence at `now`, each
-    /// file and its facts document: its kept results while its
-    /// `retain_until` is after `now`, pruned or not (the due-write rule,
-    /// module docs). Only the capture gate's evidence
-    /// pre-check reads this. The pre-check only refuses, so leaving dead
-    /// rows out there can only let a charge on to the binding pass, which
-    /// prunes them before it counts ([`Self::evidence_usage`]). A count
-    /// that admitted on this would be unsafe: a write whose `now` is before
-    /// the deadline slides it, and the rows left out are live again.
+    /// Leaves out kept rows once `retain_until` is not after `now`. Only the
+    /// capture gate's evidence pre-check reads this. A count that admitted on this
+    /// would be unsafe: a write whose `now` is before the deadline slides it, and
+    /// the rows left out are live again.
     pub async fn live_evidence_usage(
         &self,
         id: &InvestigationId,
@@ -1284,8 +1003,6 @@ impl InvestigationStore {
         })
     }
 
-    /// The stored bytes of every investigation's live evidence at `now`, as
-    /// [`Self::live_evidence_usage`] counts them, for the same pre-check.
     pub async fn live_installation_evidence_usage(
         &self,
         now: DateTime<Utc>,
@@ -1305,51 +1022,27 @@ impl InvestigationStore {
     }
 }
 
-/// How long the waits of a write's transaction may last.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum LockWait {
-    /// As long as the pool's acquire timeout and the database's own
-    /// settings allow.
     Unbounded,
-    /// No later than the deadline (module docs), on both sides: the client
-    /// stops awaiting the connection, the `BEGIN`, every statement and the
-    /// rollback at the deadline, and Postgres ends every statement there
-    /// too, by a `statement_timeout` set from what remains before each
-    /// ([`WriteTx::run`]). Either ending is [`StoreError::WaitExpired`].
-    /// A commit already sent is never cut short.
     Until(Deadline),
 }
 
 /// The `statement_timeout` each statement of a store's bounded
-/// investigation writes was given, for a test to read. Test-support code.
-///
-/// Once armed, it holds one entry per write transaction under
-/// [`LockWait::Until`], in the order the transactions began, named by the
-/// store method that began it (`begin_step`, `append_citing` or
-/// `complete_step_until`). Each entry lists, in milliseconds and in order,
-/// the timeout [`WriteTx::run`] set before each statement, recorded once
-/// Postgres accepted the setting and before the statement was sent. Each
-/// [`InvestigationStore`] owns its record, shared by its clones, so a test
-/// reads only its own server's writes; nothing is recorded until the test
-/// arms it.
+/// investigation writes was given, in milliseconds, for a test to read.
 #[cfg(any(test, feature = "test-support"))]
 #[derive(Debug, Default)]
 pub struct StatementRecord(parking_lot::Mutex<Option<Vec<(&'static str, Budgets)>>>);
 
-/// One recorded transaction's timeouts, shared by the record and the
-/// transaction's [`WriteTx`].
 #[cfg(any(test, feature = "test-support"))]
 type Budgets = std::sync::Arc<parking_lot::Mutex<Vec<u128>>>;
 
 #[cfg(any(test, feature = "test-support"))]
 impl StatementRecord {
-    /// Record from now on, from an empty record.
     pub fn arm(&self) {
         *self.0.lock() = Some(Vec::new());
     }
 
-    /// Every write transaction recorded since [`Self::arm`], named, with
-    /// its statements' timeouts in milliseconds; empty while unarmed.
     #[must_use]
     pub fn writes(&self) -> Vec<(&'static str, Vec<u128>)> {
         self.0
@@ -1360,7 +1053,6 @@ impl StatementRecord {
             .collect()
     }
 
-    /// A new entry for a transaction of `write`, while armed.
     fn open(&self, write: &'static str) -> Option<Budgets> {
         let budgets = Budgets::default();
         self.0
@@ -1371,11 +1063,6 @@ impl StatementRecord {
     }
 }
 
-/// The transaction of an investigation write (module docs). Its
-/// connection is reachable only through [`Self::run`], one statement at a
-/// time, so under [`LockWait::Until`] no statement of the write waits past
-/// the deadline. Under [`LockWait::Unbounded`] it sets nothing and runs
-/// the same code.
 #[derive(Debug)]
 pub(crate) struct WriteTx {
     tx: PooledTransaction,
@@ -1385,21 +1072,11 @@ pub(crate) struct WriteTx {
     /// session, never by a rollback that would first have to read that
     /// answer ([`PooledTransaction`]).
     cut: bool,
-    /// Where [`Self::run`] records each statement's timeout, for a
-    /// transaction a test's armed [`StatementRecord`] watches.
     #[cfg(any(test, feature = "test-support"))]
     budgets: Option<Budgets>,
 }
 
 impl WriteTx {
-    /// A transaction from `pool`, its wait for a connection and its `BEGIN`
-    /// bounded as `wait` allows.
-    ///
-    /// A `BEGIN` cut short at the deadline closes its connection, which
-    /// ends the transaction in Postgres with the session
-    /// ([`PooledTransaction`]). A deadline that passed after the answer
-    /// ends the transaction the same way, with no rollback sent, as
-    /// [`StoreError::WaitExpired`] ([`Self::end`]).
     pub(crate) async fn begin(pool: &PgPool, wait: LockWait) -> Result<Self, StoreError> {
         let tx = match wait {
             LockWait::Unbounded => PooledTransaction::begin(pool.acquire().await?).await?,
@@ -1429,22 +1106,6 @@ impl WriteTx {
         }
     }
 
-    /// Run one statement of the write on its connection.
-    ///
-    /// Under a deadline, Postgres bounds the statement first by what
-    /// remains: `statement_timeout` covers the whole statement, each of its
-    /// lock waits included, and set before every statement the waits of
-    /// the write together end at the deadline ([`timeout_millis`]). A
-    /// deadline already past refuses the statement before anything is
-    /// sent, as `WaitExpired`, and the write ends by closing its session,
-    /// since no time is left for a rollback either ([`Self::end`]): a
-    /// passed deadline grants no statement a fresh millisecond.
-    ///
-    /// The client bounds the same awaits, the setting's and the
-    /// statement's, at the deadline itself, so an answer that never comes
-    /// (a stalled socket, a paused backend) ends the write there too: cut
-    /// short, as `WaitExpired`, and the transaction closed with its
-    /// session ([`Self::end`]).
     pub(crate) async fn run<T, E>(
         &mut self,
         statement: impl AsyncFnOnce(&mut PgConnection) -> Result<T, E>,
@@ -1471,9 +1132,6 @@ impl WriteTx {
         .await
     }
 
-    /// Record each statement's timeout in `record`, as a transaction of
-    /// `write`, when `record` is armed and the transaction runs under a
-    /// deadline. Test-support code.
     #[cfg(any(test, feature = "test-support"))]
     fn record_in(&mut self, record: &StatementRecord, write: &'static str) {
         if matches!(self.wait, LockWait::Until(_)) {
@@ -1481,10 +1139,6 @@ impl WriteTx {
         }
     }
 
-    /// Await `io` on the connection no later than `deadline`. Cut short,
-    /// the write is cut ([`Self::end`]) and answers
-    /// [`StoreError::WaitExpired`], as does any later await of a write
-    /// already cut.
     async fn within<T>(
         &mut self,
         deadline: Deadline,
@@ -1500,16 +1154,9 @@ impl WriteTx {
         })
     }
 
-    /// Commit, and wait for Postgres to answer. Under a deadline the
-    /// statement timeout is lifted first, so the commit itself is never cut
-    /// short; the lift is a statement of the write, and one the deadline
-    /// cuts short ends the transaction as [`StoreError::WaitExpired`]. A
-    /// deadline already past refuses the commit before anything is sent:
-    /// the write ends without it, as `WaitExpired`, its session closed
-    /// ([`Self::end`]). The deadline is checked again once the lift is
-    /// answered, since an answer already waiting when the write is next
-    /// polled is taken however late that poll comes: only a `COMMIT` sent
-    /// before the deadline is awaited past it.
+    /// Under a deadline, the deadline is checked again once lifting
+    /// `statement_timeout` is answered, since an answer already waiting when the
+    /// write is next polled is taken however late that poll comes.
     pub(crate) async fn commit(mut self) -> Result<(), StoreError> {
         if let LockWait::Until(deadline) = self.wait {
             if deadline.expired() {
@@ -1529,10 +1176,6 @@ impl WriteTx {
         Ok(())
     }
 
-    /// Roll back what the write did, and wait for Postgres to answer. Under
-    /// a deadline the wait ends there: a write cut short, a deadline
-    /// already past, or an answer that has not come by the deadline closes
-    /// the session instead, as [`StoreError::WaitExpired`] ([`Self::end`]).
     pub(crate) async fn rollback(self) -> Result<(), StoreError> {
         if self.cut {
             return Err(StoreError::WaitExpired);
@@ -1549,8 +1192,6 @@ impl WriteTx {
         }
     }
 
-    /// Commit after `written`, or end the transaction after its error
-    /// ([`Self::end`]).
     async fn finish<T>(self, written: Result<T, StoreError>) -> Result<T, StoreError> {
         match written {
             Ok(written) => {
@@ -1561,23 +1202,9 @@ impl WriteTx {
         }
     }
 
-    /// End the transaction after `error`: roll back and wait for Postgres
-    /// to answer the rollback, because the caller may give a request's
-    /// count back the moment this returns. A failed rollback closes the
-    /// connection, which ends the transaction too; `error` is still the
-    /// answer. Under a deadline, a statement that reached its timeout, or a
-    /// lock wait the database's own `lock_timeout` ended, is
-    /// [`StoreError::WaitExpired`].
-    ///
-    /// Under a deadline the rollback is one more await of the write, and
-    /// it ends at the deadline too ([`Self::rollback`]). A write cut short
-    /// is not rolled back at all: the answer it stopped awaiting is still
-    /// on the way, and a rollback would first have to read it. Nor is one
-    /// whose deadline has already passed, and a rollback whose answer has
-    /// not come by the deadline is given up there. Each drops the open
-    /// transaction, which closes the session: Postgres ends the
-    /// transaction with it, and the answer is [`StoreError::WaitExpired`].
-    /// So a session goes back to the pool only after an answered rollback.
+    /// Roll back and wait for Postgres to answer, because the caller may give a
+    /// request's count back the moment this returns. A write cut short or past
+    /// its deadline sends no rollback, and an unanswered one ends at the deadline.
     pub(crate) async fn end(self, error: StoreError) -> StoreError {
         let wait = self.wait;
         match self.rollback().await {
@@ -1605,7 +1232,6 @@ fn timeout_millis(remaining: std::time::Duration) -> Option<u128> {
     })
 }
 
-/// Set the transaction's `statement_timeout` to `value`, until it ends.
 async fn statement_timeout(tx: &mut PgConnection, value: &str) -> Result<(), sqlx::Error> {
     sqlx::query("SELECT set_config('statement_timeout', $1, true)")
         .bind(value)
@@ -1625,8 +1251,6 @@ fn is_wait_ended(error: &StoreError) -> bool {
     )
 }
 
-/// Lock the open investigation `id` through the due-write rule and append
-/// `payload`, encoded as `text`, inside `tx`.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn append_open_in(
     tx: &mut WriteTx,
@@ -1645,10 +1269,6 @@ async fn append_open_in(
     Ok(Appended { entry, pruned })
 }
 
-/// The citing append of [`InvestigationStore::append_citing`] inside `tx`:
-/// the investigation locked through the due-write rule, the promotions in
-/// ascending id order, then the entry. A refusal writes nothing and leaves
-/// `tx` for the caller to roll back.
 #[allow(clippy::too_many_arguments)] // one append, each part named
 async fn citing_in(
     tx: &mut WriteTx,
@@ -1683,7 +1303,6 @@ async fn citing_in(
     Ok(Citing::Appended(Box::new(Appended { entry, pruned })))
 }
 
-/// Lock the investigation `id` for the rest of `tx` and read its head.
 async fn lock(tx: &mut WriteTx, id: &InvestigationId) -> Result<Locked, StoreError> {
     let row = tx
         .run(async |tx| {
@@ -1700,15 +1319,6 @@ async fn lock(tx: &mut WriteTx, id: &InvestigationId) -> Result<Locked, StoreErr
     })
 }
 
-/// Lock the investigation `id` for a write at `now` and apply the due-write
-/// rule (module docs): when its `retain_until` is at or before `now`, prune
-/// its kept results first, as [`super::ResultsStore::prune_evidence`] does.
-/// Returns the head and the files of what it pruned. Each lock is waited
-/// for as `tx` allows: the investigation's, then its kept results' in the
-/// prune.
-///
-/// The investigation row is locked before any of its results, the order
-/// every transaction that touches both takes.
 pub(crate) async fn lock_for_write(
     tx: &mut WriteTx,
     id: &InvestigationId,
@@ -1719,10 +1329,7 @@ pub(crate) async fn lock_for_write(
     Ok((locked, pruned))
 }
 
-/// Prune the kept results of the locked investigation `id` when its
-/// `retain_until` is at or before `now`: `pruned`, with `expires_at` and
-/// `gone_at` at the deadline it passed. Returns their files. The caller
-/// holds the investigation's lock.
+/// The caller holds the investigation's lock.
 pub(crate) async fn prune_if_due(
     tx: &mut WriteTx,
     id: &InvestigationId,
@@ -1748,8 +1355,6 @@ pub(crate) async fn prune_if_due(
     expired_files(files)
 }
 
-/// Append `payload`, encoded as `text`, as the next entry of the locked
-/// investigation `id`, and advance it.
 #[allow(clippy::too_many_arguments)] // one write, each part named
 async fn append_in(
     tx: &mut WriteTx,
@@ -1773,13 +1378,6 @@ async fn append_in(
     })
 }
 
-/// Write `outcome` on step `step_seq` of the locked investigation `id`, if
-/// the step has none yet, and advance the investigation: the step fill of
-/// [`InvestigationStore::complete_step_until`], inside the caller's transaction,
-/// which locked through [`lock_for_write`]. The evidence clock slides by
-/// `slide`, or stays put for `None` ([`advance`]). Returns whether it
-/// wrote; a step that already has an outcome, or a `seq` that names no
-/// step, changes nothing.
 #[allow(clippy::too_many_arguments)] // one write, each part named
 pub(crate) async fn fill_step_in(
     tx: &mut WriteTx,
@@ -1842,7 +1440,6 @@ pub(crate) async fn fill_step_in(
     Ok(true)
 }
 
-/// Rows of `(id, file_bytes)` as the files to unlink.
 fn expired_files(files: Vec<(String, i64)>) -> Result<Vec<ExpiredFile>, StoreError> {
     files
         .into_iter()
@@ -1854,7 +1451,6 @@ fn expired_files(files: Vec<(String, i64)>) -> Result<Vec<ExpiredFile>, StoreErr
         .collect()
 }
 
-/// Record entry `seq` of kind `kind` with `payload`, as of `now`.
 async fn insert_entry(
     tx: &mut WriteTx,
     id: &InvestigationId,
@@ -1886,10 +1482,6 @@ async fn insert_entry(
     Ok(())
 }
 
-/// Move the locked investigation to `seq`, changed at `now` by `actor`,
-/// and slide its evidence clock by `slide`, or leave both deadlines where
-/// they are for `None`: bookkeeping no principal asked for, as boot's
-/// interruptions ([`InvestigationStore::interrupt_running_steps`]).
 async fn advance(
     tx: &mut WriteTx,
     id: &InvestigationId,
@@ -1977,7 +1569,6 @@ fn outcome_str(outcome: StepOutcomeKind) -> &'static str {
     }
 }
 
-/// An error code's wire spelling, for the `outcome_code` column.
 fn code_str(code: &ErrorCode) -> Result<String, StoreError> {
     match serde_json::to_value(code) {
         Ok(serde_json::Value::String(text)) => Ok(text),
@@ -1987,7 +1578,6 @@ fn code_str(code: &ErrorCode) -> Result<String, StoreError> {
     }
 }
 
-/// A decode failure in the named column.
 fn column_error(
     column: &str,
     source: impl Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -2038,7 +1628,6 @@ fn decode_investigation(row: &PgRow) -> Result<InvestigationRow, sqlx::Error> {
     })
 }
 
-/// The row's payload, which must be tagged with `kind`.
 fn decode_payload(row: &PgRow, kind: EntryKind) -> Result<EntryPayload, sqlx::Error> {
     let text: String = row.try_get("payload")?;
     let payload: EntryPayload =
@@ -2079,9 +1668,6 @@ mod tests {
 
     use super::timeout_millis;
 
-    /// A positive budget is rounded up to the millisecond, however small,
-    /// and capped at what the setting holds; none left is no timeout at
-    /// all, never a fresh millisecond.
     #[test]
     fn only_a_positive_budget_has_a_statement_timeout() {
         assert_eq!(timeout_millis(Duration::ZERO), None);
@@ -2145,8 +1731,6 @@ mod pg_tests {
         id
     }
 
-    /// Wait, bounded, until session `pid` is gone: the client closed it,
-    /// and Postgres ended it and any transaction with it.
     async fn until_closed(pool: &PgPool, pid: i32) {
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
@@ -2167,11 +1751,6 @@ mod pg_tests {
         .expect("the write's session was not closed");
     }
 
-    /// A deadline that passed between two statements of a bounded write,
-    /// as it does for a task descheduled there, refuses the next statement
-    /// before anything is sent: it never runs, the answer is `WaitExpired`,
-    /// and with no time left for a rollback either, the write ends by
-    /// closing its session.
     #[sqlx::test]
     async fn a_statement_past_the_deadline_is_refused_unrun(pool: PgPool) {
         let deadline = Deadline::after(Duration::from_millis(300));
@@ -2205,11 +1784,6 @@ mod pg_tests {
         until_closed(&pool, pid).await;
     }
 
-    /// A deadline that passed after a bounded write's last statement
-    /// refuses its commit before anything is sent, and with no time left
-    /// for a rollback, the write ends by closing its session: Postgres
-    /// rolls the whole write back with it, and nothing of it is written,
-    /// neither the entry nor the investigation's sequence.
     #[sqlx::test]
     async fn a_commit_past_the_deadline_rolls_the_write_back(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());
@@ -2246,10 +1820,6 @@ mod pg_tests {
         assert!(page.entries.is_empty(), "{page:?}");
     }
 
-    /// A lift whose answer the write first sees after its deadline sends no
-    /// commit: the write answers `WaitExpired`, and nothing of it is
-    /// written.
-    ///
     /// The deadline cannot cut such a lift short: `deadline.run` polls the
     /// lift before its timer, so an answer already in the socket wins. The
     /// test makes that order certain rather than likely. The proxy, on a
@@ -2310,8 +1880,6 @@ mod pg_tests {
         proxy_runtime.shutdown_background();
     }
 
-    /// A kept capture of `investigation` holding a file of `file_bytes`,
-    /// and the facts of a sightings read when `facts` is set.
     fn kept(
         n: u32,
         investigation: Option<&InvestigationId>,
@@ -2369,9 +1937,6 @@ mod pg_tests {
         }
     }
 
-    /// Every evidence byte count adds each kept row's facts document to
-    /// its file: the binding per-investigation and installation sums, and
-    /// the live pre-check pair. A temporary row's facts count in none.
     #[sqlx::test]
     async fn evidence_usage_counts_each_kept_rows_facts_document(pool: PgPool) {
         let store = InvestigationStore::new(pool.clone());

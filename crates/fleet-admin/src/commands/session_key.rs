@@ -2,19 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `fleet-admin generate-session-key` — emit a fresh
-//! `XChaCha20`-Poly1305 key in base64url form.
-
 use std::io::Write;
 
 use fleet_auth::SessionKey;
 
 use crate::error::AdminError;
 
-/// Generate a new session key and write it to stdout as base64url-no-pad.
-///
-/// Output is exactly one line: 43 chars of base64url + trailing `\n`.
-/// The plaintext lives in a `Zeroizing` buffer for the duration of the call.
 pub fn run() -> Result<(), AdminError> {
     let key = SessionKey::generate();
     let encoded = key.to_base64url();

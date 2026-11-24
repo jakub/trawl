@@ -59,8 +59,6 @@ def check(helm_flags):
     trawld = next(c for c in pod["containers"] if c["name"] == "trawld")
     if not any(m["name"] == "data" for m in trawld.get("volumeMounts", [])):
         problems.append("trawld does not mount 'data'")
-    # Every mount name must resolve to a pod volume or a claim template, so a
-    # renamed claim cannot leave a mount dangling.
     provided = set(pod_volumes) | set(claims)
     for kind in ("initContainers", "containers"):
         for container in pod.get(kind, []):

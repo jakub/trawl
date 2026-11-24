@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! HTTP request handlers for the trawl API.
-
 use std::collections::HashMap;
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
@@ -51,20 +49,11 @@ use crate::store::{
 use crate::transport::http::RequestId;
 use trawl_engine::timing::QueryPhase;
 
-// -- handlers ----------------------------------------------------------------
-
-/// Re-decide a `from saved` read whose stored files may have gone during
-/// execution.
-///
 /// `DuckDB` answers a `read_parquet()` over a pattern that matches nothing
 /// by substituting an empty relation (`is_no_files_error` in the executor),
 /// so a file deleted between the pre-execution check and the open comes back
 /// as a success with NO columns at all — a shape no SELECT can otherwise
-/// produce, since every projection has at least one column. An engine error
-/// is the other way that window can show itself. In both cases the files are
-/// asked about once more: a confirmed absence turns the outcome into the
-/// named 409, and a file whose absence cannot be established into a redacted
-/// I/O error; anything still on disk keeps the answer it earned.
+/// produce. An engine error is the other way that window can show itself.
 fn guard_vanished_run_result(
     mut outcome: crate::pool::ExecuteOutcome,
     run_files: &[crate::from_saved::RunFile],
@@ -83,10 +72,6 @@ fn guard_vanished_run_result(
     outcome
 }
 
-/// Ask whether a `from saved` read's stored files are still there before
-/// any of them reaches `DuckDB`, and say what that leaves for
-/// [`guard_vanished_run_result`] to ask again after execution.
-///
 /// A refusal here is the read's outcome, returned as one, and leaves
 /// nothing to ask again: no file was opened, so no delete can land between
 /// this check and an open, and asking again would only log the same
@@ -110,8 +95,6 @@ fn check_run_files_before_execution(
 }
 
 /// `POST /api/v1/query` — execute a DSL query against the configured data source.
-///
-/// Requires a valid bearer token (injected by auth middleware).
 #[allow(clippy::too_many_lines)]
 pub async fn query(
     State(state): State<AppState>,
@@ -121,9 +104,6 @@ pub async fn query(
 ) -> Result<Json<QueryResponse>, ServerError> {
     let Json(req) = shaped("request body", req)?;
 
-    // One absolute budget for the whole request (ADR-0024), stamped
-    // before tracking, admission and source resolution: every wait below
-    // spends from this instant, so no phase gets a fresh timeout.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
 
@@ -141,17 +121,12 @@ pub async fn query(
         )));
     }
 
-    // One id from the pool's counter keys both the tracker entry and the
-    // pool's interrupt map, so cancel-by-id interrupts the query the client
-    // sees. Allocated before query_start so every lifecycle event correlates
-    // on query_id without carrying the query text. The entry closes with
-    // `tracked`: an outcome below, or abandoned if the transport drops this
-    // future at an await first.
+    // One id keys both the tracker entry and the pool's interrupt map, so
+    // cancel-by-id interrupts the query the client sees.
     //
     // `pending` puts the id in the pool's registry before the entry opens,
-    // so a cancel by id reaches the query while it still waits to start
-    // (ADR-0024, Amendment 2026-11-09). Declared first, it drops after
-    // `tracked`.
+    // so a cancel by id reaches the query while it still waits to start.
+    // Declared first, it drops after `tracked`.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
     let pending = state
@@ -162,8 +137,6 @@ pub async fn query(
 
     // Default-filter lifecycle events carry metadata only — never the raw
     // DSL, which can contain customer identifiers or incident indicators.
-    // Full text lives in authenticated history, the tracker, the opt-in
-    // query debug log, and the DEBUG-only query_text event below.
     tracing::info!(
         event_type = "query_start",
         user = %verified.name,
@@ -191,32 +164,14 @@ pub async fn query(
     // `outcome=abandoned`.
     let timing = TimingGuard::for_request(query_id, request_id.0, TimingKind::Query, start);
 
-    // Check for `| from saved` — if present, resolve to parquet source
-    // and execute with the pre-computed source instead of normal glob scan.
-    //
     // Admission runs over the pipeline the caller TYPED, before the
-    // `from saved` stage is sliced off (ADR-0024): resolving first would
-    // let an over-cap original be admitted as an under-cap suffix. Its
-    // failure takes the same route the engine's own parse/emit failures
-    // take below, so the lifecycle events and the query log are the ones
-    // this shape has always produced.
+    // `from saved` stage is sliced off: resolving first would let an
+    // over-cap original be admitted as an under-cap suffix.
     //
-    // Resolution reads postgres, so it spends the caller's budget like any
-    // other wait (ADR-0024) and its failures are the handler's, not the
-    // caller's to catch: escaping by `?` here would close the tracker entry
-    // this request already opened as abandoned, not as the refusal it is.
-    // Both land as a refusing outcome and finish tracking through the one
-    // path below. Expiry is
-    // the pre-start capacity refusal, since no work was ever started and a
-    // timeout history row would claim otherwise.
-    //
-    // `saved_lookup` is booked for every `from saved` read, and only one
-    // that resolved makes the account a `from_saved` one: every query
-    // takes the detection parse, and an ordinary query's is not a lookup.
-    // A lookup that failed (an unknown saved query, a database error) is
-    // booked like one that resolved, and one the deadline cut is booked
-    // like any request-side wait a deadline ends (ADR-0046): the refusal
-    // shows where its time went.
+    // Resolution failures are the handler's: escaping by `?` here would close
+    // the tracker entry this request already opened as abandoned, not as the
+    // refusal it is. Expiry is the pre-start capacity refusal, since no work
+    // was ever started and a timeout history row would claim otherwise.
     let checked = {
         let _phase = timing.clock().guard(QueryPhase::DslCheck);
         crate::admission::admit(&state.query.pool, &req.query, deadline, Some(&pending)).await
@@ -263,21 +218,12 @@ pub async fn query(
         }
     };
 
-    // Steps 1-4 of the histogram's eligibility rule, read off the parse
-    // admission made: no second parse. A refused request answers its error
-    // and no histogram.
     let histogram_plan = match &admitted {
         Ok((query, saved)) => crate::histogram::plan(req.histogram, query, saved.is_some()),
         Err(_) => crate::histogram::HistogramPlan::Absent,
     };
 
-    // The stored result files this read depends on, kept past resolution so
-    // their presence can be asked again after execution (see
-    // [`guard_vanished_run_result`]). Empty for every query that is not a
-    // `from saved` read of a run with a file.
     let mut run_files: Vec<crate::from_saved::RunFile> = Vec::new();
-    // What the guard asks about again: the run files, unless the check
-    // before execution already refused.
     let mut recheck: &[crate::from_saved::RunFile] = &[];
 
     let (outcome, degraded_fields) = match admitted {
@@ -292,11 +238,6 @@ pub async fn query(
         ),
         Ok((query, Some(mut resolved))) => {
             run_files = std::mem::take(&mut resolved.run_files);
-            // Absence is an answer, not an empty result (ADR-0035): a
-            // stored path that no longer resolves refuses here, naming the
-            // run when it is confirmed absent, before any of it reaches
-            // `DuckDB` — where a file it cannot resolve is substituted with
-            // an empty relation and would read as "the report found nothing".
             let (refused, files) = check_run_files_before_execution(&run_files);
             recheck = files;
             if let Some(refused) = refused {
@@ -386,14 +327,10 @@ pub async fn query(
         end,
     );
 
-    // Which result columns render as OTel tokens, decided by the executing
+    // Which result columns render as OTel tokens is decided by the executing
     // task under the pins the rows were produced with, not by the catalog as
-    // it stands now: history I/O and logging sit between execution and the
-    // response, and a repin landing in that window must not retype the
-    // answer's presentation. The walk is a client-shaped cost (a parse of
-    // the query text), so it runs inside the query's permit on the blocking
-    // pool, never here on a reactor thread (see
-    // `crate::pool::severity_columns_for`).
+    // it stands now: a repin landing between execution and the response must
+    // not retype the answer's presentation.
     let severity_columns = outcome.severity_columns;
     let counted = outcome.histogram;
 
@@ -402,8 +339,6 @@ pub async fn query(
             let total = qr.row_count();
             let paginated = qr.paginate(offset, limit);
             let returned = paginated.row_count();
-            // A successful execution answers what the plan decided: no
-            // field, a reason, or the worker's count of the whole result.
             let histogram = match histogram_plan {
                 crate::histogram::HistogramPlan::Absent => None,
                 crate::histogram::HistogramPlan::Refuse(reason) => {
@@ -414,14 +349,8 @@ pub async fn query(
 
             tracked.complete(total);
 
-            // Record the query in history under the authoritative fleet
-            // keystore id. Best-effort: a history-store write failure must
-            // not fail the query, but log it so a broken store (pg down,
-            // constraint trouble) is visible.
-            //
-            // Under the request's own deadline (ADR-0024), because the
-            // rows are already in hand: a wedged history store must not
-            // hold a finished answer past the budget the caller was
+            // Under the request's own deadline (ADR-0024): a wedged history store
+            // must not hold a finished answer past the budget the caller was
             // promised. Expiry abandons the write, never the result.
             let recorded = deadline
                 .run(state.storage.history.record_query(
@@ -550,10 +479,7 @@ pub async fn query(
             // `safe_msg` nor the raw error belongs in them: the public
             // message keeps parser/emitter text (which quotes the user's
             // own tokens and format strings), and the raw database error
-            // embeds the generated SQL plus the values it choked on. The
-            // public message lives on in the client response, the tracker
-            // and the opt-in query debug log; the raw error only in the
-            // DEBUG event below.
+            // embeds the generated SQL plus the values it choked on.
             let error_class = e.error_class();
             match &e {
                 // Every 400-class engine answer, including the refusal
@@ -619,11 +545,6 @@ pub async fn query(
 }
 
 /// `GET /metrics` — prometheus scrape endpoint (unauthenticated).
-///
-/// Collects process metrics and trawl gauges on each scrape, then
-/// renders the prometheus text exposition format. The gauge collection
-/// (which may walk the filesystem on cache miss) runs in `spawn_blocking`
-/// to avoid stalling the async executor.
 pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoResponse {
     let hot_buffer = state.query.hot_buffer.clone();
     let publication = state.query.pool.publication();
@@ -664,8 +585,7 @@ pub async fn prometheus_metrics(State(state): State<AppState>) -> impl IntoRespo
 }
 
 /// The names of the checks `GET /api/v1/health` reports, in the order
-/// [`health`] fills them. They live in `trawl-api`, so every doctor gives a
-/// row of its own to these names and to no other (#269).
+/// [`health`] fills them.
 pub use trawl_api::doctor::health::HEALTH_CHECK_NAMES;
 
 /// `GET /api/v1/health` — unauthenticated health check with subsystem probes.
@@ -683,33 +603,19 @@ pub async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthRe
     (http_status, Json(report))
 }
 
-/// The health report `GET /api/v1/health` answers, and the HTTP status it
-/// answers with: 200 for `ok` and `degraded`, 503 for `unavailable`.
-///
-/// Shared by the health route and `GET /api/v1/capabilities`, so both
-/// report one computation. It also sets the `trawl_health_check` gauges.
-/// It records no request failure: that is the health route's, the one
-/// caller that answers the 503.
+/// Shared by the health route and `GET /api/v1/capabilities`. It records no
+/// request failure: that is the health route's, the one caller that answers
+/// 503 for `unavailable`.
 pub(crate) async fn health_report(state: &AppState) -> (StatusCode, HealthResponse) {
-    // The `duckdb` check reads the latest engine sample (ADR-0056). It
-    // never waits for a probe and never starts one, and it takes no
-    // executor permit, so a full or retained pool cannot fail it.
     let duckdb = state.engine_sample.read();
 
-    // Probe the fleet keystore and the app-state store concurrently.
-    //
-    // `/health` is unauthenticated and unthrottled — it sits outside
-    // `require_bearer_only` and `rate_limit_middleware` — so it must not amplify a
+    // `/health` is unauthenticated and unthrottled, so it must not amplify a
     // burst of probes onto the small, shared keystore pool that bearer
-    // verification depends on. `AuthState::ping_cached` memoises the ping for a
-    // few seconds and serialises refreshes, collapsing any burst into at most
-    // one in-flight connection. It is also timeout-bounded, so a slow/downed
-    // keystore reports an unhealthy auth subsystem (non-critical → `Degraded` →
-    // HTTP 200) instead of stalling this liveness path.
+    // verification depends on: `AuthState::ping_cached` memoises the ping for a
+    // few seconds and serialises refreshes.
     let (auth_result, storage_result) =
         tokio::join!(state.auth.ping_cached(), state.storage.ping_cached());
 
-    // Data path: check that the base directory exists and is readable.
     let base_dir = state.query.pool.base_dir().to_owned();
     let data_result = std::fs::metadata(&base_dir)
         .ok()
@@ -733,8 +639,6 @@ pub(crate) async fn health_report(state: &AppState) -> (StatusCode, HealthRespon
     let corpus_settled = corpus == "ok";
     let check_value = |healthy| String::from(if healthy { "ok" } else { "error" });
 
-    // One value per name in `HEALTH_CHECK_NAMES`, in its order. The array's
-    // type holds the two lists to the same length.
     let values: [String; HEALTH_CHECK_NAMES.len()] = [
         String::from(duckdb.as_str()),
         check_value(auth_healthy),
@@ -803,19 +707,11 @@ pub(crate) async fn health_report(state: &AppState) -> (StatusCode, HealthRespon
     )
 }
 
-/// Whether hot-buffer admission is accepting ingest (ADR-0043).
-///
-/// `false` only while the ledger has latched
-/// [`AdmissionState::Refusing`](crate::hot_buffer::AdmissionState::Refusing).
-/// `Pressure` still admits, so it reads as healthy. With ingest disabled
-/// there is no buffer to refuse into, and the check reads healthy.
 fn ingest_capacity_admitting(hot_buffer: Option<&crate::hot_buffer::HotBuffer>) -> bool {
     hot_buffer
         .is_none_or(|buf| buf.admission_state() != crate::hot_buffer::AdmissionState::Refusing)
 }
 
-/// The `ingest_capacity` check's wire value: `"ok"` or `"refusing"`, never
-/// `"error"`. A refusal is back-pressure on senders, not a failed subsystem.
 const fn ingest_capacity_check(admitting: bool) -> &'static str {
     if admitting { "ok" } else { "refusing" }
 }
@@ -829,15 +725,6 @@ fn corpus_check(publication: &crate::publication::PublicationGate) -> &'static s
         .map_or("ok", crate::publication::CorpusUnsettled::label)
 }
 
-/// Derive overall health status from individual subsystem results.
-///
-/// - All green → `Ok`
-/// - Any non-critical (`auth_db`, `storage_db`, `data_path`,
-///   `ingest_capacity`, `corpus`) fails, or the engine sample reads `slow`
-///   → `Degraded` (HTTP 200 — the query path can still serve, or for
-///   `corpus` serves again once compaction settles it, so no probe may
-///   restart the server)
-/// - The engine sample reads `error` → `Unavailable`
 #[allow(clippy::fn_params_excessive_bools)] // subsystem flags, call sites are named
 fn derive_health_status(
     duckdb: EngineCheck,
@@ -862,10 +749,8 @@ fn derive_health_status(
     HealthStatus::Ok
 }
 
-/// Query parameters for `GET /api/v1/schema`.
 #[derive(Debug, Deserialize)]
 pub struct SchemaParams {
-    /// Only fields observed for this service.
     pub service: Option<String>,
     /// Lift the `last_seen` retention window (show aged-out fields too).
     pub all: Option<bool>,
@@ -873,25 +758,9 @@ pub struct SchemaParams {
 
 /// `GET /api/v1/schema` — the data schema, served from the field catalog.
 ///
-/// Columns are a `SELECT` over `field_types` LEFT JOIN `field_services`
-/// (ADR-0009) — the write-time type authority, never a `DESCRIBE`.
-/// By default fields whose most recent observation predates the retention
-/// horizon (the longest age any env still keeps data for, per
-/// [`crate::retention::maximum_enabled_age_secs`]; an env that keeps its
-/// data forever lifts it) are hidden; `?all=true` lifts the window, and a
-/// never-observed pin (e.g. the envelope seed) is always shown.
-/// `?service=` scopes the listing to fields that service has carried.
-///
-/// Corpus facts (dates, sizes, services, file count) stay a TTL-cached
-/// filesystem walk; `cached` reports whether those came from the cache,
-/// not the columns.
-///
-/// The unscoped column set is TTL-cached too (same TTL): it aggregates
-/// `field_services` across every service, and the service axis is
-/// client-chosen and unbounded while this endpoint is what autocomplete
-/// polls. A `?service=` listing is served straight from postgres — it is
-/// bounded by the pin cap through `field_services (service, field)`, and
-/// caching per client-chosen service name would be an unbounded cache.
+/// `cached` reports whether the corpus facts came from the cache, not the
+/// columns. A `?service=` listing is served straight from postgres: caching
+/// per client-chosen service name would be an unbounded cache.
 pub async fn schema(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -902,7 +771,6 @@ pub async fn schema(
     }
     let Query(params) = shaped("query parameters", params)?;
 
-    // Hot buffer stats are cheap atomics — always read fresh (never cached).
     let (hot_events, hot_bytes) = hot_buffer_stats(&state);
 
     // Columns: a catalog SELECT. Postgres down → 503 (the same dependency
@@ -929,13 +797,6 @@ pub async fn schema(
         // sampled before the flip. Before: an entry whose SELECT straddles a
         // flip is then stamped with the older generation, so the next read
         // discards it rather than serving a type the corpus no longer has.
-        //
-        // A request whose SELECT began before a flip may still return
-        // pre-flip columns in its own response (its postgres snapshot
-        // legitimately predates the commit, and the corpus-facts walk below
-        // can delay that response's arrival) — ordinary concurrent-read
-        // semantics; the stale entry it stamps cannot be served to any
-        // later request.
         let generation = state.query.field_catalog.repin_generation();
         let slot = &mut cache[usize::from(since.is_some())];
         let fresh = slot
@@ -1009,9 +870,6 @@ pub async fn schema(
     }))
 }
 
-/// The `/api/v1/schema` column set: the catalog listing, mapped to the wire
-/// type and sorted into query-result display order (envelope first,
-/// metadata last, custom fields alphabetical in between).
 async fn catalog_schema_columns(
     state: &AppState,
     service: Option<String>,
@@ -1038,7 +896,6 @@ async fn catalog_schema_columns(
     Ok(columns)
 }
 
-/// Read hot buffer event count and byte size (cheap atomic loads).
 fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
     state.query.hot_buffer.as_ref().map_or((None, None), |buf| {
         (
@@ -1048,9 +905,6 @@ fn hot_buffer_stats(state: &AppState) -> (Option<u64>, Option<u64>) {
     })
 }
 
-/// Parse parquet file paths to extract corpus facts: earliest/latest date,
-/// total bytes, distinct services, and the parquet file count.
-///
 /// Path structure: `{base}/{env}/{YYYY-MM-DD}/{HH}/{service}.parquet`, or
 /// `{base}/{env}/{YYYY-MM-DD}/{service}.parquet` for a daily rollup — hence
 /// the ancestor walk for the date component rather than a fixed depth.
@@ -1097,22 +951,6 @@ fn collect_catalog_metadata(
 }
 
 /// One unit of retained work as a given reader may see it (ADR-0024).
-///
-/// The id, the kind and the timing are facts about the server's capacity
-/// and go to every reader the route already admits.
-///
-/// Interactive work, a query some key submitted, carries its user and
-/// its DSL to every reader of this route, which is what `active` and
-/// `recent` have always done for the same query. Retention is a phase of
-/// one request's life, not a second visibility class: hiding the text here
-/// while `recent` shows it for the same id would be an incoherence, not a
-/// protection. `Permission::Query` is the gate on all three lists.
-///
-/// System work (a scheduled run) is the exception: it has
-/// no human owner and its DSL is the server's own, so only an operator
-/// (`ServerManage`) sees its text. Owner ids never leave the server in
-/// either case, and viewing is not cancellation. That authority is still
-/// the exact keystore id (see `check_cancel_authority`).
 pub(crate) fn retained_snapshot(
     work: &crate::pool::RetainedWork,
     verified: &VerifiedKey,
@@ -1165,15 +1003,6 @@ pub async fn queries(
     }))
 }
 
-/// May this key ask for that work to stop?
-///
-/// Admin (`ServerManage`) can cancel any work, including the server's own
-/// (a scheduled run). A `QueryCancel` holder can cancel
-/// work it submitted, and ownership is the exact keystore id: display
-/// names are mutable and non-unique, so two keys sharing a name must stay
-/// isolated from each other. Keys holding neither permission are rejected
-/// outright, with a different sentence — telling them nothing about
-/// whether the id exists.
 fn check_cancel_authority(
     verified: &VerifiedKey,
     tracker_owner: Option<i64>,
@@ -1206,16 +1035,11 @@ fn require_cancel_grant(verified: &VerifiedKey) -> Result<(), ServerError> {
 }
 
 /// `DELETE /api/v1/queries/{id}` — cancel a running query by ID.
-///
-/// Admin (`ServerManage`) can cancel any query. `QueryCancel` holders can cancel
-/// their own queries only. Keys without `QueryCancel` are rejected outright.
 pub async fn cancel_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
     query_id: Result<Path<u64>, PathRejection>,
 ) -> Result<Json<CancelResponse>, ServerError> {
-    // Whether this key may cancel THIS query needs the id, so only the
-    // grant is judged before the id's shape; the owner check follows it.
     require_cancel_grant(&verified)?;
     let Path(query_id) = shaped("query id", query_id)?;
     // Two records, one owner. The tracker drops a query as soon as its
@@ -1247,17 +1071,8 @@ pub async fn cancel_query(
 
 /// `POST /api/v1/validate` — validate a DSL query without executing it.
 ///
-/// Parses the text and checks every function call in every stage: its name,
-/// its argument count and its literal arguments (units, formats and integer
-/// positions). It also checks `extract` regex patterns. It does not check
-/// fields against the schema, or that every lane can run the query.
-///
-/// This route runs the two halves [`crate::admission::admit`] runs, in the
-/// same order and from the same owners — so an over-budget pipeline
-/// reports ADR-0024's sentence here too. It reports it as this route's own
-/// answer (`valid: false` with the refusal as a detail) rather than as an
-/// error status: telling a client its query is invalid IS the successful
-/// outcome of a validation call.
+/// It does not check fields against the schema, or that every lane can run
+/// the query.
 pub async fn validate_query(
     State(state): State<AppState>,
     _: Authorized<needs::Validate>,
@@ -1271,15 +1086,6 @@ pub async fn validate_query(
         .map(Json)
 }
 
-/// Validate `dsl` in one preparation job on the blocking pool, behind the
-/// preparation allowance (ADR-0063), and answer with what `/validate`
-/// reports.
-///
-/// # Errors
-///
-/// As [`crate::pool::ExecutorPool::prepare`]: no slot came free before
-/// `deadline`, or `deadline` passed while the job ran. A job whose stop was
-/// requested is [`EngineError::Cancelled`](trawl_engine::error::EngineError::Cancelled).
 pub(crate) async fn validate(
     pool: &crate::pool::ExecutorPool,
     dsl: String,
@@ -1291,9 +1097,6 @@ pub(crate) async fn validate(
     .await?
 }
 
-/// The whole `/validate` answer for `dsl`: the parse, the shared
-/// validation and the checked formatting, under `stop`.
-///
 /// A parse or validation refusal is the answer (`valid: false`). A
 /// cancellation is not a refusal of the text, so it is the error.
 fn validation(
@@ -1324,8 +1127,6 @@ fn validation(
     stop.check()
         .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?;
 
-    // Only text proven to read back as this query is ever returned; a
-    // refusal leaves the query valid and says why (ADR-0061).
     let (formatted, format_error) = match trawl_core::format::checked_format_query(&ast) {
         Ok(text) => (Some(text), None),
         Err(e) => {
@@ -1367,9 +1168,6 @@ pub async fn stats(
 }
 
 /// `GET /api/v1/whoami` — returns identity and permissions for the current token.
-///
-/// Available to any authenticated user. No permission check needed — if the
-/// token passed auth middleware, the user is entitled to know their own identity and grants.
 pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIResponse> {
     // Permissions are server-scoped: only recognized trawl permissions are
     // emitted, in canonical order — echoing raw keystore strings would
@@ -1393,9 +1191,6 @@ pub async fn whoami(Extension(verified): Extension<VerifiedKey>) -> Json<WhoAmIR
 
 /// `GET /api/v1/capabilities` — what this server offers a client: version,
 /// DSL, bounds, quotas, admission, link origin and health (ADR-0058).
-///
-/// Available to any key with a trawl grant, like [`whoami`]: no permission
-/// check. Always 200; an unavailable server says so in the health block.
 pub async fn capabilities(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1404,9 +1199,6 @@ pub async fn capabilities(
 }
 
 /// `GET /api/v1/dashboard` — full dashboard snapshot (admin only).
-///
-/// Returns the latest [`DashboardSnapshot`] collected by the background
-/// snapshot collector. Available even when the terminal monitor is disabled.
 pub async fn dashboard(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1426,11 +1218,8 @@ pub async fn dashboard(
 
 /// `GET /api/v1/dashboard/stream` — push the dashboard snapshot every 2s via SSE (admin only).
 ///
-/// Per-connection interval loop over the snapshot cache refreshed by the
-/// background collector — no dedicated push channel. Each snapshot is
-/// emitted as a named `stats` SSE event. Before the collector's first tick
-/// the loop silently skips (never a 503 mid-stream: `EventSource` treats a
-/// non-200 as terminal, whereas an empty wait of ≤1s self-heals).
+/// Before the collector's first tick the loop silently skips (never a 503
+/// mid-stream: `EventSource` treats a non-200 as terminal).
 pub async fn dashboard_stream(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1446,8 +1235,6 @@ pub async fn dashboard_stream(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
-    // Bound concurrent dashboard streams. The owned permit is held by the
-    // stream future and auto-released when the client disconnects.
     let permit = state
         .query
         .dashboard_sse_semaphore
@@ -1477,9 +1264,6 @@ pub async fn dashboard_stream(
 }
 
 /// `GET /api/v1/schema/services` — rich per-service schema from background refresh.
-///
-/// Pure cache read (two in-process caches, no postgres and no file I/O).
-/// Returns 503 if the background refresh hasn't completed yet.
 pub async fn schema_services(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -1526,18 +1310,12 @@ pub async fn schema_services(
     }))
 }
 
-/// Format a UTC instant as the wire's ISO 8601 string.
 fn iso8601(dt: chrono::DateTime<chrono::Utc>) -> String {
     dt.to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
 
-/// Convert a `?since_secs=` window into an absolute instant.
-///
-/// `since_secs` is request-controlled, so every step here is total:
-/// `TimeDelta::seconds` and `DateTime - TimeDelta` are both panicking
-/// constructors that a large enough query string reaches. Any window that
-/// reaches past the unix epoch saturates there — older than any row a
-/// catalog can hold, so the filter still means "everything", and the value
+/// `since_secs` is request-controlled, so every step here is total. Any
+/// window that reaches past the unix epoch saturates there, and the value
 /// stays bindable as a postgres `timestamptz` (whose floor is nearer than
 /// chrono's).
 fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -1552,14 +1330,10 @@ fn since_from_secs(since_secs: Option<u64>) -> Option<chrono::DateTime<chrono::U
     })
 }
 
-/// Query parameters for `GET /api/v1/schema/fields`.
 #[derive(Debug, Deserialize)]
 pub struct CatalogFieldsParams {
-    /// Only fields observed for this service.
     pub service: Option<String>,
-    /// Only fields observed within the last N seconds.
     pub since_secs: Option<u64>,
-    /// Maximum fields returned (default 500, clamped to the pin cap).
     pub limit: Option<i64>,
 }
 
@@ -1625,15 +1399,8 @@ pub async fn catalog_fields(
 }
 
 /// The degraded fields the queries bind, sorted — the incomplete-results
-/// notice (ADR-0011).
-///
-/// `queries` is every query the answer depends on, as already parsed: the
-/// query as admitted, plus — for `from saved` — the saved query whose run
-/// produced the stored rows ([`degraded_fields_with_saved`]). Nothing here
-/// parses.
-///
-/// Reads the in-process set the schema-refresh tick maintains, because the
-/// query path never touches postgres.
+/// notice (ADR-0011). Reads the in-process set the schema-refresh tick
+/// maintains, because the query path never touches postgres.
 pub(crate) fn degraded_fields_for<'a>(
     state: &AppState,
     queries: impl IntoIterator<Item = &'a trawl_core::ast::Query>,
@@ -1642,16 +1409,10 @@ pub(crate) fn degraded_fields_for<'a>(
     degraded_in(&snapshot, queries)
 }
 
-/// [`degraded_fields_for`] for a `from saved` read, against `snapshot`:
-/// `query` as admitted, and the saved query's text.
-///
-/// The saved text is parsed only when some field is degraded, so a healthy
-/// install pays a lock acquisition and nothing else. Its fields need its
-/// grammar only, so the parse builds no pattern, and it runs on the
-/// blocking pool, never here, within `deadline`. A notice is not the place
-/// to surface a failure: a text that does not parse, or a parse that did
-/// not finish before `deadline` or before a cancel reached `wake`,
-/// contributes nothing. A cancelled request then refuses at its next wait.
+/// The saved text is parsed only when some field is degraded. A notice is
+/// not the place to surface a failure: a text that does not parse, or a
+/// parse that did not finish before `deadline` or before a cancel reached
+/// `wake`, contributes nothing.
 async fn degraded_fields_with_saved(
     snapshot: std::sync::Arc<crate::state::DegradedSnapshot>,
     query: &trawl_core::ast::Query,
@@ -1662,7 +1423,6 @@ async fn degraded_fields_with_saved(
     if snapshot.fields.is_empty() {
         return Vec::new();
     }
-    // A required wait spends the request's deadline (ADR-0024).
     let saved = if deadline.expired() {
         None
     } else {
@@ -1679,8 +1439,6 @@ async fn degraded_fields_with_saved(
     degraded_in(&snapshot, std::iter::once(query).chain(saved.as_ref()))
 }
 
-/// The fields of `snapshot` that `queries` bind, sorted.
-///
 /// Fields bound, not fields returned: a `where` on a degraded field that
 /// projects it away is exactly the incomplete case
 /// ([`trawl_core::field_refs`]).
@@ -1701,27 +1459,19 @@ fn degraded_in<'a>(
         .collect()
 }
 
-/// Read a pin's stored `DuckDB` spelling back as a canonical type.
-///
 /// The column is `CHECK`-constrained to the canonical spellings, so the
 /// fallback is unreachable short of a hand-edited catalog; `VARCHAR` is the
-/// honest answer there — it is the one pin under which nothing further can
-/// be shelved.
+/// one pin under which nothing further can be shelved.
 fn current_pin(duckdb_type: &str) -> trawl_core::schema::CanonicalType {
     trawl_core::schema::CanonicalType::from_catalog(duckdb_type)
         .unwrap_or(trawl_core::schema::CanonicalType::Varchar)
 }
 
-/// Verdicts for whichever of `pins` the analyzer finds degraded (ADR-0011).
-/// Absent from the map = healthy, which is the common case and costs one
-/// aggregate read.
-///
-/// Two page-keyed queries, never a join into the listing SQL: the same trap
+/// Page-keyed queries, never a join into the listing SQL: the same trap
 /// [`crate::store::CatalogStore::list_fields`] documents for its conflict
 /// evidence applies here — a grouped subquery over the whole
 /// `field_conflict_stats` table has no predicate a planner can push down,
-/// and that table's service axis is client-chosen. The second query runs
-/// only for the fields that came back degraded (usually none).
+/// and that table's service axis is client-chosen.
 async fn degraded_verdicts(
     store: &crate::store::CatalogStore,
     pins: &[(String, trawl_core::schema::CanonicalType)],
@@ -1754,33 +1504,18 @@ async fn degraded_verdicts(
         .collect())
 }
 
-/// Query parameters for `GET /api/v1/schema/field`.
-///
 /// The field name travels as a query parameter, never a path segment: a
 /// catalog key is any ASCII-folded client JSON key ≤255 bytes — it may
 /// contain `/`, `?`, or `%`, which a path segment cannot carry reliably.
 #[derive(Debug, Deserialize)]
 pub struct CatalogFieldParams {
-    /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
     pub name: String,
-    /// Maximum service observations returned
-    /// (default [`DEFAULT_FIELD_SERVICES_LIMIT`], max
-    /// [`MAX_FIELD_SERVICES_LIMIT`]).
     pub limit: Option<i64>,
-    /// Opaque cursor from a previous response's `services_cursor`.
     pub after: Option<String>,
 }
 
-/// Default page size for the field detail's service observations.
 const DEFAULT_FIELD_SERVICES_LIMIT: i64 = 100;
 
-/// Hard ceiling for the field detail's `?limit=`.
-///
-/// `field_services` rows are ever-observed and their service axis is
-/// client-chosen — a common envelope field accumulates one row per service
-/// name a sender ever invented, none of which spends a pin slot. So the
-/// detail's response size is capped here regardless of what the caller asks
-/// for, and the rest is reached by paging.
 const MAX_FIELD_SERVICES_LIMIT: i64 = 1000;
 
 /// `GET /api/v1/schema/field?name=` — one field's pin, one page of its
@@ -1868,7 +1603,6 @@ pub async fn catalog_field(
     }))
 }
 
-/// Render a stored acknowledgement onto the wire.
 fn ack_to_wire(ack: crate::store::DegradedAck) -> trawl_api::FieldAck {
     trawl_api::FieldAck {
         acked_at: iso8601(ack.acked_at),
@@ -1878,37 +1612,23 @@ fn ack_to_wire(ack: crate::store::DegradedAck) -> trawl_api::FieldAck {
     }
 }
 
-/// The field an ack route acts on, as a query parameter for the reason
-/// [`CatalogFieldParams`] documents: a catalog key can carry `/`, `?` or `%`.
 #[derive(Debug, Deserialize)]
 pub struct FieldAckParams {
-    /// Field name (ASCII-folded before lookup, mirroring ingest's fold).
     pub name: String,
 }
 
-/// Request body for `POST /api/v1/schema/field/ack`.
 #[derive(Debug, Default, Deserialize)]
 pub struct FieldAckRequest {
-    /// Why the operator is accepting the pin as it stands. Optional, capped
-    /// at [`MAX_ACK_NOTE_BYTES`], stored verbatim and never logged.
     #[serde(default)]
     pub note: Option<String>,
 }
 
 /// Byte cap for an acknowledgement note, mirroring the migration's CHECK.
-///
-/// Checked here as well as there so an over-long note is a 400 naming the
-/// limit rather than a constraint violation surfacing as a store error, and
-/// so the refusal costs no transaction.
 const MAX_ACK_NOTE_BYTES: usize = 1024;
 
-/// `POST /api/v1/schema/field/ack?name=` — acknowledge a degraded verdict
-/// (issue #111). `SchemaWrite`-gated: it changes what every read surface
-/// says about the field.
+/// `POST /api/v1/schema/field/ack?name=` — acknowledge a degraded verdict.
 ///
-/// The ack covers the evidence that exists right now and no more, so the
-/// badge returns the moment the pin shelves another batch. 404 = no such
-/// pin; 409 = the field's evidence does not meet the degraded threshold, so
+/// 409 = the field's evidence does not meet the degraded threshold, so
 /// there is no verdict to acknowledge and installing a high-water would
 /// swallow the evidence that raises the badge for the first time.
 pub async fn ack_degraded_field(
@@ -1942,15 +1662,11 @@ pub async fn ack_degraded_field(
             advanced,
         } => {
             // The note is the one thing this record never carries: it is
-            // operator prose, and a durable log line is not where the
-            // operator chose to put it. Whether they wrote one is the part
-            // an audit reader needs.
+            // operator prose. Whether they wrote one is the part an audit reader needs.
             //
             // `advanced = false` is the interleaving where this call read
             // less evidence than a concurrent ack had already acknowledged:
-            // the stored row keeps the other operator's name, note and
-            // timestamp, and this event is the only record that the request
-            // happened at all.
+            // this event is the only record that the request happened at all.
             tracing::info!(
                 event_type = "field_degraded_acked",
                 field = %name,
@@ -1967,8 +1683,6 @@ pub async fn ack_degraded_field(
         crate::store::AckOutcome::Unpinned => {
             Err(ServerError::NotFound(format!("field not pinned: {name}")))
         }
-        // The refusal wears the same `{"error": {...}}` envelope every other
-        // error on this API does; only the status distinguishes it.
         crate::store::AckOutcome::NotDegraded => Ok((
             StatusCode::CONFLICT,
             Json(trawl_api::ErrorResponse {
@@ -1991,12 +1705,8 @@ pub async fn ack_degraded_field(
 }
 
 /// `DELETE /api/v1/schema/field/ack?name=` — withdraw an acknowledgement,
-/// re-raising the badge if the evidence still indicts the pin.
-///
-/// Idempotent: 204 whether or not a row was there, because "this field is
-/// not acknowledged" is the state the caller asked for either way. Only an
-/// unpinned field refuses (404) — the caller has the wrong name, which no
-/// amount of retrying fixes.
+/// re-raising the badge if the evidence still indicts the pin. Idempotent:
+/// 204 whether or not a row was there.
 pub async fn clear_degraded_field_ack(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2029,20 +1739,14 @@ pub async fn clear_degraded_field_ack(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-/// Query parameters for `GET /api/v1/schema/conflicts`.
 #[derive(Debug, Deserialize)]
 pub struct CatalogConflictsParams {
-    /// Only conflicts for this field.
     pub field: Option<String>,
-    /// Only conflicts from this service.
     pub service: Option<String>,
-    /// Only conflicts recorded within the last N seconds.
     pub since_secs: Option<u64>,
-    /// Maximum rows returned (default 100, max 1000).
     pub limit: Option<i64>,
 }
 
-/// Ceiling for `GET /api/v1/schema/conflicts` `?limit=`.
 const MAX_CONFLICT_LIST_LIMIT: i64 = 1000;
 
 /// `GET /api/v1/schema/conflicts` — the schema-health dashboard listing
@@ -2141,7 +1845,6 @@ pub async fn field_values(
         }
     }
 
-    // Cache miss — sample from parquet.
     let start = std::time::Instant::now();
 
     // Through the pool: the glob is expanded inside the permit-holding task,
@@ -2189,11 +1892,9 @@ pub async fn field_values(
     }))
 }
 
-/// Query parameters for the field values endpoint.
 #[derive(Debug, Deserialize)]
 pub struct FieldValuesParams {
     pub limit: Option<usize>,
-    /// Optional service name to scope values to a single service's files.
     pub service: Option<String>,
 }
 
@@ -2207,7 +1908,6 @@ pub async fn history(
         return Err(ServerError::Forbidden("insufficient permissions".into()));
     }
 
-    // The verified key carries the authoritative fleet keystore id.
     let key_id = verified.id;
 
     // RawQuery does not decode. Permission must win over parameter errors, and
@@ -2255,19 +1955,12 @@ pub async fn clear_history(
     Ok(Json(ClearHistoryResponse { deleted }))
 }
 
-/// Numeric query parameters for History's existing Axum/Serde admission.
-///
-/// Raw History admission selects only these pairs before invoking this schema.
 #[derive(Debug, Deserialize)]
 pub struct HistoryParams {
     pub limit: Option<usize>,
     pub offset: Option<usize>,
 }
 
-/// Convert a [`HistoryEntry`] into a [`HistoryEntryResponse`].
-///
-/// Timestamps are `DateTime<Utc>` in the domain and RFC 3339 strings on the
-/// wire — formatting happens here, at the handler boundary.
 fn history_entry_response(entry: HistoryEntry) -> HistoryEntryResponse {
     HistoryEntryResponse {
         id: entry.id,
@@ -2295,9 +1988,6 @@ pub async fn list_saved(
 
     let key_id = verified.id;
 
-    // Single bulk-join statement: schedule + latest run + run count arrive
-    // with the saved queries, so the round-trip count is independent of how
-    // many saved queries the user has.
     let details = state.storage.saved.list_with_details(key_id).await?;
 
     let responses: Vec<SavedQueryResponse> = details
@@ -2328,14 +2018,10 @@ pub async fn create_saved(
 
     let key_id = verified.id;
 
-    // Admit the DSL before it is stored (ADR-0024): a saved query is run
-    // later by a schedule, and a row nothing can execute is worth
-    // refusing at the one moment a human is there to read the reason.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
     crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
 
-    // DuplicateName → 409, InvalidName → 400 via the StoreError table.
     let saved = state
         .storage
         .saved
@@ -2358,9 +2044,7 @@ pub async fn update_saved(
     let key_id = verified.id;
 
     // Same door as create, and before the store call, so a refused update
-    // leaves the stored row exactly as it was. The transactional
-    // schedule-window check inside `update_checked` is untouched: it
-    // proves a different thing, under the saved-query row lock.
+    // leaves the stored row exactly as it was.
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
     crate::admission::admit(&state.query.pool, &req.query, deadline, None).await?;
@@ -2391,8 +2075,6 @@ pub async fn delete_saved(
 
     let key_id = verified.id;
 
-    // The store collects parquet result paths and deletes the rows in one
-    // transaction (FK CASCADE wipes runs); we unlink the files after commit.
     let run_paths = state.storage.saved.delete(id, key_id).await?;
 
     cleanup_run_parquet_files(&state, &run_paths);
@@ -2400,7 +2082,6 @@ pub async fn delete_saved(
     Ok(Json(DeleteSavedResponse { deleted: true }))
 }
 
-/// Convert a [`SavedQuery`] into a [`SavedQueryResponse`] (without schedule).
 fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     SavedQueryResponse {
         id: saved.id,
@@ -2412,8 +2093,7 @@ fn saved_query_response(saved: SavedQuery) -> SavedQueryResponse {
     }
 }
 
-/// Build a [`ScheduleResponse`] from a schedule and its pre-fetched latest
-/// run. The run count and `exhausted` both read off this one `schedule`, so
+/// The run count and `exhausted` both read off this one `schedule`, so
 /// they can never pair a count with some other read's cap.
 fn build_schedule_response(schedule: &Schedule, latest_run: Option<ReportRun>) -> ScheduleResponse {
     ScheduleResponse {
@@ -2438,11 +2118,8 @@ fn build_schedule_response(schedule: &Schedule, latest_run: Option<ReportRun>) -
         lag_secs: schedule.window.map(|_| schedule.lag_secs),
         // Only a tiling schedule has a watermark that claims anything. The
         // store KEEPS the stored value across a mode change on purpose
-        // (ADR-0018 ruling 14: an edit does not reset coverage, so
-        // switching back resumes where it stopped), which is exactly why
-        // reading the column alone would report a fixed-window or
-        // query-mode schedule as covered up to some instant nothing
-        // claims.
+        // (ADR-0018 ruling 14), which is why reading the column alone would report
+        // a fixed-window or query-mode schedule as covered.
         covered_through: match schedule.window {
             Some(ScheduleWindow::SinceLast) => schedule.covered_through.map(format_window_bound),
             Some(ScheduleWindow::Fixed { .. }) | None => None,
@@ -2451,15 +2128,10 @@ fn build_schedule_response(schedule: &Schedule, latest_run: Option<ReportRun>) -
     }
 }
 
-/// Build a [`ScheduleResponse`] from a bulk-join [`ScheduleWithStats`] row.
 fn schedule_response_from_stats(stats: ScheduleWithStats) -> ScheduleResponse {
     build_schedule_response(&stats.schedule, stats.latest_run)
 }
 
-/// Convert a [`ReportRun`] into a [`ReportRunSummary`].
-///
-/// Timestamps are `DateTime<Utc>` in the domain and RFC 3339 strings on the
-/// wire — formatting happens here, at the handler boundary.
 fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     ReportRunSummary {
         id: run.id,
@@ -2479,21 +2151,10 @@ fn report_run_summary(run: ReportRun) -> ReportRunSummary {
     }
 }
 
-// -- repin handlers ----------------------------------------------------------
-
-/// Wire shape of one repin job row.
-///
 /// `requires_force` asks the same force decision the two live gates ask
-/// (`repin::force_refusal`), over this row's own persisted numbers: a dry
-/// run terminates `succeeded` by design, so the verdict has to ride the
-/// report or an operator learns about the refusal from the request that was
-/// meant to do the work. Never a second condition, which would be free to
-/// drift from the gate.
-///
-/// It is absent until the scan has recorded its plan (`planned_at`): a
-/// claimed job's counts are zeros that mean "not measured yet", and a poll
-/// in that window would otherwise read a confident `false` off a row that is
-/// about to refuse. Absent means "not known yet", not "no".
+/// (`repin::force_refusal`), over this row's own persisted numbers. It is
+/// absent until the scan has recorded its plan (`planned_at`): a claimed
+/// job's counts are zeros that mean "not measured yet".
 fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse {
     let clamp = |v: i64| u64::try_from(v).unwrap_or(0);
     // The pin the job targets, and the dialect it asserted. An unparseable
@@ -2513,7 +2174,6 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
     } else {
         clamp(job.projected_nulls)
     };
-    // The store validates the plan shape. An unfinished scan has no verdict.
     let requires_force_reason = job.force_terms.and_then(|terms| {
         crate::repin::force_refusal(to, dialect, nulled, clamp(job.ambiguous_numerals), terms)
     });
@@ -2569,29 +2229,6 @@ fn repin_job_to_wire(job: crate::store::RepinJob) -> trawl_api::RepinJobResponse
 }
 
 /// `POST /api/v1/schema/repin` — trigger a repin (ADR-0011).
-/// `SchemaWrite`-gated: the one data-mutating schema action.
-///
-/// The HTTP status carries the verdict: 200 = dry-run report, 202 =
-/// rewrite started (poll `/schema/repin/status`), 409 = the scan projected
-/// nulled values and no force flag was passed — the body is the plan the
-/// refusal is based on. Admission refusals also 409, with the error
-/// envelope and no job row: the previous repin still holds the repin
-/// permit (it is running or cleaning up its staging), or staging from an
-/// earlier repin remains (a marker, or a shadow or aside root without
-/// one). Validation refusals (unpinned field, envelope field, unknown
-/// target type, same-type without force, a dialect on a non-`SEVERITY`
-/// target) are 400s; a query-only node answers 503, since it owns nothing
-/// under the data root, and so does a node whose repin staging state could
-/// not be read.
-///
-/// The request answers within `[server] timeout_secs` of this handler's
-/// call to `RepinEngine::start_within`, inside trawl-web's head deadline
-/// of `timeout_secs + 10 s` unless authentication or body reading before
-/// the handler takes the rest (ADR-0054). A job still running at that bound answers
-/// 202 with the row its claim wrote, dry runs included, and the caller
-/// follows it with `/schema/repin/status?id=`. A request whose claim has
-/// not landed by then answers 503, and a claim that lands later ends its
-/// job `blocked` before any scan (see `RepinEngine::start_within`).
 pub async fn schema_repin(
     State(state): State<AppState>,
     verified: Authorized<needs::SchemaWrite>,
@@ -2717,30 +2354,13 @@ pub async fn schema_repin_cancel(
         .into_response())
 }
 
-/// Query parameters for `GET /api/v1/schema/repin/status`.
 #[derive(Debug, Deserialize)]
 pub struct RepinStatusParams {
-    /// One job, by the id its trigger answered with.
     pub id: Option<i64>,
 }
 
 /// `GET /api/v1/schema/repin/status` — the running job if any, else the
-/// newest job of any status, or with `?id=` that one job. Served on
-/// query-only nodes too — the job rows live in postgres.
-///
-/// The unscoped read is `SchemaRead`-gated on purpose (ADR-0011: read-only
-/// surfaces show state without offering the trigger). A read by id also
-/// accepts `SchemaWrite`, because it is how a trigger caller follows its
-/// own job: the trigger needs `SchemaWrite` alone, and a dry run it started
-/// can answer 202 and leave its report here. Its own job only, though: with
-/// `SchemaWrite` and no `SchemaRead`, the read matches the id against the
-/// key's row id the claim recorded, and any other id answers the 404 an id
-/// the store never issued answers, body and all. The job rows are durable,
-/// carry event values in `unmapped_samples`, and name other operators, so
-/// the write grant alone must not be able to walk them and learn which
-/// exist. With `SchemaRead`, any id answers. The store decides existence
-/// and ownership in one statement (`RepinStore::get_requested_by`), so no
-/// row is read and then checked. An id that is not an integer is a 400.
+/// newest job of any status, or with `?id=` that one job.
 pub async fn schema_repin_status(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -2777,15 +2397,7 @@ pub async fn schema_repin_status(
 }
 
 /// `POST /api/v1/schema/gc-pins` reclaims pin slots held by fields
-/// nothing writes any more (#110). `SchemaWrite`-gated, like the repin
-/// trigger: both mutate the catalog, and neither is a read.
-///
-/// Dry and real runs both answer 200 with the same report; `dry_run` and
-/// `deleted` tell them apart. A refusal is a 409 through the ordinary
-/// error envelope: a repin owns the data root, or the corpus could not be
-/// read well enough to prove any pin dead. A query-only node answers 503,
-/// because proving a pin dead means reading parquet footers and it owns
-/// none.
+/// nothing writes any more.
 ///
 /// The engine's `run` spawns its own task internally (a disconnect must
 /// not split the postgres commit from the cache eviction), so this handler
@@ -2818,9 +2430,6 @@ pub async fn schema_gc_pins(
     Ok(Json(report))
 }
 
-// -- schedule handlers -------------------------------------------------------
-
-/// Remove parquet files for deleted report runs (best-effort, logs warnings on failure).
 fn cleanup_run_parquet_files(state: &AppState, relative_paths: &[String]) {
     if relative_paths.is_empty() {
         return;
@@ -2841,14 +2450,8 @@ pub(crate) fn saved_source(
     Some((from_saved, query.pipeline[0].span.end))
 }
 
-/// Try to resolve a `| from saved` stage from the DSL query.
-///
 /// `query` is what [`crate::admission::admit`] parsed from `dsl`, so
 /// nothing here parses the text again; its spans index into `dsl`.
-///
-/// Returns `Ok(Some(resolved))` if the query starts with `| from saved`,
-/// `Ok(None)` if it's a normal query, or `Err(...)` if resolution fails
-/// (e.g. saved query not found, no successful runs).
 pub(crate) async fn try_resolve_from_saved(
     state: &AppState,
     verified: &VerifiedKey,
@@ -2875,21 +2478,12 @@ pub(crate) async fn try_resolve_from_saved(
     Ok(Some(resolved))
 }
 
-/// What the `lag` field accepts, spelled out for a rejection message.
 const DURATION_GRAMMAR: &str = "a duration: a number and one of s, m, h, d, w";
 
-/// What the `window` field accepts. The duration half carries the same 60s
-/// floor as the schedule interval, which is why the store's own message
-/// about a short one says "interval".
+/// The duration half carries the same 60s floor as the schedule interval,
+/// which is why the store's own message about a short one says "interval".
 const WINDOW_GRAMMAR: &str = "\"since_last\" or a duration: a number and one of s, m, h, d, w";
 
-/// Turn a duration-grammar rejection into a 400 that names the request
-/// field and what that field would have taken.
-///
-/// The store's message says what was wrong with the value. What it cannot
-/// say is which of two duration fields carried it, and an operator who gets
-/// `invalid interval format: "11y"` back from a request with both a
-/// `window` and a `lag` has to guess.
 fn invalid_duration(field: &str, grammar: &str, e: &crate::store::StoreError) -> ServerError {
     ServerError::BadRequest(format!("invalid {field}: {e}; {field} takes {grammar}"))
 }
@@ -3004,8 +2598,6 @@ pub async fn delete_schedule(
 
     let key_id = verified.id;
 
-    // The store collects parquet result paths and deletes the schedule (and
-    // its cascaded runs) in one transaction; we unlink files after commit.
     let run_paths = state
         .storage
         .schedule
@@ -3017,7 +2609,6 @@ pub async fn delete_schedule(
     Ok(Json(DeleteScheduleResponse { deleted: true }))
 }
 
-/// Query params for listing report runs.
 #[derive(Debug, Deserialize)]
 pub struct ListRunsParams {
     #[serde(default = "default_runs_limit")]
@@ -3063,7 +2654,6 @@ pub async fn list_report_runs(
     }))
 }
 
-/// Global Runs parameters, separate from per-net history.
 #[derive(Debug, Deserialize)]
 pub struct ListAllRunsParams {
     #[serde(default = "default_runs_limit")]
@@ -3150,38 +2740,9 @@ pub async fn runs_stats(
 
 /// `POST /api/v1/saved/{id}/run` — run a saved query's schedule now.
 ///
-/// A manual run is the schedule's next window fired early (ADR-0018
-/// amended 2026-09-23), in any mode and whether or not the schedule is
-/// enabled. The store claims it in one transaction and resolves the window
-/// from its own clock reading `t`; this handler answers from that claim
-/// and reads no clock of its own, so the response names the bounds the run
-/// row records. Returns the run summary immediately with status "running";
-/// execution continues in the background.
-///
-/// The caller needs both `query` and `saved_query`: the run executes the
-/// saved text, so a key that may only edit nets must not run one. A saved
-/// query that does not exist or that another key owns is a 404, whatever
-/// the corpus state. An unsettled corpus is then a 503
-/// `corpus_recovering`, answered before the claim, so it creates no run.
-///
-/// The run then takes a manual-run lease, or the request is a 429
-/// `manual_run_busy` that claimed nothing (ADR-0018, amended 2026-11-11):
-/// one manual run per caller key, [`crate::pool::manual_cap`] across the
-/// installation. The lease never waits, and it comes before the claim, so
-/// a refusal spends no budget, writes no run row and moves no cursor. A
-/// key pressing Run now again on its own running net is refused here too.
-///
-/// No schedule is a 400: there is nothing to record a run under. A run in
-/// progress, a reached `max_runs` and an empty `since_last` window are 409s:
-/// the request is well formed, and the schedule's state refuses it. Each
-/// gives the lease back before it answers.
-///
 /// The claim and the execution are one spawned task, which owns the lease
-/// from before the claim's first statement; this handler only awaits the
-/// claim's answer. A request dropped while the claim commits therefore
-/// cannot leave a `running` row nothing executes: the task runs what it
-/// claimed whether or not anyone hears the answer. The lease lasts until
-/// the run's physical work ends, not until this request does.
+/// from before the claim's first statement. A request dropped while the claim
+/// commits therefore cannot leave a `running` row nothing executes.
 pub async fn trigger_run(
     State(state): State<AppState>,
     verified: Authorized<needs::RunSavedQuery>,
@@ -3288,14 +2849,12 @@ pub async fn trigger_run(
 
     match answered.await {
         Ok(summary) => summary.map(Json),
-        // The task ended without answering: it panicked.
         Err(_) => Err(ServerError::Internal(
             "the manual run's claim ended without an answer".into(),
         )),
     }
 }
 
-/// The run a manual claim started, or the answer to one that started none.
 fn started_manual_run(
     claim: Result<ManualRunClaim, crate::store::DueClaimError>,
 ) -> Result<ClaimedManualRun, ServerError> {
@@ -3323,18 +2882,9 @@ fn started_manual_run(
 
 /// `GET /api/v1/saved/{id}/runs/{run_id}` — get a single report run with result data.
 ///
-/// A run records its result EITHER as a parquet file (via `result_path`) or
-/// as a zstd JSON blob, never both. The file is typed, so a zero-row run
-/// answers with its typed columns and an empty row list rather than a null
-/// result. It has a blob when parquet cannot hold the result exactly (no
-/// columns, or a `mixed` column) or when the parquet write failed; the blob
-/// is the same typed wire result.
-///
-/// A run that names a file answers from that file or not at all. A file that
-/// is gone is a 409 naming the run (ADR-0035); any other read failure is the
-/// failure it is. Falling back to the blob here would answer 200 with
-/// `result: null` beside a non-zero `row_count`, which every client then has
-/// to describe as "no result data" for a run that succeeded.
+/// A run that names a file answers from that file or not at all. Falling back
+/// to the blob here would answer 200 with `result: null` beside a non-zero
+/// `row_count`.
 pub async fn get_report_run(
     State(state): State<AppState>,
     verified: Authorized<needs::RunSavedQuery>,
@@ -3357,8 +2907,6 @@ pub async fn get_report_run(
         ));
     }
 
-    // Pre-fetch the blob (cheap if NULL in db). A genuine absence is `Ok(None)`;
-    // a StoreError here is a live db fault and must surface as 5xx, not empty result.
     let result_blob = state
         .storage
         .schedule
@@ -3451,14 +2999,6 @@ pub async fn get_report_run(
 }
 
 /// `POST /api/v1/export` — export query results as CSV, JSON, or Parquet.
-///
-/// Tracked like a query: listed in `/queries` while it runs, cancellable
-/// there, counted in `total_queries` and `trawl_queries_total`, and
-/// recorded in recent and query history with the rows its body holds.
-///
-/// Bypasses `max_result_rows` in favor of `max_export_rows` to support larger downloads.
-/// Every format keeps the first `limit` rows (the request's, clamped to
-/// `max_export_rows`) and drops the rest rather than refusing the export.
 #[allow(clippy::too_many_lines)]
 pub async fn export(
     State(state): State<AppState>,
@@ -3470,8 +3010,6 @@ pub async fn export(
     let Query(params) = shaped("query parameters", params)?;
     let Json(req) = shaped("request body", req)?;
 
-    // One absolute budget for the export, stamped at authenticated entry
-    // like the query handler's (ADR-0024).
     let deadline =
         crate::deadline::Deadline::after(std::time::Duration::from_secs(state.query.timeout_secs));
 
@@ -3486,22 +3024,17 @@ pub async fn export(
     let max_export_rows = state.query.max_export_rows;
     let limit = req.limit.unwrap_or(max_export_rows).min(max_export_rows);
 
-    // One id keys the whole export lifecycle and the pool's interrupt map,
-    // so the events correlate without carrying the query text. `pending`
-    // puts it in the pool's registry before the entry below opens, so a
-    // cancel by id reaches the export while it still waits to start
-    // (ADR-0024, Amendment 2026-11-09). Declared first, it drops after
-    // `tracked`.
+    // `pending` puts the id in the pool's registry before the entry below opens,
+    // so a cancel by id reaches the export while it still waits to start.
+    // Declared first, it drops after `tracked`.
     let query_id = state.query.pool.allocate_query_id();
     crate::transport::failure::record_query_id(query_id);
     let pending = state
         .query
         .pool
         .pend(query_id, crate::pool::WorkKind::Export);
-    // Listed under that id like a query, so `DELETE /queries/{id}` reaches
-    // it. `refused` or the ready body takes the entry and closes it once;
-    // left in place when the transport drops this future at an await, it
-    // closes as abandoned. A mutex, not a cell: `refused` lives across
+    // The entry, left in place when the transport drops this future at an
+    // await, closes as abandoned. A mutex, not a cell: `refused` lives across
     // awaits, and the handler's future must stay `Send`.
     let tracked = parking_lot::Mutex::new(Some(
         state.query.tracker.start(query_id, &verified, &req.query),
@@ -3564,8 +3097,6 @@ pub async fn export(
 
     let start = std::time::Instant::now();
 
-    // Parquet export uses DuckDB's native COPY TO — no need to materialize
-    // the result set in memory.
     if format == trawl_api::ExportFormat::Parquet {
         let (bytes, rows) = state
             .query
@@ -3740,9 +3271,6 @@ pub async fn export(
     ))
 }
 
-/// Close a failed export's tracker entry and count its outcome, as `/query`
-/// does: a timeout as one, anything else as an error under its public
-/// message (ADR-0040). An entry already closed counts nothing.
 fn close_failed_export(
     tracked: Option<crate::tracker::Tracked>,
     error: &ServerError,
@@ -3778,10 +3306,6 @@ fn close_ready_export(
     metrics::histogram!(crate::metrics::QUERY_DURATION).record(took.as_secs_f64());
 }
 
-/// Write a ready export's one best-effort history row under the request's
-/// own deadline (ADR-0024), so a wedged store neither delays nor fails a
-/// body already in hand. A write that fails or runs out of budget is
-/// logged with the store's error class alone (ADR-0040), never retried.
 async fn record_export_history(
     state: &AppState,
     deadline: crate::deadline::Deadline,
@@ -3829,21 +3353,13 @@ async fn record_export_history(
     }
 }
 
-/// Query parameters for the export endpoint.
 #[derive(Debug, Deserialize)]
 pub struct ExportParams {
     pub format: Option<trawl_api::ExportFormat>,
 }
 
-// -- query debug log helpers -------------------------------------------------
-
-/// Maximum number of sample rows included in a query log entry.
 const QUERY_LOG_SAMPLE_SIZE: usize = 5;
 
-/// Write a query debug log entry if the query log is active.
-///
-/// No-op when `state.query.query_log` is `None`. Infallible — errors
-/// are logged via tracing and never propagated.
 #[allow(clippy::too_many_arguments)]
 fn write_query_log(
     state: &AppState,
@@ -3889,7 +3405,6 @@ fn write_query_log(
     log.write(&entry);
 }
 
-/// Build a result debug summary with column names and sample rows.
 fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
     let Some(qr) = result else {
         return ResultDebug {
@@ -3922,19 +3437,10 @@ fn build_result_debug(result: Option<&QueryResult>) -> ResultDebug {
     }
 }
 
-/// Generate RFC 4180-compliant CSV from query results.
-///
-/// Quotes fields containing commas, newlines, or quotes.
-/// Escapes quotes by doubling them.
-///
-/// Uses `Cow<str>` internally to avoid allocations when no
-/// transformation is needed (the common case for most cells).
 fn generate_csv(result: &QueryResult) -> String {
-    // Pre-allocate: ~50 bytes per cell average.
     let estimated = result.rows.len() * result.columns.len() * 50;
     let mut csv = String::with_capacity(estimated);
 
-    // Header row.
     for (i, col) in result.columns.iter().enumerate() {
         if i > 0 {
             csv.push(',');
@@ -3943,7 +3449,6 @@ fn generate_csv(result: &QueryResult) -> String {
     }
     csv.push('\n');
 
-    // Data rows.
     for row in &result.rows {
         for (i, value) in row.iter().enumerate() {
             if i > 0 {
@@ -3958,12 +3463,9 @@ fn generate_csv(result: &QueryResult) -> String {
     csv
 }
 
-/// Generate newline-delimited JSON from query results.
-///
-/// Each row is serialized as a JSON object with column names as keys.
-/// An export file is not the wire (ADR-0035, amended 2026-10-22): every
-/// cell goes through [`Value::to_plain_json`], so integers stay JSON
-/// numbers that jq and Vector read natively.
+/// An export file is not the wire (ADR-0035): every cell goes through
+/// [`Value::to_plain_json`], so integers stay JSON numbers that jq and Vector
+/// read natively.
 fn generate_ndjson(result: &QueryResult) -> String {
     let mut buf = String::new();
     for row in &result.rows {
@@ -3971,15 +3473,12 @@ fn generate_ndjson(result: &QueryResult) -> String {
         for (col, val) in result.columns.iter().zip(row.iter()) {
             map.insert(col.name.clone(), val.to_plain_json());
         }
-        // serde_json::to_string on a Map is infallible for our Value types.
         buf.push_str(&serde_json::to_string(&map).expect("Map serialization is infallible"));
         buf.push('\n');
     }
     buf
 }
 
-/// Quote a CSV field if it contains special characters (comma, newline, quote).
-/// Escape quotes by doubling them. Returns borrowed when no quoting needed.
 fn quote_csv_field(s: &str) -> Cow<'_, str> {
     let needs_quoting = s.contains(',') || s.contains('\n') || s.contains('"');
 
@@ -3991,15 +3490,11 @@ fn quote_csv_field(s: &str) -> Cow<'_, str> {
     }
 }
 
-/// Convert a `Value` to a string for CSV export.
-/// Returns borrowed for string values that don't need sanitization.
 fn value_to_string(value: &Value) -> Cow<'_, str> {
     match value {
         Value::Null => Cow::Borrowed(""),
         Value::Boolean(b) => Cow::Owned(b.to_string()),
         Value::Integer(i) => Cow::Owned(i.to_string()),
-        // Digits, at full width: a CSV export is the one place a reader
-        // takes the number away, so it must not round.
         Value::UInt(u) => Cow::Owned(u.to_string()),
         Value::Float(f) => Cow::Owned(f.to_string()),
         Value::String(s) => sanitize_csv_formula(s),
@@ -4013,10 +3508,6 @@ fn value_to_string(value: &Value) -> Cow<'_, str> {
     }
 }
 
-/// The pin scope a pass-through stream's output fields are typed under:
-/// the stream's catalog snapshot with the ADR-0009 envelope table over it,
-/// walked to the end of the pipeline (ADR-0011), so a rename carries its
-/// pin and a derived value loses it, as in the batch lanes.
 fn stream_output_pins(
     catalog: &trawl_core::schema::FieldTypes,
     pipeline: &[trawl_core::ast::Spanned<trawl_core::ast::PipeStage>],
@@ -4034,11 +3525,6 @@ fn stream_output_pins(
 
 /// What a live stream evaluates each event with, compiled once before the
 /// stream opens.
-///
-/// Its patterns hold their charge from the server-wide regex reservation
-/// (ADR-0063). The stream's live state owns them, so the charge is held for
-/// as long as the stream is open. It comes back when the client goes away,
-/// or, if a live job is running then, when that job exits ([`crate::live`]).
 pub(crate) struct StreamSetup {
     filter: trawl_core::filter::CompiledFilter,
     stream_plan: trawl_core::stream::StreamPlan,
@@ -4050,32 +3536,7 @@ pub(crate) struct StreamSetup {
 }
 
 /// Admit `dsl` and compile it for live evaluation against `pin_snapshot`.
-///
-/// The shared admission door comes first (ADR-0024), so a live tail and a
-/// batch query refuse the same text with the same sentence rather than
-/// with whichever refusal their own compiler reaches first. The query it
-/// admits is the one compiled: the text is parsed once.
-///
-/// The compile rejects whatever the SQL emitter rejects (e.g.
-/// `_severity=eror`) instead of opening a live-looking stream that can
-/// never match an event. One catalog snapshot feeds both the search-stage
-/// filter and the pipeline plan, so /query and /stream cannot disagree on
-/// a pinned comparison and the stream cannot disagree with itself
-/// (ADR-0011).
-///
-/// The filter and the plan prepare their patterns through one metered
-/// ledger, so a pattern both read is built and charged once (ADR-0063).
-/// A query whose patterns do not fit its regex budget or the server's
-/// reservation is [`ServerError::RegexResources`]; whatever setup held
-/// until then drops with the ledger.
-///
-/// The whole setup is one preparation job on the blocking pool, behind the
-/// preparation allowance (ADR-0063), so no part of it runs on the calling
-/// task's thread. `deadline` bounds the setup only.
-///
-/// # Errors
-///
-/// As [`prepare_stream_with`], and as [`crate::pool::ExecutorPool::prepare`].
+/// `deadline` bounds the setup only.
 pub(crate) async fn admit_stream(
     pool: &crate::pool::ExecutorPool,
     dsl: &str,
@@ -4089,9 +3550,6 @@ pub(crate) async fn admit_stream(
     .await?
 }
 
-/// Stream setup's job: admission, the filter compile and the plan compile,
-/// under `stop`. A requested stop ends it at its next cancellation point
-/// with [`EngineError::Cancelled`](trawl_engine::error::EngineError::Cancelled).
 pub(crate) fn prepare_stream_with(
     dsl: &str,
     pin_snapshot: &trawl_core::schema::FieldTypes,
@@ -4111,8 +3569,6 @@ pub(crate) fn prepare_stream_with(
             })?;
     stop.check()
         .map_err(|trawl_core::cancel::Cancelled| ServerError::Engine(EngineError::Cancelled))?;
-    // The same snapshot is the pin scope's root: where/let adopt the
-    // catalog.
     let stream_plan = trawl_core::stream::compile_stream_plan_with(
         &ast.pipeline,
         &trawl_core::pin_scope::PinScope::root(pin_snapshot),
@@ -4129,7 +3585,6 @@ pub(crate) fn prepare_stream_with(
     })
 }
 
-/// What a refused live plan compile answers.
 fn stream_plan_refusal(e: trawl_core::stream::StreamPlanError) -> ServerError {
     use trawl_core::pattern::PatternError;
     use trawl_core::stream::StreamPlanError;
@@ -4145,12 +3600,6 @@ fn stream_plan_refusal(e: trawl_core::stream::StreamPlanError) -> ServerError {
 }
 
 /// `GET /api/v1/stream` — stream live events via Server-Sent Events (SSE).
-///
-/// Subscribes to the event bus, and the stream's live driver
-/// ([`crate::live`]) evaluates the events it receives on the blocking pool.
-/// Each matching event is streamed as an SSE `data` event, and an
-/// aggregate's state as `snapshot` events. Requires ingest to be enabled
-/// (event bus available).
 pub async fn stream_query(
     State(state): State<AppState>,
     Extension(verified): Extension<VerifiedKey>,
@@ -4168,9 +3617,9 @@ pub async fn stream_query(
     }
     let Query(params) = shaped("query parameters", params)?;
 
-    // Bound concurrent SSE connections. The owned permit moves into the
-    // stream's live state: it comes back when the client disconnects, or,
-    // if a live job is running then, when that job exits.
+    // The owned permit moves into the stream's live state: it comes back when
+    // the client disconnects, or, if a live job is running then, when that job
+    // exits.
     let sse_permit = state
         .query
         .sse_semaphore
@@ -4230,10 +3679,8 @@ pub async fn stream_query(
     Ok(Sse::new(event_stream).keep_alive(KeepAlive::default()))
 }
 
-/// Query parameters for the stream endpoint.
 #[derive(Debug, Deserialize)]
 pub struct StreamParams {
-    /// The DSL query to filter live events.
     pub query: String,
 }
 
@@ -4252,7 +3699,6 @@ mod tests {
         std::fs::create_dir_all(&hour).unwrap();
         std::fs::write(hour.join("nginx.parquet"), "0123456789").unwrap();
 
-        // With and without a trailing separator.
         for root in [root.clone(), root.join("")] {
             let (earliest, latest, bytes, services, files) = collect_catalog_metadata(&root);
             assert_eq!(
@@ -4267,9 +3713,6 @@ mod tests {
         }
     }
 
-    /// Stream setup prepares the filter and the plan through one ledger
-    /// (ADR-0063): a pattern the search and a stage share builds once in
-    /// the metered ledger, past the one build `parse` checks it with.
     #[test]
     fn stream_setup_builds_a_shared_pattern_once() {
         use trawl_core::pattern::thread_builds;
@@ -4293,10 +3736,8 @@ mod tests {
         );
     }
 
-    /// Stream setup refuses a query over its regex budget with the typed
-    /// refusal, whether the filter's patterns or the plan's take it past
-    /// (ADR-0063). Seven bodies of the `(\pL{12})` class charge past it at
-    /// the seventh.
+    /// Seven bodies of the `(\pL{12})` class charge past the budget at the
+    /// seventh.
     #[test]
     fn stream_setup_refuses_regex_memory_typed() {
         use trawl_core::pattern::RegexRefusal;
@@ -4337,9 +3778,6 @@ mod tests {
         }
     }
 
-    /// Live `_time` and `_ingested` are typed from the ADR-0009 envelope
-    /// table, not the catalog alone: an empty catalog still pins them, a
-    /// rename carries the pin, and a field the catalog pins keeps its pin.
     #[test]
     fn stream_output_pins_hold_the_envelope_table() {
         use trawl_core::schema::{CanonicalType, FieldTypes};
@@ -4393,8 +3831,6 @@ mod tests {
         }
     }
 
-    /// A key holding exactly `permissions`, under a display name two
-    /// keys are free to share.
     fn viewer(id: i64, name: &str, permissions: &[&str]) -> VerifiedKey {
         VerifiedKey::from_roles(
             id,
@@ -4428,14 +3864,6 @@ mod tests {
         }
     }
 
-    /// An interactive query shows the same user and DSL to every reader
-    /// of this route, whichever key submitted it (ADR-0024).
-    ///
-    /// That is what `active` and `recent` already do for the same id, and
-    /// a retained entry is the same request one phase later: a reader who
-    /// can watch a query run, and read its text in history when it timed
-    /// out, learns nothing new from the retained line. Cancellation is the
-    /// authority that stays keyed to the exact id.
     #[test]
     fn retained_interactive_work_keeps_its_existing_display_visibility() {
         let work = retained_query(crate::pool::WorkOwner::Key(7));
@@ -4455,9 +3883,6 @@ mod tests {
         }
     }
 
-    /// System work (a scheduled run) has no human owner,
-    /// so its DSL reaches an operator and nobody else. No `query`
-    /// permission holder can ever match `WorkOwner::System`.
     #[test]
     fn system_retained_work_shows_no_text_below_server_manage() {
         let work = retained_query(crate::pool::WorkOwner::System);
@@ -4474,10 +3899,6 @@ mod tests {
         );
     }
 
-    /// Wire shape: an entry a reader may not see carries no null-valued
-    /// keys at all, so the absence is not a field a client must special
-    /// case. System work below `ServerManage` is the entry that hides
-    /// anything.
     #[test]
     fn a_filtered_retained_entry_omits_the_fields_it_hides() {
         let work = retained_query(crate::pool::WorkOwner::System);
@@ -4488,11 +3909,6 @@ mod tests {
         assert!(json.contains("\"retained_ms\":1500"), "{json}");
     }
 
-    /// Cancellation authority, unchanged by the retained lifecycle
-    /// (ADR-0024): an operator reaches everything including the server's
-    /// own work, a `QueryCancel` holder reaches only what its own key id
-    /// owns, and a key with neither permission is told nothing about the
-    /// id at all.
     #[test]
     fn cancel_authority_is_the_key_id_and_admin_reaches_system_work() {
         use crate::pool::WorkOwner;
@@ -4502,8 +3918,6 @@ mod tests {
         let twin = viewer(8, "twin", &["query", "query_cancel"]);
         let reader = viewer(9, "reader", &["query"]);
 
-        // Work still tracked, and work whose request already answered:
-        // either record proves ownership.
         assert!(check_cancel_authority(&owner, Some(7), None).is_ok());
         assert!(check_cancel_authority(&owner, None, Some(WorkOwner::Key(7))).is_ok());
 
@@ -4511,7 +3925,6 @@ mod tests {
             .expect_err("a twin name is not ownership");
         assert!(matches!(&denied, ServerError::Forbidden(m) if m == "cannot cancel this query"));
 
-        // System work has no human owner: no QueryCancel holder matches it.
         let system = check_cancel_authority(&owner, None, Some(WorkOwner::System))
             .expect_err("system work is not a key's own work");
         assert!(matches!(&system, ServerError::Forbidden(m) if m == "cannot cancel this query"));
@@ -4525,7 +3938,6 @@ mod tests {
         assert!(matches!(&ungranted, ServerError::Forbidden(m) if m == "insufficient permissions"));
     }
 
-    /// A retention config with a global age and per-env overrides.
     fn retention_config(max_age_days: u64, envs: &[(&str, u64)]) -> crate::config::RetentionConfig {
         crate::config::RetentionConfig {
             max_age_days,
@@ -4597,8 +4009,6 @@ mod tests {
             "one env keeping its data forever lifts the window for everyone"
         );
 
-        // An "effectively never" override is what an operator reaches for
-        // instead of 0, and no value of it may panic the handler.
         let effectively_never = retention_config(90, &[("archive", u64::MAX)]);
         assert_eq!(
             since_from_secs(crate::retention::maximum_enabled_age_secs(
@@ -4684,8 +4094,6 @@ mod tests {
         assert!(csv.contains("safe"));
     }
 
-    // -- health status derivation ────────────────────────────────────────
-
     #[test]
     fn health_all_ok() {
         assert_eq!(
@@ -4704,8 +4112,6 @@ mod tests {
 
     #[test]
     fn health_storage_down_is_degraded() {
-        // App-state store loss is non-critical: queries still serve, so the
-        // wire contract is Degraded + HTTP 200 (never a liveness failure).
         assert_eq!(
             derive_health_status(EngineCheck::Ok, true, false, true, true, true),
             HealthStatus::Degraded
@@ -4730,8 +4136,6 @@ mod tests {
 
     #[test]
     fn health_ingest_refusing_alone_is_degraded() {
-        // A refusing ledger is back-pressure: queries still serve, so the
-        // wire contract is Degraded + HTTP 200.
         assert_eq!(
             derive_health_status(EngineCheck::Ok, true, true, true, false, true),
             HealthStatus::Degraded
@@ -4751,7 +4155,6 @@ mod tests {
         use crate::hot_buffer::{AdmissionState, Charge, HotBuffer, HotBufferConfig, Refusal};
         use crate::ingest::producer::ProducerKind;
 
-        // Ingest disabled: no buffer, nothing to refuse into.
         assert!(ingest_capacity_admitting(None));
         assert_eq!(ingest_capacity_check(ingest_capacity_admitting(None)), "ok");
 
@@ -4764,7 +4167,6 @@ mod tests {
             "ok"
         );
 
-        // Past half of a cap: Pressure still admits, so the check stays ok.
         let held = buf
             .reserve(
                 ProducerKind::Http,
@@ -4780,7 +4182,6 @@ mod tests {
             "ok"
         );
 
-        // One more external event is a Full refusal, which latches Refusing.
         assert_eq!(
             buf.reserve(
                 ProducerKind::Http,
@@ -4798,7 +4199,6 @@ mod tests {
             "refusing"
         );
 
-        // Releasing below a quarter of both caps clears the latch.
         drop(held);
         assert_eq!(buf.admission_state(), AdmissionState::Open);
         assert_eq!(
@@ -4809,8 +4209,6 @@ mod tests {
 
     #[test]
     fn health_corpus_unsettled_alone_is_degraded() {
-        // An unsettled corpus refuses reads but clears without a restart:
-        // Degraded + HTTP 200, so no probe restarts the server (ADR-0041).
         assert_eq!(
             derive_health_status(EngineCheck::Ok, true, true, true, true, false),
             HealthStatus::Degraded
@@ -4825,8 +4223,6 @@ mod tests {
         );
     }
 
-    /// `checks.corpus` reads `ok`, `restart_backlog` or `rollup_pending`,
-    /// the pending rollup first when both hold (ADR-0041).
     #[test]
     fn corpus_check_reads_ok_restart_backlog_or_rollup_pending() {
         use crate::publication::PublicationGate;
@@ -4864,14 +4260,10 @@ mod tests {
         std::fs::remove_file(&marker).unwrap();
         assert_eq!(corpus_check(&gate), "ok");
 
-        // The probe takes no publication guard: a held writer cannot stall it.
         let _writer = gate.blocking_write();
         assert_eq!(corpus_check(&gate), "ok");
     }
 
-    /// A sample past its budget is a warning: degraded at HTTP 200, with
-    /// everything else green, and never better than degraded beside a
-    /// non-critical failure (ADR-0056).
     #[test]
     fn health_duckdb_slow_is_degraded() {
         assert_eq!(
@@ -4908,12 +4300,6 @@ mod tests {
         );
     }
 
-    // -- the post-execution vanished-run guard ───────────────────────────
-
-    /// Only the two shapes the vanishing window can produce are
-    /// re-decided, and only when the file really is gone: a zero-column
-    /// success or an engine error becomes the named 409, while every
-    /// other outcome keeps the answer it earned.
     #[test]
     fn guard_vanished_run_result_relabels_only_absence_after_a_suspect_outcome() {
         let dir = tempfile::tempdir().unwrap();
@@ -4939,9 +4325,6 @@ mod tests {
         };
         let expected = crate::from_saved::unavailable_run_message(7);
 
-        // (a) Zero columns is a shape no SELECT can produce, so over a
-        // file that is gone it is the vanishing window, not an answer.
-        // The passthrough of everything beside `result` rides along here.
         let mut suspect = outcome(Ok(QueryResult::empty()));
         suspect.severity_columns = vec!["severity".to_owned()];
         let guarded = guard_vanished_run_result(suspect, &[run_file(&gone)]);
@@ -4968,7 +4351,6 @@ mod tests {
             "the relabel carries the severity columns through untouched"
         );
 
-        // (b) An engine error is the window's other face.
         let failed = outcome(Err(ServerError::Engine(
             trawl_engine::error::EngineError::ColdDataUnread,
         )));
@@ -4980,8 +4362,6 @@ mod tests {
             other => panic!("expected the unavailable-run Conflict, got: {other:?}"),
         }
 
-        // (c) Columns mean rows were read before the file went. The
-        // answer stands even though the file is no longer there.
         let read = outcome(Ok(one_column()));
         match &guard_vanished_run_result(read, &[run_file(&gone)]).result {
             Ok(qr) => assert_eq!(
@@ -4992,8 +4372,6 @@ mod tests {
             other => panic!("expected the result to stand, got: {other:?}"),
         }
 
-        // (d) The same suspect shape over a file still on disk is a real
-        // empty answer, not a refusal.
         let empty = outcome(Ok(QueryResult::empty()));
         match &guard_vanished_run_result(empty, &[run_file(&present)]).result {
             Ok(qr) => assert!(
@@ -5003,8 +4381,6 @@ mod tests {
             other => panic!("expected the empty answer to stand, got: {other:?}"),
         }
 
-        // (e) Only an engine error is suspect; a refusal the request
-        // earned itself is never re-decided.
         let rejected = outcome(Err(ServerError::BadRequest("offset too large".to_owned())));
         match &guard_vanished_run_result(rejected, &[run_file(&gone)]).result {
             Err(ServerError::BadRequest(msg)) => assert_eq!(
@@ -5014,7 +4390,6 @@ mod tests {
             other => panic!("expected the BadRequest to stand, got: {other:?}"),
         }
 
-        // (f) A query that reads no stored run has nothing to re-decide.
         let unrelated = outcome(Ok(QueryResult::empty()));
         match &guard_vanished_run_result(unrelated, &[]).result {
             Ok(qr) => assert!(
@@ -5025,9 +4400,6 @@ mod tests {
         }
     }
 
-    /// A `/query` the check before execution refuses for a run file below a
-    /// dangling link logs that refusal once: the guard after execution does
-    /// not stat the files again and repeat the WARN.
     #[cfg(unix)]
     #[test]
     fn a_refusal_before_execution_warns_once() {
@@ -5062,11 +4434,6 @@ mod tests {
         assert_eq!(warned, 1, "one refusal, one WARN: {events:?}");
     }
 
-    /// A run file whose absence cannot be established, below a dangling
-    /// link or below a regular file, is a redacted 500 from the recheck,
-    /// whichever suspect shape the read came back with: never the empty
-    /// success `DuckDB` makes of a path it cannot resolve, and never the
-    /// 409 that says the file is gone.
     #[cfg(unix)]
     #[test]
     fn the_recheck_turns_an_unresolved_run_file_into_an_error() {
@@ -5125,7 +4492,6 @@ mod tests {
         }
     }
 
-    /// The preparation doors' tests (ADR-0063).
     mod preparation {
         use std::thread::ThreadId;
         use std::time::Duration;
@@ -5164,8 +4530,6 @@ mod tests {
             );
         }
 
-        /// `/validate`'s parse, validation and formatting reparse all run
-        /// in its preparation job.
         #[tokio::test(flavor = "current_thread")]
         async fn validate_parses_off_the_reactor() {
             let pool = pool(2);
@@ -5187,8 +4551,6 @@ mod tests {
             assert_off_this_thread(&parses);
         }
 
-        /// A cancelled validation answers the cancellation, never
-        /// `valid: false` and never a 400, whatever the text (R15).
         #[test]
         fn a_cancelled_validation_is_never_an_invalid_query() {
             let stop = Stop::new();
@@ -5208,8 +4570,6 @@ mod tests {
             }
         }
 
-        /// With every preparation slot held, `/validate` waits within its
-        /// deadline and then answers the preparation 503.
         #[tokio::test]
         async fn validate_refuses_when_the_allowance_is_full() {
             let pool = pool(1);
@@ -5253,7 +4613,6 @@ mod tests {
             std::sync::Arc::new(snapshot)
         }
 
-        /// The notice reads the query admission parsed: no parse of its own.
         #[test]
         fn degraded_fields_read_the_admitted_query() {
             let query =
@@ -5266,8 +4625,6 @@ mod tests {
             assert_eq!(named, ["zz_status"]);
         }
 
-        /// A `from saved` read's notice parses the saved text off the
-        /// reactor, and only when some field is degraded.
         #[tokio::test(flavor = "current_thread")]
         async fn degraded_fields_parse_the_saved_text_off_the_reactor() {
             let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
@@ -5293,9 +4650,6 @@ mod tests {
             assert_off_this_thread(&log.parses());
         }
 
-        /// The saved text's parse is a required wait, so it spends the
-        /// request's deadline (ADR-0024). A spent deadline leaves the
-        /// notice to the typed stages, as a parse that failed would.
         #[tokio::test(flavor = "current_thread")]
         async fn degraded_fields_wait_for_the_saved_text_within_the_deadline() {
             let query = trawl_core::parser::parse("| from saved daily | where zz_typed > 1")
@@ -5313,10 +4667,6 @@ mod tests {
             assert_eq!(named, ["zz_typed"]);
         }
 
-        /// A deadline with time left when the saved text's parse is
-        /// dispatched still bounds the wait: with the only blocking thread
-        /// held, the parse cannot start, and the notice returns at the
-        /// deadline with the typed stages alone, before the thread is free.
         #[test]
         fn degraded_fields_stop_waiting_for_a_held_parse_at_the_deadline() {
             use std::sync::Arc;
@@ -5368,11 +4718,6 @@ mod tests {
             assert_eq!(named, ["zz_typed"]);
         }
 
-        /// A cancel by id ends the wait for the saved text's parse, long
-        /// before the deadline: with the only blocking thread held, the
-        /// notice returns with the typed stages alone. The request's next
-        /// wait, the pool's permit, then refuses at once although a permit
-        /// is free (ADR-0024, Amendment 2026-11-09).
         #[test]
         fn a_cancel_ends_the_wait_for_the_saved_text() {
             use std::sync::Arc;
@@ -5449,7 +4794,6 @@ mod tests {
             );
         }
 
-        /// Live-stream setup parses and compiles in its preparation job.
         #[tokio::test(flavor = "current_thread")]
         async fn stream_setup_parses_off_the_reactor() {
             let pool = pool(2);
@@ -5465,7 +4809,6 @@ mod tests {
             assert_off_this_thread(&log.parses());
         }
 
-        /// A cancelled stream setup is a cancellation, never a 400 (R15).
         #[test]
         fn a_cancelled_stream_setup_is_a_cancellation() {
             let stop = Stop::new();

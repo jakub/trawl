@@ -2,17 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure-Rust merge logic for `(base_q, filters[, range])` → the DSL that
-//! runs. Two faces over one merge: [`effective_query`] folds the range in
-//! for a snapshot, [`live_query`] leaves it out for a live stream
-//! (ADR-0027 as amended 2026-09-21). [`capture_parts`] reads the same state
-//! as a capture request (ADR-0057): the range-free text and a structured
-//! window, and [`pin_range`] makes a moving range absolute first.
-//!
-//! Kept ungated (no leptos / js-sys / wasm) so it compiles on native and
-//! its tests run under plain `cargo test` / `cargo nextest`. The wasm-only
-//! `state::query` module in `trawl-web-ui` re-exports the types from here
-//! and layers the URL encoding + signal plumbing on top.
+//! `(base_q, filters[, range])` → the DSL that runs. [`capture_parts`] reads
+//! the same state as a capture request (ADR-0057).
 
 use std::fmt::Write;
 
@@ -23,7 +14,6 @@ use trawl_core::parser::suggest::quote_dsl_field;
 
 use crate::result_path::hull;
 
-/// Include/exclude operator for a facet-driven filter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FilterOp {
     Include,
@@ -40,8 +30,6 @@ impl FilterOp {
     }
 }
 
-/// One include/exclude clause bound to a field value. Multiple filters
-/// combine with implicit AND in the search stage.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
     pub field: String,
@@ -49,17 +37,9 @@ pub struct Filter {
     pub op: FilterOp,
 }
 
-/// Range window driven by the date-range popover. Merged into a SNAPSHOT
-/// wire query at request time unless the user's base query already carries
-/// a `last=`, `earliest=`, or `latest=` clause (user intent wins). A live
-/// stream merges no range at all (ADR-0027 as amended 2026-09-21), so it
-/// never reaches [`live_query`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RangeSpec {
-    /// Relative window: `5m|15m|1h|4h|24h|7d`. Emitted as `last=<label>`.
     Quick(&'static str),
-    /// Explicit from/to window. Values are RFC3339-ish; `to` accepts the
-    /// literal `now` (emitted as the literal `now` — `DuckDB` parses it).
     Absolute { from: String, to: String },
 }
 
@@ -69,42 +49,21 @@ impl Default for RangeSpec {
     }
 }
 
-/// Quick-range presets offered by the date-range popover.
 pub const QUICK_RANGES: &[&str] = &["5m", "15m", "1h", "4h", "24h", "7d"];
 
-/// Merge `(base_q, filters, range)` into the DSL a SNAPSHOT runs.
-///
-/// Rules:
-/// - empty `base_q` → empty result (filters/range no-op without a query to
-///   attach to; avoids fabricating a wildcard `*` that could flood the
-///   server).
-/// - filter clauses and the range clause prepend to the first search stage.
-///   A search stage of several OR groups is parenthesised first, so they
-///   narrow every group (`host="a" (service=web OR service=db)`), and its
-///   own time clauses stay outside the parentheses, where the grammar
-///   admits them; any other search stage is kept as written.
-/// - if the base query already carries a time clause, the range's `last=` is
-///   suppressed (user intent wins). Absolute ranges always inject
-///   `_time>="..." _time<="..."` regardless.
-/// - pipeline-only base (`| stats ...`) gets a synthetic `*` search stage
-///   preceding the filter + range clauses.
+/// An empty `base_q` merges to an empty result: filters/range no-op without
+/// a query to attach to; avoids fabricating a wildcard `*` that could flood
+/// the server.
 #[must_use]
 pub fn effective_query(base_q: &str, filters: &[Filter], range: &RangeSpec) -> String {
     merge(base_q, filters, Some(range))
 }
 
-/// Merge `(base_q, filters)` into the DSL a LIVE stream runs: the query
-/// text and the filter clauses, and no range clause at all (ADR-0027 as
-/// amended 2026-09-21). A `last=`/`earliest=`/`latest=` the reader typed
-/// into `base_q` is part of the query and is carried through untouched.
 #[must_use]
 pub fn live_query(base_q: &str, filters: &[Filter]) -> String {
     merge(base_q, filters, None)
 }
 
-/// The one merge both faces run. Everything but the range clause is
-/// shared: an absent `range` is the only difference between the DSL a
-/// live stream runs and the DSL a snapshot runs.
 fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String {
     let trimmed = base_q.trim();
     if trimmed.is_empty() {
@@ -139,8 +98,6 @@ fn merge(base_q: &str, filters: &[Filter], range: Option<&RangeSpec>) -> String 
             binds_to_a_group |= !clause.is_empty();
             Some(clause)
         }
-        // suppressed by an existing time clause, or a live stream that
-        // carries no range in the first place
         Some(RangeSpec::Quick(_)) | None => None,
     };
     if let Some(clause) = range_clause {
@@ -187,17 +144,14 @@ fn splits_into_or_groups(prefix: &str, search: &str) -> bool {
         .is_ok_and(|query| query.search.groups.len() > 1)
 }
 
-/// `search` as one parenthesised group behind its own time clauses:
-/// `a last=1h OR b` becomes `last=1h (a OR b)`.
-///
 /// A time clause sits only at the top level of the search stage (ADR-0061
-/// ruling 2), so a clause left inside the new group would not parse. The
-/// parse's hoisted spans say where each clause is. The clauses move out in
-/// written order, so the last of each kind still wins, and the text around
-/// them stays as written, comments included. The cut is kept only when the
-/// grammar reads the moved clauses and the cut text as the search itself;
-/// otherwise the search is grouped whole, which the parser refuses over
-/// the clause, so a missed case is an error and never a changed query.
+/// ruling 2), so a clause left inside the parenthesised search would not
+/// parse. The clauses move out in written order, so the last of each kind
+/// still wins.
+/// The cut is kept only when the grammar reads the moved clauses and the
+/// cut text as the search itself; otherwise the search is grouped whole,
+/// which the parser refuses over the clause, so a missed case is an error
+/// and never a changed query.
 fn group_behind_time_clauses(search: &str) -> String {
     let Ok(query) = trawl_core::parser::parse(search) else {
         return parenthesize(search);
@@ -235,12 +189,10 @@ fn group_behind_time_clauses(search: &str) -> String {
     format!("{clauses} {}", parenthesize(cut))
 }
 
-/// `search` as one parenthesised group (`( … OR … )`), so a token written
-/// before it narrows every group. Neither parenthesis may change the token
-/// beside it. A comment starts only at the start of the text or after
-/// whitespace, so a space follows the opening parenthesis when the search
-/// starts with `#`. A comment would swallow the closing parenthesis, so a
-/// newline ends the comment first.
+/// A comment starts only at the start of the text or after whitespace, so a
+/// space follows the opening parenthesis when the search starts with `#`.
+/// A comment would swallow the closing parenthesis, so a newline ends the
+/// comment first.
 fn parenthesize(search: &str) -> String {
     let open = if search.starts_with('#') { "( " } else { "(" };
     let close = if ends_inside_comment(search) {
@@ -251,15 +203,6 @@ fn parenthesize(search: &str) -> String {
     format!("{open}{search}{close}")
 }
 
-/// Split on the first top-level `|` (skipping slash-delimited regex
-/// literals, quoted strings, backtick-quoted names and comments). Returns
-/// `(search_stage, optional_tail)`.
-///
-/// The walk reads a `/…/` run through the grammar's own body rule
-/// (`trawl_core::parser::first_cut`, ADR-0061 ruling 1), so it agrees with
-/// the parser about where a regex ends: `/err|warn/` is a regex, and a run
-/// cut by a line break or by whitespace before a `|` is not, so
-/// `path=/tmp* | where x / 2 == 1` splits at its pipe.
 fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     match scan_outside_quotes(input, |_, b| b == b'|') {
         Some(i) => (&input[..i], Some(&input[i + 1..])),
@@ -267,35 +210,21 @@ fn split_search_stage(input: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// One time clause the user wrote in the search stage. `keyword` is the
-/// bare grammar word (`last`, `earliest`, `latest`); the scanner matches
-/// it followed by `=`. `value` is what the user typed after the `=`,
-/// unquoted if it was a DSL string literal.
+/// `value` is what the user typed after the `=`, unquoted if it was a DSL
+/// string literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimeClause {
     pub keyword: &'static str,
     pub value: String,
 }
 
-/// Every DSL time clause a word scan finds in a search stage, in written
-/// order.
-///
 /// A scan, not the grammar: it reads `message=last=1h` as a clause and
 /// `LAST=2h` as one too, where the grammar reads field filters. Whether a
 /// text bounds itself is the grammar's answer wherever the text parses;
-/// this scan answers it only for text the grammar refuses.
-///
-/// Word-boundary check to avoid matching `loglast=` or similar.
-/// Case-insensitive. A backticked `` `last` `` is a field, not the
-/// grammar keyword, and a `last=` inside a quoted value or a comment is
-/// prose, so the walk skips those spans entirely — otherwise the UI
-/// would read them as an existing time clause and silently drop the
-/// range. The closure never claims a hit, so one walk collects them all.
+/// this scan answers it only for text the grammar refuses. The closure
+/// never claims a hit, so one walk collects them all.
 #[must_use]
 pub fn find_time_clauses(search: &str) -> Vec<TimeClause> {
-    // The grammar's own closed set, so a fourth keyword reaches this
-    // scanner the day the parser learns it (trawl-core pins the set
-    // against `TimeClause` in `ast.rs`).
     const KEYWORDS: &[&str] = trawl_core::parser::suggest::GRAMMAR_KEYWORDS;
     let lower = search.to_ascii_lowercase();
     let bytes = lower.as_bytes();
@@ -323,8 +252,6 @@ pub fn find_time_clauses(search: &str) -> Vec<TimeClause> {
         .collect()
 }
 
-/// The value token after a `<keyword>=`, with a DSL string literal
-/// unquoted and unescaped. An unterminated literal reads to the end.
 fn read_clause_value(search: &str, start: usize) -> String {
     let bytes = search.as_bytes();
     if start >= bytes.len() {
@@ -367,10 +294,7 @@ fn read_clause_value(search: &str, start: usize) -> String {
     search[start..end].to_string()
 }
 
-/// Does the search stage already carry a DSL time clause?
-///
-/// The grammar answers when it reads the stage ([`SearchStage::time_clause`](trawl_core::ast::SearchStage::time_clause)):
-/// a keyword inside a field's value (`url=https://a/last=1h`,
+/// A keyword inside a field's value (`url=https://a/last=1h`,
 /// `message=last=1h`) is part of the value, which a word scan cannot
 /// tell. Text the grammar refuses runs nowhere, so for it the scan's
 /// answer stands, and the server's parse error is what the page shows.
@@ -390,30 +314,16 @@ fn format_filter(f: &Filter) -> Option<String> {
         FilterOp::Include => "=",
         FilterOp::Exclude => "!=",
     };
-    // Quote the value so spaces / special chars don't break the DSL, and
-    // render the field through the one DSL name renderer — a name the
-    // bare production can't spell (`x-forwarded-for`) or a keyword
-    // (`last`) needs backticks or the clause is not a filter at all
-    // (ADR-0013 ruling 7).
     let quoted = dsl_string_literal(&f.value);
     let field = quote_dsl_field(&f.field)?;
     Some(format!("{field}{op}{quoted}"))
 }
 
-/// One arbitrary string as a DSL double-quoted literal: the ONE escaper
-/// for every value this crate interpolates into a query. A filter value
-/// is a catalog value and a range bound is a URL parameter — both are
-/// client text, and a `"` in either would otherwise close the literal
-/// early and the rest would parse as grammar.
 fn dsl_string_literal(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
 fn format_absolute_range(from: &str, to: &str) -> String {
-    // _time>="<from>" _time<="<to>" — DSL parses these as implicit-AND
-    // comparison clauses in the search stage. The canonical column by
-    // name: the DSL has zero aliases (ADR-0013 §6), so `@timestamp`
-    // would name an ordinary sender field most events never carry.
     let mut out = String::new();
     if !from.is_empty() {
         write!(&mut out, "_time>={}", dsl_string_literal(from)).ok();
@@ -436,64 +346,22 @@ pub struct CaptureWindow {
     pub latest: String,
 }
 
-/// What a capture request carries for one Search URL state: the text that
-/// runs, and the window when the text does not bound itself in time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureParts {
     pub query: String,
-    /// `None` when the text is closed by its own absolute `earliest=` and
-    /// `latest=`: a request carries a window or those clauses, never both
-    /// (ADR-0057).
     pub window: Option<CaptureWindow>,
 }
 
-/// Why a Search URL state is not a capture request.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CaptureRefusal {
-    /// There is no query to run.
     EmptyQuery,
-    /// The range moves: a quick range, or an absolute range with an open
-    /// end. A capture is immutable, so the page pins the range to the
-    /// instant it ran (see [`pin_range`]) before it asks.
     Moving,
-    /// A bound is not an RFC 3339 instant, the range has no start, or its
-    /// start is after its end.
     UnreadableRange,
-    /// The window's exclusive end is past the last instant the wire form
-    /// spells (year 9999).
     RangeOverflow,
-    /// The text's own time clause moves: a `last=`, or an `earliest=` or
-    /// `latest=` without the other end or with an end that is not an
-    /// absolute instant. The range control cannot pin a clause in the
-    /// text, so the person removes it and picks the range there.
     TextMoves,
-    /// The capture would cover more than the server's `[capture]
-    /// max_span_secs`, which it advertises as `bounds.max_span_secs` and
-    /// refuses past. The interval is never narrowed to fit.
     SpanTooLong { max_span_secs: u64 },
 }
 
-/// Read a Search URL state (`base_q`, `filters`, `range`) as the parts of a
-/// capture request.
-///
-/// The capture's window is half-open, and the range the merger writes is
-/// inclusive (`_time>=from`, `_time<=to`), so an absolute `[from, to]`
-/// becomes `[from, to + 1 µs)`: an event exactly at `to` is inside. The
-/// window is not folded into the text, so time is applied once.
-///
-/// The text's own time clauses are read by the grammar. Closed by an
-/// absolute `earliest=` and `latest=`, the text bounds the capture, no
-/// window is sent, and the text is [`effective_query`]'s: the range is
-/// then merged as the snapshot merged it (a quick range yields to the
-/// clause; an absolute range stays as `_time` filters beside it). Any
-/// other clause moves with the clock the capture runs on, and pinning the
-/// range cannot fix it, so the request is refused.
-///
-/// # Errors
-/// [`CaptureRefusal`]: the query is empty, the text's own clause moves,
-/// the range moves, the range cannot be read, the window's end does not
-/// fit, or the capture would cover more than `max_span_secs`, the limit
-/// the server advertises (`None` when it is not known).
 pub fn capture_parts(
     base_q: &str,
     filters: &[Filter],
@@ -540,17 +408,12 @@ pub fn capture_parts(
     })
 }
 
-/// What a capture text's own time clauses do, as the grammar reads them.
 enum TextTime {
-    /// No time clause: the window bounds the capture.
     Free,
-    /// An `earliest=` and a `latest=` that both name an absolute instant,
-    /// and no `last=`: the text is fixed, over `[earliest, latest)`.
     Closed {
         earliest: DateTime<Utc>,
         latest: DateTime<Utc>,
     },
-    /// Any other clause: it ends when the capture runs.
     Moves,
 }
 
@@ -614,28 +477,14 @@ fn within_span(
     }
 }
 
-/// Why a range cannot be pinned.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinRefusal {
-    /// The anchor is not an RFC 3339 instant.
     UnreadableAnchor,
-    /// The quick label is not `<n>m`, `<n>h` or `<n>d`, a bound is not an
-    /// instant, the range has no start, or its start is after the anchor.
     UnreadableRange,
 }
 
 /// The absolute range a moving `range` was, at `anchor`: the instant the
 /// search ran, which a response reports as `execution.started_at`.
-///
-/// A quick range of duration `d` becomes `[anchor − d, anchor]`, and an
-/// absolute range with an open end keeps its start and ends at `anchor`.
-/// An absolute range with both ends is not moving and comes back as it is.
-/// The search URL spells instants in whole seconds, so the pinned bounds
-/// are the whole-second hull of the exact ones: the start floored and the
-/// end ceiled, never narrower than what ran.
-///
-/// # Errors
-/// [`PinRefusal`] when the anchor or the range cannot be read.
 pub fn pin_range(range: &RangeSpec, anchor: &str) -> Result<RangeSpec, PinRefusal> {
     let anchor_at = parse_instant(anchor).ok_or(PinRefusal::UnreadableAnchor)?;
     let from_at = match range {
@@ -659,7 +508,6 @@ pub fn pin_range(range: &RangeSpec, anchor: &str) -> Result<RangeSpec, PinRefusa
     Ok(RangeSpec::Absolute { from, to })
 }
 
-/// The last year the wire form spells with four digits.
 const MAX_WIRE_YEAR: i32 = 9999;
 
 fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
@@ -668,7 +516,6 @@ fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
         .map(|instant| instant.with_timezone(&Utc))
 }
 
-/// The span a quick label names: `<n>m`, `<n>h` or `<n>d`.
 fn quick_duration(label: &str) -> Option<TimeDelta> {
     let unit = label.chars().last()?;
     let count: i64 = label[..label.len() - unit.len_utf8()].parse().ok()?;
@@ -785,8 +632,6 @@ mod tests {
         }
     }
 
-    /// The grammar's keywords are lower case: `LAST=2h` is a filter on a
-    /// field called `LAST`, so it bounds nothing and the range is merged.
     #[test]
     fn an_upper_case_keyword_is_a_field_filter() {
         let q = effective_query("LAST=2h _severity=error", &[], &quick("15m"));
@@ -851,10 +696,6 @@ mod tests {
         assert_eq!(q, "_time>=\"2026-04-18T00:00:00Z\" last=1h");
     }
 
-    /// A range bound is URL text, so it reaches the DSL through the same
-    /// escaper a filter value does. A bound carrying `"` and `\\` must
-    /// still parse as one literal rather than closing the `_time` clause
-    /// and letting the rest read as grammar.
     #[test]
     fn absolute_bounds_pass_through_the_dsl_escaper() {
         let hostile = r#"2026-01-01T00:00:00Z" or host="evil\"#;
@@ -868,8 +709,6 @@ mod tests {
         );
         assert_eq!(q, r#"_time>="2026-01-01T00:00:00Z\" or host=\"evil\\" *"#);
         let ast = trawl_core::parser::parse(&q).expect("the escaped bound parses");
-        // Exactly one field filter, on `_time`, carrying the bound back
-        // verbatim — no second clause was smuggled in.
         let filters: Vec<&trawl_core::ast::FieldFilter> = ast
             .search
             .all_tokens()
@@ -924,9 +763,6 @@ mod tests {
         assert_eq!(tail, Some(" stats count()"));
     }
 
-    /// The split reads a `/…/` run as the parser reads it (ADR-0061
-    /// ruling 1): a body cut by a line break, or by whitespace before a
-    /// `|`, is no regex, so the `|` inside it ends the search stage.
     #[test]
     fn split_reads_a_regex_body_as_the_parser_does() {
         for (input, search, tail) in [
@@ -967,10 +803,6 @@ mod tests {
         assert_eq!(q, "last=15m `last`=5");
     }
 
-    /// A `//` in a value is ordinary data (ADR-0014 ruling 3), and the
-    /// shared scan primitive must not read the slashes as a regex open —
-    /// that would hide the user's own `last=` clause behind a phantom
-    /// span and silently override their time bound.
     #[test]
     fn slashes_in_a_value_do_not_hide_the_last_clause() {
         for base in [
@@ -978,11 +810,8 @@ mod tests {
             "path=/api//v1 last=1h",
             "url=//cdn.example.com/x last=1h",
         ] {
-            // the user's own `last=` wins: the quick range is suppressed
             assert_eq!(effective_query(base, &[], &quick("15m")), base, "{base}");
         }
-        // …and an absolute range still rewrites, with the search stage
-        // located correctly around the slashes.
         let q = effective_query(
             "url=https://a/b | stats count()",
             &[],
@@ -995,8 +824,6 @@ mod tests {
         assert!(q.ends_with("url=https://a/b | stats count()"), "{q}");
     }
 
-    /// A comment in the base query is prose: its words are not read as
-    /// grammar, and the range clause still lands in the search stage.
     #[test]
     fn a_comment_is_not_read_as_grammar() {
         assert_eq!(
@@ -1005,24 +832,16 @@ mod tests {
         );
     }
 
-    /// A search half that ends inside an open comment gets its pipeline
-    /// back on a new line. Joined on one line the `|` and every stage
-    /// after it would be comment text, and the result would still parse,
-    /// as a query with no pipeline at all.
     #[test]
     fn a_pipeline_is_not_swallowed_by_an_open_comment() {
-        // the split trims the newline that closed the comment, so the
-        // rejoin has to put one back
         assert_eq!(
             effective_query("service=x # note\n| stats count()", &[], &quick("15m")),
             "last=15m service=x # note\n| stats count()"
         );
-        // the newline is spent only where it is needed
         assert_eq!(
             effective_query("service=x | stats count()", &[], &quick("15m")),
             "last=15m service=x | stats count()"
         );
-        // …and a comment closed by its own newline needs none either
         assert_eq!(
             effective_query(
                 "service=x # note\nhost=y | stats count()",
@@ -1033,11 +852,6 @@ mod tests {
         );
     }
 
-    /// The scan and the grammar answer the same question: a `\` outside a
-    /// quoted span does not escape, and a comment opens only after ASCII
-    /// whitespace. Disagreeing either hides the base query's own `last=`
-    /// and injects a second time bound, or reads a phantom one and drops
-    /// the popover's range.
     #[test]
     fn the_scan_agrees_with_the_grammar_on_escapes_and_whitespace() {
         // `last=1h` lives inside the quoted phrase — not a time clause,
@@ -1053,7 +867,6 @@ mod tests {
             effective_query("message=\"x\"\u{a0}# last=1h", &[], &quick("15m")),
             "message=\"x\"\u{a0}# last=1h"
         );
-        // …while a real one still suppresses the injection
         assert_eq!(
             effective_query("message=\"x\" last=1h", &[], &quick("15m")),
             "message=\"x\" last=1h"
@@ -1134,10 +947,6 @@ mod tests {
         assert_eq!(clauses[0].value, r#"2026-01-01T00:00:00Z" x"#);
     }
 
-    /// A live stream carries the query text and nothing the popover
-    /// picked: the stream lane evaluates a `last=` per event against the
-    /// server clock, so a folded range drops every event older than the
-    /// window while the page still says Live.
     #[test]
     fn live_query_merges_no_range() {
         assert_eq!(live_query("_severity=error", &[]), "_severity=error");
@@ -1156,7 +965,6 @@ mod tests {
             ),
             "host=\"web-01\" source!=\"auth.log\" _severity=error",
         );
-        // …through the same escaper and the same DSL name renderer
         assert_eq!(
             live_query("*", &[inc("x-forwarded-for", "10.0.0.1")]),
             "`x-forwarded-for`=\"10.0.0.1\" *",
@@ -1167,9 +975,6 @@ mod tests {
         );
     }
 
-    /// A time clause the reader typed is part of the query, not the
-    /// range, so it survives into the stream untouched. The ADR names
-    /// all three keywords.
     #[test]
     fn a_typed_time_clause_survives_into_the_live_query() {
         for base in [
@@ -1181,8 +986,6 @@ mod tests {
         }
     }
 
-    /// The stream-start effect refuses to open on an empty query, and
-    /// reads this function's answer to decide.
     #[test]
     fn live_query_on_an_empty_base_is_empty() {
         assert_eq!(live_query("", &[inc("host", "web-01")]), "");
@@ -1232,8 +1035,6 @@ mod tests {
         );
     }
 
-    /// The merger writes `_time<=to`, so an event exactly at `to` is in the
-    /// snapshot; the window's exclusive end sits one microsecond past it.
     #[test]
     fn an_event_exactly_at_to_is_inside_the_window() {
         let parts = capture_parts(
@@ -1294,8 +1095,6 @@ mod tests {
                 ]
             )
         );
-        // A filter on a field named like a time keyword is a filter, not
-        // a time clause: the window is still sent.
         assert!(parts.window.is_some());
     }
 
@@ -1328,8 +1127,6 @@ mod tests {
     const CLOSED: &str =
         r#"earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" service=web"#;
 
-    /// A text closed by two absolute bounds is fixed: it bounds the
-    /// capture itself, whatever the range is, and no window is sent.
     #[test]
     fn a_closed_absolute_text_clause_bounds_the_capture_and_no_window_is_sent() {
         for base in [
@@ -1346,9 +1143,6 @@ mod tests {
         }
     }
 
-    /// A text clause that moves (`last=`, or a bound with no other end)
-    /// cannot be pinned by the range control, so the request is refused
-    /// whatever the range is: the person removes it and picks the range.
     #[test]
     fn a_moving_or_open_text_clause_is_refused() {
         for base in [
@@ -1376,9 +1170,6 @@ mod tests {
         }
     }
 
-    /// An absolute range beside a closed text clause is merged as the
-    /// snapshot merged it, as `_time` filters, so the capture reads what
-    /// the page showed; it is never also sent as a window.
     #[test]
     fn an_absolute_range_beside_a_text_clause_stays_in_the_text() {
         let parts = capture_parts(
@@ -1416,10 +1207,6 @@ mod tests {
         }
     }
 
-    /// A keyword inside a field's value is part of the value: the grammar
-    /// reads no time clause there, so the text does not bound itself and
-    /// the window is sent. Read as a clause, the request would carry no
-    /// window and the server would apply its default trailing one.
     #[test]
     fn a_keyword_inside_a_value_is_not_a_time_clause() {
         for base in ["url=https://a/last=1h", "message=last=1h", "x=earliest=y"] {
@@ -1439,7 +1226,6 @@ mod tests {
                 "{base}"
             );
             assert_eq!(parts.query, base);
-            // The snapshot merge asks the same question.
             assert_eq!(
                 effective_query(base, &[], &quick("15m")),
                 format!("last=15m {base}")
@@ -1447,9 +1233,6 @@ mod tests {
         }
     }
 
-    /// The property the server enforces: a request never carries a window
-    /// and a time clause in the text. Checked over a grid of texts and
-    /// ranges, with the text parsed by the grammar itself.
     #[test]
     fn a_capture_never_applies_time_twice() {
         let texts = [
@@ -1534,10 +1317,6 @@ mod tests {
 
     const WEEK: Option<u64> = Some(604_800);
 
-    /// The 7-day preset, pinned, covers seven days and one microsecond
-    /// once the inclusive end becomes the exclusive one, and the server
-    /// refuses a span past its limit. The interval is refused, never
-    /// narrowed to fit.
     #[test]
     fn a_window_past_the_capture_span_limit_is_refused() {
         let refused = Err(CaptureRefusal::SpanTooLong {
@@ -1546,10 +1325,8 @@ mod tests {
         for anchor in ["2026-10-26T12:00:00Z", "2026-10-26T12:00:00.500000Z"] {
             let pinned = pin_range(&quick("7d"), anchor).unwrap();
             assert_eq!(capture_parts("*", &[], &pinned, WEEK), refused, "{anchor}");
-            // An unknown limit refuses nothing: the server decides.
             assert!(capture_parts("*", &[], &pinned, None).is_ok());
         }
-        // A fixed range is held to the same limit.
         assert_eq!(
             capture_parts(
                 "*",
@@ -1573,8 +1350,6 @@ mod tests {
         );
     }
 
-    /// A text closed by its own bounds is held to the limit too: the
-    /// capture covers `[earliest, latest)`.
     #[test]
     fn a_closed_text_clause_past_the_capture_span_limit_is_refused() {
         let at_limit =
@@ -1634,7 +1409,6 @@ mod tests {
         );
         let closed = abs("2026-04-18T08:00:00Z", "2026-04-18T09:00:00Z");
         assert_eq!(pin_range(&closed, anchor), Ok(closed.clone()));
-        // Pinning twice changes nothing.
         let pinned = pin_range(&quick("15m"), anchor).unwrap();
         assert_eq!(pin_range(&pinned, "2030-01-01T00:00:00Z"), Ok(pinned));
     }
@@ -1668,8 +1442,6 @@ mod tests {
     const F: &str = "2026-09-15T12:00:00Z";
     const T: &str = "2026-09-15T12:30:00Z";
 
-    /// The search stage's groups as the grammar reads `text`: a merged
-    /// filter binds to the whole search only when there is one group.
     fn top_level_groups(text: &str) -> usize {
         trawl_core::parser::parse(text)
             .unwrap_or_else(|e| panic!("{text:?} parses: {e:?}"))
@@ -1678,9 +1450,6 @@ mod tests {
             .len()
     }
 
-    /// `a OR b` is two groups, and a token written before it joins the
-    /// first one only. A chip's filter narrows the whole search, so an OR
-    /// search goes into parentheses before the filter is put in front.
     #[test]
     fn a_chip_filter_narrows_every_or_group() {
         let merged = live_query(OR_BASE, &[inc("host", "a")]);
@@ -1715,8 +1484,6 @@ mod tests {
         assert_eq!(top_level_groups(&merged), 1, "{merged}");
     }
 
-    /// The capture's range-free text is grouped the same way, so the
-    /// window and the chips apply to every group, as in Search.
     #[test]
     fn the_capture_text_groups_an_or_search_as_search_does() {
         let parts = capture_parts(OR_BASE, &[inc("host", "a")], &abs(F, T), None).unwrap();
@@ -1725,9 +1492,6 @@ mod tests {
         assert!(parts.window.is_some());
     }
 
-    /// Parentheses already in the text are kept inside the new group; a
-    /// search that is one group already, parenthesised or not, is left as
-    /// it was.
     #[test]
     fn written_parentheses_are_kept_and_one_group_is_not_wrapped() {
         assert_eq!(
@@ -1751,9 +1515,6 @@ mod tests {
         assert_eq!(top_level_groups(&merged), 1, "{merged}");
     }
 
-    /// The grammar decides what is an OR: inside a quoted value, a
-    /// backticked name, a regex or a comment it is data, and a lower-case
-    /// `or` is the keyword.
     #[test]
     fn only_the_grammars_or_groups_the_search() {
         for base in [
@@ -1781,8 +1542,6 @@ mod tests {
         );
     }
 
-    /// Without a top-level OR the merged text is the prefix, a space and
-    /// the search, byte for byte.
     #[test]
     fn a_search_without_or_merges_byte_for_byte_as_before() {
         for base in [
@@ -1812,17 +1571,12 @@ mod tests {
         }
     }
 
-    /// A time clause applies to the whole query wherever it is written,
-    /// so a quick range is not a reason to group, and a clause the person
-    /// wrote inside an OR is still read as theirs.
     #[test]
     fn time_clauses_read_the_same_once_grouped() {
-        // the quick range alone binds to no group: nothing is wrapped
         assert_eq!(
             effective_query(OR_BASE, &[], &quick("15m")),
             "last=15m service=web OR service=db"
         );
-        // with a chip it is grouped, and `last=` is still the range
         let merged = effective_query(OR_BASE, &[inc("host", "a")], &quick("15m"));
         assert_eq!(merged, "host=\"a\" last=15m (service=web OR service=db)");
         let ast = trawl_core::parser::parse(&merged).unwrap();
@@ -1857,7 +1611,6 @@ mod tests {
         assert_eq!(top_level_groups(&parts.query), 1, "{}", parts.query);
     }
 
-    /// `merged` parses and means what `expected` means.
     fn assert_means(merged: &str, expected: &str) {
         let merged_ast = trawl_core::parser::parse(merged)
             .unwrap_or_else(|e| panic!("{merged:?} parses: {e:?}"));
@@ -1869,9 +1622,6 @@ mod tests {
         );
     }
 
-    /// A time clause sits only at the top level (ADR-0061 ruling 2), so
-    /// the group a merge adds around an OR search must leave the search's
-    /// clauses outside it, or the merged text does not parse.
     #[test]
     fn facet_grouping_keeps_existing_time_clauses_at_top_level() {
         for (base, expected) in [
@@ -1905,8 +1655,6 @@ mod tests {
             assert_means(&merged, expected);
             assert_eq!(top_level_groups(&merged), 1, "{merged}");
         }
-        // A snapshot keeps the reader's clause over the quick range, and
-        // an absolute range still binds every group beside it.
         let base = "service=web last=1h OR service=db";
         assert_eq!(
             effective_query(base, &[inc("host", "a")], &quick("15m")),
@@ -1918,15 +1666,12 @@ mod tests {
             format!("_time>=\"{F}\" _time<=\"{T}\" last=1h (service=web OR service=db)")
         );
         assert_eq!(top_level_groups(&merged), 1, "{merged}");
-        // and a capture of it is refused as the text's own clause moves
         assert_eq!(
             capture_parts(base, &[inc("host", "a")], &abs(F, T), None),
             Err(CaptureRefusal::TextMoves)
         );
     }
 
-    /// Several clauses of one kind keep their written order, so the last
-    /// one still wins.
     #[test]
     fn facet_grouping_keeps_duplicate_time_clause_order() {
         let base = "last=1h service=web OR last=2h service=db";
@@ -1954,7 +1699,6 @@ mod tests {
         );
     }
 
-    /// The pipeline after a slash-opening glob survives the grouping.
     #[test]
     fn facet_merge_keeps_pipeline_after_slash_opening_glob() {
         for (base, expected) in [
@@ -1975,8 +1719,6 @@ mod tests {
         }
     }
 
-    /// Comments stay where they were written, and a field named like a
-    /// time keyword stays in the group: it is a filter, not a clause.
     #[test]
     fn facet_grouping_keeps_comments_and_quoted_time_keyword_fields() {
         for (base, expected) in [
@@ -2002,8 +1744,6 @@ mod tests {
         }
     }
 
-    /// The closing parenthesis must not change the last token: a group
-    /// closes a regex tight, and a comment would swallow it.
     #[test]
     fn the_closing_parenthesis_keeps_the_last_token_whole() {
         let merged = live_query("service=web OR msg=/x+/", &[inc("host", "a")]);
@@ -2039,9 +1779,6 @@ mod tests {
         assert_eq!(ast.pipeline.len(), 1, "{merged}");
     }
 
-    /// A regex list element keeps a `,` and a `|` in its body through a
-    /// merge: the list is not split there, the search stage does not end
-    /// there, and the group closes the last element tight.
     #[test]
     fn a_regex_list_element_keeps_its_comma_and_pipe_through_a_merge() {
         use trawl_core::ast::{FilterValue, Scalar, SearchToken};
@@ -2090,8 +1827,6 @@ mod tests {
         }
     }
 
-    /// A comment starts only at the start of the text or after whitespace,
-    /// so the opening parenthesis must not touch a leading `#`.
     #[test]
     fn the_opening_parenthesis_keeps_a_leading_comment_a_comment() {
         let search = "# incident\nservice=web OR service=db";
@@ -2111,9 +1846,6 @@ mod tests {
         );
     }
 
-    /// The pinned range goes through the URL (`encode_range` then
-    /// `decode_range`), and the capture it yields holds every event the
-    /// moving search saw: those in `[anchor − d, anchor)`.
     #[test]
     fn a_pinned_range_survives_the_url_and_covers_what_ran() {
         use crate::search_url::{Verdict, decode_range, encode_range};
@@ -2130,11 +1862,6 @@ mod tests {
         }
     }
 
-    /// The bracket a filter puts around a search of several OR groups is a
-    /// level of the search tree (#447). A group 63 levels deep is 64 deep
-    /// inside it and still parses; a group 64 deep is 65 deep inside it,
-    /// and the merged text is refused with the search sentence, which is
-    /// what the server and the page then show.
     #[test]
     fn the_facet_bracket_is_a_level_of_the_search_tree() {
         let limit = trawl_core::parser::MAX_TREE_DEPTH;

@@ -4,39 +4,9 @@
 
 //! The absent-field oracle (ADR-0062).
 //!
-//! A field the current stage's input does not carry reads as NULL, in every
-//! lane. Every rule that holds for a NULL value then applies unchanged: the
-//! search stage's `!=`, negated patterns and negated lists match, positive
-//! comparisons are unknown, `NOT` keeps three-valued logic, `where` stays
-//! strict, and an absent field never removes a sibling `OR` branch's rows.
-//!
-//! One corpus of six events ([`EVENTS`]) runs through every case. In the
-//! base corpus no event carries `f` or `g`. A [`Split`] decides where each
-//! event lives: all in cold parquet, all in the hot snapshot (the ADR-0008
-//! cold-start route), or mixed. A [`Variant`] decides what the events carry
-//! and how the query reads them: an explicit null, as VARCHAR or as DOUBLE
-//! for a numeric reader, `f` present in one cold file or only in hot, a
-//! catalog pin with no physical column, and a query window that includes
-//! or excludes the cold file carrying `f`.
-//! The null-identity variant mixes the empty string, the text `null`, an
-//! explicit null and absence under one name.
-//!
-//! Each [`Case`] states its answer per variant: exact ids, ids in order,
-//! or typed cells for the stages that write a column. Batch runs once per
-//! split through the public executor entry points. The live lane runs the
-//! same events once per variant through `CompiledFilter` and the
-//! `StreamPlan`, as the SSE handler does, and must give the same stated
-//! answer; a stage the stream plan refuses runs batch only. Two lanes can
-//! agree on zero rows, so neither lane is the reference: the stated answer
-//! is, taken from ADR-0062 and the DSL reference's missing-field rules.
-//!
 //! Each module below is one acceptance criterion, named as its evidence
 //! filter names it (`cargo test -p trawl-engine --test absent_field
 //! <module>`).
-//!
-//! A batch result with no columns at all is never a correct answer here.
-//! Every split holds data, so a column-less result is an empty success
-//! standing in for an answer: the fallback ADR-0062 deletes.
 
 use std::path::{Path, PathBuf};
 
@@ -56,23 +26,13 @@ use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, hot_columns_of};
 use trawl_engine::value::{ColumnType, QueryResult, Value};
 
-// ── the corpus ──────────────────────────────────────────────────────
-
-/// Where an event lives in the [`Split::Mixed`] corpus.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Home {
-    /// The cold file of hour 10, the oldest. The window variants carry `f`
-    /// here and include or exclude this hour.
     Hour10,
-    /// The cold file of hour 11.
     Hour11,
-    /// The hot snapshot. [`Split::ColdOnly`] puts these events in the cold
-    /// file of hour 12 instead.
     Hot,
 }
 
-/// One event of the corpus. `message` (and `_raw`, which repeats it) is
-/// what a text search reads and what `extract kv` splits.
 #[derive(Debug)]
 struct Event {
     id: i64,
@@ -82,11 +42,6 @@ struct Event {
     message: &'static str,
 }
 
-/// The corpus. Every case's answer is stated over these ids, so read this
-/// table next to the cases: web1 is ids 1, 3 and 5, `login` appears in the
-/// messages of ids 1, 2 and 5, and the kv pairs are `user` on 1, 2 and 5
-/// and `svc` on 3. Every event carries a `service`, so a projection that
-/// names one present and one absent field has a column of each.
 const EVENTS: [Event; 6] = [
     Event {
         id: 1,
@@ -132,8 +87,6 @@ const EVENTS: [Event; 6] = [
     },
 ];
 
-/// The columns every event carries, whatever the variant: the input
-/// columns a `*` over input that lacks `f` returns.
 const INPUT_COLUMNS: &[&str] = &[
     "_time",
     "_ingested",
@@ -144,12 +97,9 @@ const INPUT_COLUMNS: &[&str] = &[
     "_raw",
 ];
 
-/// The cold hours a corpus lays out, one directory each.
 const COLD_HOURS: [u32; 3] = [10, 11, 12];
 
 impl Event {
-    /// The hour this event's `_time` falls in. The hot events are the
-    /// newest, at hour 12, whichever split stores them.
     fn hour(&self) -> u32 {
         match self.home {
             Home::Hour10 => 10,
@@ -158,13 +108,10 @@ impl Event {
         }
     }
 
-    /// `_time` and `_ingested` as the wire's RFC 3339 text: hour by home,
-    /// the id as the second, so every instant is distinct.
     fn instant(&self) -> String {
         format!("2024-01-15T{:02}:00:{:02}Z", self.hour(), self.id)
     }
 
-    /// The same instant as a `DuckDB` TIMESTAMP literal, for cold parquet.
     fn timestamp_sql(&self) -> String {
         format!(
             "TIMESTAMP '2024-01-15 {:02}:00:{:02}'",
@@ -173,8 +120,6 @@ impl Event {
         )
     }
 
-    /// The event as the live lane and the hot snapshot see it: JSON, with
-    /// `f` carried only where the variant puts it.
     fn json(&self, variant: Variant) -> Map<String, Json> {
         let mut event = Map::new();
         event.insert("_time".into(), Json::from(self.instant()));
@@ -197,30 +142,22 @@ impl Event {
     }
 }
 
-/// What one event carries under `f`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum F {
-    /// No key at all.
     Absent,
-    /// An explicit JSON null (a NULL cell in cold parquet).
     Null,
     Text(&'static str),
 }
 
-/// Where the events live. The answer never depends on the split.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Split {
-    /// Every event in cold parquet, read with no hot snapshot
-    /// (`Executor::run_query`).
     ColdOnly,
     /// Every event in the hot snapshot, with a cold source that reaches no
     /// file: the ADR-0008 cold-start route.
     HotOnly,
-    /// Hours 10 and 11 in cold parquet, the rest in the hot snapshot.
     Mixed,
 }
 
-/// Where a split stores one event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Place {
     Cold(u32),
@@ -246,46 +183,26 @@ impl Split {
     }
 }
 
-/// What the events carry, and how the query reads them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Variant {
-    /// No event carries `f`.
     Absent,
     /// Every event carries an explicit null `f`. Cold parquet holds it as
     /// an all-NULL VARCHAR column; the hot snapshot as JSON `null`, a key
     /// `read_json` can only infer as JSON.
     ExplicitNull,
-    /// No event carries `f`, and the catalog pins it VARCHAR.
     PinnedVarchar,
     /// No event carries `f`, and the catalog pins it DOUBLE. It runs only
     /// the cases whose literals a DOUBLE column accepts: an all-NULL DOUBLE
-    /// column that is present already refuses `f=x` on main ("Could not
-    /// convert string 'x' to DOUBLE"). That is pin typing, not absence.
+    /// column that is present already refuses `f=x` ("Could not convert
+    /// string 'x' to DOUBLE").
     PinnedDouble,
-    /// `f` is present in the hour-10 cold file only: id 1 `b2`, id 2 `x`.
-    /// The hot-only split stores those events hot, so there it is a
-    /// partial presence in hot.
     ColdFileOnly,
-    /// `f` is present in hot only: id 5 `a1`, id 6 `x`. The cold-only
-    /// split stores those events in the hour-12 file.
     HotOnlyPresence,
-    /// [`Self::ColdFileOnly`]'s events under a window that includes the
-    /// hour-10 file: `earliest=` at 10:00, and the cold source lists hours
-    /// 10 to 12.
     WindowIncludes,
-    /// The same events under a window that excludes the hour-10 file:
-    /// `earliest=` at 11:00, and the cold source lists hours 11 and 12
-    /// only, as the server narrows it. No selected source carries `f`.
     WindowExcludes,
-    /// [`Self::ExplicitNull`] for a numeric reader: cold parquet holds `f`
-    /// as an all-NULL DOUBLE column, so `sum(f)` and its kind bind on it
-    /// as they do on any present numeric column. The hot snapshot holds
-    /// JSON `null`, as for [`Self::ExplicitNull`].
     NullDouble,
-    /// The null identity's corpus: id 1 carries the empty string, id 2
-    /// the text `null`, id 5 an explicit null, and ids 3, 4 and 6 no `f`
-    /// at all. The hour-11 cold file (ids 3 and 4) has no `f` column, so
-    /// in every split absent and explicit null meet in one relation.
+    /// The hour-11 cold file (ids 3 and 4) has no `f` column, so in every
+    /// split absent and explicit null meet in one relation.
     NullIdentity,
 }
 
@@ -305,7 +222,6 @@ impl Variant {
         }
     }
 
-    /// What event `id` carries under `f`.
     fn f(self, id: i64) -> F {
         match (self, id) {
             (Self::ExplicitNull | Self::NullDouble, _) | (Self::NullIdentity, 5) => F::Null,
@@ -319,8 +235,6 @@ impl Variant {
         }
     }
 
-    /// The type cold parquet stores `f` as, in a file where some event
-    /// carries it.
     fn cold_type(self) -> &'static str {
         match self {
             Self::NullDouble => "DOUBLE",
@@ -328,7 +242,6 @@ impl Variant {
         }
     }
 
-    /// The catalog pin snapshot: the comparison pins of the query.
     fn pins(self) -> FieldTypes {
         let mut pins = FieldTypes::new();
         match self {
@@ -339,7 +252,6 @@ impl Variant {
         pins
     }
 
-    /// The case's query text under this variant's window.
     fn query(self, dsl: &str) -> String {
         let earliest = match self {
             Self::WindowIncludes => "2024-01-15T10:00:00Z",
@@ -349,7 +261,6 @@ impl Variant {
         format!("earliest=\"{earliest}\" {dsl}")
     }
 
-    /// The cold hours the source lists.
     fn cold_hours(self) -> &'static [u32] {
         match self {
             Self::WindowExcludes => &COLD_HOURS[1..],
@@ -357,8 +268,6 @@ impl Variant {
         }
     }
 
-    /// The splits this variant runs over. A window over cold files means
-    /// nothing when no event is cold.
     fn splits(self) -> &'static [Split] {
         match self {
             Self::WindowIncludes | Self::WindowExcludes => &[Split::ColdOnly, Split::Mixed],
@@ -367,7 +276,6 @@ impl Variant {
     }
 }
 
-/// The variants in which no event carries a non-null `f`.
 const NO_F: &[Variant] = &[
     Variant::Absent,
     Variant::ExplicitNull,
@@ -375,28 +283,21 @@ const NO_F: &[Variant] = &[
     Variant::PinnedDouble,
 ];
 /// [`NO_F`] without [`Variant::PinnedDouble`], for a case that a present
-/// all-NULL DOUBLE column already refuses on main: a string literal it
-/// cannot convert, or a string-only function.
+/// all-NULL DOUBLE column already refuses: a string literal it cannot
+/// convert, or a string-only function.
 const NO_F_TEXT: &[Variant] = &[
     Variant::Absent,
     Variant::ExplicitNull,
     Variant::PinnedVarchar,
 ];
-/// The variants with `f` on ids 1 (`b2`) and 2 (`x`), both in the window.
 const COLD_F: &[Variant] = &[Variant::ColdFileOnly, Variant::WindowIncludes];
-/// The variant with `f` on ids 5 (`a1`) and 6 (`x`).
 const HOT_F: &[Variant] = &[Variant::HotOnlyPresence];
-/// The window that leaves ids 1 and 2, and with them every `f`, out.
 const OUT: &[Variant] = &[Variant::WindowExcludes];
 /// The metamorphic law's pairs (AC 2): input that lacks `f`, and input
-/// that carries an all-null `f` of the type the stage reads. A stage that
-/// reads any type takes [`LAW`]; a text reader [`LAW_TEXT`]; a numeric
-/// reader [`LAW_NUM`], which adds the absent `f` under a DOUBLE pin.
+/// that carries an all-null `f` of the type the stage reads.
 const LAW: &[Variant] = &[Variant::Absent, Variant::ExplicitNull, Variant::NullDouble];
 const LAW_TEXT: &[Variant] = &[Variant::Absent, Variant::ExplicitNull];
 const LAW_NUM: &[Variant] = &[Variant::Absent, Variant::NullDouble, Variant::PinnedDouble];
-/// The variants in which no source carries `f` at all, pinned or not,
-/// so `*` output has no `f` column to show.
 const NOT_CARRIED: &[Variant] = &[
     Variant::Absent,
     Variant::PinnedVarchar,
@@ -405,17 +306,10 @@ const NOT_CARRIED: &[Variant] = &[
 const ABSENT: &[Variant] = &[Variant::Absent];
 const IDENTITY: &[Variant] = &[Variant::NullIdentity];
 
-/// One corpus on disk: a split of the events under one variant.
 struct Corpus {
-    /// Owns the files; dropped with the corpus.
     dir: tempfile::TempDir,
-    /// The cold source in the server's list shape, one hour directory per
-    /// element. An hour with no file is narrowed away at resolution, and a
-    /// list that reaches no file at all is the cold start.
     cold: String,
-    /// The hot snapshot, when the split stores any event hot.
     hot: Option<PathBuf>,
-    /// The keys the hot snapshot carries, to cut the hot pins from.
     hot_keys: Vec<String>,
 }
 
@@ -474,7 +368,6 @@ impl Corpus {
         }
     }
 
-    /// The pins the snapshot carries a key for, as the server cuts them.
     fn hot_pins(&self, pins: &FieldTypes) -> FieldTypes {
         let mut hot_pins = FieldTypes::new();
         for (field, ty) in pins.iter() {
@@ -485,9 +378,6 @@ impl Corpus {
         hot_pins
     }
 
-    /// Run `dsl` through the batch lane this corpus calls for: the hot
-    /// entry point when the split stores events hot, the cold one
-    /// otherwise. `pins` is the catalog snapshot.
     fn run(
         &self,
         exec: &Executor,
@@ -508,8 +398,6 @@ impl Corpus {
         }
     }
 
-    /// Export `dsl` to the parquet file `out` through the export lane
-    /// this corpus calls for, as [`Self::run`] picks the query lane.
     fn export(
         &self,
         exec: &Executor,
@@ -539,16 +427,11 @@ impl Corpus {
         format!("{}/cold/*/*.parquet", self.dir.path().display())
     }
 
-    /// A path inside the corpus directory, for a file a lane writes.
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
 }
 
-/// Write one cold parquet file. `f` is a column, of the variant's
-/// [`Variant::cold_type`], only when some event of the file carries it,
-/// even as null. A file in which no event carries `f` has no `f` column at
-/// all.
 fn write_cold_file(conn: &duckdb::Connection, path: &Path, events: &[&Event], variant: Variant) {
     let with_f = events.iter().any(|event| variant.f(event.id) != F::Absent);
     let ty = variant.cold_type();
@@ -589,9 +472,6 @@ fn write_cold_file(conn: &duckdb::Connection, path: &Path, events: &[&Event], va
     .expect("cold parquet file");
 }
 
-// ── answers ─────────────────────────────────────────────────────────
-
-/// One typed cell, as both lanes are read back.
 #[derive(Debug, Clone, PartialEq)]
 enum Cell {
     Null,
@@ -599,7 +479,6 @@ enum Cell {
     Int(i64),
     Float(f64),
     Str(String),
-    /// Anything else, as its debug text. No case expects one.
     Other(String),
 }
 
@@ -633,35 +512,20 @@ impl From<&EvalValue> for Cell {
     }
 }
 
-/// What a case expects from one variant.
 #[derive(Debug, Clone)]
 enum Answer {
-    /// The ids of the rows returned, in any order.
     Ids(Vec<i64>),
-    /// The ids of the rows returned, in this order.
     Ordered(Vec<i64>),
-    /// Typed cells.
     Rows(Rows),
 }
 
-/// The typed-cell answer of a stage that writes a column.
 #[derive(Debug, Clone)]
 struct Rows {
-    /// The columns read from every output row. A live row that lacks one
-    /// reads it as NULL; a batch result that lacks one is wrong.
     columns: Vec<&'static str>,
-    /// The cells of every output row, over `columns`, in any row order.
     cells: Vec<Vec<Cell>>,
-    /// Batch result types, per column.
     types: Vec<(&'static str, ColumnType)>,
-    /// The batch result's whole column list, in order, when the stage
-    /// fixes it.
     exact_columns: Option<Vec<&'static str>>,
-    /// The whole column set, in any order, when the stage fixes the set
-    /// but the lane picks the order: the batch result's columns, and the
-    /// keys of every live row.
     column_set: Option<Vec<&'static str>>,
-    /// Names no output row may carry, in either lane.
     gone: Vec<&'static str>,
 }
 
@@ -698,7 +562,6 @@ impl Rows {
     }
 }
 
-/// `[id, cell]` rows from `(id, cell)` pairs.
 fn by_id(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
     cells
         .iter()
@@ -706,31 +569,26 @@ fn by_id(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
         .collect()
 }
 
-/// Every id in `ids` with a NULL cell.
 fn nulls(ids: &[i64]) -> Vec<(i64, Cell)> {
     ids.iter().map(|id| (*id, Cell::Null)).collect()
 }
 
-/// Every id in `ids` with the same cell.
 fn each(ids: &[i64], cell: &Cell) -> Vec<(i64, Cell)> {
     ids.iter().map(|id| (*id, cell.clone())).collect()
 }
 
-/// `f` as the [`COLD_F`] variants carry it, over every id.
 fn cold_f(fill: &Cell) -> Vec<(i64, Cell)> {
     let mut cells = vec![(1, s("b2")), (2, s("x"))];
     cells.extend(each(&[3, 4, 5, 6], fill));
     cells
 }
 
-/// `f` as the [`HOT_F`] variant carries it, over every id.
 fn hot_f(fill: &Cell) -> Vec<(i64, Cell)> {
     let mut cells = each(&[1, 2, 3, 4], fill);
     cells.extend([(5, s("a1")), (6, s("x"))]);
     cells
 }
 
-/// The corpus event with id `id`.
 fn event(id: i64) -> &'static Event {
     EVENTS
         .iter()
@@ -738,8 +596,6 @@ fn event(id: i64) -> &'static Event {
         .expect("a corpus id")
 }
 
-/// `[host, cell]` rows from `(id, cell)` pairs, the host read off
-/// [`EVENTS`].
 fn host_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
     cells
         .iter()
@@ -747,8 +603,6 @@ fn host_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
         .collect()
 }
 
-/// `[service, cell]` rows from `(id, cell)` pairs, the service read off
-/// [`EVENTS`].
 fn service_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
     cells
         .iter()
@@ -756,16 +610,12 @@ fn service_rows(cells: &[(i64, Cell)]) -> Vec<Vec<Cell>> {
         .collect()
 }
 
-/// `f` as [`Variant::NullIdentity`] carries it, over every id.
 fn identity_f() -> Vec<(i64, Cell)> {
     let mut cells = vec![(1, s("")), (2, s("null"))];
     cells.extend(nulls(&[3, 4, 5, 6]));
     cells
 }
 
-/// One row per value: the empty string once, the text `null` once, and
-/// the null identity, absent and explicit null together, `nulls` times.
-/// The grouped answer over [`Variant::NullIdentity`].
 fn identity_groups(nulls: i64) -> Vec<Vec<Cell>> {
     vec![
         vec![s(""), Cell::Int(1)],
@@ -774,23 +624,17 @@ fn identity_groups(nulls: i64) -> Vec<Vec<Cell>> {
     ]
 }
 
-/// One row of cells.
 fn one(cells: &[Cell]) -> Vec<Vec<Cell>> {
     vec![cells.to_vec()]
 }
 
 const ALL: &[i64] = &[1, 2, 3, 4, 5, 6];
-/// The ids the window that excludes hour 10 keeps.
 const LATE: &[i64] = &[3, 4, 5, 6];
 
-/// One query and its answer per variant.
 #[derive(Debug)]
 struct Case {
     dsl: &'static str,
     answers: Vec<(&'static [Variant], Answer)>,
-    /// Whether the live lane runs the case. A stage the stream plan
-    /// refuses (`sort`, `pivot`, `eventstats`, a `timechart` bucket other
-    /// than `_time`) has no live answer to compare.
     live: bool,
 }
 
@@ -803,7 +647,6 @@ impl Case {
         }
     }
 
-    /// A case the live lane refuses: batch only.
     fn batch_only(mut self) -> Self {
         self.live = false;
         self
@@ -825,11 +668,6 @@ impl Case {
     }
 }
 
-// ── the lanes ───────────────────────────────────────────────────────
-
-/// Run the case over every variant it names: batch over each of the
-/// variant's splits, live once. Every mismatch is collected, so one
-/// failing assertion reports the whole matrix.
 fn check(case: &Case) {
     let exec = Executor::new().expect("executor");
     let mut failed = Vec::new();
@@ -872,8 +710,6 @@ fn check(case: &Case) {
     );
 }
 
-/// The outcome of every lane a hand-built test drives, collected so one
-/// failing assertion reports all of them, as [`check`] does for a case.
 #[derive(Debug, Default)]
 struct Matrix {
     passed: Vec<String>,
@@ -901,9 +737,6 @@ impl Matrix {
     }
 }
 
-/// The live lane over the variant's events: the search-stage filter and
-/// the stream plan under one catalog snapshot, as the SSE handler compiles
-/// them, one evaluation context for the whole run.
 fn live_rows(dsl: &str, variant: Variant, pins: &FieldTypes) -> Result<Vec<Row>, String> {
     let query = trawl_core::parser::parse(dsl).map_err(|errors| format!("parse: {errors:?}"))?;
     let filter = CompiledFilter::compile(&query.search, pins)
@@ -1113,12 +946,6 @@ fn compare_rows(want: &[Vec<Cell>], got: Vec<Vec<Cell>>) -> Result<(), String> {
     }
 }
 
-// ── AC 1: every read of an absent field is a NULL read ─────────────
-
-/// The search-stage operators, the boolean compositions, the strict
-/// `where`, and the stages that write a column. Each case runs over every
-/// variant whose column types it is valid for, and over each of that
-/// variant's splits.
 mod oracle {
     use super::*;
 
@@ -1211,9 +1038,8 @@ mod oracle {
     }
 
     /// Only where no selected source holds `f` as text: a present VARCHAR
-    /// `f`, all-NULL or not, already refuses an ordered numeric literal on
-    /// main ("Cannot compare values of type VARCHAR and type BIGINT"),
-    /// which is column typing, not absence.
+    /// `f`, all-NULL or not, already refuses an ordered numeric literal
+    /// ("Cannot compare values of type VARCHAR and type BIGINT").
     #[test]
     fn gt() {
         check(
@@ -1307,7 +1133,6 @@ mod oracle {
         );
     }
 
-    /// `where` is strict: a NULL `f` is not unequal to anything.
     #[test]
     fn where_ne() {
         check(
@@ -1341,8 +1166,6 @@ mod oracle {
         );
     }
 
-    /// A direct NULL of an absent field: VARCHAR when unpinned, the pin's
-    /// type when pinned (ADR-0062).
     #[test]
     fn let_bare() {
         let rows = |cells: &[(i64, Cell)], ty: ColumnType| {
@@ -1376,8 +1199,6 @@ mod oracle {
         );
     }
 
-    /// `table` materializes a requested absent name as a null column, in
-    /// the requested order.
     #[test]
     fn table() {
         let rows = |cells: &[(i64, Cell)], ty: ColumnType| {
@@ -1398,8 +1219,6 @@ mod oracle {
         );
     }
 
-    /// `rename` writes its target, NULL when the source is absent, and the
-    /// source is gone.
     #[test]
     fn rename() {
         let rows = |cells: &[(i64, Cell)], ty: ColumnType| {
@@ -1420,9 +1239,8 @@ mod oracle {
         );
     }
 
-    /// A regex `extract` writes its capture, NULL when the source is
-    /// absent. Not under the DOUBLE pin: a present DOUBLE column is no
-    /// `regexp_extract` argument on main either.
+    /// Not under the DOUBLE pin: a present DOUBLE column is no
+    /// `regexp_extract` argument.
     #[test]
     fn extract_from_absent() {
         let rows = |cells: &[(i64, Cell)]| {
@@ -1437,8 +1255,6 @@ mod oracle {
         );
     }
 
-    /// The SQL prefix before the kv batch tail reads `f` as NULL, and the
-    /// tail splits `message` as usual.
     #[test]
     fn ne_then_extract_kv() {
         let kv = |ids: &[i64]| {
@@ -1467,17 +1283,6 @@ mod oracle {
     }
 }
 
-// ── AC 2: absent equals explicit null ───────────────────────────────
-
-/// The metamorphic law: every stage that reads `f` answers the same over
-/// input that lacks `f` as over input that carries an all-null `f` of the
-/// type the stage reads. Each case states one answer for the whole of its
-/// pair ([`LAW`], [`LAW_TEXT`], [`LAW_NUM`]), so every member, every split
-/// and, where the stage exists there, the live lane must give it. The
-/// batch-only stages (`sort`, `pivot`, `eventstats`) run every split.
-///
-/// One read is excluded, as ADR-0062 rules: a `let` that reads an earlier
-/// alias of the same stage ([`lateral_alias_is_the_exception`]).
 mod absent_equals_explicit_null {
     use super::*;
 
@@ -1525,7 +1330,6 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// `count(f)` and `dc(f)` see no value; `min` and `max` see none.
     #[test]
     fn stats_arguments() {
         check(
@@ -1539,7 +1343,6 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// `sum` and `avg` over no value are NULL, per group too.
     #[test]
     fn numeric_stats_arguments() {
         let per_host = ["web1", "web2", "web3"]
@@ -1560,8 +1363,6 @@ mod absent_equals_explicit_null {
         ));
     }
 
-    /// Batch only: the live lane refuses `eventstats`. The partition and
-    /// the argument both read `f`.
     #[test]
     fn eventstats() {
         check(
@@ -1595,7 +1396,6 @@ mod absent_equals_explicit_null {
         ));
     }
 
-    /// One day bucket holds every event, so the answer is one row.
     #[test]
     fn timechart_by() {
         check(&Case::new("* | timechart span=1d count() as n by f").rows(
@@ -1604,8 +1404,6 @@ mod absent_equals_explicit_null {
         ));
     }
 
-    /// Batch only: the live lane refuses `sort`. A null key ties every
-    /// row, so the second key alone orders them.
     #[test]
     fn sort() {
         check(
@@ -1620,10 +1418,9 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// Every event shares the null identity, so `dedup f` keeps one row,
-    /// and `dedup f, host` one per host. The count is the answer because
-    /// the lanes keep different representatives: batch the newest row
-    /// of a partition, live the first to arrive.
+    /// Counted, not compared by row: the lanes keep different
+    /// representatives, batch the newest row of a partition, live the first
+    /// to arrive.
     #[test]
     fn dedup() {
         check(
@@ -1636,8 +1433,6 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// Batch only: the live lane refuses `pivot`. `f` as a pivot key, as
-    /// a counted argument, and as a summed one.
     #[test]
     fn pivot() {
         check(
@@ -1667,12 +1462,6 @@ mod absent_equals_explicit_null {
         ));
     }
 
-    /// The law's one exclusion, which the DSL reference lists. Inside one
-    /// `let`, an input column binds first and an earlier alias of the same
-    /// stage second, so `let f = 1, b = f` reads the alias when the input
-    /// lacks `f` and the input's null when it carries one. The live lane
-    /// binds the same way.
-    ///
     /// The hot-only split of the explicit null reads the alias too. A hot
     /// key that was only ever null, with no pin and no cold carrier, is
     /// left out of the hot branch, as compaction leaves an unpinned
@@ -1730,21 +1519,13 @@ mod absent_equals_explicit_null {
         matrix.assert(dsl);
     }
 
-    /// One argument of a function fixture: a column of its natural type,
-    /// or a literal the position requires.
     #[derive(Debug, Clone, Copy)]
     enum Arg {
-        /// `s`, VARCHAR.
         Text,
-        /// `n`, DOUBLE.
         Num,
-        /// `i`, BIGINT.
         Int,
-        /// `t`, TIMESTAMP.
         Time,
-        /// `b`, BOOLEAN.
         Bool,
-        /// `j`, VARCHAR holding JSON text.
         Json,
         /// A literal, written as is: a unit, a format (`DuckDB` refuses a
         /// format that is not a constant, column or not), an index, a JSON
@@ -1753,7 +1534,6 @@ mod absent_equals_explicit_null {
     }
 
     impl Arg {
-        /// The present column and its `DuckDB` type; `None` for a literal.
         fn column(self) -> Option<(&'static str, &'static str)> {
             Some(match self {
                 Self::Text => ("s", "VARCHAR"),
@@ -1839,11 +1619,8 @@ mod absent_equals_explicit_null {
         ]
     }
 
-    /// The fixture source: two rows carrying a column of every natural
-    /// type, plus each `(name, type)` of `nulls` as a column holding a
-    /// NULL of that type. Read as the subquery source `from saved` also
-    /// hands the executor, so the probe describes it like any other
-    /// reader.
+    /// A subquery, the source shape `from saved` also hands the executor, so
+    /// the probe describes it like any other reader.
     fn function_source(nulls: &[(String, &str)]) -> String {
         let nulls = nulls.iter().fold(String::new(), |mut acc, (name, ty)| {
             use std::fmt::Write as _;
@@ -1877,7 +1654,6 @@ mod absent_equals_explicit_null {
         sets
     }
 
-    /// `y` per row in id order, or the one aggregate row's `y`.
     fn y_cells(result: &QueryResult) -> Result<Vec<Cell>, String> {
         let names: Vec<&str> = result.columns.iter().map(|c| c.name.as_str()).collect();
         let y = names
@@ -1899,8 +1675,6 @@ mod absent_equals_explicit_null {
         Ok(rows.into_iter().map(|(_, y)| y).collect())
     }
 
-    /// The overloaded date functions over the parquet corpus, where no
-    /// event carries `f`: each reads a TIMESTAMP NULL and answers NULL.
     #[test]
     fn overloaded_date_functions() {
         let nulls4 = |ids: &[i64]| {
@@ -1925,7 +1699,6 @@ mod absent_equals_explicit_null {
         Coalesce,
         If,
         Case,
-        /// The three branch-selecting forms nested in one another.
         Nested,
     }
 
@@ -1948,7 +1721,6 @@ mod absent_equals_explicit_null {
             }
         }
 
-        /// The fields the spelling reads.
         fn fields(self, a: String, b: String) -> Vec<String> {
             match self {
                 Self::Bare => vec![a],
@@ -1957,17 +1729,6 @@ mod absent_equals_explicit_null {
         }
     }
 
-    /// Every known function, with each field argument absent in turn and
-    /// then all of them at once, binds, and answers what the same call
-    /// answers over a NULL of each argument's natural type: an absent
-    /// field is no reason for `DuckDB` to lose the overload it picks for
-    /// a typed column.
-    ///
-    /// Each absent argument is spelled every [`Form`] way: a bare field,
-    /// and the branch-selecting functions over absent fields only, alone
-    /// and nested. The control spells the call the same way over columns
-    /// holding a NULL of the argument's natural type.
-    ///
     /// One exception, stated rather than skipped: `typeof` names its
     /// operand's type, and an unpinned absent field has none, so it
     /// answers `DuckDB`'s name for the NULL type where a typed NULL
@@ -2051,14 +1812,10 @@ mod absent_equals_explicit_null {
         matrix.assert("every known function with each argument absent");
     }
 
-    /// A query text the corpus [`Case`] can hold.
     fn leak(dsl: String) -> &'static str {
         Box::leak(dsl.into_boxed_str())
     }
 
-    /// The overloaded positions over the parquet corpus, with each absent
-    /// argument spelled every [`Form`] way. Batch reads a typed NULL there
-    /// and the live lane a NULL, so every lane answers NULL on every row.
     #[test]
     fn composed_absent_arguments_at_overloaded_positions() {
         for form in Form::ALL {
@@ -2083,17 +1840,12 @@ mod absent_equals_explicit_null {
                 _ => percentile.batch_only(),
             });
         }
-        // The `null` literal is a NULL by construction too.
         check(
             &Case::new(r#"* | let y = date_trunc("day", coalesce(f, null)) | table id, y"#)
                 .rows(ABSENT, Rows::new(&["id", "y"], by_id(&nulls(ALL)))),
         );
     }
 
-    /// A column an earlier stage wrote, whose every value is NULL by
-    /// construction, read at an overloaded position: a `let` of a
-    /// composed absent argument, and the aggregates that keep their
-    /// argument's type.
     #[test]
     fn null_columns_of_earlier_stages_at_overloaded_positions() {
         let rows = || Rows::new(&["id", "y"], by_id(&nulls(ALL)));
@@ -2123,15 +1875,6 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// A pivot value column no event produced has the type the pivot gives
-    /// every value column, so a call reads it as it reads a column the
-    /// data made: an overloaded call binds and answers NULL, here, later,
-    /// and through a stage that carries it. Over a `count()` pivot that
-    /// type is BIGINT, and `date_part` refuses it as it refuses the
-    /// produced `web1`.
-    ///
-    /// One event, `host` web1: `web1` is produced, `web2` and `web3` are
-    /// not.
     #[test]
     fn pivot_value_columns_nobody_produced_read_the_pivots_type() {
         let exec = Executor::new().expect("executor");
@@ -2212,17 +1955,6 @@ mod absent_equals_explicit_null {
         matrix.assert("pivot value columns nobody produced");
     }
 
-    /// A read of an earlier alias of the same `let` after a pivot, at an
-    /// overloaded position, when the alias is NULL by construction. The
-    /// read binds the pivot's column of that name first when the data
-    /// made one. After `pivot max(f)` of an absent `f` that column is NULL
-    /// by construction too, so the read takes the typed NULL cast, and a
-    /// copy of the alias keeps that in the same `let` and the next one.
-    /// After a pivot whose columns carry data, the read takes a type hint
-    /// that keeps a column's values, in the same `let`.
-    ///
-    /// `host=web1` keeps ids 1, 3 and 5, so the pivot makes `web1` only,
-    /// for the services auth and api.
     #[test]
     fn same_let_aliases_after_a_pivot_at_overloaded_positions() {
         let nulls = || {
@@ -2259,13 +1991,6 @@ mod absent_equals_explicit_null {
         );
     }
 
-    /// The hint over a pivot whose `web1` carries timestamps: the read
-    /// of `web1` binds the pivot's column before the alias, and the
-    /// value comes through unchanged. Id 5 is auth's latest event, at
-    /// 12:00:05, and id 3 api's, at 11:00:03. The pivot makes no `web2`,
-    /// so its read takes the alias's NULL. Over a `count()` pivot, `web1`
-    /// is BIGINT, and the hint refuses it as `date_part` refuses the
-    /// column itself.
     #[test]
     fn the_hint_keeps_a_pivot_columns_value() {
         let latest = "host=web1 | pivot max(_time) on host by service";
@@ -2315,11 +2040,6 @@ mod absent_equals_explicit_null {
         matrix.assert("the hint refuses a BIGINT pivot column");
     }
 
-    /// Known residual, pinned: over a pivot whose columns carry data, a
-    /// copy of a NULL alias is a column of the next stage that holds the
-    /// pivot's data or the NULL, and its lineage does not record which.
-    /// So a later `let` reads it with no hint, and an overloaded call on
-    /// it fails to bind when the pivot made no such column.
     #[test]
     fn a_copied_alias_over_a_data_pivot_is_unhinted_in_the_next_let() {
         let exec = Executor::new().expect("executor");
@@ -2339,23 +2059,14 @@ mod absent_equals_explicit_null {
     }
 }
 
-// ── AC 3: alias capture ─────────────────────────────────────────────
-
-/// An absent read never binds an alias the same `SELECT` defines. Every
-/// absent read is a NULL literal, so no identifier is left for `DuckDB` to
-/// resolve against an output alias, and every case gives the live answer.
 mod alias_capture {
     use super::*;
 
-    /// `[id, host]` over `ids`: what `rename host as f` writes into `f`.
     fn hosts(ids: &[i64]) -> Rows {
         let cells: Vec<(i64, Cell)> = ids.iter().map(|id| (*id, s(event(*id).host))).collect();
         Rows::new(&["id", "f"], by_id(&cells)).without("host")
     }
 
-    /// The defect ADR-0062 records on main: with no event carrying `f`,
-    /// `DuckDB` bound the search `WHERE`'s `f` to the `host AS f` alias of
-    /// the same `SELECT`, and filtered on `host`.
     #[test]
     fn search_filter_then_rename_onto_its_field() {
         check(
@@ -2367,7 +2078,6 @@ mod alias_capture {
         );
     }
 
-    /// Batch only: the live lane refuses `eventstats`.
     #[test]
     fn search_filter_then_eventstats_onto_its_field() {
         let counted = |ids: &[i64]| {
@@ -2401,8 +2111,6 @@ mod alias_capture {
         );
     }
 
-    /// `ms` is no input column, so `total` reads the alias the same `let`
-    /// wrote before it: 2000, never NULL.
     #[test]
     fn where_then_let_reads_its_own_alias() {
         let rows = |ids: &[i64]| {
@@ -2420,7 +2128,6 @@ mod alias_capture {
         );
     }
 
-    /// `a` is no input column, so `b` reads the alias.
     #[test]
     fn let_reads_an_earlier_alias() {
         let rows = |ids: &[i64]| {
@@ -2438,11 +2145,6 @@ mod alias_capture {
         );
     }
 
-    /// After a pivot the relation is the data's to decide, and a name a
-    /// `let` of the post-pivot scope assigns is never padded with the
-    /// pivot's null fill, so `b` reads the alias: the answer the live lane
-    /// gives the same `let`. The live lane refuses `pivot` itself, so its
-    /// half is the `let` alone over the same events.
     #[test]
     fn pivot_then_let_reads_an_earlier_alias() {
         let dsl = "* | pivot count() on host | let a = 1, b = a";
@@ -2484,8 +2186,6 @@ mod alias_capture {
         );
     }
 
-    /// `x` reads `a` before the same `let` assigns it, and the input lacks
-    /// `a`: NULL, and `b` reads the alias. Both lanes, no pivot.
     #[test]
     fn let_reads_a_later_target_as_null_first() {
         let rows = |ids: &[i64]| {
@@ -2503,14 +2203,6 @@ mod alias_capture {
         );
     }
 
-    /// After a pivot, a read of a name at or before the `let`'s
-    /// assignment of it is an input read, and the pivot makes its columns
-    /// from the data: the read gives the pivot's column when the data
-    /// made one, and NULL when it did not. Ids 1 and 5 carry `host` web1
-    /// and `service` auth, so the pivot makes `web1` = 2, and
-    /// `let web1 = web1 + 1` gives 3, as it did before the resolver. Id 2
-    /// alone makes `web2` only, so there the reads of `web1` and `a` are
-    /// NULL.
     #[test]
     fn pivot_then_let_reads_the_input_before_assigning_it() {
         let rows = |columns: &[&'static str], cells: &[Cell]| {
@@ -2562,12 +2254,6 @@ mod alias_capture {
         );
     }
 
-    /// A `let` that reads a name both at or before its assignment and
-    /// after it is ambiguous after a pivot. The first read takes the
-    /// pivot's column, which has to exist for it to bind, and `DuckDB` then
-    /// binds the second read to that column before the alias. So the query
-    /// lane and the export lane refuse it with a typed error that names
-    /// the field and says how to split the `let`.
     #[test]
     fn pivot_then_let_reading_a_name_on_both_sides_of_its_assignment_is_refused() {
         let exec = Executor::new().expect("executor");
@@ -2613,8 +2299,6 @@ mod alias_capture {
         matrix.assert("an ambiguous let after a pivot");
     }
 
-    /// The refused `let`s split in two, as the refusal says: the second
-    /// `let` reads the first one's output, so `b` reads the new value.
     #[test]
     fn pivot_then_split_lets_read_the_new_value() {
         let row = |service: &str| vec![s(service), Cell::Null, Cell::Int(1), Cell::Int(1)];
@@ -2648,10 +2332,6 @@ mod alias_capture {
         );
     }
 
-    /// A read after the `let` assigned the name, where no earlier read of
-    /// the same `let` took it from the input, binds as `DuckDB` binds: the
-    /// pivot's column when the data made one, the alias otherwise. The
-    /// pivot made no `total`, so `pct` reads the alias.
     #[test]
     fn pivot_then_let_reads_its_own_total() {
         check(
@@ -2670,9 +2350,6 @@ mod alias_capture {
         );
     }
 
-    /// The same read when the pivot did make the name: `host` web1 makes
-    /// a `web1` column, and `DuckDB` binds an input column before a lateral
-    /// alias, so `b` reads the pivot's 2, not the alias's 100.
     #[test]
     fn pivot_then_let_reads_the_pivots_column_over_its_alias() {
         check(
@@ -2691,12 +2368,6 @@ mod alias_capture {
         );
     }
 
-    /// Across stages the pivot's own rule holds: a column a later stage
-    /// reads and no event produced appears as an all-null column. So the
-    /// `where` that reads `ms` makes it an input column of the `let`,
-    /// which `total` reads before the alias, as it would read a pivot
-    /// value column named `ms`. Without the pivot, `total` is 2000
-    /// ([`where_then_let_reads_its_own_alias`]).
     #[test]
     fn pivot_then_where_makes_the_column_a_later_let_reads() {
         check(
@@ -2717,13 +2388,6 @@ mod alias_capture {
         );
     }
 
-    /// After a pivot, a name a stage removed binds only the alias of the
-    /// same `let`, so a copy of an alias that is a direct NULL of an
-    /// absent field is a direct NULL too, and the result writes it
-    /// VARCHAR, as the split `let`s and the pivot-free query do. The
-    /// export keeps the type and every row, one per service after the
-    /// pivot and one per event without it, so a text function over the
-    /// file binds and answers each of them.
     #[test]
     fn pivot_then_a_removed_name_binds_only_the_alias() {
         let exec = Executor::new().expect("executor");
@@ -2800,8 +2464,6 @@ mod alias_capture {
         );
     }
 
-    /// `columns`, in that order and no others, each typed `ty` and NULL in
-    /// each of exactly `rows` rows, or why not.
     fn null_columns(
         result: &QueryResult,
         columns: &[&str],
@@ -2826,7 +2488,6 @@ mod alias_capture {
         Ok(())
     }
 
-    /// Exactly `rows` rows, every cell NULL, or why not.
     fn all_null(result: &QueryResult, rows: usize) -> Result<(), String> {
         if result.rows.len() == rows && result.rows.iter().flatten().all(|v| *v == Value::Null) {
             Ok(())
@@ -2835,27 +2496,18 @@ mod alias_capture {
         }
     }
 
-    /// The lanes where `f` is a DOUBLE NULL: absent under a DOUBLE pin in
-    /// every split, and the explicit DOUBLE NULL wherever a cold file
-    /// carries the column. The hot-only split of the explicit null holds
-    /// JSON `null` alone, which batch reads as an absent unpinned field.
+    /// The explicit DOUBLE NULL skips the hot-only split: it holds JSON
+    /// `null` alone, which batch reads as an absent unpinned field.
     const DOUBLE_NULL_F: [(Variant, &[Split]); 2] = [
         (Variant::PinnedDouble, &Split::ALL),
         (Variant::NullDouble, &[Split::ColdOnly, Split::Mixed]),
     ];
 
-    /// The lanes where `f` is a NULL that ends VARCHAR: absent and
-    /// unpinned in every split, and the explicit null, which a cold file
-    /// carries as an all-NULL VARCHAR column and the hot-only split as
-    /// JSON `null` alone.
     const TEXT_NULL_F: [(Variant, &[Split]); 2] = [
         (Variant::Absent, &Split::ALL),
         (Variant::ExplicitNull, &Split::ALL),
     ];
 
-    /// Every way a `let` copies `f` into `a` and on through the aliases:
-    /// the query, the columns its final `table` keeps, and its rows, one
-    /// per event, or one after the pivot.
     const LATERAL_COPIES: [(&str, &[&str], usize); 4] = [
         ("* | let a = f, b = a | table a, b", &["a", "b"], 6),
         (
@@ -2871,8 +2523,6 @@ mod alias_capture {
         ),
     ];
 
-    /// `pins`, and the alias names `a`, `b` and `c` pinned `alias` when
-    /// there is one.
     fn with_alias_pins(mut pins: FieldTypes, alias: Option<CanonicalType>) -> FieldTypes {
         if let Some(ty) = alias {
             for name in ["a", "b", "c"] {
@@ -2882,21 +2532,6 @@ mod alias_capture {
         pins
     }
 
-    /// A copy of `f` through a lateral alias has the type of the NULL it
-    /// copies, never the pin of the alias's own name or of any other name,
-    /// for every copy shape, with the source pinned or not, crossed with
-    /// the alias names pinned or not. The alias names are pinned to the
-    /// other type, so a copy that took that pin shows.
-    ///
-    /// With `f` a DOUBLE NULL every copy is DOUBLE, in the result and in
-    /// the export, also with the alias names pinned VARCHAR, and a later
-    /// stage over the export sums `b`. With `f` a NULL with no type, or
-    /// the explicit VARCHAR NULL control, every copy is VARCHAR, also with
-    /// the alias names pinned DOUBLE, and `lower(b)` binds and answers
-    /// NULL in the batch lane, over the export with no pins, and in the
-    /// live lane. The split `let`s are the control the single `let`
-    /// matches, and the pivot form reads the alias of a name a stage
-    /// removed.
     #[test]
     fn a_lateral_alias_keeps_its_nulls_type() {
         let exec = Executor::new().expect("executor");
@@ -3001,8 +2636,6 @@ mod alias_capture {
         matrix.assert("a lateral alias keeps its null's type");
     }
 
-    /// `[a, b]` typed `a` and `b`, with every row `cells`, `rows` times,
-    /// or why not.
     fn typed_rows(
         result: &QueryResult,
         a: &ColumnType,
@@ -3030,15 +2663,6 @@ mod alias_capture {
         }
     }
 
-    /// An expression over a lateral alias reads the type of the NULL the
-    /// alias copies, and never the pin of the alias's name. Over a DOUBLE
-    /// NULL `coalesce` with an integer answers the DOUBLE 0.0, and
-    /// `date_part` is refused as it is over the explicit DOUBLE NULL,
-    /// rather than handed a TIMESTAMP cast an untyped NULL would take,
-    /// also with the alias names pinned VARCHAR. Over an absent unpinned
-    /// `f` the copy has no type, also with the alias names pinned DOUBLE:
-    /// `coalesce` answers the integer 0 and `date_part` binds and answers
-    /// NULL, in the batch lane and in the live lane.
     #[test]
     fn an_expression_over_a_lateral_alias_reads_its_type() {
         let exec = Executor::new().expect("executor");
@@ -3121,16 +2745,9 @@ mod alias_capture {
     }
 }
 
-// ── AC 4: reads after a projection ──────────────────────────────────
-
-/// A stage that removes `f` leaves the next stage an input without it,
-/// whatever the source carried, so a later read is a NULL read. The
-/// variants where `f` holds values ([`COLD_F`], [`HOT_F`]) prove it: the
-/// field is there before the projection and NULL after it.
 mod post_projection_reads_are_null {
     use super::*;
 
-    /// Every variant, `f` present or not before the projection.
     const BEFORE: &[Variant] = &[
         Variant::Absent,
         Variant::ExplicitNull,
@@ -3162,7 +2779,6 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// `f` is present before the `drop` in [`COLD_F`] and [`HOT_F`].
     #[test]
     fn after_drop() {
         let ids = |ids: &[i64]| {
@@ -3175,7 +2791,6 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// The `stats` output carries `host` and `n` and nothing else.
     #[test]
     fn after_stats() {
         let counts = |rows: &[(&str, i64)]| {
@@ -3194,7 +2809,6 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// The rename's source is gone; its values live on under `g`.
     #[test]
     fn after_rename_source() {
         let renamed = |cells: &[(i64, Cell)]| Rows::new(&["id", "g"], by_id(cells)).without("f");
@@ -3207,11 +2821,6 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// A query that reads only the envelope timestamps skips the probe,
-    /// so nobody describes its root. A stage that removes a timestamp
-    /// removes it there too: the read after it is NULL, as on the probed
-    /// path, never `unknown field`. The source's own missing timestamp is
-    /// the loud case; a stage removing one is not.
     #[test]
     fn envelope_reads_after_a_projection_skip_the_probe() {
         use trawl_engine::executor::schema_probe;
@@ -3234,7 +2843,6 @@ mod post_projection_reads_are_null {
             .exactly(&["_time"]);
         check(&Case::new("* | stats count() | table _time").rows(ABSENT, stats_time));
 
-        // Those reads really skipped the probe.
         let exec = Executor::new().expect("executor");
         let corpus = Corpus::build(Variant::Absent, Split::ColdOnly);
         for dsl in unprobed
@@ -3253,10 +2861,6 @@ mod post_projection_reads_are_null {
         }
     }
 
-    /// Direct-null lineage: a column that is a direct NULL of an absent
-    /// field is read downstream as the NULL literal, never by its name,
-    /// so a text comparison does not meet an INTEGER column, and `sum`
-    /// does not meet a VARCHAR one.
     #[test]
     fn a_projected_null_compares_as_text() {
         let f = |cells: Vec<Vec<Cell>>| Rows::new(&["f"], cells).exactly(&["f"]);
@@ -3269,8 +2873,8 @@ mod post_projection_reads_are_null {
         );
     }
 
-    /// Only where `f` is absent or numeric: `sum` over a present VARCHAR
-    /// column is refused on main too.
+    /// Only where `f` is absent or numeric: `sum` refuses a present VARCHAR
+    /// column.
     #[test]
     fn a_projected_null_sums_to_null() {
         let numeric = &[Variant::Absent, Variant::PinnedDouble, Variant::NullDouble];
@@ -3283,15 +2887,9 @@ mod post_projection_reads_are_null {
     }
 }
 
-// ── AC 6: output shape ──────────────────────────────────────────────
-
-/// A reference never changes the output's columns by itself, and
-/// `table` lists every requested name in the requested order.
 mod output_shape {
     use super::*;
 
-    /// A filter-only read adds no column: `*` returns the input's columns,
-    /// in whatever order the lane reads them, and no `f`.
     #[test]
     fn a_filter_read_adds_no_column() {
         let input = |ids: &[i64]| {
@@ -3305,10 +2903,6 @@ mod output_shape {
         );
     }
 
-    /// A name `table` or `fields` lists twice is one column, at its first
-    /// position, as the live lane keeps it. `DuckDB` would name a repeat
-    /// `host_1` in a CTE, a column no lane's row carries, so a later read
-    /// of `host_1` is an absent read in both lanes.
     #[test]
     fn a_repeated_name_projects_once() {
         let hosts = |ids: &[i64]| {
@@ -3338,8 +2932,6 @@ mod output_shape {
         check(&Case::new(r#"* | table id, host, host | where host_1 == "web1""#).ids(ABSENT, &[]));
     }
 
-    /// The pivot's narrowing projection names each input column once: a
-    /// repeat would be a `host_1` column the `PIVOT` takes as a row key.
     #[test]
     fn a_pivot_reads_a_repeated_input_once() {
         check(
@@ -3356,7 +2948,6 @@ mod output_shape {
         );
     }
 
-    /// `service` then an all-null `f`, VARCHAR unless a pin types it.
     #[test]
     fn table_lists_absent_names_in_order() {
         let rows = |cells: &[(i64, Cell)], ty: ColumnType| {
@@ -3378,22 +2969,9 @@ mod output_shape {
     }
 }
 
-// ── AC 7: every batch lane ──────────────────────────────────────────
-
-/// Every batch lane resolves absent reads, not only the query lane the
-/// other groups drive: the hot-less query, the union with hot, the
-/// cold-start hot-only route, embedded `--data` over a parquet glob and
-/// over ndjson, the export read back, the timechart input probes, the SQL
-/// prefix before `extract kv`, and the `from saved` sources as far as the
-/// engine API reaches. The server's own `from saved` resolution is
-/// `trawl-server`'s `from_saved` tests.
 mod every_lane {
     use super::*;
 
-    /// What every lane must answer over the base corpus, where no event
-    /// carries `f`: an `OR` branch survives, a projected absent field is a
-    /// VARCHAR null, a filter-only read counts every row, and a group key
-    /// is the null identity.
     fn battery() -> Vec<(&'static str, Answer)> {
         vec![
             ("host=web1 OR f=x", Answer::Ids(vec![1, 3, 5])),
@@ -3420,7 +2998,6 @@ mod every_lane {
         ]
     }
 
-    /// Run the battery through one lane.
     fn through(
         lane: &str,
         matrix: &mut Matrix,
@@ -3431,8 +3008,6 @@ mod every_lane {
         }
     }
 
-    /// The query lane per split: no hot snapshot, the union, and the cold
-    /// start, where the cold source reaches no file.
     fn query(split: Split) {
         let exec = Executor::new().expect("executor");
         let corpus = Corpus::build(Variant::Absent, split);
@@ -3459,8 +3034,6 @@ mod every_lane {
         query(Split::HotOnly);
     }
 
-    /// Embedded `--data` hands the executor its argument as the source,
-    /// with no catalog pins: a parquet glob, not the server's list.
     #[test]
     fn embedded_data_over_a_parquet_glob() {
         let exec = Executor::new().expect("executor");
@@ -3472,7 +3045,6 @@ mod every_lane {
         matrix.assert("embedded --data over a parquet glob");
     }
 
-    /// Embedded `--data` over an ndjson file: the `read_json` reader.
     #[test]
     fn embedded_data_over_ndjson() {
         let exec = Executor::new().expect("executor");
@@ -3492,7 +3064,6 @@ mod every_lane {
         matrix.assert("embedded --data over ndjson");
     }
 
-    /// The export lane per split, its parquet file read back.
     #[test]
     fn export_read_back() {
         let exec = Executor::new().expect("executor");
@@ -3511,10 +3082,6 @@ mod every_lane {
         matrix.assert("the export lane");
     }
 
-    /// A `timechart on <column>` probes its input relation before the
-    /// statement binds. The probe carries the stages before it, so an
-    /// absent read there must resolve too. `_ingested` is a bucket column
-    /// the live lane refuses, so these are batch only.
     #[test]
     fn timechart_input_probes() {
         check(
@@ -3532,9 +3099,6 @@ mod every_lane {
         );
     }
 
-    /// Bucketing an absent field keeps the refusal unless a TIMESTAMP pin
-    /// types it, and then every event lands in the null bucket, as the
-    /// DSL reference states.
     #[test]
     fn timechart_on_an_absent_field() {
         let exec = Executor::new().expect("executor");
@@ -3567,8 +3131,6 @@ mod every_lane {
         matrix.assert(dsl);
     }
 
-    /// The SQL half before `extract kv` reads `f` as NULL, and the Rust
-    /// tail after it reads `f` as absent from its rows.
     #[test]
     fn sql_prefix_before_extract_kv() {
         let users = [
@@ -3589,10 +3151,8 @@ mod every_lane {
         );
     }
 
-    /// Two saved runs of `stats count() as n by host` over the base
-    /// corpus, written by the saved-result writer, and `run=all`'s reader
-    /// over them in the shape `from_saved::resolve_all` builds: neither
-    /// run carries `f`.
+    /// Two saved runs of `stats count() as n by host`, and `run=all`'s reader
+    /// over them in the shape `from_saved::resolve_all` builds.
     fn saved_runs(exec: &Executor, corpus: &Corpus) -> (String, String) {
         let result = corpus
             .run(exec, "* | stats count() as n by host", &FieldTypes::new())
@@ -3615,8 +3175,6 @@ mod every_lane {
         (format!("({})", parts.join(" UNION ALL BY NAME ")), latest)
     }
 
-    /// `from saved` hands the executor the run's reader as the source and
-    /// the rest of the pipeline after a `*`, with no catalog pins.
     #[test]
     fn from_saved_runs() {
         let exec = Executor::new().expect("executor");
@@ -3715,45 +3273,24 @@ mod every_lane {
     }
 }
 
-// ── AC 11: result types ─────────────────────────────────────────────
-
-/// One output column's type, as the query answers it, as the saved-result
-/// writer stores it, and as the export writes it.
-///
-/// The query lane hands back the column's wire type. The saved-result
-/// writer and the export each write a parquet file: each file states its
-/// column's `DuckDB` type, and read back it must answer the query's wire
-/// type. A direct NULL of an unpinned absent field is VARCHAR in all
-/// three, and a pinned one is the pin's type in all three.
-///
-/// Two physical exceptions hold for every column of their kind, present
-/// fields included, and each case that meets one names it
-/// ([`INTEGER_WIDTH`], [`HUGEINT_IN_PARQUET`]). The `sum(id)` control
-/// shows the second is the writer's, not absence's.
 mod result_types_agree_across_query_saved_and_export {
     use super::*;
 
-    /// What one column must type as.
     struct Typed {
         dsl: &'static str,
         variant: Variant,
         column: &'static str,
-        /// The query's wire type.
         wire: ColumnType,
         saved: Stored,
         export: Stored,
     }
 
-    /// One file's column: its `DuckDB` type, the wire type it reads back
-    /// as, and the exception that lets either differ from the query.
     struct Stored {
         ty: &'static str,
         wire: ColumnType,
         why: Option<&'static str>,
     }
 
-    /// A file that stores the column as `ty` and reads back as the query's
-    /// wire type `wire`.
     fn agrees(ty: &'static str, wire: ColumnType) -> Stored {
         Stored {
             ty,
@@ -3762,17 +3299,10 @@ mod result_types_agree_across_query_saved_and_export {
         }
     }
 
-    /// The saved-result writer stores each wire type in one exact width:
-    /// `integer` as BIGINT (UBIGINT when a cell needs it), whatever width
-    /// the statement had. The wire type is the query's.
     const INTEGER_WIDTH: &str = "the saved-result writer stores an `integer` column as BIGINT";
 
-    /// Parquet has no 128-bit integer, so `DuckDB`'s parquet writer stores
-    /// a HUGEINT column, which every integer `sum` is, as DOUBLE, and the
-    /// export reads back `float` where the query answered `integer`.
     const HUGEINT_IN_PARQUET: &str = "parquet stores a HUGEINT column as DOUBLE";
 
-    /// Every column's `DuckDB` type in a parquet file.
     fn file_types(path: &Path) -> Vec<(String, String)> {
         let conn = duckdb::Connection::open_in_memory().expect("reader database");
         let mut stmt = conn
@@ -3804,7 +3334,6 @@ mod result_types_agree_across_query_saved_and_export {
         }
     }
 
-    /// One file against its [`Stored`] answer.
     fn judge_file(
         exec: &Executor,
         what: &str,
@@ -3829,7 +3358,6 @@ mod result_types_agree_across_query_saved_and_export {
         )
     }
 
-    /// The three answers for one split.
     fn judge(exec: &Executor, case: &Typed, split: Split) -> Result<(), String> {
         let corpus = Corpus::build(case.variant, split);
         let pins = case.variant.pins();
@@ -3875,8 +3403,6 @@ mod result_types_agree_across_query_saved_and_export {
             },
         };
         vec![
-            // A direct NULL of an unpinned absent field is VARCHAR in all
-            // three.
             Typed {
                 dsl: "* | table f",
                 variant: Variant::Absent,
@@ -3893,7 +3419,6 @@ mod result_types_agree_across_query_saved_and_export {
                 saved: text(),
                 export: text(),
             },
-            // A pinned absent field keeps the pin's type.
             Typed {
                 dsl: "* | table f",
                 variant: Variant::PinnedDouble,
@@ -3931,8 +3456,6 @@ mod result_types_agree_across_query_saved_and_export {
                 dsl: "* | stats sum(id) as total",
                 ..integer_sum()
             },
-            // Under a DOUBLE pin, `sum` is DOUBLE and meets neither
-            // exception.
             Typed {
                 dsl: "* | stats sum(f) as total",
                 variant: Variant::PinnedDouble,
@@ -3949,9 +3472,6 @@ mod result_types_agree_across_query_saved_and_export {
         let exec = Executor::new().expect("executor");
         let mut matrix = Matrix::default();
         for case in cases() {
-            // Agreement is the rule, so a departure is stated with its
-            // reason: a file that reads back another wire type than the
-            // query's, and two files that store different types.
             for (what, file) in [("saved", &case.saved), ("export", &case.export)] {
                 assert!(
                     file.wire == case.wire || file.why.is_some(),
@@ -3976,20 +3496,9 @@ mod result_types_agree_across_query_saved_and_export {
     }
 }
 
-// ── AC 14: one null identity, live and batch ────────────────────────
-
-/// Absent and explicit null are one identity in every lane, apart from
-/// the empty string and the text `null`, and an aggregate over no
-/// eligible value is NULL. Every case runs live and over every batch
-/// split, with exact typed cells, so the lanes agree by stating the same
-/// answer.
-///
-/// [`Variant::NullIdentity`] carries `""` on id 1, `"null"` on id 2, an
-/// explicit null on id 5, and nothing on ids 3, 4 and 6.
 mod live_null_identity_matches_batch {
     use super::*;
 
-    /// `table` writes the null cell for a requested name the event lacks.
     #[test]
     fn table_writes_the_null_cell() {
         let rows = |cells: &[(i64, Cell)]| {
@@ -4016,7 +3525,6 @@ mod live_null_identity_matches_batch {
         );
     }
 
-    /// A second key splits the null identity by host and no further.
     #[test]
     fn stats_by_two_keys() {
         let rows = [
@@ -4049,7 +3557,6 @@ mod live_null_identity_matches_batch {
         }
     }
 
-    /// One day bucket holds every event.
     #[test]
     fn timechart_by() {
         check(
@@ -4058,8 +3565,6 @@ mod live_null_identity_matches_batch {
         );
     }
 
-    /// `dedup f` keeps one row per identity: three. `table f` writes the
-    /// kept row's cell, the null identity's as NULL.
     #[test]
     fn dedup() {
         check(&Case::new("* | dedup f | table f").rows(
@@ -4068,8 +3573,6 @@ mod live_null_identity_matches_batch {
         ));
     }
 
-    /// `sum`, `avg`, `min` and `max` over no eligible value are NULL, and
-    /// `count` is 0, over the whole input and per group.
     #[test]
     fn aggregates_over_no_value_are_null() {
         let empty = [Cell::Null, Cell::Null, Cell::Null, Cell::Null, Cell::Int(0)];

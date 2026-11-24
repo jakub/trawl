@@ -7,19 +7,6 @@
 //! thread from a static initializer before `main` runs — bare `fork` of an
 //! already-multithreaded process risks deadlock on an inherited locked mutex;
 //! re-exec resets to a clean single-threaded image).
-//!
-//! Lifecycle:
-//! - parent: spawn the monitor, connect a [`Client`], probe what a crash would
-//!   actually be allowed to do, drop `CAP_SYS_PTRACE`, install a
-//!   [`CrashHandler`].
-//! - on a fatal signal: emit a signal-safe stderr breadcrumb, call
-//!   `request_dump` (which blocks until the monitor has written the dump and
-//!   acked), then return `Handled(true)` so the instruction re-faults and the
-//!   process dies with the original signal (exit 139 for `SIGSEGV`).
-//! - the monitor exits when the client disconnects (parent died or shut down),
-//!   and before that client exists it is held to the same fate by
-//!   `PR_SET_PDEATHSIG`, so a trawld that dies during startup never leaves a
-//!   privileged listener behind.
 
 use std::collections::BTreeMap;
 use std::fs::{DirBuilder, File, OpenOptions};
@@ -38,22 +25,15 @@ use minidumper::{
 use crate::readiness::{FailureReason, ProbeInputs, Readiness, classify, credentials_match};
 use crate::{caps, mdmp, probe};
 
-/// Set on the re-exec'd monitor process to select monitor mode.
 const MONITOR_ENV: &str = "TRAWL_CRASHDUMP_MONITOR";
-/// Carries the abstract-socket name from parent to monitor.
 const SOCKET_ENV: &str = "TRAWL_CRASHDUMP_SOCKET";
 /// Carries the spawning parent's pid, so the monitor can tell whether that
 /// parent is still its parent by the time it looks.
 const PARENT_ENV: &str = "TRAWL_CRASHDUMP_PARENT";
-/// Directory for `*.dmp` output (set by the chart / operator).
 const DIR_ENV: &str = "TRAWL_CRASH_DUMP_DIR";
-/// Keep at most this many dumps.
 const RETAIN_ENV: &str = "TRAWL_CRASH_DUMP_RETAIN";
 const DEFAULT_RETAIN: usize = 10;
 
-/// Keeps the installed [`CrashHandler`] alive. Dropping it detaches the handler
-/// and drops the embedded [`Client`], which disconnects and lets the monitor
-/// exit.
 pub struct Guard {
     _handler: CrashHandler,
     /// Declared after the handler so drop order stays handler first (dropping
@@ -73,16 +53,11 @@ impl std::fmt::Debug for Guard {
     }
 }
 
-/// What [`init`] did. The crate prints nothing about it: `trawld` logs the
-/// outcome once, through `tracing`, after its subscriber is up.
 // See the note on `crate::InitReport`: one value, once, for the process.
 #[allow(clippy::large_enum_variant)]
 pub enum Init {
-    /// No dump directory configured.
     Disabled,
-    /// Handler installed, with the verdict on whether a dump would be usable.
     Armed(Guard, Readiness),
-    /// Capture did not arm.
     Failed(FailureReason),
 }
 
@@ -98,7 +73,6 @@ pub fn init() -> Init {
         };
     };
 
-    // Monitor mode: this process was re-exec'd to write dumps. Never returns.
     if std::env::var_os(MONITOR_ENV).is_some() {
         run_monitor(&dir);
     }
@@ -106,7 +80,6 @@ pub fn init() -> Init {
     install(&dir)
 }
 
-/// Parent side: spawn the monitor, probe, seal, install the handler.
 fn install(dir: &Path) -> Init {
     if create_dump_dir(dir).is_err() {
         return sealed_failure(FailureReason::DumpDir);
@@ -116,7 +89,6 @@ fn install(dir: &Path) -> Init {
     // inside the signal handler, where directory enumeration is not async-safe).
     prune_dumps(dir, retain);
 
-    // Unique abstract socket name shared with the monitor via the environment.
     let socket = format!("trawld-crashdump-{}", std::process::id());
 
     let Ok(exe) = std::env::current_exe() else {
@@ -137,7 +109,6 @@ fn install(dir: &Path) -> Init {
     let monitor_pid = monitor.id();
 
     let Some(Connected { client, fd }) = connect(&socket) else {
-        // Don't leave an orphaned monitor behind.
         reap(&mut monitor);
         return sealed_failure(FailureReason::MonitorUnreachable);
     };
@@ -167,9 +138,6 @@ fn install(dir: &Path) -> Init {
         return sealed_failure(FailureReason::MonitorUnreachable);
     }
 
-    // crash-handler issues its own PR_SET_PTRACER from inside the signal
-    // handler, where the return value is unobservable. This one is checked, and
-    // its result is what the yama scope-1 branch of the verdict turns on.
     let ptracer = caps::set_ptracer(monitor_pid).map_err(|err| err.raw_os_error().unwrap_or(-1));
     let monitor_status = probe::monitor_status(monitor_pid);
     let self_status = probe::self_status();
@@ -182,25 +150,18 @@ fn install(dir: &Path) -> Init {
             .zip(self_status)
             .map(|(monitor, parent)| credentials_match(&monitor, &parent)),
     };
-    // Advisory only. Nothing below reads it, so a probe that got the answer
-    // wrong costs an operator a misleading log line and never a disarmed
-    // handler (ADR-0023 ruling 5).
     let class = classify(inputs);
 
     if caps::seal().is_err() {
         reap(&mut monitor);
         return Init::Failed(FailureReason::Seal);
     }
-    // Read back what the seal actually achieved rather than asserting it.
     let after_seal = probe::self_status();
 
     let Ok(handler) = CrashHandler::attach(Box::new(Handler { client })) else {
         reap(&mut monitor);
         return Init::Failed(FailureReason::AttachHandler);
     };
-    // Narrow the ptrace grant to the monitor (satisfies Yama ptrace_scope=1;
-    // CAP_SYS_PTRACE covers scope 2). Issued lazily by crash-handler at crash
-    // time, which is why the checked call above exists as well.
     handler.set_ptracer(Some(monitor_pid));
 
     Init::Armed(
@@ -249,7 +210,6 @@ fn client_peer_is_monitor(fd: Option<RawFd>, monitor_pid: u32) -> bool {
             u32::try_from(cred.pid).is_ok_and(|pid| pid == monitor_pid)
                 && cred.uid == caps::effective_uid()
         }
-        // Unreadable credentials are not evidence of identity.
         Err(_) => false,
     }
 }
@@ -266,7 +226,6 @@ fn sealed_failure(reason: FailureReason) -> Init {
     }
 }
 
-/// Stop and reap a monitor we are not going to use.
 fn reap(monitor: &mut std::process::Child) {
     let _ = monitor.kill();
     let _ = monitor.wait();
@@ -275,8 +234,6 @@ fn reap(monitor: &mut std::process::Child) {
 /// A connected dump client and the descriptor its connection lives on.
 struct Connected {
     client: Client,
-    /// `None` when the descriptor accounting did not name exactly one new
-    /// socket, which [`client_peer_is_monitor`] treats as a refusal.
     fd: Option<RawFd>,
 }
 
@@ -353,10 +310,6 @@ fn open_fds() -> std::io::Result<BTreeMap<RawFd, PathBuf>> {
 }
 
 /// The one socket descriptor that is in `after` and not in `before`.
-///
-/// `None` for none, for more than one, and for a single new descriptor that is
-/// not a socket. Each of those means the accounting failed to identify the
-/// client's connection, and an unidentified connection is refused.
 fn sole_new_socket(
     before: &BTreeMap<RawFd, PathBuf>,
     after: &BTreeMap<RawFd, PathBuf>,
@@ -370,7 +323,6 @@ fn sole_new_socket(
     target.to_str()?.starts_with("socket:[").then_some(*fd)
 }
 
-/// The fatal-signal handler.
 struct Handler {
     client: Client,
 }
@@ -410,14 +362,10 @@ fn breadcrumb() {
 }
 
 /// Is `spawner`, the pid trawld stamped into the environment, still our parent?
-///
-/// Fails closed: a value that is absent, empty or not a pid is not a match, so
-/// a monitor that cannot prove the tie exits instead of assuming it.
 fn spawner_is_still_our_parent(spawner: &str, current: u32) -> bool {
     spawner.parse::<u32>() == Ok(current)
 }
 
-/// Monitor side: run the minidumper server, then exit the process.
 fn run_monitor(dir: &Path) -> ! {
     let code = match monitor_main(dir) {
         Ok(()) => 0,
@@ -466,11 +414,6 @@ fn monitor_main(dir: &Path) -> Result<(), String> {
 
     create_dump_dir(dir).map_err(|e| format!("create dump dir: {e}"))?;
 
-    // ADR-0023 ruling 3: raise before binding, so a parent that sees the socket
-    // come up is looking at the monitor's final capability state. A failed
-    // raise is deliberately NOT fatal: binding anyway is what lets the parent
-    // observe and classify the real state instead of guessing from a monitor
-    // that vanished.
     match caps::raise_ptrace_effective() {
         Ok(()) => eprintln!("trawl-crashdump monitor: cap_sys_ptrace raise ok"),
         Err(err) => eprintln!("trawl-crashdump monitor: cap_sys_ptrace raise failed: {err}"),
@@ -538,7 +481,6 @@ impl ServerHandler for MonitorHandler {
             }
             Err(e) => eprintln!("trawl-crashdump: minidump write failed: {e}"),
         }
-        // Keep serving; the client disconnecting is what ends the loop.
         LoopAction::Continue
     }
 
@@ -584,7 +526,7 @@ fn prune_dumps(dir: &Path, retain: usize) {
     if dumps.len() <= retain {
         return;
     }
-    dumps.sort_by_key(|(mtime, _)| *mtime); // oldest first
+    dumps.sort_by_key(|(mtime, _)| *mtime);
     let remove = dumps.len() - retain;
     for (_, path) in dumps.into_iter().take(remove) {
         let _ = std::fs::remove_file(path);
@@ -610,9 +552,6 @@ mod tests {
         format!("trawld-crashdump-imp-{tag}-{}-{nanos}", std::process::id())
     }
 
-    /// The whole point of the accounting: the descriptor it names is the one the
-    /// client connected on, and its peer is whoever bound the name. Here that
-    /// is this process, standing in for the monitor.
     #[test]
     fn connect_names_the_descriptor_the_client_opened() {
         let name = unique_name("accounting");
@@ -639,10 +578,6 @@ mod tests {
         drop(client);
     }
 
-    /// The wiring between the two halves of the lifetime tie: `install` stamps
-    /// its own pid as decimal text, and the monitor compares it against the pid
-    /// the kernel reports. Anything else, including the shapes a stripped or
-    /// hand-edited environment produces, is a mismatch.
     #[test]
     fn the_spawning_parent_pid_round_trips_through_the_environment() {
         let stamped = std::process::id().to_string();

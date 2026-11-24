@@ -5,11 +5,6 @@
 //! `<ConfirmWithReasonModal/>` — confirmation dialog with a required
 //! reason textarea (audit-trail actions: invalidate, retract,
 //! quarantine-resolve).
-//!
-//! `confirm_variant: Variant` follows the
-//! [`ConfirmModal`](super::ConfirmModal) convention. Confirm stays
-//! disabled until the reason is non-blank; `on_confirm` receives the
-//! entered reason.
 
 use leptos::prelude::*;
 

@@ -155,15 +155,12 @@ test('history hides stale rows and completes a newer page before the older reque
   await page.goto('/search/history');
   const footer = page.locator('.results-footer');
   await expect(footer.locator('.results-summary')).toHaveText('1–50 of 103');
-  // Keep an actual element identity across navigation, not just a URL check.
   const mountedInput = await page.getByPlaceholder('Filter history…').elementHandle();
   await footer.getByRole('button', { name: 'Next' }).click();
   await expect.poll(async () => (await paginationState(request)).held).toBe(true);
   await expect(footer).toHaveCount(0);
   await expect(page.locator('.tbl-body .row-stretch')).toHaveCount(0);
 
-  // Page controls are unavailable, but browser navigation can change the page.
-  // The newer page starts and completes while the older response remains held.
   await navigateHistory(page, '2');
   await expect(page).toHaveURL(/hpage=2$/);
   expect(await mountedInput!.evaluate(el => el.isConnected)).toBe(true);
@@ -312,8 +309,6 @@ test('global Runs orders across page boundaries for every key and direction', as
     expect(await idOf(rows.last())).toBe(last);
   }
   const calls = (await paginationState(request)).runs as Array<{ sort: string; dir: string; offset: number }>;
-  // Each new ordering starts at zero, including returning to initial When
-  // after visiting other keys. No intermediate old-page/new-sort request.
   expect(calls.map(({ sort, dir, offset }) => [sort, dir, offset])).toEqual([
     ['started', 'desc', 0],
     ...cases.flatMap(([, key, dir]) => [[key, dir, 0], [key, dir, 20], [key, dir, 40]]),

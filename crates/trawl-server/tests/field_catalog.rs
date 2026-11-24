@@ -2,13 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! End-to-end tests for the field catalog (ADR-0009): write-time type
-//! conformance closes two silent data-loss paths, the cold/cold
-//! whole-history drop and the nested-key whole-batch column drop.
-//!
-//! Shaped like `timestamp_repair.rs`: ingest through the real handler,
-//! compact through the real compaction path (with the catalog context the
-//! daemon wires), query through the real API.
+//! End-to-end tests for the field catalog (ADR-0009).
 
 mod common;
 
@@ -17,7 +11,6 @@ use std::time::Duration;
 use common::{TestServer, setup_in_dir_with_data};
 use serde_json::json;
 
-/// A current RFC 3339 timestamp so `last=1h` queries cover the events.
 fn now_ts() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true)
 }
@@ -26,8 +19,6 @@ use trawl_client::HttpClient;
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
 
-/// The catalog context exactly as trawld's main wires it: the server's
-/// catalog store plus the server's shared in-process pin cache.
 fn catalog_ctx(server: &TestServer) -> CatalogContext {
     CatalogContext {
         store: server.state.storage.catalog.clone(),
@@ -35,7 +26,6 @@ fn catalog_ctx(server: &TestServer) -> CatalogContext {
     }
 }
 
-/// Run one compaction tick over the server's WAL with the catalog wired.
 async fn compact_tick(server: &TestServer, wal_dir: &std::path::Path, data_dir: &std::path::Path) {
     let hot_buffer = server
         .state
@@ -85,7 +75,6 @@ async fn harness() -> Harness {
     let data_path = data_dir.to_str().unwrap().to_owned();
 
     let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
-    // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -99,14 +88,10 @@ async fn harness() -> Harness {
     }
 }
 
-/// Acceptance: a cold/cold type conflict returns ALL history, not
-/// hot-only; the conflict is recorded and attributed; the counter is on
-/// /metrics.
 #[tokio::test(flavor = "multi_thread")]
 async fn cold_cold_conflict_returns_full_history_with_attribution() {
     let h = harness().await;
 
-    // Service A: duration is an integer. Compacted first, so it pins BIGINT.
     let a_events: Vec<serde_json::Value> = (0..3)
         .map(|i| {
             json!({
@@ -120,7 +105,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
     assert_eq!(resp.accepted, 3);
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // Service B: duration is a string — the batch that disagrees.
     let b_events: Vec<serde_json::Value> = (0..2)
         .map(|i| {
             json!({
@@ -134,10 +118,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
     assert_eq!(resp.accepted, 2);
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // Both services' history is on disk; the hot buffer is drained. A
-    // cross-service query over the conflicted field must return service
-    // A's parquet rows, never degrade to hot-only: that would be zero rows
-    // under an HTTP 200.
     let result = h
         .query
         .query_paginated("last=1h | where duration > 1000", None, None)
@@ -149,7 +129,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
         "service A's full parquet history must be returned"
     );
 
-    // And the full corpus is visible: all 5 rows across both services.
     let all = h
         .query
         .query_paginated("last=1h", None, None)
@@ -157,8 +136,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
         .expect("query all");
     assert_eq!(all.result.row_count(), 5, "no history is dropped");
 
-    // The conflict is recorded and attributed: field duration, service B,
-    // expected BIGINT, observed VARCHAR, non-zero rows_nulled.
     let conflicts = h
         .server
         .state
@@ -175,7 +152,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
     assert_eq!(row.observed_type, "VARCHAR");
     assert!(row.rows_nulled > 0, "the nulled rows are counted");
 
-    // The nulled originals stay recoverable from _raw.
     let b_rows = h
         .query
         .query_paginated("service=svc-b last=1h", None, None)
@@ -189,7 +165,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
         "the nulled value must be findable in _raw: {raws:?}"
     );
 
-    // The conflict increments a metric on /metrics.
     let metrics_client = common::harness_client_builder().build().unwrap();
     let body = metrics_client
         .get(format!("{}/metrics", h.server.url))
@@ -209,9 +184,6 @@ async fn cold_cold_conflict_returns_full_history_with_attribution() {
     );
 }
 
-/// Acceptance: a nested-object field no longer drops its batch-mates'
-/// columns, and the nested value stays reachable via
-/// `json_extract_string`.
 #[tokio::test(flavor = "multi_thread")]
 async fn nested_object_keeps_batchmates_and_stays_reachable() {
     let h = harness().await;
@@ -233,8 +205,6 @@ async fn nested_object_keeps_batchmates_and_stays_reachable() {
     assert_eq!(resp.accepted, 2);
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // Every custom column landed in parquet: a nested value costs its own
-    // column at most, never its batch-mates'.
     let result = h
         .query
         .query_paginated("service=svc-k8s last=1h", None, None)
@@ -249,7 +219,6 @@ async fn nested_object_keeps_batchmates_and_stays_reachable() {
         );
     }
 
-    // The nested value is reachable as JSON text.
     let reach = h
         .query
         .query_paginated(
@@ -268,8 +237,6 @@ async fn nested_object_keeps_batchmates_and_stays_reachable() {
     );
 }
 
-/// Acceptance: an all-null first batch defers the pin; a later typed batch
-/// pins it, and a query across both reads cleanly.
 #[tokio::test(flavor = "multi_thread")]
 async fn all_null_first_batch_defers_then_pins() {
     let h = harness().await;
@@ -314,8 +281,6 @@ async fn all_null_first_batch_defers_then_pins() {
     assert!(values.contains(&Value::Null), "deferred rows read as NULL");
 }
 
-/// Acceptance: a pin write failure means no parquet is written and the WAL
-/// is retained for retry — never an unconformant file.
 #[tokio::test(flavor = "multi_thread")]
 async fn pin_write_failure_retains_wal_and_writes_nothing() {
     let h = harness().await;
@@ -327,8 +292,6 @@ async fn pin_write_failure_retains_wal_and_writes_nothing() {
     });
     h.ingest.ingest(&[event]).await.expect("ingest");
 
-    // A catalog whose store points at an unreachable postgres: pins cannot
-    // become durable, so the batch must not be written.
     // Deliberately unreachable: this pool exists to simulate a dead
     // catalog store, not to reach a fixture database (ADR-0021 ruling 3).
     #[allow(clippy::disallowed_methods)]
@@ -341,7 +304,6 @@ async fn pin_write_failure_retains_wal_and_writes_nothing() {
         cache: std::sync::Arc::new(trawl_server::catalog::FieldCatalog::new()),
     };
     let hot_buffer = h.server.state.query.hot_buffer.as_ref().unwrap();
-    // The tick itself completes (per-chunk failures are logged + retried).
     trawl_server::ingest::compaction::compact_once(
         &h.wal_dir,
         &h.data_dir,
@@ -374,23 +336,14 @@ async fn pin_write_failure_retains_wal_and_writes_nothing() {
         "the hot buffer keeps serving the batch meanwhile"
     );
 
-    // The real catalog drains it on the next tick.
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
     assert!(!walkdir_parquet(&h.data_dir).is_empty());
 }
 
-/// Acceptance: a HOT-side conflict — an uncompacted event disagreeing with
-/// an existing pin — is nulled on the hot branch of the union while the
-/// full cold history stays visible. The end-to-end proof of the
-/// `HotSnapshot` pin plumbing: the outcome is never hot-only (the cold rows
-/// ARE present) and never a loud error (the pin conformance resolves the
-/// conflict in one execution).
 #[tokio::test(flavor = "multi_thread")]
 async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
     let h = harness().await;
 
-    // Seed the pin: three integer durations, compacted → duration pins
-    // BIGINT and the parquet history exists.
     let cold_events: Vec<serde_json::Value> = (0..3)
         .map(|i| {
             json!({
@@ -409,7 +362,6 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
         "the cold batch must pin duration BIGINT"
     );
 
-    // The conflicting event arrives and stays UNCOMPACTED — hot only.
     let hot_event = json!({
         "service": "svc-hot", "env": "prod", "host": "web01",
         "timestamp": now_ts(),
@@ -423,9 +375,6 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
         "the conflicting event must still be in the hot buffer"
     );
 
-    // The union succeeds in one execution: all four rows, the hot value
-    // NULL, the cold values still integers. A hot-only fallback would show
-    // 1 row.
     let result = h
         .query
         .query_paginated("service=svc-hot last=1h", None, None)
@@ -448,7 +397,6 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
         "cold values stay BIGINT, the conflicting hot value degrades to NULL: {values:?}"
     );
 
-    // The nulled hot original stays recoverable from _raw.
     let hot_row = h
         .query
         .query_paginated("service=svc-hot last=1h message=hot-conflict", None, None)
@@ -462,19 +410,10 @@ async fn hot_conflicting_event_is_nulled_and_cold_history_survives() {
     );
 }
 
-/// End-to-end regression for the case-variant blockers: two services
-/// shipping `Dur` and `dur` used to pin independently (case-sensitive
-/// catalog keys), each file conformed to its own pin, and
-/// `read_parquet(union_by_name)` folded them into one column — a hard
-/// `Conversion` error on every spanning query; the in-loop mitigation then
-/// degraded the pin to VARCHAR, permanently breaking numeric comparisons.
-/// With ingest-time folding there is ONE spelling, one pin, one column,
-/// and numeric predicates keep working across services.
 #[tokio::test(flavor = "multi_thread")]
 async fn case_variant_field_names_fold_to_one_column_across_services() {
     let h = harness().await;
 
-    // svc-a ships `Dur` (uppercase), numeric. Compacted first: pins `dur`.
     let a_events: Vec<serde_json::Value> = (0..3)
         .map(|i| {
             json!({
@@ -490,7 +429,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
     );
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // svc-b ships `dur` (lowercase), numeric too.
     let b_events: Vec<serde_json::Value> = (0..2)
         .map(|i| {
             json!({
@@ -506,7 +444,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
     );
     compact_tick(&h.server, &h.wal_dir, &h.data_dir).await;
 
-    // One pin, under the folded spelling.
     assert_eq!(
         h.server.state.query.field_catalog.get("dur"),
         Some(trawl_core::schema::CanonicalType::BigInt),
@@ -518,8 +455,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
         "no mixed-case pin may exist"
     );
 
-    // A spanning query returns all rows: no Conversion error, no hot-only
-    // degrade, one column in the result.
     let all = h
         .query
         .query_paginated("last=1h", None, None)
@@ -537,7 +472,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
         all.result.columns
     );
 
-    // Numeric comparison binds across services, under the one pin.
     let big = h
         .query
         .query_paginated("last=1h | where dur > 1000", None, None)
@@ -549,7 +483,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
         "svc-a's values compare numerically"
     );
 
-    // The fold is visible in _repairs for the folded sender.
     let a_rows = h
         .query
         .query_paginated("service=svc-a last=1h", None, None)
@@ -564,9 +497,6 @@ async fn case_variant_field_names_fold_to_one_column_across_services() {
     );
 }
 
-/// Acceptance: `field_services` is ever-observed — compaction advances
-/// `last_seen`, and retention deleting a date directory leaves the rows in
-/// place (documented semantics, not a leak).
 #[tokio::test(flavor = "multi_thread")]
 async fn field_services_is_ever_observed() {
     let h = harness().await;
@@ -610,7 +540,6 @@ async fn field_services_is_ever_observed() {
     );
     assert_eq!(second[0].first_seen, first[0].first_seen);
 
-    // Retention deleting the day's data leaves the observations in place.
     for entry in std::fs::read_dir(h.data_dir.join("prod"))
         .unwrap()
         .flatten()
@@ -650,17 +579,12 @@ fn walkdir_parquet(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
     out
 }
 
-// ---------------------------------------------------------------------------
-// boot conformance pass (ADR-0009)
-// ---------------------------------------------------------------------------
-
 mod boot {
     use std::collections::HashSet;
 
     use trawl_server::catalog::{FieldCatalog, conform};
     use trawl_server::store::CatalogStore;
 
-    /// Plant a parquet file at `data_dir/rel` from a SELECT.
     fn plant(data_dir: &std::path::Path, rel: &str, select: &str) -> std::path::PathBuf {
         let path = data_dir.join(rel);
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -684,8 +608,6 @@ mod boot {
         stmt.query_row([], |row| row.get(1)).unwrap()
     }
 
-    /// A pre-catalog corpus where two files disagree on `duration`:
-    /// majority (3 rows) BIGINT, minority (1 row) VARCHAR.
     fn plant_disagreeing_corpus(
         data_dir: &std::path::Path,
     ) -> (std::path::PathBuf, std::path::PathBuf) {
@@ -728,18 +650,15 @@ mod boot {
             "exactly the minority file is rewritten"
         );
 
-        // Pin: most-rows-wins → BIGINT.
         assert_eq!(
             cache.get("duration"),
             Some(trawl_core::schema::CanonicalType::BigInt),
             "the cache is hydrated with the most-rows-wins pin"
         );
 
-        // The minority file now conforms; the majority was left alone.
         assert_eq!(column_type(&minority, "duration"), "BIGINT");
         assert_eq!(column_type(&majority, "duration"), "BIGINT");
 
-        // The conflict is recorded against the minority file's service.
         let conflicts = store.conflicts_for_field("duration").await.unwrap();
         assert!(
             conflicts
@@ -748,7 +667,6 @@ mod boot {
             "boot rewrite must record the conflict: {conflicts:?}"
         );
 
-        // Full corpus reads through one union, all rows present.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let count: i64 = conn
             .query_row(
@@ -763,29 +681,20 @@ mod boot {
             .unwrap();
         assert_eq!(count, 4, "no rows lost by the rewrite");
 
-        // The marker mirrors the catalog identity.
         let marker = std::fs::read_to_string(data_dir.join("CATALOG")).unwrap();
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
-    /// A standing file whose `_time` is VARCHAR text no parser can read must
-    /// not be rewritten to a NULL partition key: a NULL sorts first and falls
-    /// outside every `last=Xh` filter, so the row would survive the conform
-    /// and become permanently unqueryable by time (ADR-0008). The rewrite
-    /// substitutes the file's own partition instant, exactly as compaction
-    /// substitutes the WAL filename's.
     #[sqlx::test]
     async fn unparseable_standing_time_conforms_to_the_partition_instant(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        // Majority (3 rows) pins `_time` TIMESTAMP.
         plant(
             &data_dir,
             "prod/2026-08-01/10/svc-a.parquet",
             "SELECT TIMESTAMP '2026-08-01 10:00:00' + INTERVAL (x) MINUTE AS \"_time\", \
              'svc-a' AS service FROM (VALUES (1), (2), (3)) t(x)",
         );
-        // Minority: VARCHAR `_time` carrying text no TRY_CAST can read.
         let minority = plant(
             &data_dir,
             "prod/2026-08-01/11/svc-b.parquet",
@@ -826,7 +735,6 @@ mod boot {
             "the unreadable row takes its own hour directory's instant"
         );
 
-        // Substituting a value is still losing one: the evidence is recorded.
         let conflicts = store.conflicts_for_field("_time").await.unwrap();
         assert!(
             conflicts
@@ -836,21 +744,16 @@ mod boot {
         );
     }
 
-    /// The vote weighs rows that carry the field, not the file's row count:
-    /// a mostly-NULL `duration` in a big file holds no values to describe, so
-    /// it must not win the pin and `TRY_CAST` the small file's real values away.
     #[sqlx::test]
     async fn all_null_column_in_a_bigger_file_does_not_win_the_pin(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        // 6 rows, `duration` typed BIGINT but empty in every one of them.
         plant(
             &data_dir,
             "prod/2026-08-01/10/svc-a.parquet",
             "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
              NULL::BIGINT AS duration FROM range(6)",
         );
-        // 2 rows, `duration` VARCHAR and populated.
         let populated = plant(
             &data_dir,
             "prod/2026-08-01/11/svc-b.parquet",
@@ -878,7 +781,6 @@ mod boot {
         );
         assert_eq!(column_type(&populated, "duration"), "VARCHAR");
 
-        // Nothing was nulled: both real values survive.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let kept: i64 = conn
             .query_row(
@@ -908,22 +810,16 @@ mod boot {
             .collect()
     }
 
-    /// Parquet trawl did not write can carry mixed-case column names. The
-    /// boot pass folds when seeding, so `Dur` and `dur` form one group with
-    /// most-rows-wins inside it, and the rewrite renames columns to the
-    /// folded form: one spelling, one pin, a clean cross-file union.
     #[sqlx::test]
     async fn mixed_case_columns_fold_to_one_pin_and_are_renamed(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        // Majority spelling `Dur`, BIGINT, 3 populated rows.
         let majority = plant(
             &data_dir,
             "prod/2026-08-01/10/svc-a.parquet",
             "SELECT TIMESTAMP '2026-08-01 10:00:00' AS \"_time\", 'svc-a' AS service, \
              x::BIGINT AS \"Dur\" FROM (VALUES (410), (420), (430)) t(x)",
         );
-        // Minority spelling `dur`, VARCHAR, 1 row.
         let minority = plant(
             &data_dir,
             "prod/2026-08-01/11/svc-b.parquet",
@@ -948,7 +844,6 @@ mod boot {
             "the majority file is renamed, the minority file is cast"
         );
 
-        // One pin, under the folded name, decided by most rows in the group.
         assert_eq!(
             cache.get("dur"),
             Some(trawl_core::schema::CanonicalType::BigInt),
@@ -956,7 +851,6 @@ mod boot {
         );
         assert_eq!(cache.get("Dur"), None, "no mixed-case pin may exist");
 
-        // Both files store the folded spelling at the pinned type.
         for file in [&majority, &minority] {
             let names = column_names(file);
             assert!(
@@ -966,7 +860,6 @@ mod boot {
             assert_eq!(column_type(file, "dur"), "BIGINT");
         }
 
-        // The whole corpus reads through one union, one column, all rows.
         let conn = duckdb::Connection::open_in_memory().unwrap();
         let (rows, kept): (i64, i64) = conn
             .query_row(
@@ -1039,8 +932,6 @@ mod boot {
         .await
         .unwrap();
 
-        // A restored-from-backup data root (or repointed DATABASE_URL)
-        // shows up as an identity mismatch — the pass must re-run.
         std::fs::write(data_dir.join("CATALOG"), "someone-elses-catalog\n").unwrap();
         let summary = conform::ensure_conformance(
             &store,
@@ -1061,10 +952,6 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
-    /// An unconformed catalog goes straight to the pass without opening
-    /// `data/CATALOG`. A FIFO there would block that open until a writer
-    /// appears, so an eager read hangs boot; the pass instead replaces the
-    /// FIFO with the real marker through its staged rename.
     #[cfg(unix)]
     #[sqlx::test]
     async fn unconformed_boot_never_opens_the_catalog_marker(pool: sqlx::PgPool) {
@@ -1121,12 +1008,6 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
-    /// `_severity` is SEVERITY-pinned and sits in every parquet trawl
-    /// writes, and its conform is a domain guard rather than a pass-through.
-    /// Without a data-decided skip, a re-armed pass (identity mismatch, or
-    /// the `clear_conformed` inside a repin cutover) would rewrite the
-    /// entire archive in place on every re-arm; an in-ladder corpus must
-    /// come out untouched.
     #[sqlx::test]
     async fn a_rerun_over_an_in_ladder_severity_corpus_rewrites_nothing(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1172,10 +1053,6 @@ mod boot {
         assert_eq!(mtime(&file), before, "no file touched");
     }
 
-    /// Crash-mid-pass: the marker is published last, so a crash after the
-    /// rewrites but before the marker leaves a conformant corpus with no
-    /// marker. The re-run must be restartable — rewrite nothing (everything
-    /// already conforms) and republish the marker.
     #[sqlx::test]
     async fn crash_before_marker_rerun_rewrites_nothing_and_republishes(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1195,7 +1072,6 @@ mod boot {
         .await
         .unwrap();
 
-        // Simulate the crash window: marker gone, corpus already conformant.
         std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
         let mtimes = |p: &std::path::Path| std::fs::metadata(p).unwrap().modified().unwrap();
         let (m1, m2) = (mtimes(&majority), mtimes(&minority));
@@ -1222,19 +1098,12 @@ mod boot {
         );
     }
 
-    /// Only live compaction writes `field_services`, so a corpus adopted
-    /// from disk would carry pins but no observations, and the reads those
-    /// rows are authoritative for answer wrong: `?service=` returns nothing
-    /// for a service that has sent nothing since, and its pins never enter
-    /// the `last_seen` window (a never-observed pin is always shown, by
-    /// design). The boot pass backfills from the files it adopts.
     #[sqlx::test]
     async fn boot_pass_backfills_observations_for_a_pre_catalog_corpus(pool: sqlx::PgPool) {
         use trawl_server::store::FieldListFilter;
 
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
-        // Two services with disjoint custom fields, three and two rows.
         plant(
             &data_dir,
             "prod/2026-08-01/10/svc-a.parquet",
@@ -1262,7 +1131,6 @@ mod boot {
         .expect("boot pass runs");
         assert!(summary.observed > 0, "the standing corpus must be observed");
 
-        // `?service=` answers for a service that has sent nothing since.
         let by_service = |service: &str| FieldListFilter {
             service: Some(service.to_owned()),
             since: None,
@@ -1280,8 +1148,6 @@ mod boot {
             "svc-b's column must not leak into svc-a's listing: {names:?}"
         );
 
-        // Observations are stamped from the partition directory, not now(),
-        // and weighed by the rows the files hold.
         let obs = store
             .field_services("duration", None, 1000)
             .await
@@ -1293,8 +1159,6 @@ mod boot {
         assert_eq!(obs[0].first_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
         assert_eq!(obs[0].last_seen.to_rfc3339(), "2026-08-01T10:00:00+00:00");
 
-        // The observations are what let the `last_seen` window age the
-        // corpus out at all.
         let (windowed, _) = store
             .list_fields(&FieldListFilter {
                 service: None,
@@ -1318,9 +1182,6 @@ mod boot {
             "a never-observed pin is always shown: {windowed:?}"
         );
 
-        // Idempotent: the pass re-runs until the corpus is proven conformant
-        // (missing marker, restored data root), and a re-run must not
-        // re-accumulate the row counts it already recorded.
         std::fs::remove_file(data_dir.join("CATALOG")).unwrap();
         let rerun = conform::ensure_conformance(
             &store,
@@ -1343,9 +1204,6 @@ mod boot {
         assert_eq!(again[0].last_seen, obs[0].last_seen);
     }
 
-    /// Completion covers both file rewrites and observations. A database
-    /// failure after scanning must leave the pass armed, so the next boot
-    /// retries the standing corpus even when no sender sends it again.
     #[sqlx::test]
     async fn failed_observation_backfill_keeps_conformance_armed(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1443,9 +1301,6 @@ mod boot {
         );
     }
 
-    /// A live tick's accumulated `row_count` must survive a later backfill
-    /// that sees a retention-shrunk corpus: the backfill takes the max, it
-    /// never rewrites a count downward.
     #[sqlx::test]
     async fn backfill_never_clobbers_a_live_count_downward(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1468,7 +1323,6 @@ mod boot {
         )
         .await
         .unwrap();
-        // Live compaction accumulates past the corpus the pass saw.
         store
             .touch_services("svc-a", &["duration".to_owned()], 900)
             .await
@@ -1498,15 +1352,11 @@ mod boot {
         );
     }
 
-    /// `data/scheduled/**` holds report-run outputs, not the log corpus —
-    /// the boot pass must never scan it: no pins from its columns, no
-    /// rewrite of its files.
     #[sqlx::test]
     async fn scheduled_dir_is_never_scanned(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         plant_disagreeing_corpus(&data_dir);
-        // A scheduled-output file whose column set would otherwise pin.
         let sched = plant(
             &data_dir,
             "scheduled/42/report.parquet",
@@ -1544,21 +1394,12 @@ mod boot {
         );
     }
 
-    /// A readable parquet in a foreign layout is still not trawl's file.
-    /// The rewrite is in place, lossy and irreversible (no backup, no
-    /// dry-run, no opt-in), so the boot pass decides "mine" from the path,
-    /// before it opens anything: an operator's own parquet dropped under the
-    /// data root is left byte-identical, never votes on a pin, and, like
-    /// every other skip, withholds completion so the next boot re-runs
-    /// rather than declaring the corpus proven.
     #[sqlx::test]
     async fn foreign_layout_files_are_never_rewritten(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let (majority, minority) = plant_disagreeing_corpus(&data_dir);
 
-        // Perfectly readable, disagrees with the corpus pin, carries a field
-        // of its own — and sits nowhere ingest could have written it.
         let foreign = plant(
             &data_dir,
             "operator-scratch/export.parquet",
@@ -1600,11 +1441,6 @@ mod boot {
         );
     }
 
-    /// One unreadable or foreign `.parquet` under the data root must never
-    /// take trawld's boot down with it: the pass isolates it per file
-    /// (skip + warn + count), conforms everything else, and — because the
-    /// corpus was not proven conformant — withholds completion so the next
-    /// boot re-runs. Once the bad file is gone, the pass completes normally.
     #[sqlx::test]
     async fn unreadable_files_are_skipped_not_boot_fatal(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -1644,15 +1480,12 @@ mod boot {
         assert_eq!(column_type(&minority, "duration"), "BIGINT");
         assert_eq!(column_type(&majority, "duration"), "BIGINT");
 
-        // Skipped means untouched — the boot pass never moves or rewrites a
-        // file it could not read.
         assert_eq!(std::fs::read(&junk).unwrap(), b"not a parquet file at all");
         assert_eq!(
             std::fs::read(&unreadable).unwrap(),
             b"PAR1\xff\xff\xff\xffPAR1"
         );
 
-        // Completion is withheld: no marker, and the next boot re-runs.
         assert!(
             !data_dir.join("CATALOG").exists(),
             "an unproven corpus must not publish the conformance identity"
@@ -1671,7 +1504,6 @@ mod boot {
         assert_eq!(again.skipped, 2);
         assert_eq!(again.rewritten, 0, "the readable corpus already conforms");
 
-        // Operator removes the bad files → the pass completes and publishes.
         std::fs::remove_file(&junk).unwrap();
         std::fs::remove_file(&unreadable).unwrap();
         let clean = conform::ensure_conformance(
@@ -1690,11 +1522,6 @@ mod boot {
         assert_eq!(marker.trim(), store.catalog_id().await.unwrap());
     }
 
-    /// A directory the walk cannot enumerate is isolated exactly like an
-    /// unreadable file. The walk covers more than the corpus — the WAL tree
-    /// lives under the data root by default — so one `chmod 000` subdirectory
-    /// (permissions, a transient fault, a stale handle) must not be the
-    /// difference between a daemon that boots and one that refuses to.
     #[cfg(unix)]
     #[sqlx::test]
     async fn unreadable_directories_are_skipped_not_boot_fatal(pool: sqlx::PgPool) {
@@ -1739,7 +1566,6 @@ mod boot {
             "an unproven corpus must not publish the conformance identity"
         );
 
-        // Operator fixes the permissions → the pass completes and publishes.
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         let clean = conform::ensure_conformance(
             &store,
@@ -1756,19 +1582,10 @@ mod boot {
         assert!(data_dir.join("CATALOG").exists());
     }
 
-    /// A query-only node (`[ingest] enabled = false`) never runs the pass,
-    /// so nothing else proves the archive it serves came from the catalog it
-    /// is connected to. `/api/v1/schema` answers from that catalog's pins, so
-    /// a repointed app database over a populated foreign archive would
-    /// advertise the seeded envelope while queries read entirely different
-    /// physical columns. A marker naming another catalog is positive proof of
-    /// that pairing, and the boot gate refuses it.
     #[sqlx::test]
     async fn query_only_boot_refuses_an_archive_from_another_catalog(pool: sqlx::PgPool) {
         let store = CatalogStore::new(pool.clone());
 
-        // Marker naming a different catalog (the app database was repointed,
-        // or the data root was restored from another install's backup).
         let stale = tempfile::tempdir().unwrap();
         let stale_data = stale.path().join("data");
         plant_disagreeing_corpus(&stale_data);
@@ -1786,12 +1603,6 @@ mod boot {
         );
     }
 
-    /// An archive with NO marker is not proof of a foreign catalog — it is
-    /// what an incomplete conformance pass leaves behind (any skipped path
-    /// withholds `data/CATALOG`), and an ingest node warns and serves it. The
-    /// query-only gate must answer that identical state the same way, or
-    /// "disable ingest and restart to investigate" becomes a startup failure
-    /// curable only by re-enabling ingest.
     #[sqlx::test]
     async fn query_only_boot_serves_an_unmarked_archive_unproven(pool: sqlx::PgPool) {
         let store = CatalogStore::new(pool.clone());
@@ -1807,8 +1618,6 @@ mod boot {
             "no marker means unproven, not foreign"
         );
 
-        // The state a pass that skipped a path actually leaves: it ran, it
-        // rewrote what it owned, and it withheld the marker.
         let cache = FieldCatalog::new();
         let skipped = tempfile::tempdir().unwrap();
         let skipped_data = skipped.path().join("data");
@@ -1838,9 +1647,6 @@ mod boot {
         );
     }
 
-    /// The gate is identity, not paranoia: an archive this catalog conformed
-    /// passes, and so does a cold start with no parquet at all (there is no
-    /// schema to get wrong).
     #[sqlx::test]
     async fn query_only_boot_accepts_its_own_and_empty_archives(pool: sqlx::PgPool) {
         let store = CatalogStore::new(pool.clone());
@@ -1877,10 +1683,6 @@ mod boot {
         );
     }
 
-    /// A publication marker boot recovery could not resolve claims its
-    /// canonical output and `.parquet.tmp` by exact bytes (ADR-0041). The
-    /// pass must leave both alone and withhold completion, then conform the
-    /// canonical on the first run after the marker resolves.
     #[sqlx::test]
     async fn pending_publication_marker_keeps_the_pass_off_its_files(pool: sqlx::PgPool) {
         use trawl_server::ingest::publication_marker::{
@@ -1890,7 +1692,6 @@ mod boot {
         let tmp = tempfile::tempdir().unwrap();
         let data_dir = tmp.path().join("data");
         let wal_dir = tmp.path().join("wal");
-        // The VARCHAR minority would be rewritten to the BIGINT pin.
         let (_, claimed) = plant_disagreeing_corpus(&data_dir);
         let staged = claimed.with_extension("parquet.tmp");
         std::fs::write(&staged, b"staged output of the pending publish").unwrap();
@@ -1942,10 +1743,6 @@ mod boot {
         );
     }
 
-    /// A day whose rollup marker unlink still owes its day fsync holds no
-    /// marker file, yet the pass leaves its files alone and withholds
-    /// completion; other days conform. Once the obligation ends, the day
-    /// conforms on the next run.
     #[sqlx::test]
     async fn rollup_unlink_sync_retry_keeps_the_pass_off_an_owed_day(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2003,8 +1800,6 @@ mod boot {
         assert!(store.is_conformed().await.unwrap());
     }
 
-    /// Markers that cannot be read may claim any file, so the pass fails
-    /// closed: it touches nothing and stays armed.
     #[sqlx::test]
     async fn unreadable_publication_markers_skip_every_file(pool: sqlx::PgPool) {
         let tmp = tempfile::tempdir().unwrap();
@@ -2014,7 +1809,6 @@ mod boot {
             std::fs::read(&majority).unwrap(),
             std::fs::read(&minority).unwrap(),
         ];
-        // A WAL root that is a regular file cannot be listed.
         let wal_dir = tmp.path().join("wal");
         std::fs::write(&wal_dir, b"not a directory").unwrap();
 
@@ -2034,9 +1828,6 @@ mod boot {
         assert!(!data_dir.join("CATALOG").exists());
     }
 
-    /// Wiring: server boot itself runs the conformance pass — pins land in
-    /// the process cache and one query returns the full corrected corpus,
-    /// without this test ever calling `ensure_conformance`.
     #[tokio::test(flavor = "multi_thread")]
     async fn server_boot_runs_the_conformance_pass() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2053,18 +1844,15 @@ mod boot {
         .await;
         std::mem::forget(tmp);
 
-        // Pins were hydrated by boot, not by this test.
         assert_eq!(
             server.state.query.field_catalog.get("duration"),
             Some(trawl_core::schema::CanonicalType::BigInt),
             "boot must seed and hydrate the pin cache"
         );
 
-        // The corpus was corrected on disk.
         assert_eq!(column_type(&minority, "duration"), "BIGINT");
         assert_eq!(column_type(&majority, "duration"), "BIGINT");
 
-        // One union returns the full corrected corpus.
         let query =
             trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
         let result = query
@@ -2075,16 +1863,10 @@ mod boot {
     }
 }
 
-/// ADR-0011 slice A acceptance: comparisons against a VARCHAR-pinned
-/// field follow the pin over HTTP — with the hot buffer populated AND
-/// drained (the drained case exercises the formerly pin-blind cold-only
-/// `run_query` branch).
 #[tokio::test(flavor = "multi_thread")]
 async fn pinned_varchar_comparisons_behave_over_http() {
     let h = harness().await;
 
-    // Mixed numeric-looking and word statuses (all strings) — the ladder
-    // pins VARCHAR at first compaction.
     let statuses = ["200", "404", "accepted", "301"];
     let events: Vec<serde_json::Value> = statuses
         .iter()
@@ -2117,8 +1899,6 @@ async fn pinned_varchar_comparisons_behave_over_http() {
         }
     };
 
-    // Drained phase: the hot buffer emptied at compaction, so these ride
-    // the cold-only run_query branch.
     assert_eq!(count("service=pin-svc status=200 last=1h").await, 1);
     assert_eq!(count("service=pin-svc status=200,301 last=1h").await, 2);
     assert_eq!(count("service=pin-svc status!=200 last=1h").await, 3);
@@ -2128,8 +1908,6 @@ async fn pinned_varchar_comparisons_behave_over_http() {
         "only '404' is >= 400 — 'accepted' NULLs out instead of erroring"
     );
 
-    // Populated phase: fresh uncompacted events ride the hot branch of
-    // the union, under the same comparison pins.
     let more: Vec<serde_json::Value> = ["500", "accepted"]
         .iter()
         .map(|s| {
@@ -2151,12 +1929,9 @@ async fn pinned_varchar_comparisons_behave_over_http() {
         "cold '404' plus hot '500'"
     );
 
-    // Wire numbers under the same VARCHAR pin. `read_json` types the
-    // column from the whole batch, so the fractional sibling widens it to
-    // DOUBLE and `200` is stored as the text "200.0" — durably, once
-    // compaction writes the parquet. The equality rule carries the
-    // value's numeric reading precisely so this row is still `status=200`
-    // on both the hot and the cold side, and on the live tail.
+    // Under the VARCHAR pin: `read_json` types the column from the whole
+    // batch, so the fractional sibling widens it to DOUBLE and `200` is
+    // stored as the text "200.0".
     let numeric: Vec<serde_json::Value> = [json!(200), json!(200.5)]
         .iter()
         .map(|n| {
@@ -2198,8 +1973,6 @@ async fn pinned_varchar_comparisons_behave_over_http() {
     );
 }
 
-/// Read SSE chunks until `needle` shows up (bounded), returning the
-/// accumulated body.
 async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
     let mut buf = String::new();
     tokio::time::timeout(std::time::Duration::from_secs(15), async {
@@ -2216,16 +1989,10 @@ async fn read_until(resp: &mut reqwest::Response, needle: &str) -> String {
     buf
 }
 
-/// ADR-0011 slice A acceptance: live tail receives the pins. A string
-/// "404" event matches `status>=400` on the SSE stream, and the
-/// equality rule is discriminably live — `status!=200` must match
-/// "accepted" (the pin-blind numeric coercion drops it) while still
-/// excluding every spelling of 200.
 #[tokio::test(flavor = "multi_thread")]
 async fn sse_stream_applies_varchar_pin() {
     let h = harness().await;
 
-    // Seed the VARCHAR pin.
     let seed: Vec<serde_json::Value> = ["200", "404", "accepted"]
         .iter()
         .map(|s| {
@@ -2244,7 +2011,6 @@ async fn sse_stream_applies_varchar_pin() {
 
     let raw = common::harness_client_builder().build().unwrap();
 
-    // Ordered-numeric rule live: string "404" matches status>=400.
     let mut stream = raw
         .get(format!("{}/api/v1/stream", h.server.url))
         .query(&[("query", "service=sse-svc status>=400")])
@@ -2271,11 +2037,6 @@ async fn sse_stream_applies_varchar_pin() {
     );
     drop(stream);
 
-    // Equality rule live, discriminably: `status!=200` must return
-    // "accepted", which a pin-blind numeric coercion cannot read and would
-    // answer no-match for, while both spellings of 200 stay excluded: the
-    // text one through the text arm, "200.00" through the numeric reading
-    // that keeps batch and live agreeing about a widened column.
     let mut stream = raw
         .get(format!("{}/api/v1/stream", h.server.url))
         .query(&[("query", "service=sse-svc status!=200")])

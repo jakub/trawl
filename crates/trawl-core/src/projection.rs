@@ -3,15 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What a projecting stage NAMES — the one lane-neutral answer.
-//!
-//! An aggregation stage mints columns: group keys, the implicit
-//! `timechart` time bucket, the frequency count `top`/`rare` desugar to,
-//! and one column per aggregate — named by its explicit `as` alias, else
-//! by the `func`/`func_arg` default. Three lanes have to agree on those
-//! names (the SQL emitter, the SSE stream compiler, and the pin-scope
-//! walk both consume), so the derivation lives here, beside
-//! [`crate::schema`] and [`crate::pin_scope`], and not inside any one
-//! lane's emitter.
 
 use std::collections::HashMap;
 use std::collections::hash_map::Entry;
@@ -20,12 +11,6 @@ use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
 use crate::parser::suggest::quote_dsl_field;
 use crate::schema::catalog_key;
 
-/// The column name an aggregate projects: its explicit `as` alias, else
-/// the `func_arg`/`func` default.
-///
-/// This is the one derivation. The SQL emitter quotes it, the stream
-/// compiler stores it on the accumulator, and the pin-scope walk removes
-/// it from the scope — so what a query names is what every lane writes.
 #[must_use]
 pub fn agg_output_name(agg: &AggExpr) -> String {
     if let Some(alias) = &agg.alias {
@@ -37,11 +22,6 @@ pub fn agg_output_name(agg: &AggExpr) -> String {
     }
 }
 
-/// Find the innermost field reference of an aggregation argument.
-///
-/// Recurses through wrapping expressions (function calls, binary ops,
-/// unary ops), so `avg(tonumber(rssi) * -1)` names its column
-/// `avg_rssi` rather than a bare `avg`.
 fn innermost_field_name(arg: Option<&Spanned<Expr>>) -> Option<String> {
     match &arg?.node {
         Expr::FieldRef(name) => Some(name.clone()),
@@ -52,26 +32,17 @@ fn innermost_field_name(arg: Option<&Spanned<Expr>>) -> Option<String> {
     }
 }
 
-/// Which producer minted a projected column — the half of the message
-/// that tells a user WHERE the name came from, and the input to the
-/// remedy (only some producers can carry an `as`).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Producer {
     GroupKey,
     Aggregate,
-    /// `timechart`'s bucket, always projected as `_time`.
     TimeBucket,
-    /// The frequency column `top`/`rare` desugar to.
     MintedCount,
-    /// The field `top`/`rare` counts values of.
     Subject,
 }
 
-/// One statically-known output column of a projecting stage.
 struct Output {
-    /// The name folded through [`catalog_key`] — `Total` IS `total`.
     key: String,
-    /// The verbatim name, for the message.
     name: String,
     producer: Producer,
 }
@@ -85,7 +56,6 @@ impl Output {
         }
     }
 
-    /// How the message refers to this column.
     fn label(&self, agg: Option<&AggExpr>) -> String {
         let name = label_name(&self.name);
         match self.producer {
@@ -101,20 +71,10 @@ impl Output {
     }
 }
 
-/// Render an aggregate the way the query spells it, for the message:
-/// `count()`, `avg(duration)`, `count() as total`.
-///
-/// This goes through the query formatter — the one renderer, which quotes
-/// every name through [`quote_dsl_field`] — because the message pastes
-/// the result into a rewrite the user is told to type, and a name trawl
-/// offers must be a name trawl can parse back (ADR-0013 ruling 7).
-///
-/// Unlike a name, an aggregate renders its arguments, and a string literal
-/// argument's grammar (`none_of('"')`) admits ESC, BEL, U+202E and every
-/// other [`sanitize::is_unsafe_display_char`]. These messages are 400
-/// bodies rendered in a terminal, the TUI and a browser, and a saved query
-/// or scheduled report means the author and the reader need not be the same
-/// person — so the rendering is sanitised, exactly like a conflict sample.
+/// A string literal argument admits ESC, BEL, U+202E and every other
+/// [`sanitize::is_unsafe_display_char`], and the error messages this feeds
+/// are 400 bodies rendered in a terminal, the TUI and a browser, so the
+/// rendering is sanitised.
 ///
 /// [`sanitize::is_unsafe_display_char`]: crate::sanitize::is_unsafe_display_char
 fn render_agg(agg: &AggExpr) -> String {
@@ -123,12 +83,6 @@ fn render_agg(agg: &AggExpr) -> String {
     crate::sanitize::sanitize_display_text(&out)
 }
 
-/// A name inside a message: its DSL spelling, always visually quoted.
-///
-/// [`quote_dsl_field`] backticks only what the bare production cannot
-/// spell, so a plain name is wrapped here to keep the message's quoting
-/// uniform — and a name that IS backticked is left exactly as the user
-/// must type it, never double-wrapped.
 fn label_name(name: &str) -> String {
     let dsl = quote_dsl_field(name).expect("projection names came from a parsed AST");
     if dsl.starts_with('`') {
@@ -140,29 +94,6 @@ fn label_name(name: &str) -> String {
 
 /// Refuse a projecting stage that would mint two columns of one name
 /// (ADR-0013 ruling 8).
-///
-/// The output-name set of every projecting stage is assembled here —
-/// group keys, `timechart`'s implicit `_time` bucket, the `count` column
-/// `top`/`rare` desugar to, and each aggregate's output name — folded
-/// through [`catalog_key`], so `Total` and `total` are one column. The
-/// error names BOTH producers and the way out; it is returned as a plain
-/// string so that each lane can carry it in its own error type without
-/// either lane owning the sentence.
-///
-/// Non-projecting stages are `Ok` — the caller can hand every stage over
-/// without matching first.
-///
-/// `pivot`'s output set is its `by` keys alone: the `on` field's values
-/// become columns `DuckDB` mints from the data at run time, and the `on`
-/// field itself is consumed. `eventstats` projects `*` plus its aliases,
-/// so an alias naming an incoming column overwrites it the way `let` does
-/// — but it must have an alias, because the live lane cannot know a row's
-/// schema before the rows arrive.
-///
-/// # Errors
-///
-/// Returns the shared message when two producers name one column, or
-/// when an `eventstats` aggregate has no explicit `as`.
 pub fn check_projection(stage: &PipeStage) -> Result<(), String> {
     match stage {
         PipeStage::Stats(s) => check_outputs("stats", &group_outputs(&s.group_by), &s.aggregations),
@@ -193,9 +124,6 @@ fn group_outputs(group_by: &[String]) -> Vec<Output> {
         .collect()
 }
 
-/// `top`/`rare` desugar to `stats count() by <field>[, <by>]`, so their
-/// static output set is the counted field, the group keys, and the
-/// `count` column the desugar mints.
 fn check_frequency(keyword: &str, field: &str, by: &[String]) -> Result<(), String> {
     let mut outputs = vec![Output::new(field, Producer::Subject)];
     outputs.extend(group_outputs(by));
@@ -203,13 +131,8 @@ fn check_frequency(keyword: &str, field: &str, by: &[String]) -> Result<(), Stri
     check_outputs(keyword, &outputs, &[])
 }
 
-/// The one duplicate scan: static outputs first, then one output per
-/// aggregate, in projection order.
-///
-/// Names are folded into a hash map keyed on [`catalog_key`], not scanned
-/// linearly: this runs for every stage of every validated, emitted and
-/// streamed query, and a query is allowed thousands of group keys — a
-/// pairwise scan would be quadratic in request-controlled input.
+/// A hash map, not a pairwise scan: a query is allowed thousands of group
+/// keys, and a pairwise scan would be quadratic in request-controlled input.
 fn check_outputs(
     keyword: &str,
     statics: &[Output],
@@ -292,8 +215,6 @@ mod tests {
     use crate::ast::PipeStage;
     use crate::parser;
 
-    /// A FIXED anchor: nothing in this crate's `src/` may self-serve an
-    /// evaluation context (`tests/now_anchor_contract.rs`).
     fn fixed_anchor() -> crate::context::EvalContext {
         crate::context::EvalContext::at(
             chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
@@ -330,8 +251,6 @@ mod tests {
         assert_eq!(name("| stats dc(host)"), "dc_host");
     }
 
-    /// The default walks to the INNERMOST field, so a computed argument
-    /// still names the field it is about.
     #[test]
     fn default_walks_to_the_innermost_field() {
         assert_eq!(name("| stats avg(tonumber(rssi) * -1)"), "avg_rssi");
@@ -343,21 +262,17 @@ mod tests {
         assert_eq!(name("| stats count(1)"), "count");
     }
 
-    // ── the collision check's remedies (ADR-0013 ruling 8) ────────────
-
     fn refusal(dsl: &str) -> String {
         let query = parser::parse(dsl).expect("dsl parses");
         check_projection(&query.pipeline[0].node).expect_err(&format!("{dsl} must be refused"))
     }
 
-    /// An aggregate can carry a name, so the remedy is `as`.
     #[test]
     fn a_collision_with_an_aggregate_demands_as() {
         let msg = refusal("* | stats count() by count");
         assert!(msg.contains("give one an explicit name with `as`"), "{msg}");
     }
 
-    /// `top`/`rare` cannot spell `as`, so the remedy is the rewrite.
     #[test]
     fn a_frequency_collision_offers_the_stats_rewrite() {
         let msg = refusal("* | top 5 count");
@@ -368,7 +283,6 @@ mod tests {
         assert!(!msg.contains("give one an explicit name"), "{msg}");
     }
 
-    /// `timechart`'s bucket is structural — the group key is what moves.
     #[test]
     fn a_bucket_collision_says_the_bucket_is_fixed() {
         let msg = refusal("* | timechart span=1h count() by _time");
@@ -378,7 +292,6 @@ mod tests {
         );
     }
 
-    /// Two spellings of one group key: nothing to alias, just say it once.
     #[test]
     fn duplicate_group_keys_are_told_to_name_it_once() {
         let msg = refusal("* | pivot count() on status by host, Host");
@@ -386,7 +299,6 @@ mod tests {
         assert!(msg.contains("`host`"), "{msg}");
     }
 
-    /// The fold is the ONE key: `Total` and `total` are one column.
     #[test]
     fn the_collision_check_folds_names() {
         let msg = refusal("* | stats count() as total, sum(x) as Total");
@@ -394,8 +306,6 @@ mod tests {
         assert!(msg.contains("sum(x) as Total"), "{msg}");
     }
 
-    /// A refusal quotes names the way the DSL spells them, so the rewrite
-    /// it tells the user to type parses back (ADR-0013 ruling 7).
     #[test]
     fn a_refusal_renders_names_as_dsl_text() {
         let msg = refusal("* | eventstats avg(`response time`)");
@@ -410,10 +320,6 @@ mod tests {
         assert!(msg.contains("named `request id`"), "{msg}");
     }
 
-    /// A STRING LITERAL argument is not policed by the name grammar, so
-    /// the rendering that pastes it into a 400 body is sanitised: a
-    /// refusal an operator reads can never carry ESC, BEL or a bidi
-    /// override the query author chose.
     #[test]
     fn a_refusal_never_echoes_control_characters() {
         for dsl in [
@@ -430,16 +336,12 @@ mod tests {
         }
     }
 
-    /// `pivot`'s value columns come from the DATA, so only its `by` keys
-    /// are statically known — the `on` field is consumed, not projected.
     #[test]
     fn pivot_checks_by_keys_only() {
         assert!(check_projection(&stage("* | pivot count() on status by status")).is_ok());
         assert!(check_projection(&stage("* | pivot count() on status")).is_ok());
     }
 
-    /// The check is keyed, not pairwise: a stage with thousands of group
-    /// keys is linear work, and the collision is still found.
     #[test]
     fn a_very_wide_stage_is_checked_in_linear_time() {
         let keys: Vec<String> = (0..8000).map(|i| format!("k{i}")).collect();
@@ -457,13 +359,6 @@ mod tests {
             .clone()
     }
 
-    /// One derivation, every lane: the SQL emitter's `AS` alias, the
-    /// stream compiler's accumulator column and the pin-scope walk's
-    /// removal all read `agg_output_name`.
-    ///
-    /// The live lane accumulates a BARE field only, so a computed
-    /// argument is REFUSED there rather than projected — agreeing on the
-    /// name while answering NULL would be parity in name only.
     #[test]
     fn every_lane_projects_the_same_column_name() {
         for (dsl, expected, streams) in [

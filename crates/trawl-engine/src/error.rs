@@ -2,39 +2,23 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Error types for the query engine.
-
 use trawl_core::parser::ParseError;
 
-/// Errors that can occur during query execution.
 #[derive(Debug, thiserror::Error)]
 pub enum EngineError {
-    /// One or more parse errors in the DSL query.
     #[error("parse error: {}", format_parse_errors(.0))]
     Parse(Vec<ParseError>),
 
-    /// The emitter could not produce valid SQL from the AST.
     #[error("emit error: {0}")]
     Emit(#[from] trawl_core::emitter::EmitError),
 
     /// `DuckDB` returned an error during execution, other than running out
     /// of the query budgets ([`Self::ResourceExhausted`]).
-    ///
-    /// `From<duckdb::Error>` classifies by the structured diagnostic's
-    /// `exception_type` and lands every type but `Out of Memory` here. The
-    /// message renders as `DuckDB`'s own `<type> Error: <message>` text.
     #[error("database error: {}", render_duckdb_error(.0))]
     Database(#[source] duckdb::Error),
 
     /// The query ran out of the query database's memory or spill budget:
-    /// `DuckDB` reported an `Out of Memory` exception (ADR-0056). Both
-    /// `max_temp_directory_size` and `memory_limit` raise that type.
-    ///
-    /// Carries nothing from `DuckDB`: its message names sizes, and the
-    /// spill path can appear in it, so neither crosses into this error's
-    /// text. The read lanes never retry it hot-only: the budgets are shared
-    /// by every query on the database, so a retry would only spend them
-    /// again.
+    /// `DuckDB` reported an `Out of Memory` exception (ADR-0056).
     #[error(
         "query could not complete with the available query resources; \
          narrow the time range or simplify the query"
@@ -45,62 +29,29 @@ pub enum EngineError {
     /// query may hold, or than the server's regex reservation can hold
     /// while other work holds it (ADR-0063). Raised while the tail
     /// prepares, before it matches a row.
-    ///
-    /// A capacity refusal like [`Self::ResourceExhausted`], and like it
-    /// never retried hot-only: the same query would ask for the same
-    /// memory. It carries which bound refused and nothing of the pattern.
     #[error("{}", trawl_core::pattern::PatternError::Resources(*.0))]
     RegexResources(trawl_core::pattern::RegexRefusal),
 
-    /// Query produced more rows than the configured limit.
     #[error("result too large: query returned more than {0} rows")]
     ResultTooLarge(usize),
 
     /// The Rust tail's aggregation would have dropped input at one of its
-    /// caps (ADR-0001), so its answer would leave groups or values out.
-    /// The batch answer has no channel to say it is partial, so the query
-    /// is refused instead. The server answers it as `result_too_large`.
-    ///
-    /// The message is trawl-authored and names only the cap and its limit.
+    /// caps (ADR-0001). The server answers it as `result_too_large`.
     #[error("result too large: {}; narrow the query", describe_cap(*.0))]
     AggregationCapped(trawl_core::stream::AggregationCap),
 
     /// A read matched no files even though its source still reaches files on
-    /// disk — the empty answer would silently drop the cold data, which
-    /// ADR-0008 forbids. Raised by every lane (query and export, with a hot
-    /// buffer and without), because the source is resolved before the read
-    /// on all of them and the gate is the same. Transient by nature: the read
-    /// raced retention/compaction/a repin moving a file, or the hot snapshot
-    /// vanished.
+    /// disk (ADR-0008).
     #[error("query matched no files while cold data exists on disk; retry the query")]
     ColdDataUnread,
 
     /// The query is wrong in a way the engine proved by asking `DuckDB`
     /// a question of its own, and no fallback can make it right.
-    ///
-    /// Like [`Self::Emit`], no lane retries it against a narrower source:
-    /// that produces the same refusal, and turning it into an empty result
-    /// would answer 200 with zero rows to a query that was never going to
-    /// mean anything, which is how a `timechart` over a non-timestamp
-    /// column once escaped its own check. Unlike an emit refusal, its
-    /// message is the whole of the error's text.
-    ///
-    /// The message is trawl-authored and names the reader's own tokens,
-    /// so it crosses the trust boundary intact, like a parse or emit
-    /// refusal.
     #[error("{message}")]
     Refused { message: String },
 
     /// A `HUGEINT` or `UHUGEINT` result cell outside `i64` ∪ `u64`
-    /// (ADR-0035, amended 2026-10-22), for example a `sum` past
-    /// `u64::MAX`. The result wire's `integer` type has no wider variant,
-    /// and a float or digits as text would be a different answer, so the
-    /// query is refused by the column's name with the casts that make it
-    /// answerable.
-    ///
-    /// The message is trawl-authored and names only the result column, a
-    /// name the caller's own query produced, so it crosses the trust
-    /// boundary intact.
+    /// (ADR-0035), for example a `sum` past `u64::MAX`.
     #[error(
         "column {column:?} holds an integer outside the 64-bit range; \
          cast it explicitly with tonumber() or tostring()"
@@ -109,8 +60,7 @@ pub enum EngineError {
 
     /// A result the run parquet writer cannot store exactly: it has no
     /// columns (a parquet file holds at least one), or a `mixed` column
-    /// (parquet has no union type). The scheduler keeps such a result as
-    /// its typed blob instead (ADR-0035, amended 2026-10-22).
+    /// (parquet has no union type). The scheduler keeps it as its typed blob.
     #[error("the result has no exact parquet form: {reason}")]
     NotParquetStorable { reason: String },
 
@@ -130,25 +80,15 @@ pub enum EngineError {
     },
 
     /// A compiled stage of the Rust tail reached a pattern operand its
-    /// table does not hold (ADR-0063). Every pattern is prepared when the
-    /// plan compiles, so this is the server breaking its own invariant,
-    /// never a fault in the query, and the row is not read as a
-    /// non-match instead.
-    ///
-    /// Carries nothing: the pattern is the caller's text, and none of it
-    /// crosses into this error's message.
+    /// table does not hold (ADR-0063).
     #[error("a compiled stage has no prepared pattern for an operand it reads")]
     MissingPreparedPattern,
 
-    /// Filesystem I/O error (e.g. writing temp files for parquet export).
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
 
     /// The caller's cancellation latch was set, and the lane stopped at
-    /// its next cancellation point: the parse, a pattern build or search
-    /// (ADR-0063), a step of the Rust tail, or the bind-to-execute
-    /// boundary (ADR-0024). Content-free: which query, and who cancelled
-    /// it, is the caller's own record.
+    /// its next cancellation point.
     #[error("query cancelled")]
     Cancelled,
 }
@@ -159,7 +99,6 @@ impl From<trawl_core::cancel::Cancelled> for EngineError {
     }
 }
 
-/// What passed an aggregation cap, with the cap's limit.
 fn describe_cap(cap: trawl_core::stream::AggregationCap) -> String {
     use trawl_core::stream::AggregationCap;
     let limit = cap.limit();
@@ -174,19 +113,11 @@ fn describe_cap(cap: trawl_core::stream::AggregationCap) -> String {
     }
 }
 
-/// `DuckDB`'s exception type for running out of memory or spill space.
 const OUT_OF_MEMORY: &str = "Out of Memory";
 
-/// `DuckDB`'s exception type for a statement stopped by an interrupt.
 const INTERRUPT: &str = "INTERRUPT";
 
 impl EngineError {
-    /// Whether `DuckDB` stopped the statement because its connection was
-    /// interrupted, read off the structured diagnostic's `exception_type`
-    /// like every other classification here.
-    ///
-    /// The engine sample (ADR-0056) reads it to tell the interrupt it
-    /// raised on its own overrunning probe from a failure of the engine.
     #[must_use]
     pub fn is_interrupt(&self) -> bool {
         matches!(self, Self::Database(error)
@@ -195,14 +126,6 @@ impl EngineError {
 }
 
 impl From<duckdb::Error> for EngineError {
-    /// Classify a `DuckDB` error by its diagnostic's `exception_type`.
-    ///
-    /// `Out of Memory` is [`Self::ResourceExhausted`]. Everything else is
-    /// [`Self::Database`]: another type, a message that is not a
-    /// diagnostic (a connection without `errors_as_json`, or a malformed
-    /// one), and every driver-side variant. The message text is never
-    /// searched, so a message that says "Out of Memory" under another type
-    /// stays a database error.
     fn from(error: duckdb::Error) -> Self {
         if is_out_of_memory(&error) {
             Self::ResourceExhausted
@@ -213,11 +136,7 @@ impl From<duckdb::Error> for EngineError {
 }
 
 /// Whether `error` is `DuckDB` running out of memory or spill space: its
-/// structured diagnostic names the `Out of Memory` exception type. The one
-/// test [`EngineError::from`] classifies [`EngineError::ResourceExhausted`]
-/// by, for callers that keep the `duckdb::Error`. The maintenance databases
-/// (compaction, rollup, conform and repin) read it too: they turn on
-/// `errors_as_json` for the same reason the query database does.
+/// structured diagnostic names the `Out of Memory` exception type.
 #[must_use]
 pub fn is_out_of_memory(error: &duckdb::Error) -> bool {
     DuckDbDiagnostic::of(error).is_some_and(|d| d.exception_type == OUT_OF_MEMORY)
@@ -227,17 +146,12 @@ pub fn is_out_of_memory(error: &duckdb::Error) -> bool {
 /// text when `errors_as_json` is on: one flat JSON object of strings.
 ///
 /// Every connection an [`crate::executor::Executor`] opens turns the
-/// setting on before anything clones the database, so every error those
-/// connections raise carries one. `exception_type` is `DuckDB`'s
-/// `ExceptionTypeToString` name (`Out of Memory`, `Binder`, `IO`,
-/// `Conversion`, ...). The other keys are the exception's extra info and
-/// are ignored here; [`missing_column`] reads `error_subtype` and `name`.
+/// setting on before anything clones the database.
 ///
 /// `DuckDB` 1.5.5 passes a raw message that already starts with `{`
 /// through unchanged (`ErrorData::ConvertErrorToJSON`), so a statement
 /// that controls its whole message, as `error('{...}')` does, can name
-/// any type. Trawl's DSL cannot emit such a statement, and the worst it
-/// could do is make the caller's own query answer as exhausted.
+/// any type.
 #[derive(Debug, serde::Deserialize)]
 pub(crate) struct DuckDbDiagnostic {
     pub(crate) exception_type: String,
@@ -245,10 +159,6 @@ pub(crate) struct DuckDbDiagnostic {
 }
 
 impl DuckDbDiagnostic {
-    /// The diagnostic `error` carries, if it is a `DuckDB` failure whose
-    /// message parses as one. A message that is not JSON, not an object,
-    /// lacks either key, holds a non-string value or repeats a key gives
-    /// `None`.
     pub(crate) fn of(error: &duckdb::Error) -> Option<Self> {
         let duckdb::Error::DuckDBFailure(_, Some(message)) = error else {
             return None;
@@ -277,25 +187,12 @@ fn parse_object<T: serde::de::DeserializeOwned>(message: &str) -> Option<T> {
     serde_json::from_str(json).ok()
 }
 
-/// `DuckDB`'s exception type for a statement that does not bind.
 const BINDER: &str = "Binder";
 
-/// The `error_subtype` `DuckDB` 1.5.5 gives a binder failure over a column
-/// the statement's input does not have. `BinderException::ColumnNotFound`
-/// is its only source, and it always adds the column as `name`.
 const COLUMN_NOT_FOUND: &str = "COLUMN_NOT_FOUND";
 
 /// The column `error` names as missing from the statement's input, if it
-/// is that binder failure: a diagnostic of the `Binder` type with the
-/// `COLUMN_NOT_FOUND` subtype and a string `name`.
-///
-/// The binder-column fallback reads only these structured fields, never
-/// the message text (ADR-0056). Every other failure gives `None`: another
-/// type or subtype, a diagnostic without the subtype or `name`, one that
-/// does not parse as [`DuckDbDiagnostic`] does not, and every driver-side
-/// variant. `DuckDB` 1.5.5 raises some binder failures over a missing name
-/// with no subtype (a name in an `EXCLUDE` or `REPLACE` list, a struct key,
-/// a table), so none of them is the fallback.
+/// is a `Binder` diagnostic with the `COLUMN_NOT_FOUND` subtype (ADR-0056).
 pub(crate) fn missing_column(error: &duckdb::Error) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct ColumnNotFound {
@@ -329,14 +226,10 @@ fn format_parse_errors(errors: &[ParseError]) -> String {
 mod structured_error_classification {
     use super::EngineError;
 
-    /// A `DuckDB` failure whose message is `message`, as the driver builds
-    /// one from a failed statement.
     fn failure(message: &str) -> duckdb::Error {
         duckdb::Error::DuckDBFailure(duckdb::ffi::Error::new(1), Some(message.to_owned()))
     }
 
-    /// The error `sql` raises on a connection with `errors_as_json` set as
-    /// given.
     fn live(sql: &str, json: bool) -> duckdb::Error {
         let conn = duckdb::Connection::open_in_memory().expect("duckdb");
         conn.execute_batch(&format!("SET errors_as_json = {json}"))
@@ -357,9 +250,6 @@ mod structured_error_classification {
         );
     }
 
-    /// The words "Out of Memory" anywhere but the exception type do not
-    /// classify: in another type's message, live and planted, or in a
-    /// message that is not a diagnostic.
     #[test]
     fn out_of_memory_text_under_another_type_stays_a_database_error() {
         let hostile = [
@@ -388,11 +278,6 @@ mod structured_error_classification {
         }
     }
 
-    /// A message that is not a well-formed diagnostic stays a database
-    /// error, whatever it says: text from a connection without
-    /// `errors_as_json`, broken or partial JSON, a non-string type, a
-    /// repeated key, an array (serde's derive takes a positional sequence
-    /// for a struct), and the driver's own variants.
     #[test]
     fn a_malformed_diagnostic_stays_a_database_error() {
         let malformed = [
@@ -440,9 +325,6 @@ mod structured_error_classification {
         );
     }
 
-    /// A statement stopped through the connection's interrupt handle is an
-    /// interrupt, and no other failure is: not another type, not the word
-    /// in a message, not a message that is not a diagnostic.
     #[test]
     fn only_an_interrupt_diagnostic_is_an_interrupt() {
         let conn = duckdb::Connection::open_in_memory().expect("duckdb");
@@ -484,8 +366,6 @@ mod structured_error_classification {
         assert!(!EngineError::Cancelled.is_interrupt());
     }
 
-    /// A database error reads as `DuckDB`'s text form, not as the JSON the
-    /// connection reported.
     #[test]
     fn a_database_error_renders_the_diagnostic_as_text() {
         let error = EngineError::from(live("SELECT nonexistent_col FROM (SELECT 1 AS x)", true));

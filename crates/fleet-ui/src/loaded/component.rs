@@ -2,39 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `<Loaded>` render-prop wrapper. Wasm-only (pulls leptos) — the
-//! pure [`LoadState`] mapping and the canonical copy live in
-//! [`super::state`] so they are native-testable.
-
 use leptos::prelude::*;
 
 use super::state::{LoadState, error_copy, loading_copy, missing_copy};
 
-/// Tri-state wrapper: renders the canonical loading / error hints and
-/// hands the `Ready` payload to the `render` prop.
-///
-/// ```ignore
-/// <Loaded
-///     state=Signal::derive(move || LoadState::from_resource(nets.get()))
-///     label="nets"
-///     render=Box::new(move |resp| view! { … }.into_any())
-/// />
-/// ```
-///
-/// `label` names the resource in the canonical copy (`loading nets…` /
-/// `couldn't load nets: …` / `nets not found`); omit it for the bare
-/// forms. `error` overrides the error arm for surfaces that
-/// deliberately suppress error copy (trawl's facet sidebar and
-/// histogram render a quiet `—` because the results table already
-/// shows the failure). `missing` likewise overrides the
-/// [`LoadState::Missing`] arm; the default renders the canonical "not
-/// found" copy on the neutral `.load-hint` tone (a missing resource is
-/// not a failure), with `missing_subtitle` as an optional explanatory
-/// second line. `missing_subtitle` decorates only that default arm:
-/// pass a custom `missing` closure and the subtitle is ignored (render
-/// it yourself inside the closure).
-/// `retry` adds a recovery button to the default error presentation. The
-/// caller owns the request and its context; custom error views own recovery too.
 #[component]
 pub fn Loaded<T>(
     #[prop(into)] state: Signal<LoadState<T>>,

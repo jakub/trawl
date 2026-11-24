@@ -79,8 +79,6 @@ class CargoRuntime(unittest.TestCase):
         (self.root / "scripts/release/duckdb-runtime.json").write_text(json.dumps(self.manifest))
         env = {**self.env, "TARGET": target, "OUT_DIR": str(out)}
         if explicit:
-            # This is the intentional construction step. The subsequent Cargo
-            # helper must only read this existing dependency directory.
             subprocess.run([sys.executable, str(self.root / "scripts/release/distribution.py"),
                             "prepare", "--source", str(self.root), "--target", target,
                             "--output", str(runtime)], check=True, env=self.env)
@@ -112,7 +110,6 @@ class CargoRuntime(unittest.TestCase):
                 watched = [Path(line.removeprefix("cargo:rerun-if-changed="))
                            for line in result.stdout.splitlines()
                            if line.startswith("cargo:rerun-if-changed=")]
-                # A deleted runtime copy must still rerun the script and be restored.
                 self.assertIn(deps, watched)
                 self.assertIn(runtime / deps.name, watched)
                 for path in watched:
@@ -130,7 +127,6 @@ class CargoRuntime(unittest.TestCase):
         self.run_helper(env)
         self.assertEqual(deps.read_bytes(), target.encode())
         self.assertEqual((runtime / deps.name).read_bytes(), target.encode())
-        # A second profile has no runtime yet and must use the existing cache.
         env["OUT_DIR"] = env["OUT_DIR"].replace("/debug/", "/release/")
         self.run_helper(env)
         self.assertEqual(Path(env["OUT_DIR"]).joinpath("duckdb", deps.name).read_bytes(), target.encode())

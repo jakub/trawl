@@ -2,34 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `trawld --doctor` checks of the certificate and trawld's own listener
-//! (#269, D12 to D14).
-//!
-//! - `server.tls.material` reads the pair the configuration selects: an
-//!   operator's pair through [`super::fsread`], trawld's generated pair
-//!   through [`tls::inspect_generated_pair`], which makes a start's checks
-//!   and changes nothing. It judges the pair with the functions boot serves
-//!   it with ([`tls::parse_pem_pair`], [`tls::serving_config`]) and with one
-//!   rule of the doctor's own: every certificate is within its validity
-//!   dates. Nothing is generated.
-//! - `server.listener.identity` dials the configured address, a wildcard
-//!   mapped to loopback, and accepts only the leaf on disk, from a server
-//!   that proves in the handshake that it holds the leaf's key
-//!   ([`PinnedLeaf`]). It makes no claim about a host name. A host name is
-//!   dialed at each address it resolves to, in order, until one proves it;
-//!   when none does, which of them trawld binds is unknown. The material is
-//!   read again after the probe, and a change means the comparison proves
-//!   nothing. With no material yet, it only opens and closes a TCP
-//!   connection.
-//! - `server.listener.health` reads the health answer the identity probe
-//!   received, at most [`HEALTH_BODY_MAX`] bytes, and maps each reported
-//!   value through the classifier every doctor shares
-//!   ([`trawl_api::doctor::health`]). An answer that breaks off is not
-//!   classified, and no value is shown as the server sent it.
-//!
-//! The probe is one `GET /api/v1/health` per address over HTTP/1.1, with
-//! no proxy, no redirect, no retry, no key, and one bounded time for all
-//! addresses. The group fills [`Ctx::tls`] and [`Ctx::listener_refused`].
+//! The `trawld --doctor` checks of the certificate and trawld's own listener.
+//! The probe makes at most one `GET /api/v1/health` per address, over
+//! HTTP/1.1 with no proxy, no redirect, no retry and no key, in one bounded
+//! time for all addresses.
 
 use std::io;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -52,8 +28,6 @@ use super::{Ctx, Der, Runner, ServerCheck};
 use crate::tls::{self, GeneratedPair, OwnerRule, Regenerate, TlsError, TlsSource, UnsafeReason};
 use trawl_config::{GENERATED_KEY_DIR, GENERATED_TLS_DIR};
 
-/// This group's checks, in [`ServerCheck::ALL`] order; the graph test in
-/// [`super`] reads this list.
 #[cfg(test)]
 pub(super) const CHECKS: [ServerCheck; 3] = [
     ServerCheck::TlsMaterial,
@@ -61,24 +35,16 @@ pub(super) const CHECKS: [ServerCheck; 3] = [
     ServerCheck::ListenerHealth,
 ];
 
-/// How long a TCP connection to the listener may take to open.
 const CONNECT_DEADLINE: Duration = Duration::from_secs(5);
 
-/// How long the whole health probe may take: connection, handshake,
-/// request, and body, at every address the listener address resolves to.
 const PROBE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// How long a listener address that names a host may take to resolve.
 const RESOLVE_DEADLINE: Duration = Duration::from_secs(5);
 
-/// The most bytes of the health answer the doctor reads, as every doctor
-/// reads it.
 const HEALTH_BODY_MAX: usize = health::BODY_MAX;
 
-/// The endpoint the probe reads.
 const HEALTH_PATH: &str = "/api/v1/health";
 
-/// Run this group's checks through `runner`.
 pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     let source = MaterialSource::of(ctx);
     let before = check_material(ctx, runner, source.as_ref()).await;
@@ -86,19 +52,14 @@ pub(super) async fn run(ctx: &mut Ctx, runner: &mut Runner) {
     check_health(runner, answer).await;
 }
 
-// -- server.tls.material ---------------------------------------------------
-
-/// Where the listener's certificate and key are read from.
 #[derive(Debug)]
 enum MaterialSource {
-    /// `[server] tls_cert_path` and `tls_key_path`.
     Configured {
         cert: PathBuf,
         key: PathBuf,
         shown_cert: SelectedPath,
         shown_key: SelectedPath,
     },
-    /// trawld's generated pair under `state_dir`, judged for `owner`.
     Generated {
         state_dir: PathBuf,
         owner: OwnerRule,
@@ -106,9 +67,6 @@ enum MaterialSource {
 }
 
 impl MaterialSource {
-    /// The source the configuration selects, as boot selects it. `None`
-    /// when only one of the two paths is set, which the configuration's own
-    /// validation refuses first.
     fn of(ctx: &Ctx) -> Option<Self> {
         let server = &ctx.config.server;
         match TlsSource::of(
@@ -134,7 +92,6 @@ impl MaterialSource {
         }
     }
 
-    /// What the rows name as the input they read.
     fn text(&self) -> Text {
         match self {
             Self::Configured {
@@ -157,37 +114,26 @@ impl MaterialSource {
     }
 }
 
-/// Which file a read fault is about.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Part {
     Cert,
     Key,
-    /// One of the generated TLS directories.
     Directory,
 }
 
-/// Why the material was not read as a pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fault {
-    /// A read gave no bytes.
     Read(Part, ReadFault),
-    /// Boot refuses what is in its generated TLS directories.
     Refused(UnsafeReason),
 }
 
-/// What one read of the material found.
 #[derive(Clone, PartialEq, Eq)]
 enum Material {
-    /// Both PEM files, as read.
     Pair { cert: Vec<u8>, key: Vec<u8> },
-    /// No generated pair a start would load: it generates a new one.
     WillGenerate(Regenerate),
-    /// Nothing that a start would serve was read.
     Unread(Fault),
 }
 
-/// One read of the material, compared as a whole before and after the
-/// listener probe.
 #[derive(Clone, PartialEq, Eq)]
 struct Observed {
     material: Material,
@@ -217,7 +163,6 @@ impl std::fmt::Debug for Observed {
     }
 }
 
-/// Read the material `source` names, bounded in size and time.
 async fn read_material(source: &MaterialSource) -> Observed {
     match source {
         MaterialSource::Configured { cert, key, .. } => {
@@ -261,8 +206,6 @@ async fn read_material(source: &MaterialSource) -> Observed {
     }
 }
 
-/// The fault an inspection of the generated pair reports. Only the kind of
-/// failure is kept: no path and no OS text.
 fn generated_fault(error: &TlsError) -> Fault {
     let io_fault = |error: &io::Error| match error.kind() {
         io::ErrorKind::PermissionDenied => ReadFault::PermissionDenied,
@@ -279,21 +222,16 @@ fn generated_fault(error: &TlsError) -> Fault {
     }
 }
 
-/// A pair that parses, matches, and is in date.
 #[derive(Debug)]
 struct Judged {
-    /// The leaf certificate's DER.
     leaf: Vec<u8>,
     /// Whole days until the leaf expires.
     days_left: i64,
 }
 
-/// Why a pair that was read is not one boot serves, or not one in date.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Misjudged {
-    /// Boot refuses it: it does not parse, or the key is not the leaf's.
     Content(&'static str),
-    /// Boot serves it, but a certificate is outside its validity dates.
     Dates(&'static str),
 }
 
@@ -305,7 +243,6 @@ impl Misjudged {
     }
 }
 
-/// Judge a PEM pair the way boot serves it, then by its validity dates.
 fn judge_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<Judged, Misjudged> {
     use Misjudged::{Content, Dates};
 
@@ -352,9 +289,6 @@ fn judge_pair(cert_pem: &[u8], key_pem: &[u8]) -> Result<Judged, Misjudged> {
     Ok(Judged { leaf, days_left })
 }
 
-/// `server.tls.material`: read and judge the pair, and fill [`Ctx::tls`]
-/// when it is one boot serves. Returns what was read, for the listener
-/// check to compare after its probe.
 async fn check_material(
     ctx: &mut Ctx,
     runner: &mut Runner,
@@ -416,8 +350,6 @@ async fn generation_row(state_dir: PathBuf) -> Option<Row> {
     }
 }
 
-/// The `server.tls.material` row for what was seen at one generated TLS
-/// directory a start creates or writes, or `None` when the start can.
 fn generation_fault(seen: RootSeen) -> Option<Row> {
     let check = ServerCheck::TlsMaterial;
     let access = || {
@@ -428,7 +360,6 @@ fn generation_fault(seen: RootSeen) -> Option<Row> {
     };
     let point = || Text::new("point [data] path below a directory trawld can create");
     let row = match seen {
-        // The start re-modes a directory it owns before it writes there.
         RootSeen::Directory(Access::Granted | Access::NoWrite) => return None,
         seen if seen.holds() => return None,
         RootSeen::Absent(Some(Access::NoRead | Access::NoWrite)) => Row::failed(
@@ -476,8 +407,6 @@ fn generation_fault(seen: RootSeen) -> Option<Row> {
     Some(row)
 }
 
-/// The row for what one read found, and the leaf when the pair is one boot
-/// serves.
 fn material_row(source: &MaterialSource, observed: &Observed) -> (Row, Option<Vec<u8>>) {
     let check = ServerCheck::TlsMaterial;
     let root_note = "; a generated directory or the key belongs to another uid, which a root run \
@@ -550,7 +479,6 @@ fn material_row(source: &MaterialSource, observed: &Observed) -> (Row, Option<Ve
     (row.source(source.text()), leaf)
 }
 
-/// The row for material that changed while the doctor read or compared it.
 fn changed_row(check: ServerCheck, source: &MaterialSource) -> Row {
     Row::not_sampled(check, reason::MATERIAL_CHANGED)
         .detail(Text::new(
@@ -560,7 +488,6 @@ fn changed_row(check: ServerCheck, source: &MaterialSource) -> Row {
         .next(Text::new("rerun once they stop changing"))
 }
 
-/// The `server.tls.material` row for material that was not read as a pair.
 fn fault_row(source: &MaterialSource, fault: Fault) -> Row {
     let check = ServerCheck::TlsMaterial;
     let row = match fault {
@@ -609,7 +536,6 @@ fn fault_row(source: &MaterialSource, fault: Fault) -> Row {
     row.source(source.text())
 }
 
-/// Why boot refuses what is in its generated TLS directories.
 const fn refusal_reason(why: UnsafeReason) -> &'static str {
     match why {
         UnsafeReason::Symlink => {
@@ -630,9 +556,6 @@ const fn refusal_reason(why: UnsafeReason) -> &'static str {
     }
 }
 
-/// Why a configured certificate or key path is refused, for the read
-/// faults that prove the path wrong: missing, not a regular file, or a
-/// symlink loop.
 const fn configured_refusal(part: Part, read: ReadFault) -> &'static str {
     match (part, read) {
         (Part::Key, ReadFault::Missing) => "the configured private key does not exist",
@@ -644,21 +567,13 @@ const fn configured_refusal(part: Part, read: ReadFault) -> &'static str {
     }
 }
 
-// -- server.listener.identity ----------------------------------------------
-
-/// What the listener did with the doctor's connection, when it proved
-/// nothing about its certificate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Contact {
-    /// A TCP connection opened.
     Accepted,
-    /// No connection opened; the reason code says why.
     Refused(&'static str),
-    /// Nothing answered within the deadline.
     TimedOut,
 }
 
-/// Whether a connection error says nothing is there to accept it.
 fn nothing_listens(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -670,7 +585,6 @@ fn nothing_listens(kind: io::ErrorKind) -> bool {
     )
 }
 
-/// The reason code for a connection that did not open, when one fits.
 fn refusal(kind: io::ErrorKind) -> Option<&'static str> {
     if nothing_listens(kind) {
         Some(reason::NOT_LISTENING)
@@ -681,8 +595,6 @@ fn refusal(kind: io::ErrorKind) -> Option<&'static str> {
     }
 }
 
-/// Open a TCP connection to `addr` and close it at once, sending nothing,
-/// within `budget` and at most [`CONNECT_DEADLINE`].
 async fn tcp_contact(addr: SocketAddr, budget: Duration) -> Contact {
     let deadline = budget.min(CONNECT_DEADLINE);
     match tokio::time::timeout(deadline, tokio::net::TcpStream::connect(addr)).await {
@@ -696,8 +608,6 @@ async fn tcp_contact(addr: SocketAddr, budget: Duration) -> Contact {
     }
 }
 
-/// The address the probe dials: the configured one, with a wildcard mapped
-/// to loopback of its family. The flag says whether it was a wildcard.
 fn dial_addr(addr: SocketAddr) -> (SocketAddr, bool) {
     if !addr.ip().is_unspecified() {
         return (addr, false);
@@ -709,12 +619,9 @@ fn dial_addr(addr: SocketAddr) -> (SocketAddr, bool) {
     (SocketAddr::new(ip, addr.port()), true)
 }
 
-/// One address the probe dials.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Dial {
-    /// The address, a wildcard mapped to loopback by [`dial_addr`].
     addr: SocketAddr,
-    /// Whether it was a wildcard.
     wildcard: bool,
 }
 
@@ -765,17 +672,13 @@ async fn listener_addrs(configured: &str) -> Result<Vec<Dial>, Row> {
     }
 }
 
-/// What the probe's verifier saw.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct Seen {
-    /// Whether the server's leaf was the pinned one, once it sent one.
     leaf: Option<bool>,
-    /// Whether every handshake signature verified, once one was checked.
     signature: Option<bool>,
 }
 
 impl Seen {
-    /// The server sent the pinned leaf and proved it holds its key.
     const fn proven(self) -> bool {
         matches!(
             self,
@@ -789,16 +692,9 @@ impl Seen {
 
 /// A `rustls` verifier that accepts exactly one certificate, the leaf on
 /// disk, and only from a server that proves it holds the leaf's key.
-///
-/// The leaf is compared byte for byte with the pinned DER. Nothing else in
-/// the chain, no host name, and no validity date is consulted: the doctor
-/// asks whether this listener serves this certificate, not whether a client
-/// would trust it. Every handshake signature is verified with the ring
-/// provider's algorithms against the pinned leaf's key, through `rustls`'s
-/// own [`rustls::crypto::verify_tls12_signature`] and
-/// [`rustls::crypto::verify_tls13_signature`]; a server that presents the
-/// leaf without its key cannot complete the handshake. What it saw is
-/// recorded in [`Seen`] for the report.
+/// Nothing else in the chain, no host name, and no validity date is consulted:
+/// the doctor asks whether this listener serves this certificate, not whether
+/// a client would trust it.
 struct PinnedLeaf {
     leaf: CertificateDer<'static>,
     algorithms: WebPkiSupportedAlgorithms,
@@ -817,8 +713,6 @@ impl PinnedLeaf {
         update(&mut self.seen.lock().unwrap_or_else(PoisonError::into_inner));
     }
 
-    /// Verify one handshake signature with `verify`, only when `cert` is
-    /// the pinned leaf, and record the result. A failure sticks.
     fn signature(
         &self,
         cert: &CertificateDer<'_>,
@@ -886,11 +780,8 @@ impl ServerCertVerifier for PinnedLeaf {
     }
 }
 
-/// The probe's HTTP client: TLS through [`PinnedLeaf`] on the ring
-/// provider, SNI off, ALPN `http/1.1` only, no session resumption (every
-/// handshake verifies the certificate and a signature), no proxy, no
-/// redirect, no retry, HTTP/1.1 only, and `budget` for the whole exchange,
-/// at most [`CONNECT_DEADLINE`] of it to connect.
+/// No session resumption: every handshake verifies the certificate and a
+/// signature.
 fn probe_client(
     leaf: &Der,
     seen: Arc<Mutex<Seen>>,
@@ -925,19 +816,14 @@ fn probe_client(
         .map_err(drop)
 }
 
-/// What the probe got.
 #[derive(Debug)]
 struct Probe {
     seen: Seen,
-    /// `None` when the client could not be built.
     answer: Option<Answer>,
 }
 
-/// The health request's result.
 type Answer = Result<reqwest::Response, reqwest::Error>;
 
-/// Send the one `GET /api/v1/health` to `addr`, accepting only `leaf`,
-/// within `budget`, which the health body's read shares.
 async fn probe(addr: SocketAddr, leaf: &Der, budget: Duration) -> Probe {
     let seen = Arc::new(Mutex::new(Seen::default()));
     let answer = match probe_client(leaf, Arc::clone(&seen), budget) {
@@ -975,14 +861,10 @@ fn io_kind(error: &reqwest::Error) -> Option<io::ErrorKind> {
     None
 }
 
-/// What dialing one address found.
 #[derive(Debug)]
 struct Attempt {
-    /// The row this address alone gives.
     row: Row,
-    /// The health answer, when this address proved its identity.
     answer: Option<Answer>,
-    /// Nothing accepted a connection at this address.
     not_listening: bool,
     /// This address settles the check whatever the others give: it proved
     /// the certificate, it accepted a connection when there is no material
@@ -990,8 +872,6 @@ struct Attempt {
     decisive: bool,
 }
 
-/// Dial `dial`, one of `count` addresses, within `budget`: a TCP contact
-/// when there is no `leaf` to compare, else the pinned TLS probe.
 async fn attempt(dial: Dial, count: usize, leaf: Option<&Der>, budget: Duration) -> Attempt {
     let check = ServerCheck::ListenerIdentity;
     let dialed = |text: Text| dialed_text(text, dial, count);
@@ -1040,8 +920,6 @@ async fn attempt(dial: Dial, count: usize, leaf: Option<&Der>, budget: Duration)
     }
 }
 
-/// `text`, with what the report may say of how `dial`, one of `count`
-/// addresses, was reached. No address is shown.
 fn dialed_text(text: Text, dial: Dial, count: usize) -> Text {
     let text = if dial.wildcard {
         text.lit("; dialed on loopback for the wildcard address")
@@ -1057,9 +935,6 @@ fn dialed_text(text: Text, dial: Dial, count: usize) -> Text {
     }
 }
 
-/// The identity row from the attempts at `count` addresses, the proven
-/// address's health answer, and whether nothing listens at any address.
-///
 /// A decisive attempt settles it. One address gives what it found, so a
 /// stable mismatch there fails. Of several addresses with no proof, none
 /// accepting a connection is `not_listening`; anything else leaves unknown
@@ -1102,11 +977,6 @@ fn settle(mut attempts: Vec<Attempt>, count: usize) -> (Row, Option<Answer>, boo
     (row, None, false)
 }
 
-/// `server.listener.identity`: dial the listener and compare what it
-/// serves with the material, then read the material again. A listener
-/// address that resolves to several addresses is dialed at each in turn,
-/// within one [`PROBE_DEADLINE`], until one proves it. Returns the probe's
-/// answer when the listener proved its identity, for the health check.
 async fn check_identity(
     ctx: &mut Ctx,
     runner: &mut Runner,
@@ -1154,7 +1024,6 @@ async fn check_identity(
     let (row, answer, refused) = settle(attempts, dials.len());
     ctx.listener_refused = refused;
 
-    // The comparison holds only for material that did not change meanwhile.
     if read_material(source).await != before {
         runner.record(
             gate,
@@ -1172,7 +1041,6 @@ async fn check_identity(
     answer
 }
 
-/// The identity row for a connection that did not open.
 fn contact_row(code: &'static str, dialed: &impl Fn(Text) -> Text) -> Row {
     let check = ServerCheck::ListenerIdentity;
     if code == reason::PERMISSION_DENIED {
@@ -1193,8 +1061,6 @@ fn timed_out_row(dialed: &impl Fn(Text) -> Text) -> Row {
         .detail(dialed(Text::new("the listener did not answer in time")))
 }
 
-/// The identity row for a TLS probe, from what the verifier saw first and
-/// the request's result second.
 fn probe_row(seen: Seen, answer: &Answer, dialed: &impl Fn(Text) -> Text) -> Row {
     let check = ServerCheck::ListenerIdentity;
     let not_trawld =
@@ -1268,11 +1134,6 @@ fn cut_off(kind: io::ErrorKind) -> bool {
     )
 }
 
-// -- server.listener.health ------------------------------------------------
-
-/// `server.listener.health` and its `server.listener.health.<key>` rows,
-/// from the answer the identity probe received.
-///
 /// Only an answer the protocol proves whole is classified. One that breaks
 /// off, before its head or inside its body, is `not_sampled`,
 /// [`reason::INTERRUPTED`], with no per-key rows: what arrived may be a prefix of
@@ -1334,7 +1195,6 @@ async fn check_health(runner: &mut Runner, answer: Option<Answer>) {
     runner.record_with(gate, row, keyed);
 }
 
-/// The next action for an answer that is not trawld's.
 const NOT_TRAWLD: &str =
     "check that trawld, and not another service, listens at the configured address";
 
@@ -1354,7 +1214,6 @@ fn not_http(error: &reqwest::Error) -> bool {
     false
 }
 
-/// Why the health body was not read whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyFault {
     TooLarge,
@@ -1362,7 +1221,6 @@ enum BodyFault {
     Broken,
 }
 
-/// The response body, read chunk by chunk, refused past `max` bytes.
 async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<u8>, BodyFault> {
     if response
         .content_length()
@@ -1386,17 +1244,6 @@ async fn read_capped(mut response: reqwest::Response, max: usize) -> Result<Vec<
     }
 }
 
-/// The health rows for a body that arrived whole with HTTP `status`, as
-/// the judge every doctor shares reads it ([`health::judge`]).
-///
-/// A 200 or 503 health body keeps its rows, one per reported check, so a
-/// 503 from a failed `DuckDB` probe fails its own row. An `unavailable`
-/// answer, which trawld sends only with a 503, fails the check itself
-/// whatever its checks say, even when it reports none or only `ok` ones. A
-/// 503 `corpus_recovering` envelope is `recovering`, as the classifier maps
-/// the corpus recovery values, and a 503 `request_limit_reached` envelope is
-/// `request_limit_reached` with no per-check rows. Anything else is not
-/// trawld's health answer.
 fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     let check = ServerCheck::ListenerHealth;
     match health::judge(status, body) {
@@ -1453,14 +1300,10 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     }
 }
 
-/// The failed health row for an HTTP `status` trawld's health endpoint
-/// never sends, whatever the body; `None` for 200 and 503.
 fn status_row(status: u16) -> Option<Row> {
     (!health::is_health_http_status(status)).then(|| status_failure(status))
 }
 
-/// The failed health row for the HTTP `status`, one trawld's health
-/// endpoint never sends.
 fn status_failure(status: u16) -> Row {
     Row::failed(
         ServerCheck::ListenerHealth,
@@ -1470,7 +1313,6 @@ fn status_failure(status: u16) -> Row {
     .next(Text::new(NOT_TRAWLD))
 }
 
-/// The health row for an answer larger than the doctor reads.
 fn too_large_row() -> Row {
     Row::not_sampled(ServerCheck::ListenerHealth, reason::TOO_LARGE).detail(
         Text::new("the doctor reads at most ")
@@ -1479,11 +1321,6 @@ fn too_large_row() -> Row {
     )
 }
 
-/// One row per reported check, sorted by name. Names trawld's health
-/// endpoint does not report become one failed
-/// `server.listener.health._invalid` row, and none of them is shown: the
-/// report names only checks it knows, since even an identifier-shaped name
-/// may be a secret.
 fn keyed_rows(health: &Health) -> Vec<Row> {
     let mut rows: Vec<Row> = health.checks().iter().map(key_row).collect();
     let invalid = health.unknown_names();
@@ -1504,27 +1341,17 @@ fn keyed_rows(health: &Health) -> Vec<Row> {
     rows
 }
 
-/// The row for one reported check.
-///
-/// No value a server sends is shown as sent: a known value is named by a
-/// literal of this doctor's, and a value it does not know is not shown at
-/// all, since even an identifier-shaped value may be a secret.
 fn key_row(answer: &KeyAnswer) -> Row {
     let key = HealthKey::new(answer.name())
         .expect("the judge names only checks trawld's health endpoint reports");
     let row = |reason| Row::for_key(ServerCheck::ListenerHealth, key, answer.outcome(), reason);
     match answer.value() {
         Reported::Ok => row(None).detail(Text::new("reported ok")),
-        // A slow engine answered its latest sample past the budget, and
-        // answered within the last minute: trawld is degraded, not down
-        // (ADR-0056).
         Reported::Slow => row(None).detail(Text::new("reported slow")).next(
             Text::new("trawld is degraded, not down; read trawld's log if ")
                 .key(&key)
                 .lit(" stays slow"),
         ),
-        // A recovering corpus is not a failure: trawld cannot yet vouch for
-        // what it holds, so the doctor could not look (ADR-0047).
         recovering @ (Reported::RollupPending | Reported::RestartBacklog) => {
             row(Some(reason::RECOVERING))
                 .detail(Text::new(if recovering == Reported::RollupPending {
@@ -1565,7 +1392,6 @@ mod tests {
 
     use super::*;
 
-    /// A fresh self-signed pair whose names are `names`.
     fn pair(names: &[&str]) -> (CertificateDer<'static>, PrivateKeyDer<'static>) {
         let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
         let rcgen::CertifiedKey { cert, signing_key } =
@@ -1586,7 +1412,6 @@ mod tests {
         Arc::new(CertifiedKey::new(vec![cert], signer))
     }
 
-    /// What a server saw of the client's hello.
     #[derive(Debug, Default)]
     struct Hello {
         alpn: Option<Vec<Vec<u8>>>,
@@ -1594,7 +1419,6 @@ mod tests {
         count: usize,
     }
 
-    /// Serves one fixed key and records each client hello.
     #[derive(Debug)]
     struct Recording {
         key: Arc<CertifiedKey>,
@@ -1613,9 +1437,6 @@ mod tests {
         }
     }
 
-    /// A TLS listener on loopback that serves `key` over `versions`,
-    /// offering ALPN `h2` and `http/1.1` as trawld does, and answers every
-    /// request with `response`.
     async fn listener(
         key: Arc<CertifiedKey>,
         versions: &[&'static SupportedProtocolVersion],
@@ -1665,11 +1486,6 @@ mod tests {
     const V12: &[&SupportedProtocolVersion] = &[&rustls::version::TLS12];
     const V13: &[&SupportedProtocolVersion] = &[&rustls::version::TLS13];
 
-    /// reqwest runs the probe on the doctor's own `ClientConfig`, not one
-    /// of its own: a self-signed certificate that names only a DNS host,
-    /// dialed by IP, passes only through the pinned-leaf verifier, which
-    /// records that it ran; the hello carries exactly ALPN `http/1.1` and
-    /// no SNI. Over TLS 1.2 and 1.3, both of which the probe offers.
     #[tokio::test]
     async fn the_probe_runs_on_the_pinned_client_config() {
         for versions in [V12, V13] {
@@ -1695,8 +1511,6 @@ mod tests {
         }
     }
 
-    /// A listener serving any other certificate is refused at its leaf,
-    /// before any signature is checked.
     #[tokio::test]
     async fn another_leaf_is_refused() {
         let (served, key) = pair(&["localhost"]);
@@ -1723,9 +1537,6 @@ mod tests {
         );
     }
 
-    /// The pinned leaf alone proves nothing: a server that presents it but
-    /// signs the handshake with another key fails signature verification,
-    /// over TLS 1.2 and 1.3, and the probe never gets an answer.
     #[tokio::test]
     async fn the_pinned_leaf_without_its_key_is_refused() {
         for versions in [V12, V13] {
@@ -1756,9 +1567,6 @@ mod tests {
         }
     }
 
-    /// The verifier refuses a signature from any certificate but the pinned
-    /// one, whatever called it, and a failed signature is never overwritten
-    /// by a later good one.
     #[test]
     fn a_signature_by_another_certificate_is_refused() {
         let (pinned, _) = pair(&["localhost"]);
@@ -1795,9 +1603,6 @@ mod tests {
         assert!(!verifier.supported_verify_schemes().is_empty());
     }
 
-    /// A port nothing listens on is `not_listening` through both paths: the
-    /// TLS probe and the plain connection of a run with no material yet.
-    /// A port something listens on is accepted, and nothing is sent to it.
     #[tokio::test]
     async fn a_closed_port_is_not_listening() {
         let closed = {
@@ -1835,10 +1640,6 @@ mod tests {
         assert!(received.await.unwrap().is_empty(), "nothing was sent");
     }
 
-    /// Of the addresses a host name resolves to, any proof settles the
-    /// identity. One address gives what it found, so its stable mismatch
-    /// fails; several with no proof leave unknown which one trawld binds,
-    /// unless nothing listens at any of them.
     #[test]
     fn several_addresses_settle_on_a_proof_or_stay_unknown() {
         use Outcome::{Complete, Failed, NotSampled};
@@ -1880,8 +1681,6 @@ mod tests {
         );
     }
 
-    /// A socket address is dialed alone, a wildcard on loopback; a repeat
-    /// in what a name resolves to is dialed once.
     #[tokio::test]
     async fn the_listener_address_is_dialed_as_resolved() {
         assert_eq!(
@@ -1969,7 +1768,6 @@ mod tests {
                 expected
             );
         }
-        // An expired certificate in the chain behind a valid leaf.
         let chain = format!("{cert}{expired}");
         assert_eq!(
             judge_pair(chain.as_bytes(), key.as_bytes()).unwrap_err(),
@@ -1986,9 +1784,6 @@ mod tests {
             .collect()
     }
 
-    /// A starved engine answers 200 `degraded` with `duckdb: slow`. The
-    /// engine row is complete, not failed, and says what it saw, so the run
-    /// is not failed by a server that is degraded and not down (ADR-0056).
     #[test]
     fn health_slow_engine_is_degraded_not_failed() {
         let body =
@@ -2017,7 +1812,6 @@ mod tests {
                 .next_action
                 .is_some_and(|next| next.contains("degraded"))
         );
-        // Under a 503 the status and the HTTP status disagree: not trawld's.
         let (disagrees, rows) = health_rows(
             503,
             br#"{"status":"degraded","version":"x","checks":{"duckdb":"slow"}}"#,
@@ -2026,8 +1820,6 @@ mod tests {
         assert!(rows.is_empty());
     }
 
-    /// Each reported value maps as the shared classifier says, and nothing
-    /// a server sends is shown unless the report may show it.
     #[test]
     fn health_values_map_as_specified() {
         let body = br#"{"status":"degraded","version":"x","checks":{
@@ -2067,8 +1859,6 @@ mod tests {
                 ),
             ]
         );
-        // No unknown value or name is shown, not even one shaped like an
-        // identifier or a fingerprint.
         let shown = format!("{keyed:?}");
         for hidden in ["Weird", "Bad-Key", "secret", "wal", "9f86d081", "a08"] {
             assert!(!shown.contains(hidden), "{hidden}: {shown}");
@@ -2121,8 +1911,6 @@ mod tests {
         }
     }
 
-    /// An unavailable answer fails the check itself and keeps its rows,
-    /// whatever they say: failing ones, none, or only ok ones.
     #[test]
     fn an_unavailable_answer_fails_whatever_its_checks_say() {
         let id = |key: &str| format!("server.listener.health.{key}");
@@ -2194,13 +1982,6 @@ mod tests {
         Option<&'static str>,
     );
 
-    /// When a start would generate a pair, `server.tls.material` fails
-    /// what stops the start from creating or writing `tls/` and `tls-key/`,
-    /// and each state is checked against boot's own start. A directory the
-    /// start owns is re-moded before it writes, so its mode bits stop
-    /// nothing; an absent one needs the directory above it writable. A
-    /// privileged user may do everything its modes forbid; the test asserts
-    /// whichever the running user is.
     #[cfg(unix)]
     #[tokio::test]
     async fn a_start_that_cannot_create_its_pair_fails() {
@@ -2275,7 +2056,6 @@ mod tests {
             assert_eq!(boot, expected.is_none(), "{name}: boot disagrees");
         }
 
-        // What refuses the start whoever runs it.
         let file = tmp.path().join("file");
         std::fs::write(&file, b"x").unwrap();
         let dangling = tmp.path().join("dangling");

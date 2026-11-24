@@ -3,17 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Formatting never changes what a query means, in the live lane
-//! (ADR-0061). Each fixture query compiles to a live filter and stream
-//! plan as written and again as `checked_format_query` spells it. Both
-//! run over the same in-memory events at one fixed instant, and the
-//! per-event filter verdicts and the emitted rows must be equal.
+//! (ADR-0061).
 //!
 //! The comparison stays inside this lane. Whether the live lane agrees
 //! with the SQL lane is a different property (`filter_parity`), and
 //! mixing the two here would hide a formatter defect behind a lane gap.
-//!
-//! Every row also names the row count it must emit, so a query that
-//! matches nothing before and after formatting cannot pass by accident.
 
 use serde_json::{Map, Value, json};
 use trawl_core::context::EvalContext;
@@ -25,8 +19,6 @@ use trawl_core::row::{self, Row};
 use trawl_core::schema::FieldTypes;
 use trawl_core::stream::{self, LiveOutcome, StageResult, StreamPlan, compile_stream_plan};
 
-/// [`trawl_core::stream::apply_stage`] over a compiled plan, which
-/// prepares every pattern its stages read.
 fn apply_stage(
     stage: &mut trawl_core::stream::CompiledStage,
     event: &mut trawl_core::row::Row,
@@ -36,8 +28,6 @@ fn apply_stage(
         .expect("a compiled plan prepares every pattern")
 }
 
-/// The one instant every case evaluates at, so `last=` reads a fixed
-/// window and nothing here samples a clock.
 fn anchor() -> EvalContext {
     EvalContext::at(
         chrono::DateTime::parse_from_rfc3339("2024-01-15T10:06:00Z")
@@ -46,12 +36,8 @@ fn anchor() -> EvalContext {
     )
 }
 
-/// Six events. Keys that start with a field-start keyword (`or.a`,
-/// `true.a`, `not.a`) are the spellings the formatter used to print
-/// bare; the queries name the first as `` `OR.a` ``. Ingest ASCII-folds
-/// every key it writes, so the events carry the folded spelling. `opt` is `null` on one event and absent from the last two. One
-/// `host` holds a literal `*` and one `message` holds a `*`, so bare `*`
-/// and quoted `"*"` select different events.
+/// The queries name `or.a` as `` `OR.a` ``. Ingest ASCII-folds every key it
+/// writes, so the events carry the folded spelling.
 fn events() -> Vec<Map<String, Value>> {
     [
         json!({"_time": "2024-01-15T10:00:00Z", "service": "web", "host": "web01",
@@ -78,7 +64,6 @@ fn events() -> Vec<Map<String, Value>> {
 /// `(query, rows it emits)`. Six events in all; no row expects 0 or 6
 /// unless the query is about matching everything.
 const FIXTURES: &[(&str, usize)] = &[
-    // Keyword-prefixed fields, in the search stage.
     ("`OR.a`=x", 3),
     ("`OR.a`=\"\"", 1),
     ("`true.a`=1", 3),
@@ -86,31 +71,26 @@ const FIXTURES: &[(&str, usize)] = &[
     ("`OR.a`=x OR `true.a`=2", 4),
     ("service=web `OR.a`=x OR service=cache", 3),
     ("NOT `OR.a`=x", 3),
-    // Keyword-prefixed fields, in pipeline expressions.
     ("* | where `OR.a` == \"x\" and `true.a` == 1", 2),
     ("* | where `true.a` in (2, 3)", 3),
     (
         "* | let t = `true.a` + 1 | where t > 2 | stats count() as n by service",
         3,
     ),
-    // NOT text terms.
     ("NOT refused", 4),
     ("NOT \"bad gateway\"", 5),
     ("NOT refused NOT timeout", 3),
     ("connection NOT again", 1),
     ("refused OR NOT service=web", 4),
-    // Bare against quoted `*`.
     ("*", 6),
     ("\"*\"", 1),
     ("host=*", 6),
     ("host=\"*\"", 1),
     ("service=db \"*\"", 1),
-    // Missing and null fields.
     ("opt=*", 3),
     ("opt=keep", 2),
     ("* | where isnull(opt)", 3),
     ("* | where opt != \"keep\" | stats count() as n", 1),
-    // Time bounds: absolute, relative to the anchor, and last-wins.
     (
         "earliest=\"2024-01-15T10:00:01Z\" latest=\"2024-01-15T10:05:00Z\"",
         3,
@@ -129,9 +109,6 @@ const FIXTURES: &[(&str, usize)] = &[
     ),
 ];
 
-/// What the live lane decides for one query: the filter's verdict on
-/// each event, and the rows the whole plan emits, as text in a fixed
-/// order.
 #[derive(Debug, PartialEq)]
 struct Outcome {
     verdicts: Vec<bool>,
@@ -211,8 +188,6 @@ fn live(dsl: &str, events: &[Map<String, Value>]) -> Outcome {
     Outcome { verdicts, rows }
 }
 
-/// The rows a query emitted: its row count, or the sum of its `n` cells
-/// when it ends in `stats count() as n`.
 fn emitted(dsl: &str, outcome: &Outcome) -> usize {
     outcome
         .rows

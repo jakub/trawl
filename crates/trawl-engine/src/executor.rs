@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Query execution against `DuckDB`.
-//!
-//! Handles connection management, prepared statements, parameter binding,
-//! and result extraction.
 
 use std::borrow::Cow;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -53,26 +50,13 @@ struct TimestampColumns {
 
 /// How many statements the query and export lanes handed `DuckDB` to bind.
 ///
-/// The evidence behind "admission refuses before `DuckDB` sees anything"
-/// (ADR-0024): an over-budget pipeline must fail in the emitter, and the
-/// only way to prove no bind happened is to count the binds. There is no
-/// production seam that exposes them, so this is a test-only counter,
-/// compiled for this crate's unit tests and — through the `test-support`
-/// feature and the self dev-dependency — its integration tests. No
-/// production consumer enables the feature, so a release build carries
-/// neither the counter nor the `fetch_add`.
-///
 /// Process-global, so a reader that shares its test binary with binding
 /// tests must serialize against them (see
 /// `tests/complexity_admission.rs`).
 ///
-/// It also keeps the text of the last statement each thread bound, which
-/// is the only evidence of what `DuckDB` was asked to run: a row count
-/// cannot tell a `LIMIT` `DuckDB` applied from a cut made after it built
-/// the whole result. Per thread, because the lanes run synchronously on
-/// their caller's thread, so parallel tests cannot read each other's
-/// statements; and only the last one, so a long-lived worker thread holds
-/// one string, not a history.
+/// It also keeps the text of the last statement each thread bound. Per
+/// thread, because the lanes run synchronously on their caller's thread,
+/// so parallel tests cannot read each other's statements.
 #[cfg(any(test, feature = "test-support"))]
 pub mod prepare_probe {
     use std::cell::RefCell;
@@ -89,13 +73,11 @@ pub mod prepare_probe {
         LAST_STATEMENT.with(|last| *last.borrow_mut() = Some(sql.to_owned()));
     }
 
-    /// Binds counted since the process started.
     #[must_use]
     pub fn count() -> u64 {
         PREPARES.load(Ordering::SeqCst)
     }
 
-    /// The SQL of the last statement this thread handed `DuckDB` to bind.
     #[must_use]
     pub fn last_statement() -> Option<String> {
         LAST_STATEMENT.with(|last| last.borrow().clone())
@@ -161,7 +143,6 @@ pub mod schema_probe {
         FaultGuard(id)
     }
 
-    /// Removes its fault when dropped.
     #[derive(Debug)]
     #[must_use = "the fault is removed when the guard drops"]
     pub struct FaultGuard(u64);
@@ -194,7 +175,6 @@ pub mod schema_probe {
         }
     }
 
-    /// Add every column a claim whose marker `sql` contains says is there.
     pub(super) fn claim(sql: &str, columns: &mut Vec<(String, String)>) {
         for fault in faults().iter().filter(|fault| sql.contains(&fault.marker)) {
             if let FaultKind::Claim { column, ty } = &fault.kind
@@ -205,19 +185,16 @@ pub mod schema_probe {
         }
     }
 
-    /// `DESCRIBE`s counted since the process started.
     #[must_use]
     pub fn count() -> u64 {
         DESCRIBES.load(Ordering::SeqCst)
     }
 
-    /// `DESCRIBE`s this thread has handed `DuckDB`.
     #[must_use]
     pub fn count_on_this_thread() -> u64 {
         ON_THIS_THREAD.with(Cell::get)
     }
 
-    /// The text of the last `DESCRIBE` this thread handed `DuckDB`.
     #[must_use]
     pub fn last_statement() -> Option<String> {
         LAST_STATEMENT.with(|last| last.borrow().clone())
@@ -243,9 +220,6 @@ pub mod schema_probe {
     }
 }
 
-/// One lane bind: counted and recorded for the tests, then handed to
-/// `DuckDB`. The probe sees exactly the text `DuckDB` prepares, because
-/// it is the same argument.
 fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duckdb::Statement<'c>> {
     #[cfg(any(test, feature = "test-support"))]
     prepare_probe::record(sql);
@@ -255,11 +229,6 @@ fn prepare_statement<'c>(conn: &'c Connection, sql: &str) -> duckdb::Result<duck
 /// What a hot ndjson file a test wrote carries, for the `hot_columns` a hot
 /// lane takes: every key any line holds, and among them the keys whose
 /// every value is JSON `null`.
-///
-/// The server takes this from its snapshot's survey. A test that writes its
-/// own hot file has no snapshot, and a key list written by hand drifts from
-/// the file it describes. A file that cannot be read carries no key, and a
-/// line that is not a JSON object adds none.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn hot_columns_of(path: impl AsRef<Path>) -> HotColumns {
@@ -282,9 +251,6 @@ pub fn hot_columns_of(path: impl AsRef<Path>) -> HotColumns {
 }
 
 /// How a query lane bounds the rows it hands back.
-///
-/// Every lane holds its answer in memory, so every lane has a bound. The
-/// variants differ in what a result past the bound means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RowCap {
     /// Refuse a result longer than this with
@@ -303,7 +269,6 @@ pub enum RowCap {
 }
 
 impl RowCap {
-    /// The cap the SQL half of a pipeline reads under.
     fn sql_read(self, rust_tail: bool) -> Self {
         match self {
             Self::Truncate { tail_input, .. } if rust_tail => Self::Refuse(tail_input),
@@ -311,22 +276,16 @@ impl RowCap {
         }
     }
 
-    /// Cut a finished answer to the rows this cap keeps.
     fn trim(self, result: &mut QueryResult) {
         if let Self::Truncate { rows, .. } = self {
             result.rows.truncate(rows);
         }
     }
 
-    /// The statement a SQL read under this cap executes.
-    ///
     /// `DuckDB` builds a whole result before the first row is handed back,
     /// so a cut made only while copying rows out still pays for every row
-    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`,
-    /// the same shape and the same [`export_row_limit`] decision the
-    /// Parquet export's staging `SELECT` takes; an unbounded cap adds no
-    /// clause. `Refuse` executes the SQL untouched. Neither adds a
-    /// placeholder, so the emitted parameters bind as they are.
+    /// the query matched. `Truncate` therefore wraps the SQL in a `LIMIT`
+    /// unless the cap is unbounded.
     fn statement(self, sql: &str) -> Cow<'_, str> {
         match self {
             Self::Truncate { rows, .. } => match export_row_limit(rows) {
@@ -341,25 +300,9 @@ impl RowCap {
 /// The four query and export lanes, bound to a caller's cancellation
 /// latch.
 ///
-/// Cancellation is opt-in and explicit: [`Executor`]'s own entry points
-/// keep their signatures and pass [`CancelLatch::never`], so embedded
-/// `--data` and every test are unchanged and cannot silently acquire a
-/// latch, while the pool asks for one by name
-/// ([`Executor::cancellable`]). The lanes behind both doors are the same
-/// code, so the schema probe and the hot-only fallback inherit the latch
-/// rather than each remembering to carry it.
-///
-/// Phase timing rides the same door ([`Self::timed`]): without it the
-/// lanes run on [`PhaseClock::off`] and record nothing.
-///
-/// So does the batch statement's RE2 allowance (ADR-0063). Over the query
-/// database ([`Executor::open_query_database`]), each lane here holds
-/// every regex site its statement binds, once on each of the database's
-/// threads, from the server-wide regex reservation, before the statement
-/// or any probe of it binds, and keeps it until the lane returns: inside
-/// the caller's work, whatever the request's deadline did. [`Executor`]'s
-/// own entry points hold none, as an unbudgeted database
-/// ([`Executor::new`]) does through either door.
+/// Over the query database, each lane here holds the batch statement's RE2
+/// allowance (ADR-0063) before the statement or any probe of it binds, and
+/// keeps it until the lane returns.
 #[derive(Debug)]
 pub struct Cancellable<'a> {
     executor: &'a Executor,
@@ -369,11 +312,6 @@ pub struct Cancellable<'a> {
 
 impl Cancellable<'_> {
     /// Record the lanes' phases on `clock` (ADR-0046).
-    ///
-    /// The engine books source resolution, emit, probe, bind, execute,
-    /// copy and post, counts main-statement binds, and records which
-    /// fallback ran. The clock is shared, so the caller reads it back
-    /// once the lane returns, or while it runs for a partial account.
     #[must_use]
     pub fn timed(mut self, clock: &PhaseClock) -> Self {
         self.clock = clock.clone();
@@ -504,24 +442,15 @@ impl Cancellable<'_> {
     }
 }
 
-/// The directory a database [`Executor::new`] opens spills under: the
-/// system temp dir. trawld's query database spills into its query scratch
-/// directory instead ([`Executor::open_query_database`]), and the server's
-/// headroom measurement stats that (ADR-0056).
 #[must_use]
 fn spill_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-/// Make a directory in [`spill_dir`] that only this process's user can
-/// enter, with a fresh random name.
 fn private_spill_dir() -> std::io::Result<tempfile::TempDir> {
     crate::scratch::private_dir_in(&spill_dir(), crate::scratch::TMPDIR_SETTING, |_| Ok(()))
 }
 
-/// The `SET temp_directory` statement for `dir`. `setting` is what a
-/// refusal tells the operator to change.
-///
 /// The path goes into SQL as text, so one that is not UTF-8 is refused
 /// rather than converted: a lossy conversion would point `DuckDB` at a
 /// different path than the private directory that was checked (ADR-0052).
@@ -556,13 +485,10 @@ pub struct QueryBudgets {
     pub spill_max_bytes: NonZeroU64,
     /// Bytes of memory `DuckDB` may manage for the database.
     pub memory_limit: NonZeroU64,
-    /// Worker threads of the database.
     pub threads: NonZeroU32,
 }
 
 impl QueryBudgets {
-    /// The `SET GLOBAL` statements that apply the budgets.
-    ///
     /// Byte values go in as `'<n> bytes'`: `DuckDB` reads `M` and `MB` as
     /// 1000-based, while trawl's byte sizes are 1024-based, so handing it the
     /// configured spelling would set a different number.
@@ -636,12 +562,8 @@ impl QueryBudgets {
     }
 }
 
-/// Reads of an executor's own connection for tests: the settings it runs
-/// under and the outcome of a statement the DSL cannot spell. Compiled for
-/// this crate's tests and the `test-support` feature only.
 #[cfg(any(test, feature = "test-support"))]
 impl Executor {
-    /// `current_setting(name)` on this connection, as text.
     pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
         Ok(self
             .conn
@@ -650,21 +572,14 @@ impl Executor {
             })?)
     }
 
-    /// Run `sql` on this connection and count the rows it returns. A
-    /// failure converts as every lane's does.
     pub fn count_rows_for_test(&self, sql: &str) -> Result<u64, EngineError> {
         Ok(self.raw_count_rows_for_test(sql)?)
     }
 
-    /// Run `sql`, which answers one `BIGINT`, on this connection, as a
-    /// test reads a system table (`duckdb_temporary_files()`) beside the
-    /// queries it drives.
     pub fn query_i64_for_test(&self, sql: &str) -> Result<i64, EngineError> {
         Ok(self.conn.query_row(sql, [], |row| row.get(0))?)
     }
 
-    /// [`Self::count_rows_for_test`] with the failure as `DuckDB` raised
-    /// it, before classification.
     pub fn raw_count_rows_for_test(&self, sql: &str) -> Result<u64, duckdb::Error> {
         let mut statement = self.conn.prepare(sql)?;
         let mut rows = statement.query([])?;
@@ -678,7 +593,6 @@ impl Executor {
 
 #[cfg(any(test, feature = "test-support"))]
 impl DiagnosticConnection {
-    /// `current_setting(name)` on this connection, as text.
     pub fn current_setting(&self, name: &str) -> Result<String, EngineError> {
         Ok(self
             .conn
@@ -711,15 +625,12 @@ pub struct DiagnosticConnection {
 }
 
 impl DiagnosticConnection {
-    /// Run `SELECT 1` on the query database.
     pub fn select_one(&self) -> Result<(), EngineError> {
         self.conn
             .query_row("SELECT 1", [], |_row| Ok(()))
             .map_err(EngineError::from)
     }
 
-    /// Get an interrupt handle for stopping an overrunning sample from
-    /// another thread.
     pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
         self.conn.interrupt_handle()
     }
@@ -732,10 +643,7 @@ impl DiagnosticConnection {
 /// [`Executor`] and [`DiagnosticConnection`] declare their connection
 /// before it, so the connection closes first. The last connection of the
 /// database to close removes the spill directory and only then releases
-/// the lock. No other trawld can take the scratch directory, and with it
-/// reclaim this spill directory, while any connection to the database is
-/// open, whatever holds that connection: a pool, a worker that outlived
-/// its request and its pool, the engine sample or a detached executor.
+/// the lock.
 #[derive(Debug)]
 struct Spill {
     // Declared first, so the directory is removed while the lock holds.
@@ -762,9 +670,6 @@ pub struct Executor {
     // Declared first, so it drops first: `DuckDB` closes and removes its
     // spill files before the directory holding them goes.
     conn: Connection,
-    /// The database's private spill directory, and the scratch lock over
-    /// it, shared with every clone and released when the last of them
-    /// drops ([`Spill`]).
     spill: Arc<Spill>,
     /// The threads each regex a statement binds compiles on, which its
     /// RE2 allowance counts ([`Cancellable`]): the query database's
@@ -774,26 +679,12 @@ pub struct Executor {
 }
 
 impl Executor {
-    /// Create a new executor with an in-memory `DuckDB` connection.
-    ///
     /// Points `temp_directory` at a private directory made for this
     /// database in [`spill_dir`], so `DuckDB` can spill to disk even when
-    /// the process working directory is read-only (e.g. container overlay
-    /// filesystems), and pins the session time zone ([`Self::configure`]).
-    ///
-    /// The directory is made with a random name and mode 0700, never
-    /// reused, and refused unless its handle shows it owner-only and owned
-    /// by this process's euid. `DuckDB` opens its spill files by predictable names and
-    /// without `O_EXCL`, and the umask does not tighten a file that exists,
-    /// so spilling into the shared temp dir would reuse a file another user
-    /// planted, or one an older process left readable (ADR-0052). It is
-    /// removed when the last executor sharing this database drops. A process
-    /// that exits without dropping it, as on a wedged shutdown, leaves the
-    /// empty directory behind; `DuckDB` deletes its own files when the
-    /// database closes.
+    /// the process working directory is read-only (ADR-0052).
     ///
     /// It sets no budgets, so `DuckDB` sizes its memory and spill caps from
-    /// the host. trawld's query database is [`Self::open_query_database`].
+    /// the host.
     pub fn new() -> Result<Self, EngineError> {
         Self::open(
             Spill {
@@ -811,14 +702,7 @@ impl Executor {
     /// The budgets are database-global and go on before anything clones
     /// the database, so every later clone shares them. A clone then reads
     /// each one back, and a setting `DuckDB` rejects or reads back
-    /// differently refuses the open. The spill directory is made and
-    /// checked as [`Self::new`] describes, inside the scratch directory
-    /// instead of the system temp dir.
-    ///
-    /// Every connection to the database, this one and each clone, holds
-    /// `scratch` until it closes ([`Spill`]), so the directory stays locked
-    /// for as long as any of them is open, and no longer than that unless
-    /// another holder keeps it.
+    /// differently refuses the open.
     pub fn open_query_database(
         scratch: Arc<ScratchLock>,
         budgets: &QueryBudgets,
@@ -836,9 +720,6 @@ impl Executor {
         Ok(root)
     }
 
-    /// Open an in-memory database spilling into `spill`, with `budgets` if
-    /// given, then configure its first connection.
-    ///
     /// `errors_as_json` goes on first, as the database's default, so every
     /// error from this database and its clones carries the structured
     /// diagnostic the error classification reads ([`DuckDbDiagnostic`]),
@@ -863,10 +744,6 @@ impl Executor {
     }
 
     /// Clone the connection the engine sample runs on (ADR-0056).
-    ///
-    /// It shares this database, and so its budgets and spill directory,
-    /// but it is a [`DiagnosticConnection`], not an [`Executor`]: it runs
-    /// `SELECT 1` and nothing else, so it can never join a query pool.
     pub fn diagnostic_connection(&self) -> Result<DiagnosticConnection, EngineError> {
         let conn = self.conn.try_clone()?;
         Self::configure(&conn)?;
@@ -878,13 +755,8 @@ impl Executor {
 
     /// Create a new executor sharing the same underlying database.
     ///
-    /// The cloned connection benefits from `DuckDB`'s internal metadata
-    /// caching (parquet file stats, column statistics) accumulated by
-    /// other connections to the same database. A clone shares the
-    /// database, not the session: settings are not inherited, it starts
-    /// from the process default, so the clone is configured in its own
-    /// right (`a_cloned_connection_starts_from_the_process_default_not_the_parent`
-    /// in `trawl-engine/tests/duckdb_probe.rs`).
+    /// A clone shares the database, not the session: settings are not
+    /// inherited, so the clone is configured in its own right.
     pub fn try_clone(&self) -> Result<Self, EngineError> {
         let conn = self.conn.try_clone()?;
         Self::configure(&conn)?;
@@ -898,21 +770,14 @@ impl Executor {
     /// Pin the settings a query's answer depends on: currently the session
     /// time zone, which must be UTC on every connection.
     ///
-    /// The shared `DuckDB` runtime includes ICU and defaults `TimeZone` to the host
-    /// zone (probed with the clone behaviour above), and two things read
-    /// it: the hot branch's TIMESTAMP conform
-    /// (`trawl_core::conform`, which parses through `TIMESTAMPTZ` so an
-    /// offset in the text is applied and a zoneless text is UTC), and
-    /// `now()::TIMESTAMP` — the anchor of every `last=Xh` window, compared
-    /// against `_time` values ingest canonicalized to UTC. On a host in
-    /// `Asia/Kolkata` an unpinned session anchored that window 5h30m into
-    /// the future and dropped every fresh event from it.
+    /// The shared `DuckDB` runtime includes ICU and defaults `TimeZone` to the
+    /// host zone, and two things read it: the hot branch's TIMESTAMP conform
+    /// and `now()::TIMESTAMP`, the anchor of every `last=Xh` window.
     fn configure(conn: &Connection) -> Result<(), EngineError> {
         conn.execute_batch(trawl_core::conform::SESSION_TIME_ZONE_SQL)?;
         Ok(())
     }
 
-    /// Get an interrupt handle for cancelling in-flight queries from another thread.
     pub fn interrupt_handle(&self) -> Arc<duckdb::InterruptHandle> {
         self.conn.interrupt_handle()
     }
@@ -1018,11 +883,6 @@ impl Executor {
         })
     }
 
-    /// Full pipeline with hot buffer: parse DSL, emit composite SQL, execute.
-    ///
-    /// The emitted SQL unions the primary parquet source with a hot buffer
-    /// ndjson file via `UNION ALL BY NAME`.
-    ///
     /// Handles cold-start gracefully: when the cold source matches no file at
     /// all, falls back to querying just the hot buffer so events ingested
     /// before the first compaction are visible. A columnless union result is
@@ -1114,17 +974,6 @@ impl Executor {
             Err(e) => (None, Err(e)),
         };
 
-        // A hot value disagreeing with a catalog pin is already conformed on
-        // the union's hot branch by the emitter (TRY_CAST to NULL), and
-        // parquet is write-time conformant, so a type conflict surviving to
-        // here means a nonconformant corpus (foreign parquet dropped in
-        // post-boot, restore against a stale catalog). There is no read-time
-        // coerced retry: it falls through to the outcome policy below as a
-        // loud error whenever cold files exist (ADR-0009).
-
-        // Classify the outcome, then route on the pure `cold_action`
-        // decision so the outcome policy stays unit-testable and identical
-        // across the four lanes.
         let read = match self.cold_action_for(
             classify_query_outcome(outcome.as_ref().map(|read| &read.result)),
             &resolved,
@@ -1181,9 +1030,6 @@ impl Executor {
     }
 
     /// Execute a pre-emitted query (SQL + params) against `DuckDB`.
-    ///
-    /// `max_rows` caps the number of result rows to prevent unbounded memory
-    /// allocation. Returns [`EngineError::ResultTooLarge`] if exceeded.
     ///
     /// Timestamps render in the wire's RFC 3339, in UTC.
     pub fn execute_emitted(
@@ -1248,8 +1094,6 @@ impl Executor {
         // `DuckDB` API phase.
         cancel.check()?;
 
-        // From here to the last row materialized is `execute`; the guard
-        // books it on every return below.
         let _execute = clock.guard(QueryPhase::Execute);
 
         // start query execution — column metadata is only available
@@ -1308,9 +1152,6 @@ impl Executor {
     /// Resolve a source argument against the files actually on disk — once,
     /// before anything is read (ADR-0008).
     ///
-    /// The one door onto [`resolve_list_source`], binding its matcher to this
-    /// connection's files.
-    ///
     /// The matcher is split by element shape, for cost: a `glob()` round trip
     /// through `DuckDB` costs roughly a millisecond, and a service-pinned
     /// window is all literals (`.../{HH}/nginx.parquet`, one element per
@@ -1320,9 +1161,7 @@ impl Executor {
     ///
     /// The two halves must agree on what "matches" means, because both feed
     /// the same no-silent-cold-drop verdict; `fs_matcher_agrees_with_duckdb_glob_on_literals`
-    /// is the drift guard, pinning agreement on the shapes where a filesystem
-    /// answer could plausibly diverge from `read_parquet`'s (directory,
-    /// symlink, broken symlink, missing path).
+    /// is the drift guard.
     fn resolve_source(&self, source: &str) -> ResolvedSource {
         resolve_list_source(source, |pattern| {
             if has_glob_meta(pattern) {
@@ -1333,23 +1172,11 @@ impl Executor {
         })
     }
 
-    /// What the request's input carries, described once before emission
-    /// (ADR-0062).
+    /// What the request's input carries, described at most once before
+    /// emission (ADR-0062).
     ///
-    /// One `DESCRIBE` of the resolved cold reader, the very text the
-    /// emitter reads from ([`emitter::source_reader`]): the narrowed list,
-    /// the glob, or the `from saved` subquery. It runs on the lane's
-    /// connection, so the interrupt handle covers it, and under the lane's
-    /// latch, booked as `probe` and never as a bind attempt. The
-    /// description is used for the whole request, the hot-only cold start
+    /// The description is used for the whole request, the hot-only cold start
     /// included ([`InputColumns::hot_only`]), and never kept past it.
-    ///
-    /// No probe runs when the emitted SQL cannot depend on the answer
-    /// ([`needs_input_columns`]), and none for a list no element of which
-    /// reaches a file: resolution already proved there is nothing to
-    /// describe. A probe whose reader matches no file says the same. Any
-    /// other failure is returned for the lane to classify, the way the
-    /// statement's own failure would be.
     fn input_columns(
         &self,
         ast: &Query,
@@ -1374,8 +1201,6 @@ impl Executor {
         } else {
             let reader = emitter::source_reader(&resolved.sql)?;
             let described = clock.time(QueryPhase::Probe, || self.describe_reader(&reader, cancel));
-            // A cancellation that landed during the probe stops the lane
-            // before it emits and binds the statement.
             cancel.check()?;
             described?
         };
@@ -1385,8 +1210,6 @@ impl Executor {
         })
     }
 
-    /// `DESCRIBE` one reader, between the latch checks the lanes run
-    /// around every statement.
     fn describe_reader(
         &self,
         reader: &str,
@@ -1418,17 +1241,10 @@ impl Executor {
 
     /// Whether the resolved source has any concrete files behind it.
     ///
-    /// Consulted only where the outcome policy's verdict actually depends on
-    /// it: a hot-only read — or an empty success — is permitted exactly when
-    /// there is no cold data it could hide. A list source already carries its
-    /// evidence from resolution, so this costs nothing and never re-globs: a
-    /// file that matched at resolution and vanished before the read must
-    /// surface as [`EngineError::ColdDataUnread`], not be silently
-    /// re-resolved away. A plain glob was never resolved (there is nothing to
-    /// narrow), so it is globbed lazily, here and only here.
-    /// [`Executor::glob_has_match`] errs on the side of "matches", so an
-    /// unexpected failure surfaces as an error rather than degrading to
-    /// hot-only success.
+    /// A list source already carries its evidence from resolution, so this
+    /// never re-globs: a file that matched at resolution and vanished before
+    /// the read must surface as [`EngineError::ColdDataUnread`], not be
+    /// silently re-resolved away.
     fn cold_presence(&self, resolved: &ResolvedSource) -> ColdPresence {
         match resolved.evidence {
             ListEvidence::NotAList => {
@@ -1477,19 +1293,10 @@ impl Executor {
     /// Describe the schema without reading row data — embedded mode's schema
     /// introspection (`trawl schema fields --data`).
     ///
-    /// A single `DESCRIBE` over `read_parquet(union_by_name=true)`: `DuckDB`
-    /// resolves it without reading rows, and its result is exactly the schema
-    /// a *successful* query sees — for all-scalar columns and for union-able
-    /// same-kind complex columns (`STRUCT`-vs-`STRUCT`) it reports the MERGED
-    /// type, and union-able scalar drift (`BIGINT`-vs-`DOUBLE`) reports the
-    /// reconciled type.
-    ///
     /// Errors propagate rather than degrading an irreconcilable cross-file
     /// mix to `VARCHAR`: every trawl-written file conforms to the field
     /// catalog at write time, so a union conflict can only mean
-    /// foreign/nonconformant parquet (ADR-0009). The server's
-    /// `/api/v1/schema` reads the catalog instead, so embedded mode over the
-    /// user's own parquet is the sole caller.
+    /// foreign/nonconformant parquet (ADR-0009).
     pub fn describe_schema(&self, source: &str) -> Result<SchemaResult, EngineError> {
         // Validate source path before interpolation — DuckDB doesn't truly
         // parameterize table-valued function arguments.
@@ -1520,15 +1327,6 @@ impl Executor {
     }
 
     /// Sample distinct values for a field (for autocomplete).
-    ///
-    /// Returns up to `limit` distinct values for the specified field, ordered
-    /// lexicographically. Only string values are returned; numeric/timestamp
-    /// fields are skipped.
-    ///
-    /// # Security
-    ///
-    /// The field name is validated to prevent SQL injection. Only alphanumeric
-    /// characters, underscores, and dots are allowed.
     pub fn sample_field_values(
         &self,
         source: &str,
@@ -1548,7 +1346,6 @@ impl Executor {
 
         trawl_core::emitter::validate_source_path(source)?;
 
-        // Use DuckDB identifier quoting for safety.
         let sql = format!(
             r#"SELECT DISTINCT "{field}" FROM read_parquet(?, union_by_name=true)
                WHERE "{field}" IS NOT NULL
@@ -1562,7 +1359,6 @@ impl Executor {
 
         let mut values = Vec::new();
         while let Some(row) = rows.next()? {
-            // Only return string values (skip numeric/timestamp fields).
             if let Ok(val) = row.get::<_, String>(0) {
                 values.push(val);
             }
@@ -1572,13 +1368,6 @@ impl Executor {
     }
 
     /// Export query results directly to a Parquet file via `DuckDB` `COPY TO`.
-    ///
-    /// Uses a temp table to stage the query results, then writes them to
-    /// the output path as Snappy-compressed Parquet, and returns the number
-    /// of rows written.
-    ///
-    /// Returns an error if the pipeline contains Rust post-processing stages
-    /// (e.g. `extract kv`) since those can't be expressed as pure SQL.
     ///
     /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
     /// the caller-facing sentinel for an unbounded export, which emits no
@@ -1671,21 +1460,6 @@ impl Executor {
 
     /// Export with hot buffer union, falling back to hot-only on cold start,
     /// and return the number of rows written.
-    ///
-    /// Routes through the same resolution and the same outcome gate as
-    /// [`Self::run_query_with_hot`]: the hot branch is pin-conformed by the
-    /// emitter (a nonconformant corpus errors loudly — see the note in
-    /// `run_query_with_hot`), a partial list-source miss is narrowed away
-    /// before the read, and a database failure over an existing cold corpus
-    /// returns the error instead of silently exporting hot-only data
-    /// (ADR-0008).
-    ///
-    /// `max_rows` is a two-mode parameter: a row cap, or `usize::MAX` —
-    /// the caller-facing sentinel for an unbounded export, which emits no
-    /// LIMIT at all. Any cap above `DuckDB`'s INT64 LIMIT domain reads as
-    /// the sentinel too, since a larger literal is a conversion error.
-    /// Both halves are the one decision `export_row_limit` takes, on the
-    /// `usize` itself — so the contract holds at every pointer width.
     #[allow(clippy::too_many_arguments)]
     pub fn export_parquet_with_hot(
         &self,
@@ -1841,9 +1615,9 @@ impl Executor {
             })
         })?;
 
-        // Create temp table from query results. Which shape the staging
-        // SELECT takes is one decision, `export_row_limit`, read off the
-        // caller's `usize` before any narrowing conversion.
+        // Which shape the staging SELECT takes is one decision,
+        // `export_row_limit`, read off the caller's `usize` before any
+        // narrowing conversion.
         let create_sql = match export_row_limit(max_rows) {
             Some(max_rows) => format!(
                 "CREATE TEMP TABLE __trawl_export AS (SELECT * FROM ({}) LIMIT {max_rows})",
@@ -1932,20 +1706,9 @@ impl Executor {
     /// Write an in-memory [`QueryResult`] to a Parquet file, every column
     /// in an exact type, and return the number of rows written.
     ///
-    /// Each column is stored as its [`StoredType`]: the column's type, with
-    /// an `integer` column as wide as its cells need (`BIGINT` or
-    /// `UBIGINT`) and a `timestamp` column as a UTC `TIMESTAMP`. Nothing
-    /// is inferred. The cells go to a temp ndjson file in their wire
-    /// encoding ([`QueryResult`]'s serde), under positional keys, are read
-    /// back with `read_json` as declared `VARCHAR` (or `VARCHAR` lists),
-    /// and each column is cast to its stored type in the `COPY`. A zero-row
-    /// result is no different: the empty file reads as a typed, empty
-    /// relation, and the parquet file carries its schema.
-    ///
     /// Refused with [`EngineError::NotParquetStorable`] when the result has
     /// no columns, a `mixed` column, or an `integer` column holding both a
-    /// negative and a value above `i64::MAX` (see [`StoredType`]). A cell that disagrees with its
-    /// column's type fails the wire encoding, and the write with it.
+    /// negative and a value above `i64::MAX` (see [`StoredType`]).
     pub fn write_query_result_to_parquet(
         &self,
         result: &QueryResult,
@@ -2010,7 +1773,6 @@ impl Executor {
             Ok(self.conn.execute_batch(&copy_sql)?)
         });
 
-        // Always clean up the temp ndjson file.
         let _ = std::fs::remove_file(&tmp_json);
 
         copy_result?;
@@ -2018,9 +1780,6 @@ impl Executor {
     }
 
     /// Read a Parquet file into a [`QueryResult`].
-    ///
-    /// Used by the API's `get_report_run` endpoint to serve historical
-    /// scheduled query results.
     pub fn read_parquet_to_result(
         &self,
         path: &Path,
@@ -2199,25 +1958,10 @@ impl Executor {
     /// the file at `path`, the columns at `positions` in that order, a
     /// repeated position repeated.
     ///
-    /// `columns` and `stored_as` describe every column of the capture, by
-    /// position, as the capture's metadata records them and
-    /// [`Self::write_capture_parquet`] reported them. A row is its 0-based
-    /// position in the file, which is the result's order: the rows are
-    /// selected by `file_row_number` and ordered by it, never by scan
-    /// order. Past the last row the page is short or empty. The path,
-    /// `offset` and `limit` are bound, never spliced; the projection is
-    /// the file's own positional names, which only `positions` choose.
+    /// A row is its 0-based position in the file, which is the result's
+    /// order: the rows are selected by `file_row_number` and ordered by it,
+    /// never by scan order.
     ///
-    /// A [`StoredAs::Native`] column is decoded as a query result's column
-    /// is, its timestamps in UTC; a [`StoredAs::WireText`] one is parsed as
-    /// JSON and landed under its recorded type by the result wire's
-    /// decoder, `QueryResult`'s serde. A file column whose type disagrees
-    /// with the recorded one, or a stored text that does not land, fails
-    /// the read as invalid data.
-    ///
-    /// A position past the last column, or `columns` and `stored_as` of
-    /// different lengths, is refused as invalid input: the caller checks a
-    /// requested column against the capture's metadata before it reads.
     /// `path` must not carry a glob metacharacter, because `read_parquet`
     /// expands one even in a bound path.
     pub fn read_capture_page(
@@ -2261,10 +2005,8 @@ impl Executor {
     /// `row`, the column at `position`, recorded as `column` and stored as
     /// `stored_as`. `None` past the last row.
     ///
-    /// The read is [`Self::read_capture_page`]'s, for one column and one
-    /// row. `position` must be a column of the capture, checked against
-    /// its metadata by the caller: past the last one, the file has no such
-    /// column and the read fails as a database error.
+    /// `position` must be a column of the capture, checked against
+    /// its metadata by the caller.
     pub fn read_capture_cell(
         &self,
         path: &Path,
@@ -2282,7 +2024,6 @@ impl Executor {
         Ok(rows.pop().and_then(|mut cells| cells.pop()))
     }
 
-    /// The rows `from` up to `from + limit` of `selected`, in file order.
     fn read_capture_rows(
         &self,
         path: &Path,
@@ -2331,8 +2072,6 @@ impl Executor {
         }
 
         let mut page = Vec::new();
-        // Each wire-text column's stored texts, by row, landed once the
-        // page is read.
         let mut texts: Vec<(usize, Vec<Option<String>>)> = selected
             .iter()
             .enumerate()
@@ -2384,9 +2123,7 @@ pub enum StoredAs {
 /// What [`Executor::write_capture_parquet`] wrote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaptureFile {
-    /// How each column is stored, by position.
     pub stored_as: Vec<StoredAs>,
-    /// The rows written: every row of the result.
     pub rows: u64,
     /// The file's length in bytes once synced.
     pub bytes: u64,
@@ -2396,7 +2133,6 @@ pub struct CaptureFile {
 struct Selected<'a> {
     /// Its position, which names it in the file (`c3`).
     position: usize,
-    /// Its recorded type.
     ty: &'a ColumnType,
     stored_as: StoredAs,
 }
@@ -2441,10 +2177,6 @@ fn invalid_data(message: String) -> EngineError {
     ))
 }
 
-/// Land a wire-text column's stored texts, by row, under its recorded type
-/// `ty`: each text is parsed as one JSON value, then the whole column goes
-/// through `QueryResult`'s own decoder, the one every result consumer
-/// lands cells with. A `NULL` is a null cell.
 fn land_wire_texts(
     position: usize,
     ty: &ColumnType,
@@ -2479,11 +2211,6 @@ fn land_wire_texts(
         .collect())
 }
 
-/// Write `result`'s rows to `file` as ndjson for
-/// [`Executor::write_capture_parquet`]: one object per row, its index under
-/// `r` and its cells under `c0`, `c1`, ... by position, in the result
-/// wire's encoding. A [`StoredAs::WireText`] cell is its encoded JSON as a
-/// string, and a null cell `null` either way.
 fn write_capture_ndjson(
     result: &QueryResult,
     stored_as: &[StoredAs],
@@ -2519,17 +2246,12 @@ fn write_capture_ndjson(
     Ok(())
 }
 
-/// A wire encoding that failed, as the writers report it.
 fn unencodable(e: &serde_json::Error) -> EngineError {
     EngineError::Emit(trawl_core::emitter::EmitError::UnsupportedOperation {
         message: format!("failed to encode the result: {e}"),
     })
 }
 
-/// `result`'s rows in the result wire's cell encoding, [`QueryResult`]'s
-/// own serde, each row an array of its cells. A cell its column's type
-/// refuses, or a row of the wrong length, fails the encoding, naming the
-/// column or the row.
 fn wire_rows(result: &QueryResult) -> Result<Vec<Vec<serde_json::Value>>, EngineError> {
     let wire = serde_json::to_value(result).map_err(|e| unencodable(&e))?;
     let rows = match wire {
@@ -2550,9 +2272,6 @@ fn wire_rows(result: &QueryResult) -> Result<Vec<Vec<serde_json::Value>>, Engine
         .collect())
 }
 
-/// Write `result`'s rows to `path` as ndjson in the result wire's cell
-/// encoding, one object per row keyed `c0`, `c1`, ... by column position.
-///
 /// The cells are encoded by [`QueryResult`]'s own serde, so an integer is
 /// a decimal string, a non-finite float is `NaN`, `Infinity` or
 /// `-Infinity`, and a timestamp is RFC 3339 with its offset: text the
@@ -2582,16 +2301,11 @@ fn write_wire_ndjson(result: &QueryResult, path: &Path) -> Result<(), EngineErro
     Ok(())
 }
 
-/// Hold the RE2 allowance of `emitted`'s statement on `ledger`: each
-/// regex site it binds, at its kind's figure, once on each of `re2`
-/// threads (ADR-0063). Nothing for `None`, a database with no budgets, or
-/// for a statement that binds no regex.
+/// Hold the RE2 allowance of `emitted`'s statement on `ledger` (ADR-0063).
 ///
 /// Call it before the statement or any probe of it binds: `DuckDB`
 /// compiles a regex at bind, then once more on every thread that runs the
-/// statement. The ledger keeps the allowance until it drops, at the end of
-/// the lane, so it outlives the statement, and a later statement of the
-/// same query holds its own allowance in its place.
+/// statement.
 fn hold_re2(
     emitted: &EmittedQuery,
     re2: Option<NonZeroU32>,
@@ -2620,7 +2334,7 @@ impl SqlRead {
     ///
     /// The Rust stages run under the split-point pins plus a Timestamp pin
     /// for each exact TIMESTAMP column of the SQL step that those pins
-    /// leave unpinned (ADR-0011, amended 2026-11-09). A caller's pin wins.
+    /// leave unpinned (ADR-0011). A caller's pin wins.
     ///
     /// The Rust stages prepare their patterns through `ledger`, the
     /// query's, so they share its cap with the statement's RE2 allowance.
@@ -2677,21 +2391,13 @@ fn hot_only_columns(probed: Option<&InputColumns>, hot: &HotColumns) -> InputCol
 }
 
 /// Whether emitting `ast` over this input needs the input described
-/// first (ADR-0062): when the query reads beyond the envelope timestamps
-/// ([`emitter::needs_input_columns`]), or the hot snapshot holds a
-/// null-only key no hot pin conforms, whatever the query reads
-/// ([`emitter::hot_needs_input_columns`]).
+/// first (ADR-0062).
 fn needs_input_columns(ast: &Query, hot: Option<(&HotColumns, &FieldTypes)>) -> bool {
     emitter::needs_input_columns(ast)
         || hot
             .is_some_and(|(columns, hot_pins)| emitter::hot_needs_input_columns(columns, hot_pins))
 }
 
-/// The probe's answer to a failed `DESCRIBE`: a reader that matches no
-/// file has nothing to describe, the way the timechart probes read it
-/// ([`validate_timechart_inputs`]), and the statement's own read then
-/// takes the no-files route. Every other failure is classified the way the
-/// statement's would be.
 fn describe_failure(e: duckdb::Error) -> Result<ColdColumns, EngineError> {
     if is_no_files_error(&e) {
         Ok(ColdColumns::NoFiles)
@@ -2707,15 +2413,9 @@ fn describe_failure(e: duckdb::Error) -> Result<ColdColumns, EngineError> {
 /// the outcome-policy tests below provoke the real error against the
 /// bundled build.
 const DUCKDB_NO_FILES_MSG: &str = "No files found that match the pattern";
-/// `DuckDB`'s exception type for a failed file operation.
 const DUCKDB_IO_ERROR: &str = "IO";
-/// `DuckDB`'s exception type for a failed cast.
 const DUCKDB_CONVERSION_ERROR: &str = "Conversion";
 
-/// Check if a `DuckDB` error is the "No files found" error from `read_parquet()`
-/// when a glob matches zero files. Semantically this means "no data" — not a
-/// server error.
-///
 /// Reads the structured diagnostic: an `IO` exception whose message is
 /// the no-files message. The same words under another type (a table named
 /// after them, say) are not this error.
@@ -2725,9 +2425,6 @@ fn is_no_files_error(e: &duckdb::Error) -> bool {
     })
 }
 
-/// Check if a `DuckDB` error is a binder error about a missing column. This is
-/// a user error (querying a nonexistent field), not a server error.
-///
 /// Read off the structured diagnostic alone ([`missing_column`]): the
 /// `Binder` type with the `COLUMN_NOT_FOUND` subtype. A type failure over a
 /// column the input has (`sum` over text, say) is the `NO_MATCHING_FUNCTION`
@@ -2759,9 +2456,7 @@ fn bucket_input_is_timestamp(id: LogicalTypeId) -> bool {
 /// The `DuckDB` SQL name for a bucket type a refusal reports.
 ///
 /// Trawl-authored, so what the reader sees does not depend on `DuckDB`'s
-/// error wording. The three spellings that differ from the enum are
-/// given outright; the rest are the enum's own names, which are
-/// `DuckDB`'s SQL names in every case a bucket source can take.
+/// error wording.
 fn duckdb_type_name(id: LogicalTypeId) -> String {
     match id {
         LogicalTypeId::SqlNull => "NULL".to_string(),
@@ -2797,31 +2492,22 @@ fn run_timechart_probes(
 /// timestamp, before the statement it belongs to is bound.
 ///
 /// One probe per timechart, each reading its own stage's input
-/// relation ([`trawl_core::emitter::TimechartInputCheck`]), so the
-/// answer is about the column that stage buckets and not about
-/// whatever the finished query happens to call `_time`. That makes
-/// the refusal the same on every lane that runs a statement — query
-/// and export alike — and immune to a later stage dropping the
-/// bucket, re-typing it, or manufacturing a column of that name.
+/// relation, so the answer is about the column that stage buckets and
+/// not about whatever the finished query happens to call `_time`.
 ///
 /// A probe that fails is an answer too, and only one failure is
 /// silence: the no-files case, which the query lane answers with an
-/// empty result rather than an error, so the probe must not turn an
-/// empty window into a refusal. Every other failure propagates, with
-/// the same classification the main statement would get. It has to:
-/// a probe carries the search predicate, and a `_time` filter over a
-/// source with no `_time` column fails HERE while the main statement
-/// survives it — `time_bucket(…, "d") AS "_time"` gives `DuckDB` an
-/// output alias to resolve that filter against, and the query comes
-/// back with buckets nobody checked.
+/// empty result rather than an error. Every other failure propagates:
+/// a `_time` filter over a source with no `_time` column fails HERE
+/// while the main statement survives it, because
+/// `time_bucket(…, "d") AS "_time"` gives `DuckDB` an output alias to
+/// resolve that filter against.
 fn validate_timechart_inputs(
     conn: &Connection,
     checks: &[TimechartInputCheck],
     cancel: &CancelLatch,
 ) -> Result<(), EngineError> {
     for check in checks {
-        // Same rule as the lanes below: no bind starts once the
-        // caller has asked for this work to stop.
         cancel.check()?;
         let mut stmt = match prepare_statement(conn, &check.sql) {
             Ok(stmt) => stmt,
@@ -2830,10 +2516,6 @@ fn validate_timechart_inputs(
             Err(e) => return Err(e.into()),
         };
 
-        // The probe's own bind-to-execute boundary, for the reason the
-        // lanes below have one: a long bind is where a cancellation is
-        // most likely to land, and the next thing this does is ask
-        // `DuckDB` to execute.
         cancel.check()?;
 
         let params = bind_params(&check.params);
@@ -2872,10 +2554,6 @@ fn validate_timechart_inputs(
 /// The exception type of a `DuckDB` error — `"Conversion"` for a failed
 /// cast, `"Binder"` for a statement that does not bind — read from its
 /// structured diagnostic.
-///
-/// Returns `None` when the error carries no diagnostic: a non-database
-/// `duckdb::Error` variant, a connection without `errors_as_json`, or a
-/// message that does not parse.
 fn error_class(e: &duckdb::Error) -> Option<String> {
     DuckDbDiagnostic::of(e).map(|d| d.exception_type)
 }
@@ -2884,37 +2562,16 @@ fn error_class(e: &duckdb::Error) -> Option<String> {
 /// failed cast reports, whether its cause is a *schema* the sources cannot
 /// reconcile or a *value* that cannot be converted.
 ///
-/// Keys off the diagnostic's `exception_type` (never a substring match
-/// anywhere in the body — ADR-0008), so the error must come from a
-/// connection with `errors_as_json` on, as every executor's is; any other
-/// answers `false`. Every irreconcilable kind mix raises this class on the
-/// bundled `DuckDB` 1.5.5, on both the `UNION ALL BY NAME` path and the
-/// `read_parquet(union_by_name)` per-file remap path (pinned by
-/// `conflicting_kind_mixes_all_carry_the_conversion_class`).
-///
 /// No production path classifies conversion errors: write-time catalog
 /// conformance makes a surviving `Conversion` error mean a nonconformant
 /// corpus, which errors loudly (ADR-0009). The function is retained because
 /// the ADR-evidence tests below pin the `DuckDB` behaviour that design rests
 /// on.
-///
-/// It is a *necessary but not sufficient* condition for a union type
-/// conflict: a genuine data-conversion error (`CAST('abc' AS INTEGER)`)
-/// carries the very same class, and no substring of the body separates the
-/// two either — both shapes say a value "can't be cast to the destination
-/// type" and both name a "source column".
-///
-/// Deliberately does not match corruption ("too small to be a Parquet
-/// file") or missing-column binder errors: the first is handled by
-/// quarantine, and the second is the unknown-field refusal.
 pub fn is_conversion_error(e: &duckdb::Error) -> bool {
     error_class(e).as_deref() == Some(DUCKDB_CONVERSION_ERROR)
 }
 
 /// Classification of a read's outcome, shared by all four entry points.
-///
-/// Produced by [`classify_query_outcome`] and [`classify_export_outcome`]
-/// so no lane holds a private opinion about what a failure means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HotColdOutcome {
     /// The read produced columns (rows may be empty) — an authoritative
@@ -2951,7 +2608,6 @@ enum HotLane {
 /// What a lane should do with a classified outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColdAction {
-    /// Return the outcome unchanged (result or error).
     ReturnOutcome,
     /// Read hot-only — no cold data can be hidden by doing so.
     HotOnly,
@@ -2965,7 +2621,7 @@ enum ColdAction {
 }
 
 /// Decide the next step for a classified outcome — the one outcome policy,
-/// consulted by all four entry points (ADR-0008, amended by ADR-0062).
+/// consulted by all four entry points (ADR-0008, ADR-0062).
 ///
 /// | outcome          | hot=P, cold=P      | hot=P, cold=A | hot=A, cold=P      | hot=A, cold=A |
 /// |------------------|--------------------|---------------|--------------------|---------------|
@@ -2981,9 +2637,6 @@ enum ColdAction {
 /// read less data. `cold` is [`ColdPresence`], `hot` is
 /// [`HotLane`]; the match is exhaustive with no wildcard arms, so a new
 /// variant of either must state its rule or fail to compile.
-///
-/// Pure, so the policy is unit-testable without provoking every failure
-/// class against a live `DuckDB`.
 fn cold_action(outcome: HotColdOutcome, cold: ColdPresence, hot: HotLane) -> ColdAction {
     match outcome {
         // An authoritative result and a non-recoverable error are the
@@ -3023,10 +2676,8 @@ impl HotColdOutcome {
     }
 }
 
-/// Classify a query lane's outcome.
 fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotColdOutcome {
     match outcome {
-        // Columns present → real result (possibly empty rows).
         Ok(r) if !r.columns.is_empty() => HotColdOutcome::Columns,
         // No columns: `execute_emitted` substituted an empty result for a
         // "no files match the pattern" read error.
@@ -3034,20 +2685,14 @@ fn classify_query_outcome(outcome: Result<&QueryResult, &EngineError>) -> HotCol
         Err(EngineError::Database(_)) => HotColdOutcome::Recoverable,
         // Emit (an emitter refusal, or an unknown field the query path
         // remapped), Refused, ResultTooLarge, AggregationCapped,
-        // ResourceExhausted, parse, IO — propagate. No narrower source makes
-        // any of them mean something else, and an exhausted budget is
-        // shared by every query on the database, so a hot-only retry would
-        // only spend it again. So does RegexResources, the regex memory
-        // refusal of the statement's RE2 allowance or the Rust tail's
-        // patterns (ADR-0063): it is no `Database` error, so never the
-        // binder fallback, and a hot-only retry would hold the same
-        // allowance and prepare the same patterns and be refused again.
+        // ResourceExhausted, RegexResources, parse, IO — propagate. No narrower
+        // source makes any of them mean something else. A hot-only retry
+        // would spend an exhausted budget, shared by every query on the
+        // database, again, or prepare the same patterns and be refused again.
         Err(_) => HotColdOutcome::Fatal,
     }
 }
 
-/// Classify an export lane's outcome.
-///
 /// The export surfaces "no files" raw where the query path substitutes an
 /// empty result, so it arrives as `Database` here. An unknown field is
 /// remapped at staging as on the query path ([`staging_failure`]), so it
@@ -3065,22 +2710,13 @@ fn classify_export_outcome(outcome: &Result<usize, EngineError>) -> HotColdOutco
     }
 }
 
-/// The LIMIT an export's staging SELECT carries, decided from the caller's
-/// `max_rows`.
+/// `None`, no LIMIT clause at all, answers both the unbounded sentinel
+/// `usize::MAX` and any `usize` above `i64::MAX`: `DuckDB`'s LIMIT domain
+/// is INT64, so a bigger LIMIT would be a Conversion Error, not a cap.
 ///
-/// `None` is the unbounded shape — no LIMIT clause at all — and it is the
-/// answer for two disjoint reasons. `usize::MAX` is the caller-facing
-/// sentinel for an unbounded export; and `DuckDB`'s LIMIT domain is INT64,
-/// so every `usize` above `i64::MAX` is a Conversion Error rather than a
-/// bigger cap, which the sentinel is not the only way to reach
-/// (`max_export_rows` is operator-set).
-///
-/// The sentinel is tested on the `usize` before the conversion, because the
-/// conversion alone only recognises it where `usize` is wider than `i64`:
-/// on a 32-bit target `usize::MAX` is `4_294_967_295` and converts cleanly,
-/// which would silently turn the documented unbounded export into a real
-/// `LIMIT 4294967295`. Reading the sentinel first is what makes the
-/// contract target-independent.
+/// The sentinel is tested on the `usize` before the conversion: on a
+/// 32-bit target `usize::MAX` converts cleanly, which would silently turn
+/// the documented unbounded export into a real `LIMIT 4294967295`.
 fn export_row_limit(max_rows: usize) -> Option<i64> {
     if max_rows == usize::MAX {
         return None;
@@ -3103,7 +2739,6 @@ enum ListEvidence {
     NoneMatching,
 }
 
-/// Whether the cold side of a read has files behind it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ColdPresence {
     Present,
@@ -3125,13 +2760,10 @@ pub(crate) struct ResolvedSource {
     /// all-matching list and an all-missing list; the narrowed list when
     /// some but not all elements match.
     sql: String,
-    /// What the resolution learned about the files behind it.
     evidence: ListEvidence,
 }
 
 impl ResolvedSource {
-    /// Emit the cold-only read over this source.
-    ///
     /// The crate's only call to [`emitter::emit_with_pins`]: every lane that
     /// reads parquet reads a source that has been resolved.
     fn emit_cold(
@@ -3144,8 +2776,6 @@ impl ResolvedSource {
         emitter::emit_with_pins(query, &self.sql, pins, columns, anchor)
     }
 
-    /// Emit the hot+cold union read over this source.
-    ///
     /// The crate's only call to [`emitter::emit_with_hot_source`], for the
     /// same reason as [`Self::emit_cold`]. (`emit_hot_only` stays a free
     /// call — it reads no cold source at all.)
@@ -3199,8 +2829,6 @@ impl SourceOrigin {
     }
 }
 
-/// A recorded run keeps the live pins of the names it carries, under any
-/// spelling, and drops the rest; the corpus keeps every pin.
 #[cfg(test)]
 #[test]
 fn a_recorded_source_keeps_only_the_pins_of_the_names_it_carries() {
@@ -3250,9 +2878,6 @@ fn literal_path_is_file(path: &str) -> bool {
 
 /// Resolve `source` against a file matcher — the one owner of list-source
 /// resolution semantics.
-///
-/// The matcher is injected so the semantics are unit-testable without a live
-/// `DuckDB` connection; [`Executor::resolve_source`] binds it to `glob()`.
 ///
 /// List elements are retained verbatim in their original order, duplicates
 /// included, and never expanded to concrete filenames: the narrowed source
@@ -3305,9 +2930,6 @@ fn resolve_list_source(source: &str, matches: impl Fn(&str) -> bool) -> Resolved
 /// `Some(vec![])` when it is list-shaped but cannot be parsed — the caller
 /// treats that as "assume cold files exist" so a parse gap never turns into
 /// a silent cold-data drop.
-///
-/// Kept as a pure function so the list handling is unit-testable without a
-/// live `DuckDB` connection.
 fn glob_list_items(source: &str) -> Option<Vec<&str>> {
     let trimmed = source.trim();
     let inner = trimmed.strip_prefix('[')?;
@@ -3355,7 +2977,6 @@ fn staging_failure(e: duckdb::Error) -> EngineError {
     }
 }
 
-/// Convert trawl-core `SqlValue` params into duckdb `ToSql` trait objects.
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
         .iter()
@@ -3442,24 +3063,18 @@ fn extract_value(
         ValueRef::Timestamp(unit, val) => Value::String(format_timestamp(unit, val, timestamps)),
         ValueRef::Date32(days) => Value::String(format_date(days)),
         ValueRef::Time64(unit, val) => Value::String(format_time(unit, val)),
-        // list values from aggregations like LIST(DISTINCT col)
         ValueRef::List(..) | ValueRef::Array(..) => match row.get::<_, duckdb::types::Value>(idx) {
             Ok(value) => convert_duckdb_value(value, column, timestamps)?,
             Err(_) => Value::Null,
         },
-        // everything else: try string extraction, fall back to null
         _ => row.get::<_, String>(idx).map_or(Value::Null, Value::String),
     })
 }
 
-/// Recursively convert a `duckdb::types::Value` to our `Value`.
-///
 /// This is the nested twin of [`extract_value`] — a `list()` aggregate
 /// arrives here element by element — so it lands the same integer widths
 /// and renders the same temporal text the same way, refusing a huge
-/// integer by the same column name. Without the unsigned arms a `UBIGINT`
-/// inside a list fell through to the debug-text fallback below and reached
-/// the reader as `UBigInt(18446744073709551615)`.
+/// integer by the same column name.
 fn convert_duckdb_value(
     v: duckdb::types::Value,
     column: &str,
@@ -3502,15 +3117,12 @@ fn convert_duckdb_value(
     })
 }
 
-/// A `HUGEINT` cell, narrowed by checked conversion or refused by its
-/// column's name.
 fn land_huge(v: i128, column: &str) -> Result<Value, EngineError> {
     land_i128(v).ok_or_else(|| EngineError::IntegerOutOfRange {
         column: column.to_owned(),
     })
 }
 
-/// A `UHUGEINT` cell, the unsigned twin of [`land_huge`].
 fn land_uhuge(v: u128, column: &str) -> Result<Value, EngineError> {
     u64::try_from(v)
         .map(land_u64)
@@ -3518,12 +3130,6 @@ fn land_uhuge(v: u128, column: &str) -> Result<Value, EngineError> {
             column: column.to_owned(),
         })
 }
-/// A `UBIGINT` inside a `list()` reaches the reader as a number,
-/// including the ones past `i64::MAX` that only `Value::UInt` holds.
-///
-/// Driven through a real `DuckDB` list so the element type is whatever the
-/// driver actually hands back, not whatever this module assumes: the arm
-/// this guards was missing, and the cell rendered Rust debug text.
 #[cfg(test)]
 #[test]
 fn list_ubigint_renders_digits() {
@@ -3616,14 +3222,6 @@ const ALL_TYPES_MAPPED: [&str; 55] = [
     "geometry string",
 ];
 
-/// Every `DuckDB` type's column type agrees with the cells
-/// [`extract_value`] lands for it, row by row over `test_all_types()`:
-/// the wire encoder takes each cell under its column's mapped type, and the
-/// decoder lands it back unchanged. A disagreement here would be a real
-/// query refused at the wire, so this is the guard on [`column_type`].
-///
-/// The only refusals are by design, and they name their column: the
-/// `HUGEINT` extremes and the `UHUGEINT` maximum lie outside `i64` ∪ `u64`.
 /// `time_ns` is left out because the bundled duckdb-rs cannot read a
 /// `TIME_NS` cell at all (`get_ref_unwrap` panics), whatever its type.
 #[cfg(test)]
@@ -3680,9 +3278,6 @@ fn every_duckdb_type_agrees_with_its_cells() {
     assert_eq!(landed, columns.len() * 3 - refused.len());
 }
 
-/// A zero-row statement is typed from its logical types all the same, and
-/// a bare `NULL` column is typed as `DuckDB` resolves it (INTEGER), never
-/// left untyped.
 #[cfg(test)]
 #[test]
 fn zero_row_statements_are_typed() {
@@ -3703,10 +3298,6 @@ fn zero_row_statements_are_typed() {
     );
 }
 
-/// Convert a temporal value to microseconds based on its `TimeUnit`.
-///
-/// `DuckDB` stores temporal values as integer offsets from the Unix epoch;
-/// the `TimeUnit` gives the resolution.
 const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
     match unit {
         TimeUnit::Second => val * 1_000_000,
@@ -3723,7 +3314,6 @@ const fn to_micros(unit: TimeUnit, val: i64) -> i64 {
 const TIMESTAMP_INFINITY: i64 = i64::MAX;
 const TIMESTAMP_NEG_INFINITY: i64 = -i64::MAX;
 
-/// How a result renders its `TIMESTAMP` cells.
 #[derive(Debug, Clone, Copy)]
 enum TimestampText {
     /// The result wire's RFC 3339 in UTC
@@ -3760,13 +3350,11 @@ fn cast_timestamp(micros: i64) -> String {
     let (total_secs, sub_secs) = if micros >= 0 {
         (micros / 1_000_000, (micros % 1_000_000) as u32)
     } else {
-        // handle pre-epoch timestamps
         let s = (micros - 999_999) / 1_000_000;
         let us = (micros - s * 1_000_000) as u32;
         (s, us)
     };
 
-    // days since epoch and time-of-day
     let (days, day_secs) = if total_secs >= 0 {
         ((total_secs / 86400) as i32, (total_secs % 86400) as u32)
     } else {
@@ -3783,7 +3371,6 @@ fn cast_timestamp(micros: i64) -> String {
     if sub_secs == 0 {
         format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}")
     } else {
-        // trim trailing zeros from fractional seconds
         let frac = format!("{sub_secs:06}");
         let trimmed = frac.trim_end_matches('0');
         format!("{y:04}-{m:02}-{d:02} {hour:02}:{min:02}:{sec:02}.{trimmed}")
@@ -3805,19 +3392,11 @@ fn parse_cast_timestamp(text: &str) -> Option<i64> {
     }
 }
 
-/// How the SQL result renders its TIMESTAMP cells.
-///
 /// The wire's RFC 3339 in UTC, unless a Rust tail follows,
-/// because that tail is a second evaluator, not a printer. Its `| where`
-/// and `| let` are pin-aware (ADR-0011). Its scope carries the split-point
-/// pins plus a Timestamp pin for each of the SQL step's unpinned TIMESTAMP
-/// columns ([`SqlRead::finish`]), so they read a TIMESTAMP cell's text as
-/// the stored instant through `compare::conformed_timestamp`, and its
-/// string functions read that text where the all-SQL lane reads
-/// `CAST(ts AS VARCHAR)`. So the tail gets `DuckDB`'s own cast text in UTC,
-/// the text the SQL lane compares and prints, and
-/// [`render_tracked_timestamps`] renders the wire's text afterwards: the
-/// all-SQL path's order too, compare the stored instant and render last.
+/// because that tail is a second evaluator, not a printer. So the tail
+/// gets `DuckDB`'s own cast text in UTC, the text the SQL lane compares
+/// and prints, and [`render_tracked_timestamps`] renders the wire's text
+/// afterwards.
 fn sql_timestamp_text(emitted: &EmittedQuery) -> TimestampText {
     if emitted.rust_stages.is_empty() {
         TimestampText::Wire
@@ -3829,13 +3408,9 @@ fn sql_timestamp_text(emitted: &EmittedQuery) -> TimestampText {
 /// Follow the SQL result's TIMESTAMP columns, and its lists of them,
 /// through the Rust tail's own rename/alias lineage.
 ///
-/// The tail re-uses the pin-scope walk ([`PinScope::advance`]) with a scope
-/// holding exactly the tracked columns: a `rename`d timestamp column carries
-/// its tracking to the new name, a bare-alias `let t2 = _time` copies it,
-/// and a computed value or aggregate output — the tail's own, no longer the
-/// stored rendering — is killed by the walk and stays as the tail rendered
-/// it. Display lineage and comparison pins follow the same stage rules, so
-/// they can never disagree about which column is "still `_time`".
+/// Display lineage and comparison pins follow the same stage rules
+/// ([`PinScope::advance`]), so they can never disagree about which column
+/// is "still `_time`".
 fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStage>]) -> PinScope {
     let mut seed = FieldTypes::new();
     for name in timestamp_columns {
@@ -3848,8 +3423,6 @@ fn tail_timestamp_scope(timestamp_columns: &[String], stages: &[Spanned<PipeStag
     scope
 }
 
-/// Whether a column of type `ty` holds stored timestamps: a `timestamp`,
-/// or a `list` whose items do, at any depth.
 fn holds_timestamps(ty: &ColumnType) -> bool {
     match ty {
         ColumnType::Timestamp => true,
@@ -3871,9 +3444,6 @@ fn rendered_timestamp_type(ty: &ColumnType) -> Option<ColumnType> {
     }
 }
 
-/// One tracked cell in the wire's text: cast text as RFC 3339,
-/// a list element by element, and NULL as NULL. `None` when any text in
-/// it is not cast text.
 fn render_tracked_cell(cell: &Value) -> Option<Value> {
     match cell {
         Value::Null => Some(Value::Null),
@@ -3897,18 +3467,9 @@ fn render_tracked_cell(cell: &Value) -> Option<Value> {
 /// still calls a stored TIMESTAMP, or a stored list of them, in the wire's
 /// text, and type them `timestamp` (or the list of it).
 ///
-/// The tail ran over `DuckDB`'s cast text ([`sql_timestamp_text`]), where a
-/// stored TIMESTAMP is a string, list items included, so
-/// [`crate::post_process::rows_to_result`] typed a pass-through column
-/// `string` or a `list` of `string`. The lineage knows better: it is the
-/// SQL result's timestamps, renamed or aliased at most. The column's own
-/// type says which shape its cells have ([`rendered_timestamp_type`]), and
-/// list cells are rendered element by element. A column is rendered whole
-/// or not at all: if any text in it is not cast text (the tail replaced
-/// it, or its year is outside chrono's calendar), the column stays the
-/// type the tail left. A column the lineage cannot vouch for, such as an
-/// aggregate output or a computed `let`, keeps the type its own cells gave
-/// it, and a timestamp the tail computed is already wire text in UTC.
+/// A column is rendered whole or not at all: if any text in it is not
+/// cast text (the tail replaced it, or its year is outside chrono's
+/// calendar), the column stays the type the tail left.
 fn render_tracked_timestamps(
     result: &mut QueryResult,
     tracked: &PinScope,
@@ -3948,8 +3509,6 @@ fn render_tracked_timestamps(
     Ok(())
 }
 
-/// The render of a tracked timestamp column reads the lane's latch: a
-/// cancelled tail leaves its answer unrendered instead of walking it.
 #[cfg(test)]
 #[test]
 fn a_tracked_render_observes_cancellation() {
@@ -3979,11 +3538,6 @@ fn a_tracked_render_observes_cancellation() {
     );
 }
 
-/// A tracked list renders element by element at any depth, NULLs kept, and
-/// is typed the same list of timestamps. A list holding one text that is
-/// not cast text stays as the tail left it, and so does a tracked `string`
-/// column whose text is a list's (a group key's), since its shape is not a
-/// stored timestamp's.
 #[cfg(test)]
 #[test]
 fn tracked_lists_render_element_by_element() {
@@ -4048,7 +3602,6 @@ fn tracked_lists_render_element_by_element() {
     }
 }
 
-/// Convert a date (days since Unix epoch) to YYYY-MM-DD.
 fn format_date(days: i32) -> String {
     let (y, m, d) = days_to_ymd(days);
     format!("{y:04}-{m:02}-{d:02}")
@@ -4071,8 +3624,6 @@ fn format_time(unit: TimeUnit, val: i64) -> String {
     }
 }
 
-/// Convert days since Unix epoch (1970-01-01) to (year, month, day).
-///
 /// Uses the civil calendar algorithm from Howard Hinnant's `date` library.
 #[allow(
     clippy::cast_possible_truncation,
@@ -4095,9 +3646,6 @@ fn days_to_ymd(days: i32) -> (i32, u32, u32) {
     (y as i32, m, d)
 }
 
-/// The wire's timestamp text: RFC 3339 with six fraction digits and `Z`,
-/// before the epoch and after it, and `DuckDB`'s words for its infinities
-/// in every unit.
 #[cfg(test)]
 #[test]
 fn timestamps_render_as_rfc3339_with_micros() {
@@ -4187,7 +3735,6 @@ fn timestamps_past_chronos_calendar_keep_their_civil_date() {
     assert_eq!(cast_timestamp(max), "294247-01-10 04:00:54.775806");
 }
 
-/// A time keeps its fraction, in `DuckDB`'s cast spelling.
 #[cfg(test)]
 #[test]
 fn times_keep_their_fraction() {
@@ -4232,7 +3779,6 @@ fn timechart_fixture(dir: &tempfile::TempDir) -> String {
     path
 }
 
-/// The directory `DuckDB` spills `exec`'s database into, as it reads it.
 #[cfg(test)]
 fn temp_directory(exec: &Executor) -> std::path::PathBuf {
     exec.conn
@@ -4243,13 +3789,6 @@ fn temp_directory(exec: &Executor) -> std::path::PathBuf {
         .into()
 }
 
-/// A query spills into a directory only this process's user can enter,
-/// made for its database: `DuckDB` opens its spill files by predictable
-/// names without `O_EXCL`, so a shared temp directory would let another
-/// user plant or read one (ADR-0052). The directory sits in [`spill_dir`],
-/// on the filesystem the headroom measurement stats (ADR-0042). A clone
-/// shares its database and so its directory, which goes when the last of
-/// them does.
 #[cfg(unix)]
 #[test]
 fn an_executor_spills_into_a_private_directory_of_its_own() {
@@ -4278,8 +3817,6 @@ fn an_executor_spills_into_a_private_directory_of_its_own() {
     assert!(!dir.exists(), "the last clone removed it");
 }
 
-/// A spill path that is not UTF-8 is refused, not converted, so `DuckDB`
-/// never spills somewhere other than the checked directory (ADR-0052).
 #[cfg(unix)]
 #[test]
 fn a_spill_path_that_is_not_utf8_is_refused() {
@@ -4296,9 +3833,6 @@ fn a_spill_path_that_is_not_utf8_is_refused() {
     );
 }
 
-/// A spill directory the filesystem leaves open, as a fixed-mode mount
-/// does whatever mode was asked for, is refused and removed rather than
-/// handed to `DuckDB` (ADR-0052).
 #[cfg(unix)]
 #[test]
 fn a_spill_directory_left_open_is_refused() {
@@ -4321,7 +3855,6 @@ fn a_spill_directory_left_open_is_refused() {
     );
 }
 
-/// A spill directory another user owns is refused whatever its mode.
 #[cfg(unix)]
 #[test]
 fn a_spill_directory_another_user_owns_is_refused() {
@@ -4335,8 +3868,6 @@ fn a_spill_directory_another_user_owns_is_refused() {
     assert!(error.to_string().contains("mode 0700"), "{error}");
 }
 
-/// The message of the bucket-type refusal `dsl` earns, or a panic
-/// naming what came back instead.
 #[cfg(test)]
 fn timechart_refusal(source: &str, dsl: &str) -> String {
     match timechart_outcome(source, dsl) {
@@ -4346,7 +3877,6 @@ fn timechart_refusal(source: &str, dsl: &str) -> String {
     }
 }
 
-/// What the cold query lane answers `dsl` with.
 #[cfg(test)]
 fn timechart_outcome(source: &str, dsl: &str) -> Result<QueryResult, EngineError> {
     Executor::new()
@@ -4354,16 +3884,6 @@ fn timechart_outcome(source: &str, dsl: &str) -> Result<QueryResult, EngineError
         .run_query(dsl, source, &FieldTypes::new(), usize::MAX)
 }
 
-/// Every bucket source that is not a timestamp is refused, naming the
-/// column the reader wrote and the type `DuckDB` reports for it — and
-/// the timestamps are not.
-///
-/// `DATE` and the untyped NULL are the two that bind: `time_bucket` has
-/// a DATE overload and `DuckDB` resolves an untyped NULL onto it, so
-/// without this check `| let t = null | timechart on t count()` charts
-/// every row into one NULL bucket and says nothing. The rest fail in
-/// the binder, which would answer with a sentence about a SQL function
-/// the reader never typed.
 #[cfg(test)]
 #[test]
 fn timechart_input_refuses_each_non_timestamp() {
@@ -4395,7 +3915,6 @@ fn timechart_input_refuses_each_non_timestamp() {
         "an untyped NULL binds, so only the input check can catch it"
     );
 
-    // And the two that are bucket sources.
     for column in ["good", "tz"] {
         let result = Executor::new()
             .expect("executor")
@@ -4410,12 +3929,6 @@ fn timechart_input_refuses_each_non_timestamp() {
     }
 }
 
-/// The export lanes refuse what the query lane refuses.
-///
-/// They run their own statement and never touch the query lane's
-/// checks, so before this the same pipeline was refused on screen and
-/// written to a file — a DATE-typed NULL bucket, in a parquet nobody
-/// would look at twice.
 #[cfg(test)]
 #[test]
 fn export_refuses_bad_timechart_input() {
@@ -4464,9 +3977,6 @@ fn export_refuses_bad_timechart_input() {
     );
 }
 
-/// A later `stats` drops `_time` from the output, and the bad bucket is
-/// still refused: the check reads the stage's input, not the query's
-/// result.
 #[cfg(test)]
 #[test]
 fn timechart_input_checked_before_stats_hides_it() {
@@ -4482,8 +3992,6 @@ fn timechart_input_checked_before_stats_hides_it() {
     );
 }
 
-/// A later plain `timechart` re-types `_time` through its own
-/// `TRY_CAST`, and the bad bucket underneath it is still refused.
 #[cfg(test)]
 #[test]
 fn timechart_input_checked_before_default_timechart_retypes_it() {
@@ -4524,8 +4032,6 @@ fn pivot_made_time_column_is_not_the_bucket() {
     );
 }
 
-/// Two timecharts, and the refusal names the stage that failed: each
-/// stage carries its own probe, so there is nothing to guess between.
 #[cfg(test)]
 #[test]
 fn two_timecharts_attribute_the_failing_stage() {
@@ -4542,13 +4048,6 @@ fn two_timecharts_attribute_the_failing_stage() {
     );
 }
 
-/// A bucket column called `column_name` is named as itself.
-///
-/// The refusal used to come from `DuckDB`'s binder, whose message
-/// quotes the offending SQL line back — and the missing-column guard
-/// matches the word "column" anywhere in a binder message, so this
-/// query answered `unknown field: column_name` and sent the reader
-/// after a field that exists. Nothing reads that message now.
 #[cfg(test)]
 #[test]
 fn on_column_named_column_name_is_named() {
@@ -4561,15 +4060,6 @@ fn on_column_named_column_name_is_named() {
     );
 }
 
-/// A probe that fails to bind is not permission to run the statement.
-///
-/// The fixture has a DATE column and NO `_time`, so the probe's own
-/// search predicate cannot bind — while the statement it guards can:
-/// `time_bucket(…, "d") AS "_time"` gives `DuckDB` an output alias to
-/// resolve that same `_time` filter against, and the query comes back
-/// with DATE buckets nobody ever checked. Skipping a failed probe made
-/// the check optional exactly where the relation is strange enough to
-/// need it.
 #[cfg(test)]
 #[test]
 fn failed_probe_is_not_silence() {
@@ -4592,11 +4082,6 @@ fn failed_probe_is_not_silence() {
     );
 }
 
-/// The one failure that stays silent: an empty glob.
-///
-/// The query lane answers a window that matched no files with an empty
-/// result, not an error, and a probe that fails the same way must not
-/// turn that into a refusal.
 #[cfg(test)]
 #[test]
 fn empty_glob_probe_stays_silent() {
@@ -4615,16 +4100,6 @@ fn empty_glob_probe_stays_silent() {
     assert!(result.rows.is_empty(), "{:?}", result.rows);
 }
 
-/// A hot buffer does not turn a refusal into an empty 200.
-///
-/// The hot lanes once answered a missing column with an empty result: the
-/// cold read could not bind it, so they retried hot-only, and when that
-/// failed the same way they handed back no rows rather than an error. A
-/// refusal caught by that policy answered
-/// `| let t = null | timechart on t count()` with 200 and zero rows,
-/// which is the one outcome worse than the wrong buckets, because
-/// nothing on the wire says the query was refused. That policy is gone
-/// (ADR-0062), and the refusal stays the caller's answer.
 #[cfg(test)]
 #[test]
 fn type_refusal_survives_hot_fallback() {
@@ -4680,10 +4155,7 @@ fn type_refusal_survives_hot_fallback() {
 
 /// A column neither source has is no error with a hot buffer either: it
 /// reads as NULL over the union (ADR-0062), so `where` keeps no row and the
-/// answer still carries the union's columns. Changed on purpose: the binder
-/// error this query used to raise was answered by a hot-only retry that
-/// failed the same way and turned into an empty result, with no column of
-/// either source.
+/// answer still carries the union's columns.
 #[cfg(test)]
 #[test]
 fn missing_column_still_benign_with_hot() {
@@ -4745,10 +4217,6 @@ fn rawless_fixture(dir: &tempfile::TempDir) -> String {
     path
 }
 
-/// A refusal over a source without `_raw` names the bucket the reader
-/// wrote, never the `_raw` column trawl's text search reads: that column
-/// is absent, so it reads as NULL and the stage's probe binds, and
-/// `DuckDB` reports the bucket source as the VARCHAR it is.
 #[cfg(test)]
 #[test]
 fn refusal_survives_a_source_without_raw() {
@@ -4762,14 +4230,6 @@ fn refusal_survives_a_source_without_raw() {
     );
 }
 
-/// The hot-only retry runs its own probes, against its own relation.
-///
-/// A cold start routes the whole query to the hot buffer, and the
-/// re-emission it reads carries the bucket checks for the relation it
-/// actually binds. Without them the one lane with no cold data to hide
-/// would be the one lane that never checks the bucket source — and
-/// `time_bucket(INTERVAL, <untyped NULL>)` binds happily, so the answer
-/// would be a chart of every row in one NULL bucket.
 #[cfg(test)]
 #[test]
 fn refusal_survives_hot_only_retry() {
@@ -4808,8 +4268,6 @@ fn refusal_survives_hot_only_retry() {
     }
 }
 
-/// The export lane's hot-only retry, for the same reason — with a file
-/// on disk as the consequence.
 #[cfg(test)]
 #[test]
 fn export_refusal_survives_hot_only_retry() {
@@ -4849,10 +4307,6 @@ fn export_refusal_survives_hot_only_retry() {
     );
 }
 
-/// The bucket-source accept-list and the type names a refusal reports,
-/// exercised directly: `bucket_input_is_timestamp` decides what the
-/// lanes above refuse, and a `DuckDB` type the enum spells differently
-/// from SQL would otherwise reach a reader unnoticed.
 #[cfg(test)]
 #[test]
 fn bucket_types_accepted_and_named() {
@@ -4897,11 +4351,8 @@ mod tests {
     use crate::cancel::CancelLatch;
     use crate::timing::{Fallback, PhaseClock, PhaseTotals, QueryPhase, Transition};
 
-    /// A staging write that fails inside the encoder is the filesystem's
-    /// fault, not the query's: it answers as [`EngineError::Io`], whose
-    /// public message is fixed, and never as an emit refusal quoting the
-    /// I/O error. The cell is larger than the writer's buffer, so the
-    /// failure surfaces from `serde_json::to_writer` itself.
+    /// The cell is larger than the writer's buffer, so the staging write
+    /// fails inside `serde_json::to_writer` itself.
     #[test]
     fn a_capture_staging_write_failure_is_an_io_error() {
         use crate::value::{Column, ColumnType, QueryResult, Value};
@@ -4924,9 +4375,7 @@ mod tests {
         );
     }
 
-    /// A scheduled result's ndjson staging write that fails inside the
-    /// encoder answers as [`EngineError::Io`], as the capture staging write
-    /// does. `/dev/full` opens fine and fails every write with ENOSPC, and
+    /// `/dev/full` opens fine and fails every write with ENOSPC, and
     /// the cell is larger than the writer's buffer, so the failure surfaces
     /// from `serde_json::to_writer` rather than from `File::create`.
     #[test]
@@ -4946,17 +4395,12 @@ mod tests {
         );
     }
 
-    /// A connection with `DuckDB`'s structured diagnostics on, as every
-    /// executor's is, for provoking the errors the classifiers read.
     fn json_errors_conn() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(super::ERRORS_AS_JSON_SQL).unwrap();
         conn
     }
 
-    /// Write a one-row parquet file whose `meta` column has the given SQL
-    /// type/value expression (e.g. `{'a': 1}` for a `STRUCT`, `'plain'` for a
-    /// `VARCHAR`). Mirrors the cold-fixture shape used in `integration.rs`.
     fn write_meta_parquet(conn: &Connection, path: &Path, meta_expr: &str) {
         conn.execute_batch(&format!(
             "COPY (SELECT CAST('2024-01-15 10:00:00' AS TIMESTAMP) AS \"_time\", \
@@ -4967,9 +4411,6 @@ mod tests {
         .unwrap();
     }
 
-    /// Provoke a live `read_parquet(union_by_name=true)` type conflict by
-    /// reading two files where `meta` is `STRUCT` in one and `VARCHAR` in the
-    /// other. Returns the raw `DuckDB` error.
     fn read_parquet_remap_error(dir: &Path) -> duckdb::Error {
         let conn = json_errors_conn();
         let struct_file = dir.join("struct.parquet");
@@ -4986,8 +4427,6 @@ mod tests {
             .expect_err("STRUCT-vs-VARCHAR read_parquet union must error")
     }
 
-    /// Provoke a live `UNION ALL BY NAME` Conversion error: a `STRUCT` column
-    /// unioned with a `VARCHAR` column of the same name.
     fn union_conversion_error() -> duckdb::Error {
         let conn = json_errors_conn();
         conn.prepare("SELECT {'a': 1} AS meta UNION ALL BY NAME SELECT 'plain' AS meta")
@@ -4999,8 +4438,6 @@ mod tests {
             .expect_err("STRUCT-vs-VARCHAR UNION ALL BY NAME must error")
     }
 
-    /// Provoke a live "too small to be a Parquet file" corruption error by
-    /// pointing `read_parquet` at a file with valid head magic but no trailer.
     fn corruption_error(dir: &Path) -> duckdb::Error {
         let conn = json_errors_conn();
         let bad = dir.join("truncated.parquet");
@@ -5015,7 +4452,6 @@ mod tests {
             .expect_err("truncated parquet must error")
     }
 
-    /// Provoke a binder error about a missing column.
     fn missing_column_error() -> duckdb::Error {
         let conn = json_errors_conn();
         conn.prepare("SELECT nonexistent_col FROM (SELECT 1 AS x)")
@@ -5027,8 +4463,6 @@ mod tests {
             .expect_err("missing-column query must error")
     }
 
-    /// Provoke a live *data*-conversion error: a value that cannot be
-    /// converted, with no schema disagreement anywhere in sight.
     fn data_conversion_error() -> duckdb::Error {
         let conn = json_errors_conn();
         conn.prepare("SELECT CAST(x AS INTEGER) FROM (SELECT unnest(['1', 'abc']) AS x)")
@@ -5071,14 +4505,6 @@ mod tests {
 
     #[test]
     fn genuine_data_conversion_error_carries_the_conversion_class() {
-        // The premise ADR-0008 rests on: neither the class token nor the
-        // message body can tell a value that cannot be converted from a
-        // schema that cannot be reconciled. Both are `Conversion`-class, and
-        // on the bundled 1.5.5 both bodies name a "source column" and talk
-        // about casting to a "destination type". That is why the read path
-        // does not classify conflicts at all: the catalog enforces
-        // conformance at write time and any surviving Conversion error is
-        // loud.
         let data = data_conversion_error();
         assert_eq!(
             error_class(&data).as_deref(),
@@ -5142,17 +4568,6 @@ mod tests {
 
     #[test]
     fn irreconcilable_drift_describes_raw_and_errors_loudly_at_read() {
-        // `meta` is a STRUCT in file A and a VARCHAR in file B — an
-        // irreconcilable cross-file mix a real query cannot read. Every
-        // trawl-written file conforms at write time (ADR-0009), so this shape
-        // can only be foreign/nonconformant parquet.
-        //
-        // Execution-verified on the bundled DuckDB 1.5.5: DESCRIBE never
-        // reads rows, so it resolves the union to the complex side without
-        // erroring — the describe reports what is in the footers, raw. The
-        // query over the same glob errors loudly rather than coercing the
-        // column to VARCHAR. Pin both halves: describe succeeds (raw), query
-        // errors (loud).
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'a': 1}");
@@ -5186,12 +4601,6 @@ mod tests {
 
     #[test]
     fn describe_schema_keeps_union_able_struct_drift() {
-        // `meta` is `STRUCT(x INTEGER)` in file A and `STRUCT(y INTEGER)` in
-        // file B — realistic per-batch JSON inference on sparse nested objects.
-        // `read_parquet(union_by_name=true)` merges these to
-        // `STRUCT(x INTEGER, y INTEGER)` and a real query reads them fine, so
-        // describe_schema must report the merged STRUCT, not collapse to
-        // VARCHAR, which would report a type no query returns.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("a.parquet"), "{'x': 1}");
@@ -5215,8 +4624,6 @@ mod tests {
             meta.data_type
         );
 
-        // Prove describe matches read time: a SELECT over the same glob must
-        // succeed, returning both rows the union merges.
         let result = exec
             .run_query("* | fields meta", &glob, &FieldTypes::new(), usize::MAX)
             .expect("SELECT meta over the merged-STRUCT glob must succeed");
@@ -5229,9 +4636,6 @@ mod tests {
 
     #[test]
     fn run_query_with_hot_returns_hot_on_cold_start() {
-        // Cold start: the parquet source matches zero files, so the union
-        // raises a "no files" error, not a type conflict. The hot-only
-        // fallback must return the hot row without erroring.
         let dir = tempfile::tempdir().unwrap();
         let hot = dir.path().join("hot.ndjson");
         std::fs::write(
@@ -5241,7 +4645,6 @@ mod tests {
         .unwrap();
 
         let exec = Executor::new().unwrap();
-        // Glob that matches no parquet files (cold start).
         let source = format!("{}/nonexistent/*.parquet", dir.path().display());
         let result = exec
             .run_query_with_hot(
@@ -5263,10 +4666,6 @@ mod tests {
 
     #[test]
     fn duckdb_error_classes_parsed_from_live_errors() {
-        // The classifier keys off the diagnostic's exception type, so pin
-        // the class each live-provoked error actually carries (verified
-        // against the bundled crate — the four ADR-0008 trigger variants all
-        // produce this Conversion class, see conversion_error_class below).
         let dir = tempfile::tempdir().unwrap();
 
         // On the bundled 1.5.5 the per-file remap variant is also a
@@ -5302,13 +4701,6 @@ mod tests {
         );
     }
 
-    /// The four ADR-0008 trigger variants under a hard CAST all produce a
-    /// `Conversion Error`-class message — the evidence (verified by execution
-    /// against the bundled crate) behind the classifier keying off the class
-    /// token. No ingest or read lane hard-CASTs a `_time` value — the hot
-    /// branch `TRY_CAST`s it and compaction resolves it through `COALESCE` —
-    /// so this pins `DuckDB` behaviour the design relies on, not a live code
-    /// path.
     #[test]
     fn trigger_variants_produce_conversion_class_errors() {
         let dir = tempfile::tempdir().unwrap();
@@ -5346,12 +4738,6 @@ mod tests {
 
     #[test]
     fn cold_action_matrix_is_exhaustive() {
-        // The whole outcome policy, cell by cell (ADR-0008, amended by
-        // ADR-0062). Two invariants read off it: a hot-only read happens
-        // exactly where it cannot hide cold data, and an empty answer is
-        // returned only when the source provably reaches no files. The
-        // `hot=Absent` column is the same gate applied to
-        // `run_query`/`export_parquet`.
         use ColdAction::{ColdDataUnread as Unread, HotOnly, ReturnOutcome as Return};
         use ColdPresence::{Absent as ColdAbsent, Present as ColdPresent};
         use HotColdOutcome::{Columns, Fatal, NoColumns, Recoverable};
@@ -5448,9 +4834,6 @@ mod tests {
 
     #[test]
     fn the_happy_path_never_pays_the_presence_check() {
-        // The presence check globs; a successful query must never do that.
-        // `consults_cold_presence` is derived from the table, so this asserts
-        // the table's own shape rather than a second copy of it.
         for hot in [HotLane::Present, HotLane::Absent] {
             assert!(
                 !HotColdOutcome::Columns.consults_cold_presence(hot),
@@ -5477,10 +4860,6 @@ mod tests {
 
     #[test]
     fn unexpected_cold_failure_returns_error_not_hot_only() {
-        // An unreadable parquet file (valid magic, truncated body) inside the
-        // cold glob, with hot rows present: the query must return an error —
-        // never HTTP-200-shaped hot-only success that silently drops the
-        // (unreadable but existing) cold data.
         let dir = tempfile::tempdir().unwrap();
         let bad = dir.path().join("truncated.parquet");
         std::fs::write(&bad, b"PAR1\x00\x00").unwrap();
@@ -5511,8 +4890,7 @@ mod tests {
     /// A field neither the cold files nor the hot snapshot carry reads as
     /// NULL over both of them (ADR-0062): one bind of the union, an answer
     /// with the union's columns, and no hot-only read that would leave the
-    /// cold rows out. Changed on purpose: the binder error this query used
-    /// to raise was answered with an empty result from the hot buffer alone.
+    /// cold rows out.
     #[test]
     fn missing_column_with_cold_files_returns_empty_not_error() {
         let dir = tempfile::tempdir().unwrap();
@@ -5597,10 +4975,6 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn fs_matcher_agrees_with_duckdb_glob_on_literals() {
-        // The drift guard on the literal fast path: "matches" must mean the
-        // same thing whether resolution asked the filesystem or `glob()`,
-        // because both feed the same no-silent-cold-drop verdict. Pinned on
-        // the shapes where the two could plausibly diverge.
         let dir = tempfile::tempdir().unwrap();
         let exec = Executor::new().unwrap();
         let setup = Connection::open_in_memory().unwrap();
@@ -5610,12 +4984,9 @@ mod tests {
 
         let missing = dir.path().join("missing.parquet");
 
-        // A directory named like a parquet file: not something `read_parquet`
-        // can open as an element.
         let dir_named_parquet = dir.path().join("dir.parquet");
         std::fs::create_dir(&dir_named_parquet).unwrap();
 
-        // A symlink to a real file, and a broken one.
         let good_link = dir.path().join("good-link.parquet");
         std::os::unix::fs::symlink(&present, &good_link).unwrap();
         let broken_link = dir.path().join("broken-link.parquet");
@@ -5646,9 +5017,7 @@ mod tests {
 
     #[test]
     fn literal_path_is_file_retains_on_a_non_notfound_error() {
-        // Fail toward retaining the element: an unreadable path must reach
-        // `read_parquet` and error loudly, never vanish from the list. A
-        // path component that is a file makes the lookup ENOTDIR, not
+        // A path component that is a file makes the lookup ENOTDIR, not
         // ENOENT.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
@@ -5670,11 +5039,6 @@ mod tests {
 
     #[test]
     fn cold_presence_reads_resolved_list_evidence() {
-        // A list source is not "present by construction": the server emits a
-        // list of per-hour globs for essentially every time-filtered query,
-        // and an hour directory can exist while holding no parquet yet.
-        // Resolution is what settles it, and `cold_presence` reads that
-        // evidence rather than globbing again.
         let dir = tempfile::tempdir().unwrap();
         let empty_hour = dir.path().join("10");
         std::fs::create_dir_all(&empty_hour).unwrap();
@@ -5710,9 +5074,6 @@ mod tests {
 
     #[test]
     fn plain_glob_resolves_lazily_and_is_globbed_on_demand() {
-        // A plain glob has nothing to narrow, so resolution neither globs nor
-        // rewrites it — presence is answered later, and only if the outcome
-        // policy asks.
         let dir = tempfile::tempdir().unwrap();
         let exec = Executor::new().unwrap();
         let glob = format!("{}/*.parquet", dir.path().display());
@@ -5735,9 +5096,6 @@ mod tests {
 
     #[test]
     fn subquery_source_is_never_a_list() {
-        // `from saved` builds a `(SELECT ...)` source. It is not list-shaped,
-        // so resolution passes it through untouched — no globbing, no
-        // rewriting.
         let source = "(SELECT * FROM read_parquet('/data/**/*.parquet'))";
         let resolved = resolve_list_source(source, |_| panic!("must not glob a subquery source"));
         assert_eq!(resolved.evidence, ListEvidence::NotAList);
@@ -5746,8 +5104,6 @@ mod tests {
 
     #[test]
     fn resolve_list_source_narrows_to_matching_elements() {
-        // The everyday `service=X last=Nh` shape: some hour globs reach the
-        // service's file, some reach an hour directory another service wrote.
         let source = "['/a/*.parquet', '/b/*.parquet', '/c/*.parquet']";
         let resolved = resolve_list_source(source, |item| item != "/b/*.parquet");
         assert_eq!(resolved.evidence, ListEvidence::Matching);
@@ -5756,9 +5112,6 @@ mod tests {
 
     #[test]
     fn resolve_list_source_preserves_order_and_duplicates() {
-        // Elements are kept verbatim, in the original order, duplicates
-        // included: the narrowed source must reach exactly what the original
-        // reached, and never a set of concrete filenames.
         let source = "['/z/*.parquet', '/a/*.parquet', '/z/*.parquet', '/m/*.parquet']";
         let resolved = resolve_list_source(source, |item| item != "/m/*.parquet");
         assert_eq!(
@@ -5769,9 +5122,6 @@ mod tests {
 
     #[test]
     fn resolve_list_source_keeps_the_original_when_nothing_is_narrowed() {
-        // All matching and none matching both leave the source text alone —
-        // only the evidence differs, and only that distinguishes an empty
-        // window from a read that must not answer empty.
         let source = "['/a/*.parquet', '/b/*.parquet']";
 
         let all = resolve_list_source(source, |_| true);
@@ -5785,8 +5135,6 @@ mod tests {
 
     #[test]
     fn resolve_list_source_fails_closed_on_an_unparseable_list() {
-        // A list shape the splitter doesn't understand must never read as
-        // "no cold data" — that is exactly the silent drop ADR-0008 forbids.
         for source in ["['/a/*.parquet", "['/a/*.parquet]", "[]"] {
             let resolved = resolve_list_source(source, |_| {
                 panic!("an unparseable list must not be globbed")
@@ -5802,14 +5150,6 @@ mod tests {
 
     #[test]
     fn partial_list_source_miss_keeps_cold_rows() {
-        // The server emits one glob per hour in the query range and prunes
-        // only on parent-directory existence, so a sparse-traffic service
-        // routinely gets a list whose elements point at hour directories
-        // (created by other services) holding no file of its own. DuckDB
-        // raises "No files found that match the pattern" for such an element
-        // even when a sibling element has data, and `execute_emitted` maps
-        // that to an empty result — so an empty result must not be read as
-        // "cold start". The cold rows that do exist must still come back.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -5851,11 +5191,6 @@ mod tests {
 
     #[test]
     fn partial_list_source_miss_keeps_cold_rows_without_a_hot_buffer() {
-        // The same shape as `partial_list_source_miss_keeps_cold_rows`, one
-        // lane over: with no hot buffer to rescue it, resolution alone has to
-        // keep the cold row. Regression guard: `service=X last=Nh` against an
-        // idle install must not answer 200 with zero rows because some hour in
-        // range belongs to another service.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -5883,8 +5218,6 @@ mod tests {
 
     #[test]
     fn export_without_hot_keeps_cold_rows_on_partial_list_miss() {
-        // The export lane surfaces DuckDB's "no files" error raw, so without
-        // resolution narrowing the list this everyday shape would be a 500.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -5919,10 +5252,6 @@ mod tests {
 
     #[test]
     fn empty_window_without_a_hot_buffer_is_an_empty_success() {
-        // The one shape where an empty answer is the truth: the list reaches
-        // no file at all. The gate must not turn a genuinely empty window
-        // into an error — that would fail every query over a quiet time
-        // range.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -5935,14 +5264,6 @@ mod tests {
         assert_eq!(result.row_count(), 0, "an empty window has no rows");
     }
 
-    /// The same empty window under queries that read fields, so the emitter
-    /// needs the input described (ADR-0062), and it describes no file:
-    /// resolution proves that for a list, and a `DESCRIBE` of a plain glob
-    /// answers "no files". No file is no source, not a source without
-    /// `_time`: the window filter, the order and every absent read bind as
-    /// written, and the empty reader's own "no files" read answers, as it
-    /// does for `*`. A data root behind a symlink to nowhere reaches no
-    /// file either.
     #[test]
     #[cfg(unix)]
     fn a_field_reading_query_over_an_empty_window_is_an_empty_success() {
@@ -5985,9 +5306,6 @@ mod tests {
 
     #[test]
     fn export_without_hot_stays_loud_for_an_empty_window() {
-        // An export has no empty answer to write, so the raw "no files" error
-        // stands where the query lane returns zero rows. Deliberate, and
-        // pinned so the gate does not quietly convert it.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -6004,12 +5322,9 @@ mod tests {
 
     #[test]
     fn no_files_outcome_with_cold_data_errors_instead_of_empty_success() {
-        // A "no files" read error with cold parquet on disk must not surface
-        // as the substituted empty success: that would silently drop the
-        // entire cold history (ADR-0008). Provoked here the same way it
-        // happens in production — the hot snapshot path matches no file while
-        // a sibling cold element still does — so narrowing cannot rescue it
-        // and the outcome policy is the last line of defence.
+        // The missing hot snapshot provokes the no-files error the way
+        // production does while the cold element still matches, so narrowing
+        // cannot rescue it and the outcome policy is the last line of defence.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -6037,10 +5352,6 @@ mod tests {
 
     #[test]
     fn export_with_hot_falls_back_to_hot_only_for_empty_list_source() {
-        // Cold start with a list source (the shape the server builds for a
-        // time-filtered query): no parquet exists yet, so the export must
-        // fall back to the hot buffer instead of surfacing the cold "No files
-        // found" error.
         let dir = tempfile::tempdir().unwrap();
         let hour = dir.path().join("10");
         std::fs::create_dir_all(&hour).unwrap();
@@ -6082,14 +5393,6 @@ mod tests {
 
     #[test]
     fn export_with_hot_keeps_cold_rows_on_partial_list_miss() {
-        // The everyday `service=X last=24h` export shape: one glob per hour in
-        // range, one hour directory holding the service's parquet and a
-        // sibling hour directory that exists (other services compacted there)
-        // without a file of its own. DuckDB rejects the whole list, and the
-        // hot-only arm cannot rescue it because the matching sibling makes
-        // cold files "present" — narrowing the list before the read is what
-        // keeps this from 500ing. Both the cold row and the hot row must land
-        // in the exported parquet.
         let dir = tempfile::tempdir().unwrap();
         let full_hour = dir.path().join("10");
         let empty_hour = dir.path().join("11");
@@ -6143,10 +5446,6 @@ mod tests {
 
     #[test]
     fn describe_schema_reconciles_union_able_scalar_drift() {
-        // `meta` is BIGINT in one file and DOUBLE in another — union-able
-        // scalar drift `read_parquet(union_by_name)` reconciles to DOUBLE.
-        // The single-DESCRIBE path must report the reconciled type, exactly
-        // what a real query over the same glob reads.
         let dir = tempfile::tempdir().unwrap();
         let setup = Connection::open_in_memory().unwrap();
         write_meta_parquet(&setup, &dir.path().join("00.parquet"), "CAST(1 AS BIGINT)");
@@ -6176,17 +5475,6 @@ mod tests {
         );
     }
 
-    /// The export lane's LIMIT shape is decided on the caller's `usize`,
-    /// so the unbounded contract holds at every pointer width.
-    ///
-    /// This asserts the decision, not an execution, which is what makes it
-    /// target-independent: `usize::MAX` here is the target's sentinel,
-    /// whatever its width.
-    ///
-    /// Deciding by conversion alone — `i64::try_from` with the error arm
-    /// standing in for "unbounded" — passes on a 64-bit target and fails on
-    /// a 32-bit one, where `usize::MAX` is `4_294_967_295` and converts
-    /// cleanly into a real `LIMIT`.
     #[test]
     fn export_row_limit_sentinel_is_target_independent() {
         assert_eq!(
@@ -6195,8 +5483,6 @@ mod tests {
             "`usize::MAX` is the unbounded sentinel on every target"
         );
 
-        // Ordinary caps are unchanged, including the degenerate zero: the
-        // bounded arm renders exactly the integer it is handed.
         assert_eq!(export_row_limit(0), Some(0));
         assert_eq!(export_row_limit(2), Some(2));
         assert_eq!(export_row_limit(5_000), Some(5_000));
@@ -6216,8 +5502,6 @@ mod tests {
         }
     }
 
-    /// A cutting cap pushes its cut into the SQL as the Parquet export's
-    /// `LIMIT`; a refusing cap executes the emitted SQL byte for byte.
     #[test]
     fn row_cap_statement_pushes_truncate_into_the_sql() {
         let sql = "SELECT * FROM read_parquet(?) WHERE \"service\" = ? ORDER BY \"_time\"";
@@ -6239,12 +5523,10 @@ mod tests {
             format!("SELECT * FROM ({sql}) LIMIT 0"),
         );
 
-        // The interactive lane is untouched, however large its cap.
         for max_rows in [5, 100_000, usize::MAX] {
             assert_eq!(RowCap::Refuse(max_rows).statement(sql), sql);
         }
 
-        // The unbounded sentinel adds no clause, as in the Parquet lane.
         assert_eq!(
             RowCap::Truncate {
                 rows: usize::MAX,
@@ -6254,7 +5536,6 @@ mod tests {
             sql
         );
 
-        // The wrapper adds no placeholder: the emitted params bind as is.
         let wrapped = RowCap::Truncate {
             rows: 10,
             tail_input: 50,
@@ -6278,11 +5559,6 @@ mod tests {
             .expect("the clock records")
     }
 
-    /// Every lane parses under its latch (ADR-0063): a query whose latch
-    /// is already set when it arrives is cancelled at the parse, so even
-    /// text that does not parse answers [`EngineError::Cancelled`] and
-    /// never a parse diagnostic. With the latch clear, the same text is
-    /// the parse error it always was.
     #[test]
     fn a_cancelled_parse_is_a_cancellation_on_every_lane() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6348,10 +5624,6 @@ mod tests {
         }
     }
 
-    /// A cold start reads the hot buffer alone, and the account names
-    /// that fallback: two main-statement binds, the second one hot-only,
-    /// with the cold-presence glob booked as `source` and the hot-only
-    /// re-emission as `emit`.
     #[test]
     fn hot_only_fallback_reports_its_kind() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6477,8 +5749,6 @@ mod tests {
         );
     }
 
-    /// A parquet export books its staging as `execute` and its `COPY` as
-    /// `copy`, and binds once.
     #[test]
     fn parquet_export_books_copy_apart_from_bind() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6507,10 +5777,6 @@ mod tests {
     }
 }
 
-/// The classification of `DuckDB` errors by their structured diagnostic
-/// (ADR-0056), against the bundled build: every executor connection
-/// reports diagnostics, both budgets fail as [`EngineError::ResourceExhausted`],
-/// and the ported no-files and binder-column fallbacks keep their answers.
 #[cfg(test)]
 mod structured_error_classification {
     use std::num::{NonZeroU32, NonZeroU64};
@@ -6524,7 +5790,6 @@ mod structured_error_classification {
 
     const MIB: u64 = 1024 * 1024;
 
-    /// A query database in a fresh scratch directory under these budgets.
     fn query_database(spill: u64, memory: u64) -> (tempfile::TempDir, Executor) {
         let parent = tempfile::tempdir().expect("scratch parent");
         let scratch = ScratchLock::open(&parent.path().join("query-scratch")).expect("scratch");
@@ -6538,7 +5803,6 @@ mod structured_error_classification {
         (parent, exec)
     }
 
-    /// The raw error `sql` raises on `exec`'s own connection, rows drained.
     fn raw_error(exec: &Executor, sql: &str) -> duckdb::Error {
         exec.conn
             .prepare(sql)
@@ -6662,14 +5926,9 @@ mod structured_error_classification {
         assert!(!is_binder_column_error(&catalog), "{catalog}");
     }
 
-    /// A failure is the binder-column fallback only when its diagnostic is
-    /// a `Binder` exception with the `COLUMN_NOT_FOUND` subtype and the
-    /// column's `name`. Nothing reads the message text. So a diagnostic of
-    /// another type or subtype, or with no subtype, a malformed one, text
-    /// with no diagnostic and the driver's own variants never take it, live
-    /// or planted, whatever their message says. The binder failures over a
-    /// missing name that `DuckDB` 1.5.5 raises without the subtype (the
-    /// `EXCLUDE` and `REPLACE` lists, a struct key, a table) do not either.
+    /// The binder failures over a missing name that `DuckDB` 1.5.5 raises
+    /// without the `COLUMN_NOT_FOUND` subtype (`EXCLUDE`, `REPLACE`, a struct
+    /// key, a table) never take the binder-column fallback.
     #[test]
     fn a_malformed_or_non_binder_diagnostic_is_never_the_fallback() {
         fn failure(message: &str) -> duckdb::Error {
@@ -6746,18 +6005,6 @@ mod structured_error_classification {
         }
     }
 
-    /// The cold query lane answers a binder failure as the unknown-field
-    /// refusal only when a column is missing, and names the column the
-    /// diagnostic names.
-    ///
-    /// Changed on purpose from b02b8acf. That fallback read `DuckDB`'s text
-    /// form, which ends with the statement line, so a type failure on a line
-    /// that said "column" was the unknown-field 400, naming the first quoted
-    /// identifier (`sum(column_name) by hostname` named `hostname`), and the
-    /// same failure over another field was a 500. A type failure is now a
-    /// database error whatever its fields are called, because its diagnostic
-    /// has the `NO_MATCHING_FUNCTION` subtype.
-    ///
     /// A field the input does not carry reads as NULL (ADR-0062), so a
     /// missing column reaches the binder only through a resolver defect.
     /// The defect is planted: the probe's description claims `nope` and
@@ -6810,17 +6057,6 @@ mod structured_error_classification {
         }
     }
 
-    /// A type failure over a column the cold data has never reaches the
-    /// hot buffer alone, and a field only the hot buffer carries is read
-    /// from the union.
-    ///
-    /// Changed on purpose from b02b8acf, where summing a cold text field
-    /// whose name says "column" read as a missing column, because the
-    /// statement line said "column", and the hot-only read answered from
-    /// the hot buffer alone. It dropped the cold rows without saying so. The
-    /// type failure is now a database error, and with cold files present
-    /// the lanes return it. A field the cold data lacks reads as NULL there
-    /// (ADR-0062), so the union answers with the hot buffer's values.
     #[test]
     fn a_type_failure_over_cold_data_does_not_reach_the_hot_buffer() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -6880,20 +6116,6 @@ mod structured_error_classification {
         assert!(out.is_file());
     }
 
-    /// A type failure is an execution error whatever its field is called,
-    /// with a hot buffer that carries the field as a number.
-    ///
-    /// Changed on purpose from b02b8acf. The fallback then read the
-    /// statement line `DuckDB` puts at the end of its text form, cut to
-    /// about 60 columns either side of the error, and took the failure for
-    /// a missing column when the word "column" fell inside the cut. Where
-    /// it fell turned on grapheme clusters and their render widths: thirty
-    /// two-column characters before "column" pushed the word out, forty `e`
-    /// plus combining acute clusters kept it, and the Hangul medial vowel
-    /// U+1161 is a width the port and `DuckDB` measured differently. A short
-    /// name like `mycolumn` was always inside the cut, so its type failure
-    /// answered from the hot buffer alone. None of these is a missing
-    /// column, and the diagnostic's subtype says so.
     #[test]
     fn a_type_failure_stays_an_execution_error_whatever_the_field_is_called() {
         let (_scratch, exec) = query_database(512 * MIB, 256 * MIB);
@@ -6950,9 +6172,6 @@ mod structured_error_classification {
         }
     }
 
-    /// A query that ran out of the query database's budgets, or of its
-    /// regex memory (ADR-0063), propagates as itself: no lane retries it
-    /// hot-only or reads it as the binder fallback.
     #[test]
     fn resource_exhausted_is_fatal_not_retried() {
         use trawl_core::pattern::RegexRefusal;
@@ -6978,9 +6197,6 @@ mod structured_error_classification {
     }
 }
 
-/// An export returns the number of rows it wrote, and that number is the
-/// written file's row count on every lane: a filter that matches nothing,
-/// a LIMIT below the result size, and an unbounded export.
 #[cfg(test)]
 mod export_row_count {
     use std::path::Path;
@@ -7132,7 +6348,6 @@ mod export_row_count {
         }
     }
 
-    /// The cancellable lanes return the same count as the plain ones.
     #[test]
     fn cancellable_exports_return_the_written_row_count() {
         let dir = tempfile::tempdir().unwrap();

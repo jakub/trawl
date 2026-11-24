@@ -4,26 +4,6 @@
 
 //! Alignment of an aggregation result onto the axes the Visualization
 //! tab draws (ADR-0038).
-//!
-//! [`align_series`] turns a `timechart` result into one x vector of
-//! bucket instants and one y vector per series, every y the same length
-//! as x, with a `None` wherever a (bucket, series) has no row. The roles
-//! come from the executed query — the `by` fields are the group columns
-//! and every other non-`_time` column is a metric — never from cell
-//! types, the same way [`crate::categorical`] reads a `stats … by`. The
-//! bucket width comes from the query too, through the [`Lane`] that
-//! produced the result. [`cat_points`] is the ordinal-axis twin for a
-//! categorical shape that module already detected.
-//!
-//! At the crate root rather than under `components/`, which is
-//! wasm-gated, so the ladder is tested on native
-//! `cargo test -p trawl-web-ui series`.
-//!
-//! On native, only the tests consume these items — `#[allow(dead_code)]`
-//! at module scope silences the bin-crate dead-code warning, as in
-//! `categorical.rs`. Gated on the target, so the wasm build — where
-//! `components/chart.rs` is the consumer — still fails on an item the
-//! component stopped using.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -45,12 +25,9 @@ use crate::service_card_fmt::format_exact;
 /// indistinguishable from it. `palette_covers_the_series_cap` pins the
 /// two together.
 pub const SERIES_CAP: usize = 6;
-/// The most groups a Column or Bar chart draws.
 pub const GROUP_CAP: usize = 20;
-/// The most grid instants a Line chart lays out before refusing.
 pub const MAX_INSTANTS: usize = 20_000;
 
-/// A `timechart` result aligned on its bucket grid.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SeriesSet {
     /// Epoch seconds, ascending, one per grid instant.
@@ -77,9 +54,7 @@ pub struct SeriesSet {
 }
 
 /// The sentence that names a line chart's aggregation period, such as
-/// `10 minutes per bucket.`, in the histogram caption's per-bucket
-/// wording, so the reader need not find `span=` in the query or mistake
-/// the axis's tick spacing for it. It names the bucket and not the
+/// `10 minutes per bucket.`. It names the bucket and not the
 /// metric, because a bucket may hold an average or a sum as well as a
 /// count.
 #[must_use]
@@ -166,9 +141,6 @@ impl Refusal {
         }
     }
 
-    /// Whether the refusal should be followed by a link to the Events
-    /// tab. True for every variant today; the component asks here so the
-    /// answer has one home when a variant without a table arrives.
     #[must_use]
     pub fn offers_events(&self) -> bool {
         match self {
@@ -191,24 +163,11 @@ impl Refusal {
 /// Parse a `_time` cell into epoch seconds, admitting exactly the two
 /// forms ADR-0038 names and nothing else.
 ///
-/// - `YYYY-MM-DD HH:MM:SS[.fff]`: `DuckDB`'s cast text, a UTC wall clock
-///   with no zone.
-/// - `YYYY-MM-DDTHH:MM:SS[.fff]Z` or `…+00:00`: RFC 3339 with a zero
-///   offset. The result wire writes a `timestamp` cell this way
-///   (`…T00:00:00.000000Z`), batch and live alike, because trawld answers
-///   in UTC only.
-///
-/// A non-zero offset, a `T` form with no zone, a space form with one, an
-/// impossible date (`2026-02-30`), or any other text is `None`. The
-/// fraction is parsed so that it is admitted, then truncated: the grid
+/// The fraction is parsed so that it is admitted, then truncated: the grid
 /// is whole seconds.
 ///
-/// Strict where [`crate::histogram::parse_bucket_ms`] is lenient. That
-/// parser lays the service drawer's ingest grid and ignores zone and
-/// fraction because it treats any timestamp as naive wall clock; this
-/// one refuses, because a `_time` the chart cannot place exactly is a
-/// point drawn in the wrong place, and the Line refusal ladder says so
-/// instead ([`Refusal::UnparsedTime`]). Both share [`days_from_civil`].
+/// Strict where [`crate::histogram::parse_bucket_ms`] is lenient: a `_time`
+/// the chart cannot place exactly is a point drawn in the wrong place.
 #[must_use]
 pub fn parse_instant_secs(text: &str) -> Option<i64> {
     let bytes = text.as_bytes();
@@ -250,7 +209,6 @@ pub fn parse_instant_secs(text: &str) -> Option<i64> {
     }
     let second = digits(17, 2)?;
 
-    // Optional fraction: a dot and at least one digit, then truncated.
     let mut rest = &bytes[19..];
     if let [b'.', tail @ ..] = rest {
         let count = tail.iter().take_while(|c| c.is_ascii_digit()).count();
@@ -296,34 +254,19 @@ fn days_in_month(year: i64, month: i64) -> i64 {
 
 /// Which execution produced a result, and so which bucket width it was
 /// cut with.
-///
-/// The snapshot emitter resolves the automatic span from the query's
-/// `last=` filter; the live compiler has no filter and always resolves as
-/// if there were none (`resolve_span(span, None)`). A live
-/// `last=4h | timechart count()` is therefore bucketed at one minute,
-/// and aligning it on the five-minute grid the snapshot would use would
-/// scatter its rows as off-lattice instants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Lane {
     Snapshot,
     Live,
 }
 
-/// Align a `timechart` result on its bucket grid, or say why it cannot
-/// be drawn as lines.
-///
 /// `query` is the DSL that produced `result`, never the text being
-/// typed: the roles are read from its last `timechart` stage. The
-/// output is a function of the row SET — any row order aligns
-/// identically — because the grid is the sorted set of instants and the
-/// legend is sorted by label.
+/// typed. The output is a function of the row SET — any row order aligns
+/// identically.
 ///
 /// Memory is bounded by the cap, not by the result: every group is read
 /// into a sparse map first, and a dense `xs.len()` vector is allocated
-/// only for the [`SERIES_CAP`] groups that survive ranking. Twenty
-/// thousand rows in twenty thousand groups over twenty thousand instants
-/// is twenty thousand small maps and six dense vectors, not 400 million
-/// cells.
+/// only for the [`SERIES_CAP`] groups that survive ranking.
 ///
 /// # Errors
 ///
@@ -427,7 +370,6 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
         return Err(Refusal::Empty);
     }
 
-    // The width the lane's executor cut the buckets with (see `Lane`).
     let bucket = match lane {
         Lane::Snapshot => query_span(&ast).unwrap_or(TrawlDuration {
             quantity: 1,
@@ -548,8 +490,6 @@ pub fn align_series(query: &str, result: &QueryResult, lane: Lane) -> Result<Ser
     })
 }
 
-/// One series before ranking: its visited slots and their values, and
-/// the running total the ranking sorts on.
 struct Sparse {
     label: String,
     /// Grid slot → value; a `None` value is a visited null.
@@ -558,8 +498,6 @@ struct Sparse {
 }
 
 impl Sparse {
-    /// Record the row at `slot`, refusing a second visit or a cell that
-    /// is not a number.
     fn visit(
         &mut self,
         slot: usize,
@@ -585,8 +523,6 @@ impl Sparse {
     }
 }
 
-/// The dense vector the chart draws from one series' sparse points, one
-/// entry per grid instant.
 fn dense(points: HashMap<usize, Option<f64>>, len: usize) -> Vec<Option<f64>> {
     #[cfg(test)]
     DENSE_ALLOCATIONS.with(|n| n.set(n.get() + 1));
@@ -605,8 +541,6 @@ thread_local! {
     static DENSE_ALLOCATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// The index of the series under `key`, creating it with `label` on
-/// first sight.
 fn series_index(
     index: &mut HashMap<Vec<String>, usize>,
     series: &mut Vec<Sparse>,
@@ -663,13 +597,10 @@ fn numeric(value: &Value) -> Option<f64> {
     }
 }
 
-/// A categorical result on an ordinal axis: one label and one value per
-/// group, largest first.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatPoints {
     /// Group cells as the table prints them.
     pub labels: Vec<String>,
-    /// Metric cells; `None` is a null.
     pub values: Vec<Option<f64>>,
     /// How many groups the result held before [`GROUP_CAP`] applied.
     pub total_groups: usize,
@@ -677,13 +608,6 @@ pub struct CatPoints {
     pub omitted: Vec<String>,
 }
 
-/// The points a Column or Bar chart draws for a shape
-/// [`crate::categorical::detect`] already admitted.
-///
-/// Every row is read — the detector ran over the whole fetched result,
-/// so this is the whole result too — and the groups are ranked by value
-/// descending with nulls last, ties by label, then cut at
-/// [`GROUP_CAP`].
 #[must_use]
 pub fn cat_points(shape: &CatShape, result: &QueryResult) -> CatPoints {
     let mut points: Vec<(String, Option<f64>)> = result
@@ -846,7 +770,6 @@ mod align_series_tests {
         QueryResult { columns, rows }
     }
 
-    /// The snapshot lane, which most tests exercise.
     fn align(query: &str, result: &QueryResult) -> Result<SeriesSet, Refusal> {
         align_series(query, result, Lane::Snapshot)
     }
@@ -877,12 +800,10 @@ mod align_series_tests {
         assert_eq!(parse_instant_secs("2026-09-01 00:00:00"), Some(T0));
         assert_eq!(parse_instant_secs("2026-09-01T00:00:00Z"), Some(T0));
         assert_eq!(parse_instant_secs("2026-09-01T00:00:00+00:00"), Some(T0));
-        // The result wire's exact spelling, batch and live alike.
         let wire = chrono::DateTime::from_timestamp(T0, 0)
             .unwrap()
             .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         assert_eq!(parse_instant_secs(&wire), Some(T0), "{wire}");
-        // The epoch itself, and a date before it.
         assert_eq!(parse_instant_secs("1970-01-01 00:00:00"), Some(0));
         assert_eq!(parse_instant_secs("1969-12-31 23:59:59"), Some(-1));
     }
@@ -895,7 +816,6 @@ mod align_series_tests {
             parse_instant_secs("2026-09-01T00:00:00.123456789+00:00"),
             Some(T0)
         );
-        // A dot with no digits is not a fraction.
         assert_eq!(parse_instant_secs("2026-09-01 00:00:00."), None);
     }
 
@@ -974,7 +894,6 @@ mod align_series_tests {
 
     #[test]
     fn a_bucket_absent_for_every_group_is_a_null_column() {
-        // Nobody has minute 1: the grid still holds it, as a gap for all.
         let rows = vec![
             vec![at(0), s("a"), Value::Integer(1)],
             vec![at(2), s("a"), Value::Integer(1)],
@@ -1017,7 +936,6 @@ mod align_series_tests {
         let turned = align(BY_HOST, &result(&["_time", "host", "count"], rotated)).unwrap();
         assert_eq!(forward, backward);
         assert_eq!(forward, turned);
-        // Minute 4 is nobody's row and sits on the grid regardless.
         assert_eq!(forward.xs.len(), 6);
     }
 
@@ -1176,7 +1094,6 @@ mod align_series_tests {
         .unwrap();
         assert_eq!(set.total_series, 3);
         assert!(set.group_fields.is_empty());
-        // Three quantities share the axis: none of them names it.
         assert_eq!(set.metric, None);
         assert_eq!(series(&set, "count"), &[Some(3.0), Some(4.0)]);
         assert_eq!(series(&set, "mean"), &[Some(1.5), None]);
@@ -1189,7 +1106,6 @@ mod align_series_tests {
         let rows = vec![vec![at(0), Value::Integer(3)]];
         let set = align(renamed, &result(&["_time", "n"], rows)).unwrap();
         assert_eq!(set.series[0].0, "n");
-        // The axis takes the name the result carries, not the declared one.
         assert_eq!(set.metric.as_deref(), Some("n"));
     }
 
@@ -1211,8 +1127,6 @@ mod align_series_tests {
 
     #[test]
     fn an_earlier_top_does_not_refuse_a_final_timechart() {
-        // The picker enables Line when the final aggregation stage is a
-        // timechart; the ladder must agree, whatever fed that timechart.
         let rows = vec![vec![at(0), Value::Integer(1)]];
         let r = result(&["_time", "count"], rows);
         let set = align("* | top 5 host | timechart span=1m count()", &r).expect("drawn");
@@ -1231,7 +1145,6 @@ mod align_series_tests {
             ),
             ("* | top 5 host", Refusal::Top, "Top"),
             ("* | rare 5 host", Refusal::Rare, "Rare"),
-            // After the last timechart it supersedes the shape.
             (
                 "* | timechart span=1m count() by host | top 5 host",
                 Refusal::Top,
@@ -1261,7 +1174,6 @@ mod align_series_tests {
             err.message(),
             "This result has no time axis. Choose Column for stats by, or open Events."
         );
-        // A timechart whose `_time` was projected away has no axis either.
         let rows = vec![vec![Value::Integer(1)]];
         let err = align(
             "* | timechart span=1m count() | table count",
@@ -1274,18 +1186,15 @@ mod align_series_tests {
     #[test]
     fn the_remaining_rungs_refuse_with_their_sentences() {
         let query = "* | timechart span=1m count()";
-        // No metric column at all.
         let err = align(query, &result(&["_time"], vec![vec![at(0)]])).unwrap_err();
         assert_eq!(err, Refusal::NoMetric);
         assert_eq!(
             err.message(),
             "Visualization needs a metric column. Use timechart count(), or open Events."
         );
-        // No rows.
         let err = align(query, &result(&["_time", "count"], vec![])).unwrap_err();
         assert_eq!(err, Refusal::Empty);
         assert_eq!(err.message(), "No rows to draw.");
-        // A `_time` cell in neither form.
         let rows = vec![vec![s("2026-09-01T00:00:00+02:00"), Value::Integer(1)]];
         let err = align(query, &result(&["_time", "count"], rows)).unwrap_err();
         assert_eq!(
@@ -1296,7 +1205,6 @@ mod align_series_tests {
             err.message(),
             "A _time value could not be read as a timestamp: 2026-09-01T00:00:00+02:00. Open Events for the exact rows."
         );
-        // A metric that is text.
         let rows = vec![vec![at(0), s("many")]];
         let err = align(query, &result(&["_time", "count"], rows)).unwrap_err();
         assert_eq!(err, Refusal::BadMetric("many".into()));
@@ -1385,7 +1293,6 @@ mod align_series_tests {
             "nulls rank last"
         );
 
-        // Nulls last, ties by label, when everything fits.
         let r = result(
             &["status", "count"],
             vec![
@@ -1489,7 +1396,6 @@ mod align_series_tests {
         assert_eq!(set.series.len(), SERIES_CAP);
         assert_eq!(set.xs.len(), 5_000);
         assert_eq!(DENSE_ALLOCATIONS.with(std::cell::Cell::get), SERIES_CAP);
-        // The largest survive: g4999 down to g4994.
         assert_eq!(set.series[0].0, "g4994");
         assert_eq!(set.series[5].0, "g4999");
         assert_eq!(set.series[5].1[4_999], Some(4_999.0));
@@ -1512,7 +1418,6 @@ mod align_series_tests {
         let mut firsts: Vec<Option<f64>> = set.series.iter().map(|(_, v)| v[0]).collect();
         firsts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(firsts, vec![Some(1.0), Some(2.0)]);
-        // Different instants: still two series, each with its own gap.
         let rows = vec![
             vec![at(0), s("a · b"), s("c"), Value::Integer(1)],
             vec![at(1), s("a"), s("b · c"), Value::Integer(2)],
@@ -1547,7 +1452,6 @@ mod align_series_tests {
         let snap = align(query, &result(&["_time", "count"], rows)).unwrap();
         assert_eq!(snap.xs.len(), 2);
         assert_eq!(snap.series[0].1, vec![Some(1.0), Some(1.0)]);
-        // The note names the width each lane was cut with.
         assert_eq!(bucket_sentence(live.span), "1 minute per bucket.");
         assert_eq!(bucket_sentence(snap.span), "5 minutes per bucket.");
     }
@@ -1594,8 +1498,6 @@ mod align_series_tests {
     fn float_groups_that_render_alike_stay_distinct() {
         let query = "* | timechart span=1m count() by latency_ms";
         let cols = &["_time", "latency_ms", "count"];
-        // Same bucket: `1.001` and `1.002` both print `1.00`, yet they are
-        // two groups, not a duplicate row.
         let rows = vec![
             vec![at(0), Value::Float(1.001), Value::Integer(1)],
             vec![at(0), Value::Float(1.002), Value::Integer(2)],
@@ -1608,8 +1510,6 @@ mod align_series_tests {
         let mut firsts: Vec<Option<f64>> = set.series.iter().map(|(_, v)| v[0]).collect();
         firsts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         assert_eq!(firsts, vec![Some(1.0), Some(2.0)]);
-        // Different buckets: still two series with a gap each, never one
-        // merged line.
         let rows = vec![
             vec![at(0), Value::Float(1.001), Value::Integer(1)],
             vec![at(1), Value::Float(1.002), Value::Integer(2)],
@@ -1633,7 +1533,6 @@ mod align_series_tests {
         assert_eq!(set.total_series, 2);
         assert_eq!(set.series.len(), 2);
         assert!(set.series.iter().all(|(label, _)| label == "NULL"));
-        // And the same for a number beside its own spelling.
         let rows = vec![
             vec![at(0), Value::Integer(200), Value::Integer(1)],
             vec![at(0), s("200"), Value::Integer(2)],
@@ -1654,13 +1553,9 @@ mod align_series_tests {
         assert_eq!(set.total_series, 2);
         assert_eq!(series(&set, "200"), &[Some(7.0)]);
         assert_eq!(series(&set, "500"), &[Some(1.0)]);
-        // The caption hint names the field as the reader wrote it.
         assert_eq!(set.group_fields, vec!["status"]);
-        // The renamed group is not mistaken for the metric.
         assert_eq!(set.metric.as_deref(), Some("count"));
 
-        // A chain of renames follows the name through every stage, and
-        // the renames inside one stage are parallel.
         let query = "* | timechart span=1m count() by status \
                      | rename status as code | rename code as c, count as n";
         let set = align(query, &result(&["_time", "n", "c"], rows.clone())).unwrap();
@@ -1674,7 +1569,6 @@ mod align_series_tests {
     #[test]
     fn a_dropped_group_column_refuses() {
         let rows = vec![vec![at(0), Value::Integer(7)]];
-        // Projected away.
         let query = "* | timechart span=1m count() by status | fields _time, count";
         let err = align(query, &result(&["_time", "count"], rows.clone())).unwrap_err();
         assert_eq!(err, Refusal::GroupMissing("status".into()));
@@ -1683,15 +1577,11 @@ mod align_series_tests {
             "The group column status is not in the result. Open Events for the table."
         );
         assert!(err.offers_events());
-        // Renamed to a name the result does not carry: the looked-for
-        // name is the renamed one.
         let query = "* | timechart span=1m count() by status | rename status as code";
         let err = align(query, &result(&["_time", "count", "status"], rows)).unwrap_err();
         assert_eq!(err, Refusal::GroupMissing("code".into()));
     }
 
-    /// The bridge's palette and dash list are the other half of
-    /// `SERIES_CAP`: a seventh series would wrap onto the first colour.
     #[test]
     fn palette_covers_the_series_cap() {
         let ts = include_str!("../vendor/src/uplot.ts");
@@ -1715,8 +1605,6 @@ mod align_series_tests {
         );
     }
 
-    /// The text of the array literal that `opener` starts, up to its
-    /// matching close bracket.
     fn list_after<'a>(source: &'a str, opener: &str) -> &'a str {
         let start = source
             .find(opener)

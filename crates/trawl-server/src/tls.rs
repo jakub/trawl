@@ -28,20 +28,13 @@ use rustls_pki_types::{CertificateDer, PrivateKeyDer};
 use tokio_rustls::TlsAcceptor;
 use trawl_config::{GENERATED_CERT_FILE, GENERATED_KEY_DIR, GENERATED_KEY_FILE, GENERATED_TLS_DIR};
 
-/// Why a path inside trawld's generated TLS directories is refused.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnsafeReason {
-    /// It is a symbolic link.
     Symlink,
-    /// A generated directory is not a directory.
     NotDirectory,
-    /// `cert.pem` or `key.pem` is not a regular file.
     NotRegular,
-    /// A generated directory is owned by `owner`, not by trawld's `euid`.
     ForeignOwner {
-        /// The directory's owner.
         owner: u32,
-        /// trawld's effective uid.
         euid: u32,
     },
     /// A directory is at `tls/key.pem`, where an older trawld kept its key.
@@ -69,7 +62,6 @@ impl std::fmt::Display for UnsafeReason {
     }
 }
 
-/// TLS configuration errors.
 #[derive(Debug, thiserror::Error)]
 pub enum TlsError {
     #[error("failed to read certificate {}: {source}", path.display())]
@@ -99,31 +91,17 @@ pub enum TlsError {
     #[error("TLS configuration error: {0}")]
     Config(String),
 
-    /// A path inside trawld's generated TLS directories is not what trawld
-    /// made there. It is refused, never followed.
     #[error("refusing {}: {reason}", path.display())]
     Unsafe { path: PathBuf, reason: UnsafeReason },
 }
 
-/// Where the listener's certificate and key come from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TlsSource<'a> {
-    /// `[server] tls_cert_path` and `tls_key_path`: the operator's pair.
-    Configured {
-        /// The certificate chain's PEM file.
-        cert: &'a Path,
-        /// The private key's PEM file.
-        key: &'a Path,
-    },
-    /// Neither is set: the pair trawld generates under its state directory.
+    Configured { cert: &'a Path, key: &'a Path },
     Generated,
 }
 
 impl<'a> TlsSource<'a> {
-    /// The source that `cert_path` and `key_path` select.
-    ///
-    /// # Errors
-    /// [`TlsError::Config`] when only one of them is set.
     pub fn of(cert_path: Option<&'a Path>, key_path: Option<&'a Path>) -> Result<Self, TlsError> {
         match (cert_path, key_path) {
             (Some(cert), Some(key)) => Ok(Self::Configured { cert, key }),
@@ -135,14 +113,6 @@ impl<'a> TlsSource<'a> {
     }
 }
 
-/// Build a `rustls` [`ServerConfig`] from user-provided cert/key paths,
-/// or auto-generate a self-signed certificate if neither is set.
-///
-/// `state_dir` is the base directory for the auto-generated pair (the
-/// certificate in `{state_dir}/tls/`, the key in `{state_dir}/tls-key/`).
-/// Only consulted when both cert/key paths are `None`.
-///
-/// Returns `Err` if only one of cert/key is provided.
 pub fn build_server_config(
     cert_path: Option<&Path>,
     key_path: Option<&Path>,
@@ -167,15 +137,8 @@ pub fn build_server_config(
     Ok((Arc::new(config), self_signed))
 }
 
-/// The certificate chain and the private key of a PEM pair, parsed the way
-/// the listener's certificate is parsed.
-///
 /// A file with no PEM certificate in it parses to an empty chain, which
 /// [`serving_config`] refuses.
-///
-/// # Errors
-/// [`TlsError::InvalidCert`] or [`TlsError::InvalidKey`] when a file is
-/// not PEM.
 pub fn parse_pem_pair(
     cert_pem: &[u8],
     key_pem: &[u8],
@@ -189,12 +152,6 @@ pub fn parse_pem_pair(
     Ok((certs, key))
 }
 
-/// The listener's `rustls` config for a parsed pair: TLS 1.2 and 1.3 from
-/// the ring provider, and ALPN for HTTP/1.1 alone.
-///
-/// # Errors
-/// [`TlsError::Config`] when the chain is empty, or the key is not one
-/// `rustls` can sign with or its public half is not the leaf's.
 pub fn serving_config(
     certs: Vec<CertificateDer<'static>>,
     key: PrivateKeyDer<'static>,
@@ -207,17 +164,12 @@ pub fn serving_config(
             .with_single_cert(certs, key)
             .map_err(|e| TlsError::Config(e.to_string()))?;
 
-    // HTTP/1.1 only (ADR-0054, amended 2026-10-17): the listener serves
-    // with hyper's HTTP/1 builder, whose header deadline is the bound on
-    // incomplete requests, and hyper's HTTP/2 has no such deadline. A
-    // client whose ALPN offer holds no `http/1.1` is refused at the
-    // handshake; a client that offers no ALPN gets HTTP/1.1.
+    // HTTP/1.1 only (ADR-0054).
     config.alpn_protocols = vec![b"http/1.1".to_vec()];
 
     Ok(config)
 }
 
-/// Read cert and key PEM files from disk.
 fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<(Vec<u8>, Vec<u8>), TlsError> {
     let cert = fs::read(cert_path).map_err(|e| TlsError::ReadCert {
         path: cert_path.to_owned(),
@@ -230,9 +182,6 @@ fn load_pem_files(cert_path: &Path, key_path: &Path) -> Result<(Vec<u8>, Vec<u8>
     Ok((cert, key))
 }
 
-/// Log certificate details (subject, issuer, validity period) for observability.
-///
-/// Parses the PEM-encoded certificate and emits a `tls_cert_details` event.
 /// Failures are logged as warnings rather than propagated, since cert
 /// details are informational — the actual TLS handshake will catch
 /// genuinely broken certs. A parser's own wording goes to DEBUG only.
@@ -259,8 +208,6 @@ fn log_cert_details(pem_bytes: &[u8]) {
     }
 }
 
-/// A certificate validity bound in RFC 2822, or `(invalid)` when it does
-/// not format as one. The formatter's wording goes to DEBUG only.
 fn validity_bound(time: x509_parser::time::ASN1Time, bound: &'static str) -> String {
     time.to_rfc2822().unwrap_or_else(|e| {
         tracing::debug!(
@@ -273,8 +220,6 @@ fn validity_bound(time: x509_parser::time::ASN1Time, bound: &'static str) -> Str
     })
 }
 
-/// The `tls_cert_details` warning for a certificate the parser refused:
-/// its class at WARN, the parser's wording at DEBUG.
 fn cert_details_unparsed(error: &dyn std::fmt::Display, what: &'static str) {
     tracing::debug!(event_type = "tls_cert_details", error = %error, "{what}");
     tracing::warn!(
@@ -285,30 +230,14 @@ fn cert_details_unparsed(error: &dyn std::fmt::Display, what: &'static str) {
     );
 }
 
-/// Load existing default certs or generate new self-signed ones.
-///
 /// `cert.pem` is also a published artifact: a `trawl-web` running as
 /// another user pins it (ADR-0048), so it is world-readable and appears
 /// only once complete. Generation removes any old `cert.pem` first, then
 /// writes the key, and publishes `cert.pem` last, so a visible certificate
 /// always has its own key.
 ///
-/// The key lives in its own directory, `{state_dir}/tls-key/`, not beside
-/// the certificate: the Helm chart's `trawl-web` sidecar mounts `tls/` to
-/// pin `cert.pem`, and Kubernetes' fsGroup ownership walk makes every file
-/// on the volume group-readable to that sidecar, so only keeping the key out
-/// of the mount keeps it from the sidecar.
-///
 /// `tls/` is set to `0755` on every start: the proxy's uid must search it,
 /// and no uid but trawld's may write where the proxy reads its pin.
-///
-/// Both directories are trawld's own: a symlink, a non-directory, or a
-/// directory another uid owns is refused with [`TlsError::Unsafe`] (see
-/// [`GeneratedDir`]), and so is a symlink or non-regular file at `cert.pem`
-/// or `key.pem`. An existing key with extra hard links or another owner is
-/// discarded and the pair regenerated (see [`key_exposure`]).
-///
-/// Returns `(cert_pem, key_pem, was_generated)`.
 fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool), TlsError> {
     fs::create_dir_all(state_dir).map_err(TlsError::Write)?;
     let tls_dir = GeneratedDir::open(&state_dir.join(GENERATED_TLS_DIR), Some(0o755))?;
@@ -410,8 +339,6 @@ fn load_or_generate_default(state_dir: &Path) -> Result<(Vec<u8>, Vec<u8>, bool)
     Ok((cert_pem.into_bytes(), key_pem.into_bytes(), true))
 }
 
-/// trawld's effective uid, which its generated directories and key must
-/// belong to. `None` where the platform has no uid.
 #[allow(clippy::unnecessary_wraps, reason = "there is no uid off unix")]
 fn current_euid() -> Option<u32> {
     #[cfg(unix)]
@@ -455,40 +382,27 @@ fn doctor_open_at(dir: &fs::File, name: &str) -> rustix::io::Result<fs::File> {
     }
 }
 
-/// Off Linux there is no `O_PATH` open, so the doctor opens nothing.
 #[cfg(all(unix, not(target_os = "linux")))]
 fn doctor_open_at(_dir: &fs::File, _name: &str) -> rustix::io::Result<fs::File> {
     Err(rustix::io::Errno::NOSYS)
 }
 
-/// How a generated file is read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Reader {
-    /// As a start reads it: whole.
     Start,
-    /// As `trawld --doctor` reads it (#269, D15): opened only once an
-    /// `O_PATH` look saw a regular file ([`doctor_open_at`]), and at most
-    /// this many bytes, past which the read fails with
-    /// [`std::io::ErrorKind::FileTooLarge`].
+    /// As `trawld --doctor` reads it: opened only once an `O_PATH` look saw a
+    /// regular file ([`doctor_open_at`]), and at most this many bytes, past
+    /// which the read fails with [`std::io::ErrorKind::FileTooLarge`].
     Bounded(u64),
 }
 
-/// What a start finds at `tls-key/key.pem`.
 #[derive(Debug)]
 enum KeyFound {
-    /// No key.
     Absent,
-    /// A key that may be readable outside trawld ([`key_exposure`]'s
-    /// reason). A start discards it and generates a new pair.
     Exposed(String),
-    /// A key a start loads, with the metadata of the file read.
     Read { pem: Vec<u8>, meta: fs::Metadata },
 }
 
-/// Read the generated key from `key_dir` (`None` when there is no such
-/// directory) with `reader`, judged as a start judges it: by its directory
-/// entry before it is opened, then by the opened file.
-///
 /// A key another uid owns (root `0600` after a restore) may be unreadable
 /// to trawld, and the open would fail before its owner could be seen, so
 /// the entry is judged first. That look is advisory; the check of the
@@ -515,8 +429,6 @@ fn find_generated_key(
     }
 }
 
-/// Read the generated certificate from `tls_dir` (`None` when there is no
-/// such directory) with `reader`, refusing what a start refuses.
 fn find_generated_cert(
     tls_dir: Option<&GeneratedDir>,
     reader: Reader,
@@ -531,18 +443,9 @@ fn find_generated_cert(
         .map(|(pem, _)| pem))
 }
 
-/// What a start does with the generated pair it found.
 #[derive(Clone, PartialEq, Eq)]
 pub enum GeneratedPair {
-    /// Both halves are there and the key is trawld's alone: the start loads
-    /// them.
-    Found {
-        /// `tls/cert.pem`.
-        cert_pem: Vec<u8>,
-        /// `tls-key/key.pem`.
-        key_pem: Vec<u8>,
-    },
-    /// The start generates a new pair.
+    Found { cert_pem: Vec<u8>, key_pem: Vec<u8> },
     Regenerate(Regenerate),
 }
 
@@ -560,21 +463,14 @@ impl std::fmt::Debug for GeneratedPair {
     }
 }
 
-/// Why a start generates a new pair.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Regenerate {
-    /// There is neither a certificate nor a key.
     Absent,
-    /// There is a key but no certificate.
     NoCertificate,
-    /// There is a certificate but no key.
     NoKey,
-    /// The key may be readable outside trawld, for this reason.
     KeyExposed(String),
 }
 
-/// A start loads a certificate and key it found, and generates a new pair
-/// when either is missing or the key may be exposed.
 fn judge_generated_pair(cert: Option<Vec<u8>>, key: KeyFound) -> GeneratedPair {
     match (cert, key) {
         (_, KeyFound::Exposed(reason)) => GeneratedPair::Regenerate(Regenerate::KeyExposed(reason)),
@@ -588,8 +484,6 @@ fn judge_generated_pair(cert: Option<Vec<u8>>, key: KeyFound) -> GeneratedPair {
     }
 }
 
-/// Whose the generated directories and key must be, for
-/// [`inspect_generated_pair`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnerRule {
     /// trawld runs as this uid: another owner is refused, or makes the key
@@ -600,10 +494,8 @@ pub enum OwnerRule {
     Observed(u32),
 }
 
-/// What [`inspect_generated_pair`] found.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GeneratedInspection {
-    /// What a start does with the pair.
     pub pair: GeneratedPair,
     /// Under [`OwnerRule::Observed`]: a generated directory or the key
     /// belongs to another uid, which that rule does not judge.
@@ -624,13 +516,6 @@ pub struct GeneratedInspection {
 /// with [`std::io::ErrorKind::FileTooLarge`].
 ///
 /// The work is blocking; call it off the async runtime.
-///
-/// # Errors
-/// What a start by `owner`'s uid would refuse ([`TlsError::Unsafe`]),
-/// including a directory at the old key path, which the start's removal
-/// fails on ([`UnsafeReason::OldKeyDirectory`]), and failures to open a
-/// directory or look at the old key path ([`TlsError::Write`]) or to read a
-/// file ([`TlsError::ReadKey`], [`TlsError::ReadCert`]).
 pub fn inspect_generated_pair(
     state_dir: &Path,
     owner: OwnerRule,
@@ -676,7 +561,6 @@ pub fn inspect_generated_pair(
     })
 }
 
-/// The owner of the file `meta` describes, where the platform has one.
 #[allow(clippy::unnecessary_wraps, reason = "there is no owner off unix")]
 fn file_owner(meta: &fs::Metadata) -> Option<u32> {
     #[cfg(unix)]
@@ -691,8 +575,6 @@ fn file_owner(meta: &fs::Metadata) -> Option<u32> {
     }
 }
 
-/// Why a generated directory owned by `owner` is refused to a start as
-/// `euid`, or `None` when it is that start's own.
 const fn foreign_owner_reason(owner: u32, euid: u32) -> Option<UnsafeReason> {
     if owner == euid {
         None
@@ -701,10 +583,6 @@ const fn foreign_owner_reason(owner: u32, euid: u32) -> Option<UnsafeReason> {
     }
 }
 
-/// Why a generated key with `links` hard links, owned by uid `owner`, may be
-/// readable through something other than `tls-key/key.pem` when trawld runs
-/// as `euid`, or `None` when it is trawld's alone.
-///
 /// A second hard link, for one inside the `tls/` directory the sidecar
 /// mounts, exposes the same inode under that name; a key another uid owns
 /// was not written by this trawld. Either key is discarded rather than
@@ -728,8 +606,6 @@ fn key_exposure(links: u64, owner: u32, euid: u32) -> Option<String> {
     }
 }
 
-/// [`key_exposure`] of the key file whose metadata is `meta`, for a start
-/// as `euid`. `None` for `euid` judges the hard links only.
 #[cfg(unix)]
 fn metadata_exposure(meta: &fs::Metadata, euid: Option<u32>) -> Option<String> {
     use std::os::unix::fs::MetadataExt;
@@ -742,13 +618,9 @@ fn metadata_exposure(_meta: &fs::Metadata, _euid: Option<u32>) -> Option<String>
     None
 }
 
-/// Why a symlink inside the generated TLS directories is refused.
 const SYMLINK_REFUSAL: &str = "it is a symbolic link; trawld does not follow one in the \
                                directories it generates its certificate and key into";
 
-/// One of trawld's generated TLS directories, created if missing, opened
-/// once, and checked.
-///
 /// On unix the directory is opened with `O_NOFOLLOW | O_DIRECTORY` and must
 /// be owned by trawld's effective uid. Anyone who can write the state
 /// directory could otherwise plant `tls-key -> tls` and have the private key
@@ -763,7 +635,6 @@ struct GeneratedDir {
     path: PathBuf,
     #[cfg(unix)]
     handle: fs::File,
-    /// The directory's owner, read from the open handle.
     #[cfg(unix)]
     owner: u32,
 }
@@ -809,10 +680,6 @@ impl GeneratedDir {
         }
     }
 
-    /// Open the directory at `path` as it is, creating and changing nothing.
-    /// A symlink or anything but a directory is refused. Its owner is read
-    /// from the open handle and not judged here. A missing directory is
-    /// [`TlsError::Write`] with [`std::io::ErrorKind::NotFound`].
     fn open_existing(path: &Path) -> Result<Self, TlsError> {
         #[cfg(unix)]
         {
@@ -853,7 +720,6 @@ impl GeneratedDir {
         }
     }
 
-    /// The directory's owner, where the platform has one.
     #[allow(clippy::unnecessary_wraps, reason = "there is no owner off unix")]
     fn owner(&self) -> Option<u32> {
         #[cfg(unix)]
@@ -866,10 +732,6 @@ impl GeneratedDir {
         }
     }
 
-    /// Read the file `name` with `reader`, and the metadata of the file
-    /// read, or `None` when there is none. A symlink or anything but a
-    /// regular file is refused; any other failure is reported through
-    /// `err`.
     fn read(
         &self,
         name: &str,
@@ -892,8 +754,7 @@ impl GeneratedDir {
                         OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
                     rustix::fs::openat(&self.handle, name, flags, Mode::empty()).map(fs::File::from)
                 }
-                // The doctor opens nothing but a regular file for I/O, so a
-                // device at `name` is never opened (#269).
+                // The doctor opens nothing but a regular file for I/O.
                 Reader::Bounded(_) => doctor_open_at(&self.handle, name),
             };
             let mut file = match opened {
@@ -953,11 +814,7 @@ impl GeneratedDir {
     }
 
     /// [`key_exposure`] of the file `name`, judged from its directory entry
-    /// without opening it, so a file trawld cannot read is judged too, for a
-    /// start as `euid` (`None`: the hard links only). `None` when there is
-    /// no file or nothing exposes it. A symlink or anything but a regular
-    /// file is refused, as [`read`](Self::read) refuses it; any other
-    /// failure is reported through `err`.
+    /// without opening it, so a file trawld cannot read is judged too.
     fn entry_exposure(
         &self,
         name: &str,
@@ -1088,7 +945,6 @@ impl GeneratedDir {
         fs::rename(self.path.join(from), self.path.join(to))
     }
 
-    /// Make earlier removals and renames in the directory durable.
     fn sync(&self) -> std::io::Result<()> {
         #[cfg(unix)]
         {
@@ -1106,9 +962,6 @@ fn unsafe_path(path: &Path, reason: UnsafeReason) -> TlsError {
     }
 }
 
-/// Read `file`, whose metadata is `meta`, to its end, or fail with
-/// [`std::io::ErrorKind::FileTooLarge`] once it holds more than `max`
-/// bytes: past the size `fstat` gave, or past `max` in what is read.
 fn read_at_most(file: &fs::File, meta: &fs::Metadata, max: u64) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
 
@@ -1147,20 +1000,12 @@ fn publish_cert(tls_dir: &GeneratedDir, pem: &[u8]) -> std::io::Result<()> {
     tls_dir.rename(&tmp_name, GENERATED_CERT_FILE)
 }
 
-/// Background task that polls cert/key files for changes and sends a new
-/// [`TlsAcceptor`] through the watch channel when they change.
-///
-/// Uses content-based comparison instead of mtime to avoid TOCTOU races
-/// between the change check and file read.
-///
-/// Runs until the watch receiver is dropped (i.e. the server shuts down).
 pub async fn cert_reload_task(
     cert_path: PathBuf,
     key_path: PathBuf,
     interval: Duration,
     tx: tokio::sync::watch::Sender<TlsAcceptor>,
 ) {
-    // Seed with the current file contents so we only reload on actual changes.
     let mut last_cert = fs::read(&cert_path).ok();
     let mut last_key = fs::read(&key_path).ok();
 
@@ -1197,7 +1042,6 @@ pub async fn cert_reload_task(
             Ok((config, _)) => {
                 let acceptor = TlsAcceptor::from(config);
                 if tx.send(acceptor).is_err() {
-                    // Receiver dropped — server is shutting down.
                     break;
                 }
                 last_cert = Some(current_cert);
@@ -1207,13 +1051,9 @@ pub async fn cert_reload_task(
                     "TLS certificate reloaded successfully"
                 );
             }
-            // A refusal in trawl's own words: its text may stand.
             Err(e @ TlsError::Unsafe { .. }) => {
                 tracing::error!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
             }
-            // Every other variant carries an I/O error's text, or the PEM
-            // parser's, `rustls`'s or `rcgen`'s wording: DEBUG only. An I/O
-            // error keeps its kind.
             Err(e) => {
                 tracing::debug!(event_type = "tls_reload_error", error = %e, "failed to reload TLS certificate, keeping current");
                 let (error_class, cause_kind) = match &e {
@@ -1255,7 +1095,6 @@ mod tests {
         fs::write(&cert_path, &cert_pem).unwrap();
         fs::write(&key_path, &key_pem).unwrap();
 
-        // Verify we can load them back and build a rustls config.
         let (config, self_signed) =
             build_server_config(Some(&cert_path), Some(&key_path), tmp.path()).unwrap();
         assert!(!self_signed);
@@ -1289,15 +1128,11 @@ mod tests {
         let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
         assert!(self_signed);
 
-        // Verify the cert was written to {state_dir}/tls/ and the key to
-        // {state_dir}/tls-key/.
         assert!(tmp.path().join("tls").join("cert.pem").exists());
         assert!(tmp.path().join("tls-key").join("key.pem").exists());
     }
 
-    /// The generated certificate is published for a proxy running as another
-    /// user: world-readable and complete, while the key stays owner-only. A
-    /// temporary file left by a crashed start (here `0600` and garbage) must
+    /// A temporary file left by a crashed start (here `0600` and garbage) must
     /// not leak its mode or bytes into the published certificate.
     #[cfg(unix)]
     #[test]
@@ -1341,15 +1176,10 @@ mod tests {
             .expect("cert.pem is PEM");
         assert_eq!(certs.len(), 1, "cert.pem holds one certificate");
 
-        // The pair on disk is what a restart loads, so it must still serve.
         let (_, self_signed) = build_server_config(None, None, tmp.path()).unwrap();
         assert!(!self_signed, "the restart loads the published pair");
     }
 
-    /// A proxy running as another uid pins `tls/cert.pem`, so it must be
-    /// able to search `tls/`, and only trawld may write it. Whatever mode an
-    /// earlier start, the umask, or a group ownership walk left, trawld sets
-    /// the directory to `0755`.
     #[cfg(unix)]
     #[test]
     fn the_certificate_directory_is_0755_whatever_it_was() {
@@ -1369,11 +1199,7 @@ mod tests {
         }
     }
 
-    /// A certificate whose key is gone is regenerated, and a generation
-    /// interrupted after the new key is written must not leave the old
-    /// certificate beside it: the next start would load a pair that does not
-    /// match and fail TLS on every start after. Publication is made to fail
-    /// by a directory squatting on `cert.pem.tmp`.
+    /// Publication is made to fail by a directory squatting on `cert.pem.tmp`.
     #[test]
     fn an_interrupted_generation_never_pairs_a_new_key_with_the_old_cert() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1382,7 +1208,6 @@ mod tests {
         let cert_path = tls_dir.join(GENERATED_CERT_FILE);
         let key_path = tmp.path().join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
 
-        // Only a certificate from some other keypair survives.
         let rcgen::CertifiedKey { cert: stale, .. } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         fs::write(&cert_path, stale.pem()).unwrap();
@@ -1410,11 +1235,6 @@ mod tests {
         assert!(!self_signed, "the start after loads the published pair");
     }
 
-    /// An older trawld kept its key at `tls/key.pem`, inside the directory a
-    /// proxy mounts to pin the certificate. Any start that owns the
-    /// generated pair deletes it: an old-layout pair has no key in the key
-    /// directory, so it is regenerated, and a stray legacy key beside a
-    /// current pair is removed without regenerating.
     #[test]
     fn a_legacy_key_in_the_certificate_directory_is_removed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1422,7 +1242,6 @@ mod tests {
         fs::create_dir_all(&tls_dir).unwrap();
         let legacy_key = tls_dir.join(GENERATED_KEY_FILE);
 
-        // The old layout: a matching pair, both inside tls/.
         let rcgen::CertifiedKey { cert, signing_key } =
             rcgen::generate_simple_self_signed(vec!["localhost".to_owned()]).unwrap();
         fs::write(tls_dir.join(GENERATED_CERT_FILE), cert.pem()).unwrap();
@@ -1434,7 +1253,6 @@ mod tests {
         assert!(!legacy_key.exists(), "the legacy key is gone");
         assert_eq!(dir_entries(&tls_dir), [GENERATED_CERT_FILE]);
 
-        // A legacy key beside a current pair.
         fs::write(&legacy_key, signing_key.serialize_pem()).unwrap();
         let (_, self_signed) =
             build_server_config(None, None, tmp.path()).expect("the current pair loads");
@@ -1442,10 +1260,6 @@ mod tests {
         assert!(!legacy_key.exists(), "the stray legacy key is gone");
     }
 
-    /// A `tls-key` symlink planted at the key directory must not steer the
-    /// private key anywhere: pointed at `tls/`, it would put the key in the
-    /// directory the proxy sidecar mounts. Generation refuses the link,
-    /// naming it, and writes nothing into its target.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_key_directory_is_refused() {
@@ -1470,9 +1284,6 @@ mod tests {
         assert_eq!(mode, 0o755, "the link target is not re-moded");
     }
 
-    /// The same holds for the certificate directory: a `tls` symlink is
-    /// refused rather than followed, so no certificate or key is written
-    /// into the directory it points at.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_certificate_directory_is_refused() {
@@ -1497,7 +1308,6 @@ mod tests {
         );
     }
 
-    /// A key directory that is not a directory at all is refused too.
     #[test]
     fn a_key_directory_that_is_a_file_is_refused() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1513,9 +1323,6 @@ mod tests {
         assert!(err.to_string().contains("not a directory"), "{err}");
     }
 
-    /// A symlink at `tls-key/key.pem` or `tls/cert.pem` is refused whether
-    /// or not a pair is already published, and its target is neither read
-    /// as the key nor replaced.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_key_or_certificate_file_is_refused() {
@@ -1566,12 +1373,6 @@ mod tests {
         assert_eq!(fs::read(&victim).unwrap(), b"not yours");
     }
 
-    /// A second link to the generated key, here one inside the `tls/`
-    /// directory the proxy sidecar mounts, exposes the key through that
-    /// name. The next start discards the key and generates a new pair, so
-    /// the exposed inode holds only a key whose certificate is no longer
-    /// served, and the start after loads the new pair.
-    ///
     /// A key owned by another uid is discarded the same way. Planting one
     /// inside trawld's own `0700` key directory needs root, so
     /// [`key_exposure_names_extra_links_and_a_foreign_owner`] covers the
@@ -1612,9 +1413,6 @@ mod tests {
         assert!(!self_signed, "the start after loads the new pair");
     }
 
-    /// Which keys are trawld's alone: one link, owned by trawld's uid. A
-    /// second link or another owner is a reason to regenerate, and the
-    /// reason names what was found.
     #[cfg(unix)]
     #[test]
     fn key_exposure_names_extra_links_and_a_foreign_owner() {
@@ -1650,7 +1448,6 @@ mod tests {
             return;
         }
 
-        // trawld's alone, but unreadable: refused, naming the key.
         let err = build_server_config(None, None, tmp.path())
             .expect_err("an unreadable key trawld owns stops the start");
         assert!(
@@ -1659,7 +1456,6 @@ mod tests {
             "{err:?}"
         );
 
-        // Exposed and unreadable: regenerated without being opened.
         let exposed = tmp.path().join("exposed.pem");
         fs::hard_link(&key_path, &exposed).unwrap();
         let (_, self_signed) = build_server_config(None, None, tmp.path())
@@ -1676,9 +1472,6 @@ mod tests {
         assert!(!self_signed, "the start after loads the new pair");
     }
 
-    /// Something at `key.pem` that is not a regular file is not a key trawld
-    /// wrote. It is refused by name, and a FIFO there does not hang the
-    /// start on open.
     #[cfg(unix)]
     #[test]
     fn a_key_that_is_not_a_regular_file_is_refused() {
@@ -1699,8 +1492,6 @@ mod tests {
         assert!(err.to_string().contains("not a regular file"), "{err}");
     }
 
-    /// Every entry under `dir` with its mode, size and modification time,
-    /// sorted; empty when `dir` does not exist.
     #[cfg(unix)]
     fn tree(dir: &Path) -> Vec<(PathBuf, u32, u64, std::time::SystemTime)> {
         use std::os::unix::fs::MetadataExt;
@@ -1720,9 +1511,6 @@ mod tests {
         entries
     }
 
-    /// The doctor's read of the generated pair agrees with what a start
-    /// does with it, state by state, and changes nothing: no directory is
-    /// created or re-moded, and no file is removed or written.
     #[cfg(unix)]
     #[test]
     fn inspecting_the_generated_pair_agrees_with_boot_and_writes_nothing() {
@@ -1745,7 +1533,6 @@ mod tests {
         let cert_path = state.join(GENERATED_TLS_DIR).join(GENERATED_CERT_FILE);
         let key_path = state.join(GENERATED_KEY_DIR).join(GENERATED_KEY_FILE);
 
-        // Before the first start there is nothing, and nothing is created.
         let found = inspect(&state).unwrap();
         assert_eq!(found.pair, GeneratedPair::Regenerate(Regenerate::Absent));
         assert!(!state.exists());
@@ -1772,7 +1559,6 @@ mod tests {
             "boot loads it"
         );
 
-        // Each half missing: boot generates a new pair.
         fs::remove_file(&cert_path).unwrap();
         let found = inspect(&state).unwrap();
         assert_eq!(
@@ -1785,7 +1571,6 @@ mod tests {
         assert_eq!(found.pair, GeneratedPair::Regenerate(Regenerate::NoKey));
         assert!(build_server_config(None, None, &state).unwrap().1);
 
-        // An exposed key: boot discards it and generates a new pair.
         let exposed = tmp.path().join("exposed.pem");
         fs::hard_link(&key_path, &exposed).unwrap();
         let found = inspect(&state).unwrap();
@@ -1795,8 +1580,6 @@ mod tests {
         );
         assert!(build_server_config(None, None, &state).unwrap().1);
 
-        // A symlinked key directory: boot refuses it, and so does the
-        // inspection, naming the same reason.
         let key_dir = state.join(GENERATED_KEY_DIR);
         let moved = tmp.path().join("moved-key-dir");
         fs::rename(&key_dir, &moved).unwrap();
@@ -1811,12 +1594,6 @@ mod tests {
         }
     }
 
-    /// A start removes whatever an older trawld left at `tls/key.pem` before
-    /// it reads the pair, and fails when that removal fails. The doctor's
-    /// read-only inspection agrees entry by entry: absent, a regular file, a
-    /// symlink or a FIFO is removed, and the pair beside it is judged as
-    /// usual; a directory, empty or not, stops the start, and the inspection
-    /// refuses it. The inspection removes nothing.
     #[cfg(unix)]
     #[test]
     fn the_old_key_path_is_judged_as_a_start_removes_it() {
@@ -1833,14 +1610,12 @@ mod tests {
         assert!(build_server_config(None, None, state).unwrap().1);
         let old = state.join(GENERATED_TLS_DIR).join(GENERATED_KEY_FILE);
 
-        // Absent: both go on to the pair, which the start loads.
         assert!(matches!(
             inspect(state).unwrap().pair,
             GeneratedPair::Found { .. }
         ));
         assert!(!build_server_config(None, None, state).unwrap().1);
 
-        // Entries the start's unlink removes, pair and all left as it was.
         for what in ["a regular file", "a symlink", "a FIFO"] {
             match what {
                 "a regular file" => fs::write(&old, b"old key").unwrap(),
@@ -1869,8 +1644,6 @@ mod tests {
             );
         }
 
-        // A directory, empty and with an entry: the start's unlink fails,
-        // and the inspection refuses what the start fails on.
         for with_entry in [false, true] {
             fs::create_dir(&old).unwrap();
             if with_entry {
@@ -1891,9 +1664,6 @@ mod tests {
         }
     }
 
-    /// Another owner is refused as boot refuses it when the uid is
-    /// enforced, and only recorded when it is observed, as a root run
-    /// observes it. A key past its read cap stops the read.
     #[cfg(unix)]
     #[test]
     fn the_owner_rule_and_the_read_cap_hold() {
@@ -1952,7 +1722,6 @@ mod tests {
         }
     }
 
-    /// Names of the entries in `dir`, sorted.
     fn dir_entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<String> = fs::read_dir(dir)
             .unwrap()
@@ -1962,9 +1731,6 @@ mod tests {
         names
     }
 
-    /// The Debian package's trawl-web pins the certificate this module
-    /// generates, so the packaged `[web] upstream_ca_path` must be the file
-    /// trawld writes for the packaged `[data] path`.
     #[test]
     fn the_debian_config_pins_the_generated_certificate() {
         let config = trawl_config::Config::parse_toml(include_str!("../debian/trawld.toml"))
@@ -1986,7 +1752,6 @@ mod tests {
             .strip_prefix(config.state_dir())
             .expect("the generated certificate lies under trawld's state directory");
 
-        // Generate into a scratch state directory and read the pin from it.
         let tmp = tempfile::tempdir().unwrap();
         build_server_config(None, None, tmp.path()).unwrap();
         let pem = fs::read(tmp.path().join(relative)).expect("trawld wrote the pinned file");

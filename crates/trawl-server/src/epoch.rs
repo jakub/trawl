@@ -4,15 +4,6 @@
 
 //! Current storage-format gate. No storage conversion runs at startup.
 //!
-//! Owned roots require `EPOCH = 3`. A missing or empty root can be initialized;
-//! an interrupted initial marker write can be retried on an otherwise empty
-//! owned root. Any other nonempty root without its marker must be restored
-//! from a complete current backup or replaced with a new empty root selected
-//! by the operator.
-//! Query-only nodes can also read unversioned generic archives without Trawl
-//! ownership markers. They never initialize those archives or inspect unused WAL.
-//! An explicit incompatible epoch refuses in every mode.
-//!
 //! The gate precedes repin recovery. Current repin swaps only environment
 //! directories, so it cannot change EPOCH. Recovery still finishes before
 //! readers or conformance inspect the corpus.
@@ -20,19 +11,14 @@
 use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
 
-/// The current storage epoch, written to `data/EPOCH`.
 pub const CURRENT_EPOCH: &str = "3";
-/// Marker filename inside the data root.
 pub const EPOCH_FILE: &str = trawl_config::EPOCH_MARKER;
-/// Suffix for staged marker files shared with catalog, repin, and rollup.
 const NEXT_SUFFIX: &str = ".next";
 
-/// What the boot gate decided, for logging and tests.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Outcome {
     /// Created a missing root and published its current marker.
     FreshRoot,
-    /// The existing marker names the current format.
     Current,
     /// Published the current marker in a precreated empty root.
     InitializedEmpty,
@@ -41,12 +27,8 @@ pub enum Outcome {
 }
 
 /// Validate storage before any recovery can mutate the data root or siblings.
-/// All refusal checks run before fresh-root initialization. Filesystem errors
-/// are errors, never evidence of an empty directory or an absent marker.
-///
 /// With ingest enabled, an admitted root's ancestor chain is then synced
-/// ([`sync_ancestor_chain`]) before compaction can retire WAL into it, and
-/// a failed sync is a boot error.
+/// before compaction can retire WAL into it.
 pub fn ensure_current_epoch(
     data_root: &Path,
     wal_dir: &Path,
@@ -64,13 +46,10 @@ pub fn ensure_current_epoch(
     Ok(outcome)
 }
 
-/// What the boot gate will do with a data root, decided before anything is
-/// written ([`classify_data_root`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DataRootState {
     /// Absent on an ingest node: boot creates it and publishes `EPOCH`.
     Fresh,
-    /// The existing marker names the current format.
     Current,
     /// Present and empty on an ingest node, but for these proven remnants
     /// of an interrupted initial publication: boot removes them and
@@ -84,55 +63,35 @@ pub enum DataRootState {
     ReadOnlyArchive,
 }
 
-/// Which inspection of the data root or the WAL directory failed, for the
-/// wording of boot's refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Inspected {
     /// One path: the root, the WAL directory, the marker, or an entry.
     Path,
-    /// Listing the WAL directory.
     WalDir,
-    /// Listing the data root.
     DataRoot,
 }
 
-/// Why the boot gate refuses a data root ([`classify_data_root`]). `E` is
-/// the error of the injected [`RootReader`].
 #[derive(Debug)]
 pub enum RootFault<E> {
-    /// A filesystem call failed. Filesystem errors are errors, never
-    /// evidence of an empty directory or an absent marker.
     Inspect {
-        /// What was being inspected.
         at: Inspected,
-        /// The path it failed on.
         path: PathBuf,
-        /// The failure.
         error: std::io::Error,
     },
-    /// The `EPOCH` marker exists but could not be read.
     ReadEpoch {
-        /// The marker.
         path: PathBuf,
-        /// The reader's failure.
         error: E,
     },
-    /// A staged `EPOCH.next.<pid>` file could not be read.
     ReadStaged {
-        /// The staged file.
         path: PathBuf,
-        /// The reader's failure.
         error: E,
     },
     /// A flat `*.ndjson` batch sits directly in the WAL directory of an
     /// ingest node.
     FlatWal {
-        /// The first such batch.
         batch: PathBuf,
     },
-    /// The data root exists and is not a directory.
     NotADirectory,
-    /// `EPOCH` names another format.
     UnsupportedEpoch {
         /// The marker's content, trimmed.
         found: String,
@@ -147,7 +106,6 @@ pub enum RootFault<E> {
 }
 
 impl<E: std::fmt::Display> RootFault<E> {
-    /// Boot's refusal, word for word as the gate has always given it.
     pub fn into_boot_message(self, data_root: &Path) -> String {
         match self {
             Self::Inspect {
@@ -214,24 +172,15 @@ impl<E: std::fmt::Display> RootFault<E> {
     }
 }
 
-/// How [`classify_data_root`] reads the two small files it opens. Boot
-/// passes [`BootReader`], the reads it has always made; the doctor passes
-/// its bounded reader.
+/// How [`classify_data_root`] reads the two small files it opens. The
+/// doctor passes its bounded reader.
 pub trait RootReader {
-    /// What a failed read says.
     type Error;
 
-    /// The whole `EPOCH` marker, as text.
-    ///
-    /// # Errors
-    /// When it cannot be read as text.
     fn epoch(&mut self, path: &Path) -> Result<String, Self::Error>;
 
     /// A staged `EPOCH.next.<pid>` file, when it holds at most `max` bytes;
     /// `None` when it holds more.
-    ///
-    /// # Errors
-    /// When it cannot be read.
     fn staged(&mut self, path: &Path, max: u64) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 
@@ -255,14 +204,8 @@ impl RootReader for BootReader {
 }
 
 /// Decide what the boot gate does with `data_root`, writing nothing.
-///
-/// Every refusal is decided here, before [`admit_data_root`] acts: with
-/// ingest enabled the WAL is validated first, then the root, its marker and
-/// every entry. The precedence is the gate's, so boot and `trawld --doctor`
-/// reach the same answer from the same observations.
-///
-/// # Errors
-/// The [`RootFault`] boot refuses the root for.
+/// The check order is the gate's, so boot and `trawld --doctor` reach the
+/// same answer from the same observations.
 pub fn classify_data_root<R: RootReader>(
     data_root: &Path,
     wal_dir: &Path,
@@ -359,11 +302,7 @@ fn admit_data_root(
         DataRootState::Fresh => {
             // Compaction retires acknowledged WAL once its output is durable
             // inside the root, so the root's own entry, and that of every
-            // ancestor created for it, must be durable first: without them a
-            // power loss drops the whole tree. A failed sync removes what it
-            // created, so the next boot creates and syncs it again. Exclusive
-            // creation does not adopt a root another process created after
-            // the absence check.
+            // ancestor created for it, must be durable first.
             create_dir_all_durably(data_root, fsync_dir)
                 .map_err(|e| format!("failed to create data root {}: {e}", data_root.display()))?;
             publish_epoch(data_root)?;
@@ -424,9 +363,6 @@ fn is_staged_epoch<R: RootReader>(
 
 /// Preserve read errors, including dangling symlinks. Only a genuinely absent
 /// path is `None`; following an existing symlink must succeed.
-///
-/// # Errors
-/// The failed inspection, as an [`Inspected::Path`] fault.
 pub(crate) fn metadata_if_present<E>(
     path: &Path,
 ) -> Result<Option<std::fs::Metadata>, RootFault<E>> {
@@ -495,11 +431,6 @@ fn publish_epoch(data_root: &Path) -> Result<(), String> {
 /// rename → dir fsync. A crash can then never publish a half-written
 /// marker — every reader sees either the previous content or the new one.
 ///
-/// The catalog identity marker (`catalog::conform::publish_marker`) and the
-/// repin marker (`repin::marker::write_marker`) publish through this helper.
-/// Initial epoch publication uses exclusive staging creation in
-/// [`publish_epoch`] after admission validates any interrupted initial write.
-///
 /// The staged name is PID-unique: concurrent publishers (test harnesses
 /// share a fixture corpus) must not clobber each other's staged file
 /// between the write and the rename.
@@ -512,11 +443,6 @@ pub(crate) fn publish_marker_staged(dir: &Path, name: &str, body: &str) -> Resul
 /// [`publish_marker_staged`] for a marker whose durability is part of a
 /// correctness argument: a failed directory fsync is an error, not a warning.
 ///
-/// The compaction publication marker (`ingest::publication_marker`) must be
-/// on disk before its output is renamed into place, so the caller has to
-/// learn that the rename entry may not survive a crash. The marker stays
-/// visible after such a failure; recovery treats it like any other marker.
-///
 /// The staged name is predictable, so this writer never opens it by path:
 /// it removes any leftover entry (a crashed earlier attempt, or a planted
 /// symlink), creates the file exclusively, and writes and fsyncs that one
@@ -528,10 +454,8 @@ pub(crate) fn publish_marker_durable(dir: &Path, name: &str, body: &str) -> Resu
 }
 
 /// [`publish_marker_durable`] with the staged file's sync and the directory
-/// fsync done by `sync_staged` (given the staged path and its open file)
-/// and `sync_dir`, so a caller can observe each or fail it. Either one failing fails the publish, as in
-/// [`publish_marker_durable`]. The error keeps the kind of the I/O error
-/// behind it, and its text is [`publish_marker_durable`]'s.
+/// fsync done by `sync_staged` and `sync_dir`, so a caller can observe each
+/// or fail it.
 pub(crate) fn publish_marker_durable_with(
     dir: &Path,
     name: &str,
@@ -575,7 +499,6 @@ pub(crate) fn publish_marker_durable_with(
     })
 }
 
-/// The PID-unique staged name a marker is written under before its rename.
 fn staged_path(dir: &Path, name: &str) -> std::path::PathBuf {
     // A hidden marker's staged file must not share its discovery prefix.
     // In particular, rollup recovery recognizes `.rollup-*`; it must never
@@ -587,8 +510,7 @@ fn staged_path(dir: &Path, name: &str) -> std::path::PathBuf {
     ))
 }
 
-/// Staged temp name, write, fsync, atomic rename. The caller owns the
-/// directory fsync that makes the rename durable.
+/// The caller owns the directory fsync that makes the rename durable.
 fn stage_and_rename(dir: &Path, name: &str, body: &str) -> Result<(), String> {
     let staged = staged_path(dir, name);
     std::fs::write(&staged, body)
@@ -602,9 +524,6 @@ fn stage_and_rename(dir: &Path, name: &str, body: &str) -> Result<(), String> {
         .map_err(|e| format!("failed to publish {}: {e}", marker.display()))
 }
 
-/// fsync a directory so entries created, renamed or removed inside it
-/// survive a crash. Unlike [`fsync_dir_best_effort`], the error reaches the
-/// caller.
 pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
     #[cfg(test)]
     if fail_dir_fsync::matches(dir) {
@@ -617,12 +536,11 @@ pub(crate) fn fsync_dir(dir: &Path) -> std::io::Result<()> {
 /// directory created, top down, so every new entry survives a power loss.
 /// The first sync is of the nearest ancestor that already existed.
 ///
-/// A directory that already exists costs one `stat` and no fsync. Every
-/// missing directory is created exclusively, so one that another process
-/// creates first is an `AlreadyExists` error rather than adopted. On any
-/// error the directories this call created are removed again, deepest
-/// first and only while empty, so a retry finds them missing and repeats
-/// the syncs instead of trusting entries that may not be durable.
+/// Every missing directory is created exclusively, so one that another
+/// process creates first is an `AlreadyExists` error rather than adopted.
+/// On any error the directories this call created are removed again,
+/// deepest first and only while empty, so a retry finds them missing and
+/// repeats the syncs instead of trusting entries that may not be durable.
 pub(crate) fn create_dir_all_durably(
     dir: &Path,
     mut sync: impl FnMut(&Path) -> std::io::Result<()>,
@@ -723,15 +641,11 @@ pub(crate) fn mount_root(dir: &Path) -> std::io::Result<Option<bool>> {
     }
 }
 
-/// No mount-root query off Linux: [`sync_ancestor_chain`] walks up to `/`.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn mount_root(_dir: &Path) -> std::io::Result<Option<bool>> {
     Ok(None)
 }
 
-/// Unit-test injection for [`fsync_dir`]: fail every fsync of one directory
-/// on the current thread. Real filesystems give no portable way to make a
-/// directory fsync fail on demand.
 #[cfg(test)]
 pub(crate) mod fail_dir_fsync {
     use std::cell::RefCell;
@@ -1114,9 +1028,6 @@ mod tests {
         }
     }
 
-    /// Owned-residue detection is looser than partition validity: a
-    /// date-shaped directory that is no calendar date still marks the root
-    /// as trawl's, so a query-only node refuses it and changes nothing.
     #[test]
     fn refuses_impossible_date_as_owned_residue() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1130,9 +1041,6 @@ mod tests {
         assert_eq!(crate::env_dirs::parse_date("2026-13-45"), None);
     }
 
-    /// Every consumer of the reserved root entries reads the one
-    /// definition in `trawl-config`: the env exclusions, this gate's owned
-    /// check and the `server.log_file` marker guard.
     #[test]
     fn reserved_root_entries_agree_across_consumers() {
         for dir in trawl_config::RESERVED_ROOT_DIRS {
@@ -1333,7 +1241,6 @@ mod tests {
             ensure_current_epoch(&data, &wal, true).unwrap(),
             Outcome::Current
         );
-        // A query-only node writes nothing into the root and syncs nothing.
         let _fail = fail_dir_fsync::set(canonical.parent().unwrap());
         assert_eq!(
             ensure_current_epoch(&data, &wal, false).unwrap(),
@@ -1341,7 +1248,6 @@ mod tests {
         );
     }
 
-    /// Record every directory `sync_ancestor_chain` syncs for `dir`.
     fn synced_chain(
         dir: &Path,
         mount_root: impl FnMut(&Path) -> std::io::Result<Option<bool>>,
@@ -1355,7 +1261,6 @@ mod tests {
         synced
     }
 
-    /// `a/b/c` under a canonical tempdir.
     fn abc() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
         let a = std::fs::canonicalize(tmp.path()).unwrap().join("a");
@@ -1373,7 +1278,6 @@ mod tests {
         let mount_root = |p: &Path| Ok(Some(p == b));
         assert_eq!(synced_chain(&c, mount_root), [b.as_path()]);
 
-        // A failed sync of an ancestor on the mount still fails the walk.
         let err = sync_ancestor_chain(&c, mount_root, |p| {
             if p == b {
                 Err(std::io::Error::other("sync failed"))
@@ -1384,7 +1288,6 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.to_string(), "sync failed");
 
-        // So does a directory the mount-root query cannot inspect.
         let err = sync_ancestor_chain(
             &c,
             |p| {
@@ -1445,8 +1348,6 @@ mod tests {
             "body",
             |staged, file| {
                 assert_eq!(staged, staged_path(dir, ".marker"));
-                // The staged file holds the whole body before its sync, and
-                // the marker name is not published yet.
                 assert_eq!(file.metadata().unwrap().len(), 4);
                 assert!(!dir.join(".marker").exists());
                 order.borrow_mut().push("staged");

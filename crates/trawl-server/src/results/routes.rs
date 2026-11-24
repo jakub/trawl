@@ -5,23 +5,13 @@
 //! The captured-results routes (ADR-0057): axum adapters over
 //! [`super::service`] and the correlation reads beside it (ADR-0058).
 //!
-//! They sit on the `authenticated` router, so every request passes bearer
-//! authentication, the trawl grant, the per-key rate and the ADR-0054
-//! request count before it reaches a handler here, with no control
-//! allowance. A handler extracts the request and answers what the service
-//! answers. A query parameter the route does not take, or one that does not
-//! read as its type, is a 400.
-//!
 //! No handler binds `Path`, `Query` or `Json` bare: axum would answer its
 //! plain-text rejection before the handler ran, and a key without `query`
 //! would learn whether its request parsed. Each takes the extractor's
 //! `Result`, checks `query` first, then passes the rejection through
 //! [`shaped`]. The capture and the correlation reads check `query` with
 //! the [`Authorized`] extractor, ahead of their bodies, so the body of a key
-//! without it is never read. Whether a capture or a correlation read
-//! attaches is a field of its body, so the service checks
-//! `investigation_write` once the body is shaped: the one grant that
-//! follows the body (ADR-0059).
+//! without it is never read.
 
 use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -105,7 +95,6 @@ pub(crate) async fn list(
     service::list(&state, &verified).await.map(Json)
 }
 
-/// The query parameters of `GET /api/v1/results/{id}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct PageParams {
@@ -137,7 +126,6 @@ pub(crate) async fn page(
     .map(Json)
 }
 
-/// The query parameters of `GET /api/v1/results/{id}/cells/{row}/{column}`.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct CellParams {

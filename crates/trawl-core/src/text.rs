@@ -10,12 +10,8 @@ mod duckdb_lower;
 
 /// The bundled `DuckDB`'s lowercase fold of `s`.
 ///
-/// Each character folds through `DuckDB`'s own `lower()` table, one code
-/// point to one and with no context rule, so `ÄB` folds to `äb`, `İ`
-/// (U+0130) to `i` and `Σ` to `σ` wherever it stands. `ILIKE` folds both
-/// sides with the same table, so the live filter and `sightings`
-/// attribution match exactly what the emitted SQL matches. The table is
-/// generated from the bundled `DuckDB`; a `DuckDB` bump that changes its
+/// One code point to one and with no context rule, so `İ` (U+0130) folds to
+/// `i` and `Σ` to `σ` wherever it stands. A `DuckDB` bump that changes its
 /// mapping fails `tests/fold_table.rs` until the table is regenerated.
 #[must_use]
 pub fn fold_ci(s: &str) -> String {
@@ -25,7 +21,6 @@ pub fn fold_ci(s: &str) -> String {
     s.chars().map(fold_char).collect()
 }
 
-/// `c` under the table, or `c` itself when `DuckDB`'s `lower()` keeps it.
 fn fold_char(c: char) -> char {
     if c.is_ascii() {
         return c.to_ascii_lowercase();
@@ -35,9 +30,6 @@ fn fold_char(c: char) -> char {
         .map_or(c, |i| duckdb_lower::LOWER[i].1)
 }
 
-/// Whether `haystack` contains `needle` under the [`fold_ci`] fold of
-/// both sides, the text search's `ILIKE` containment.
-///
 /// `_` and `%` are characters here, never wildcards.
 #[must_use]
 pub fn contains_ci(haystack: &str, needle: &str) -> bool {

@@ -4,34 +4,6 @@
 
 //! The one DSL admission door every entry point that accepts query text
 //! goes through (ADR-0024).
-//!
-//! `trawl-core` owns the verdict: [`trawl_core::parser::parse`] decides
-//! whether the text is a query at all, and
-//! [`trawl_core::emitter::validate_pipeline`] runs the shared pipeline
-//! validation whose first statement is the bind-time expansion budget. So
-//! an over-budget query is refused with the same sentence wherever it
-//! arrives, and a query the engine would refuse to emit is refused before
-//! it is stored, scheduled or handed a permit.
-//!
-//! Two properties matter more than the parse it hands back:
-//!
-//! * It runs over the WHOLE pipeline, ahead of anything that rewrites it.
-//!   `/query` calls it before `try_resolve_from_saved` slices the
-//!   `from saved` stage off, so a pipeline over the stage cap cannot
-//!   become an under-cap suffix by being resolved.
-//! * It runs before the store call on saved create/update, so the pipeline
-//!   that fails admission is never persisted to be run later by a
-//!   schedule. The scheduler asks again anyway, because a query stored
-//!   before this door existed is still out there.
-//!
-//! [`admit`] runs the check on the blocking pool, behind the preparation
-//! allowance (ADR-0063), so no parse spends a reactor thread's time.
-//!
-//! The errors are the ones the engine's own lanes raise for the same text,
-//! so [`crate::error`]'s existing mapping decides the status and body: a
-//! parse failure is `EngineError::Parse` (400, one detail per parse error)
-//! and a validation failure is `EngineError::Emit` (400, the sentence).
-//! Nothing here formats a message of its own.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -47,15 +19,6 @@ use crate::prepare::Door;
 
 /// Admit one DSL query on the blocking pool, behind the preparation
 /// allowance (ADR-0063), and hand back the query it parsed.
-///
-/// The parse and its pattern builds can spend about 0.85 s of CPU, so they
-/// never run on the calling task's thread. A request that stops waiting
-/// asks the check to stop, and it ends at its next cancellation point.
-///
-/// A tracked request passes its `pending` guard, so a cancel by id ends
-/// the wait for a preparation slot and stops the check
-/// ([`crate::prepare::Preparation::run_with`]); an untracked one passes
-/// `None`.
 ///
 /// # Errors
 ///
@@ -75,8 +38,7 @@ pub(crate) async fn admit(
 
 /// [`admit`] for a caller whose charge must stay charged while the check
 /// runs: a scheduled run passes its lease, which the preparation job keeps
-/// until it ends, also after the run stopped waiting (ADR-0018, amended
-/// 2026-11-09; [`crate::prepare::Preparation::run_with_holding`]).
+/// until it ends ([`crate::prepare::Preparation::run_with_holding`]).
 ///
 /// # Errors
 ///
@@ -97,14 +59,7 @@ pub(crate) async fn admit_holding(
 }
 
 /// Admit one DSL query on the caller's thread under `stop`, and hand back
-/// the query it parsed, for a preparation job: [`admit`]'s, or a door's
-/// that runs admission inside a larger job. A caller that reads the query
-/// after admission (saved-source detection, live-stream setup) takes this
-/// one rather than parsing the text again.
-///
-/// A requested stop ends the parse at its next cancellation point with
-/// [`EngineError::Cancelled`], never a parse or validation diagnostic. The
-/// request that owned the stop has stopped waiting by then (ADR-0063).
+/// the query it parsed, for a preparation job.
 ///
 /// # Errors
 ///
@@ -133,7 +88,6 @@ mod tests {
     use crate::deadline::Deadline;
     use crate::error::ServerError;
 
-    /// [`check_dsl_with`] under a stop nobody requests.
     fn check_dsl(dsl: &str) -> Result<trawl_core::ast::Query, ServerError> {
         check_dsl_with(dsl, &Stop::never())
     }
@@ -165,7 +119,6 @@ mod tests {
         );
     }
 
-    /// `admit` refuses what `check_dsl` refuses, with the same errors.
     #[tokio::test]
     async fn admit_refuses_as_check_dsl_does() {
         let pool = pool();
@@ -182,8 +135,6 @@ mod tests {
         );
     }
 
-    /// A check whose stop was requested ends cancelled, whatever the text:
-    /// never a parse or validation diagnostic, and never a 400 (R15).
     #[test]
     fn a_cancelled_check_is_never_a_diagnostic() {
         use axum::response::IntoResponse as _;
@@ -207,9 +158,6 @@ mod tests {
         }
     }
 
-    /// A doubling chain: every assignment names the previous one twice, so
-    /// each link doubles the work the binder does, and the budget refuses
-    /// it long before the text gets long.
     fn doubling_chain(links: usize) -> String {
         use std::fmt::Write as _;
         let mut dsl = String::from("* | let a0 = 1");
@@ -236,8 +184,6 @@ mod tests {
         );
     }
 
-    /// The refusal carries `trawl-core`'s sentence, through the emit
-    /// error the engine's own lanes would have raised.
     #[test]
     fn an_over_budget_pipeline_carries_the_shared_sentence() {
         let err = check_dsl(&doubling_chain(12)).expect_err("refused");
@@ -264,12 +210,11 @@ mod tests {
     }
 
     /// Each caller that reads the query after admission takes the one
-    /// `check_dsl` parsed. Every count here is one under what the same
-    /// caller took when it parsed the text again.
+    /// `check_dsl` parsed.
     #[test]
     fn admission_reuses_the_parsed_query() {
         // `/query`: admission, then the `from saved` detection the
-        // resolver runs. Two parses before.
+        // resolver runs.
         for (dsl, saved) in [
             ("error | stats count() by host", false),
             ("| from saved daily_errors | head 5", true),
@@ -284,8 +229,7 @@ mod tests {
 
         // Capture planning: the caller's text is admitted, its bounds are
         // resolved from a parse of their own, and the executed text is
-        // admitted; the `from saved` lookup reads that last query. Four
-        // parses before.
+        // admitted; the `from saved` lookup reads that last query.
         let limits = crate::results::bounds::Limits {
             default_window: std::time::Duration::from_hours(1),
             max_span: std::time::Duration::from_hours(24),
@@ -307,7 +251,7 @@ mod tests {
         assert!(found);
         assert_eq!(n, 3);
 
-        // SSE setup: admission, then the live compile. Two parses before.
+        // SSE setup: admission, then the live compile.
         let (setup, n) = parses(|| {
             crate::handlers::prepare_stream_with(
                 "error | where message matches /time(out)?/",

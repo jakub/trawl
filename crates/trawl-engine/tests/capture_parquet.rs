@@ -2,12 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A captured result's parquet file (ADR-0057): columns named by position,
-//! rows in the result's order, every column exact or kept as its wire
-//! JSON, and pages and cells read back by row number. Each test writes a
-//! real file with `Executor::write_capture_parquet`, asks `DuckDB` what the
-//! file holds, and reads it back with `read_capture_page` and
-//! `read_capture_cell`.
+//! A captured result's parquet file (ADR-0057).
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _};
@@ -25,7 +20,6 @@ fn text(s: &str) -> Value {
     Value::String(s.to_owned())
 }
 
-/// A 0600 file for the capture, made the way the results root makes one.
 fn dest_in(dir: &Path) -> PathBuf {
     let path = dir.join(".stage-a1B2c3.parquet");
     std::fs::OpenOptions::new()
@@ -37,7 +31,6 @@ fn dest_in(dir: &Path) -> PathBuf {
     path
 }
 
-/// Write `result` as a capture into a fresh directory.
 fn capture(result: &QueryResult) -> (tempfile::TempDir, PathBuf, CaptureFile) {
     let dir = tempfile::tempdir().unwrap();
     let path = dest_in(dir.path());
@@ -50,7 +43,6 @@ fn capture(result: &QueryResult) -> (tempfile::TempDir, PathBuf, CaptureFile) {
     (dir, path, file)
 }
 
-/// Every row of the capture at `path`, every column in position order.
 fn read_all(path: &Path, result: &QueryResult, stored_as: &[StoredAs]) -> Vec<Vec<Value>> {
     let types = types(result);
     let positions: Vec<usize> = (0..types.len()).collect();
@@ -64,7 +56,6 @@ fn types(result: &QueryResult) -> Vec<ColumnType> {
     result.columns.iter().map(|c| c.ty.clone()).collect()
 }
 
-/// The name and `DuckDB` type of every column in the file, in order.
 fn described(path: &Path) -> Vec<(String, String)> {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let mut stmt = conn
@@ -86,7 +77,6 @@ fn described_as(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// The texts a `VARCHAR` column of the file holds, in file order.
 fn stored_texts(path: &Path, column: &str) -> Vec<Option<String>> {
     let conn = duckdb::Connection::open_in_memory().unwrap();
     let mut stmt = conn
@@ -127,9 +117,6 @@ fn assert_rows(got: &[Vec<Value>], want: &[Vec<Value>]) {
     }
 }
 
-/// Display names never reach the file: its columns are `c0`, `c1`, ..., so
-/// duplicates, quotes and a name that spells another column's file name
-/// all read back under their positions.
 #[test]
 fn duplicate_and_odd_display_names_reach_no_file_column() {
     let written = QueryResult {
@@ -163,10 +150,6 @@ fn duplicate_and_odd_display_names_reach_no_file_column() {
     assert_rows(&read_all(&path, &written, &file.stored_as), &written.rows);
 }
 
-/// A `mixed` column has no parquet type, so each cell is kept as its wire
-/// JSON text in a `VARCHAR`, null cells as `NULL`, and lands back through
-/// the wire's decoder exactly: tags, `u64` digits, a non-finite float and
-/// a list of mixed items included.
 #[test]
 fn a_mixed_column_is_kept_as_wire_text_and_lands_back() {
     let written = QueryResult {
@@ -211,8 +194,7 @@ fn a_mixed_column_is_kept_as_wire_text_and_lands_back() {
 }
 
 /// Integers that need both a negative and the range above `i64::MAX` have
-/// no exact parquet type (`HUGEINT` is stored as `DOUBLE`), so the column
-/// is kept as wire text, its digits exact; a list of them likewise.
+/// no exact parquet type (`HUGEINT` is stored as `DOUBLE`).
 #[test]
 fn integers_of_both_signs_past_i64_are_kept_exactly_as_wire_text() {
     let written = QueryResult {
@@ -248,8 +230,6 @@ fn integers_of_both_signs_past_i64_are_kept_exactly_as_wire_text() {
     assert_rows(&read_all(&path, &written, &file.stored_as), &written.rows);
 }
 
-/// A value above `i64::MAX` with no negative beside it fits `UBIGINT`, so
-/// the column stays native and unsigned in the file.
 #[test]
 fn an_integer_above_i64_alone_stays_native() {
     let written = QueryResult {
@@ -266,9 +246,6 @@ fn an_integer_above_i64_alone_stays_native() {
     assert_rows(&read_all(&path, &written, &file.stored_as), &written.rows);
 }
 
-/// The wire spells a non-finite float as `"NaN"`, `"Infinity"` or
-/// `"-Infinity"`; the file holds them as `DOUBLE` values, and every float
-/// reads back to the bit, the extremes and a negative zero included.
 #[test]
 fn non_finite_floats_are_stored_as_doubles_and_read_back_to_the_bit() {
     let floats = [
@@ -309,8 +286,6 @@ fn non_finite_floats_are_stored_as_doubles_and_read_back_to_the_bit() {
     assert_rows(&read_all(&path, &written, &file.stored_as), &written.rows);
 }
 
-/// Lists nest as their element types, at any depth: native when the items
-/// have a stored type, wire text when they are mixed.
 #[test]
 fn nested_lists_round_trip() {
     let nested = ColumnType::list(ColumnType::list(ColumnType::Integer));
@@ -362,9 +337,6 @@ fn nested_lists_round_trip() {
     assert_rows(&read_all(&path, &written, &file.stored_as), &written.rows);
 }
 
-/// A timestamp is stored as a UTC `TIMESTAMP` to the microsecond and
-/// reads back as the same instant in UTC, whatever offset it was written
-/// in; `infinity` stays `infinity`.
 #[test]
 fn timestamps_keep_their_microseconds() {
     let written = QueryResult {
@@ -414,8 +386,6 @@ fn timestamps_keep_their_microseconds() {
     );
 }
 
-/// A result with columns and no rows writes a file that carries its
-/// schema, a mixed column as `VARCHAR`, and reads back as no rows.
 #[test]
 fn zero_rows_write_a_typed_empty_file() {
     let written = QueryResult {
@@ -458,8 +428,7 @@ fn zero_rows_write_a_typed_empty_file() {
 
 /// A parquet file holds at least one column, so a result without columns
 /// is refused before anything is written: the caller keeps it as metadata
-/// alone. A cell its column does not admit, or a ragged row, fails the
-/// wire encoding; none of the refusals leaves a staging file behind.
+/// alone.
 #[test]
 fn the_writer_refuses_what_has_no_file() {
     let scratch_parent = tempfile::tempdir().unwrap();
@@ -505,8 +474,6 @@ fn the_writer_refuses_what_has_no_file() {
     );
 }
 
-/// 10,000 rows span several row groups and read back in order, a page at
-/// a time, at every row-group boundary, and past the end.
 #[test]
 fn rows_page_in_order_across_row_groups() {
     const ROWS: usize = 10_000;
@@ -583,10 +550,6 @@ fn rows_page_in_order_across_row_groups() {
     assert_rows(&page(9_990, u64::MAX), &written.rows[9_990..]);
 }
 
-/// A page returns the columns at the given positions in the given order,
-/// a repeated position repeated, and with no position its rows still
-/// count. A position past the last column, or metadata that does not
-/// describe every column, is refused.
 #[test]
 fn a_page_projects_by_position() {
     let written = QueryResult {
@@ -629,8 +592,6 @@ fn a_page_projects_by_position() {
     assert!(matches!(&err, EngineError::Io(e) if e.kind() == std::io::ErrorKind::InvalidInput));
 }
 
-/// One cell by row and position, native or wire text; `None` past the
-/// last row.
 #[test]
 fn a_cell_reads_by_row_and_position() {
     let written = QueryResult {
@@ -667,9 +628,6 @@ fn a_cell_reads_by_row_and_position() {
     }
 }
 
-/// The file the caller made 0600 stays that file: `COPY` writes into it in
-/// place, so its inode and mode survive under any umask, and a second
-/// write truncates it. `bytes` is its synced length.
 #[test]
 fn a_pre_created_0600_file_keeps_its_inode_and_mode() {
     let dir = tempfile::tempdir().unwrap();
@@ -760,7 +718,6 @@ fn a_read_path_with_a_glob_character_is_refused() {
     assert!(err.to_string().contains("glob character '*'"), "{err}");
 }
 
-/// A query database whose scratch directory is `path`, as trawld opens it.
 fn query_database(path: &Path) -> Executor {
     let scratch = Arc::new(ScratchLock::open(path).expect("the scratch directory locks"));
     let budgets = QueryBudgets {

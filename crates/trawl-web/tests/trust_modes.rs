@@ -3,11 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! How each shipped channel makes `trawl-web` trust trawld (ADR-0048).
-//!
-//! `trawl-web` always verifies trawld's certificate, against the platform
-//! roots or a pinned CA file. A channel that runs trawld with its generated
-//! self-signed certificate has to pin that exact file, or its sign-in fails.
-//! These tests read the channel's own files rather than restating them.
 
 use std::path::{Path, PathBuf};
 
@@ -25,7 +20,6 @@ fn read(relative: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The `[[processes]]` entry of `fleet-dev.toml` with this name.
 fn fleet_dev_process<'a>(manifest: &'a toml::Table, name: &str) -> &'a toml::Table {
     manifest["processes"]
         .as_array()
@@ -36,17 +30,8 @@ fn fleet_dev_process<'a>(manifest: &'a toml::Table, name: &str) -> &'a toml::Tab
         .unwrap_or_else(|| panic!("fleet-dev.toml declares no {name} process"))
 }
 
-/// The development stack pins the certificate its own trawld generates.
-///
-/// fleet-dev starts `bin/trawld-dev` and `trawl-web` with no `--config`
-/// and no `TRAWL_CONFIG`, so both read the default `~/.trawl/trawld.toml`
-/// (config/README.md). That file is made from the starter
-/// `config/trawld.toml`, which names no `[server]` certificate, so trawld
-/// generates one under its state directory. The pin `trawl-web` gets
-/// through `TRAWL_WEB_UPSTREAM_CA_PATH` must be that path, as trawl-config
-/// derives it. Neither side expands `~` here: fleet-dev passes the value
-/// through literally and `trawl-web` expands it, as trawld expands the
-/// data path.
+/// The paths compare unexpanded: fleet-dev passes the value through
+/// literally, and `trawl-web` expands `~` as trawld expands the data path.
 #[test]
 fn fleet_dev_pins_the_dev_certificate() {
     let manifest: toml::Table = read("fleet-dev.toml")
@@ -87,8 +72,6 @@ fn fleet_dev_pins_the_dev_certificate() {
     assert_eq!(Path::new(pinned), generated);
 }
 
-/// Every file under `path`, depth first. Symlinks are not followed, and
-/// build output (`target/`, `node_modules/`) and `skip` are left out.
 fn walk(path: &Path, skip: &[PathBuf], files: &mut Vec<PathBuf>) {
     if skip.iter().any(|skipped| skipped == path) {
         return;
@@ -127,13 +110,7 @@ fn walk(path: &Path, skip: &[PathBuf], files: &mut Vec<PathBuf>) {
 }
 
 /// The unverified-upstream switch is deleted, not deprecated (ADR-0048).
-///
-/// No code reads it and nothing shipped may mention it: a config line, a
-/// chart value, a dev-stack entry or a doc that names it would teach an
-/// operator a setting that does nothing. The needle is spelled in two
-/// parts so this file does not match itself; the trial's absence checks
-/// and `packaging.sh` rule 11 split it the same way.
-///
+/// The needle is spelled in two parts so this file does not match itself.
 /// `docs/launch/evidence/` is out of scope: it holds dated records of what
 /// earlier builds did, and a record is not rewritten.
 #[test]

@@ -2,18 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<HistoryPage/>` lives in the Search app shell at `/search/history`.
-//!
-//! `GET /api/v1/history` searches all stored query text for the current key
-//! before pagination. Enter/Filter applies the draft; typing leaves the
-//! applied view in place. Rows can reopen a query in the Search editor or
-//! open Save as Net's modal for `POST /api/v1/saved`.
-//!
-//! `hq` records the applied filter, and `hpage` records its requested page.
 //! History uses `hpage` separately from Search's `page` parameter so changing
-//! sections leaves a clean History URL. Export serializes the loaded applied
-//! page as CSV or JSON. Confirmed Clear deletes every history row for the key,
-//! including entries outside the filter.
+//! sections leaves a clean History URL.
 
 use crate::api;
 use crate::components::save_as_net_modal::SaveAsNetModal;
@@ -137,7 +127,6 @@ pub fn HistoryPage() -> impl IntoView {
                     "This history page is too large to request.",
                 )),
             };
-            // Guard every result field and the interval before a URL effect.
             if generation.try_get_untracked() != Some(token)
                 || location.search.get_untracked() != raw
                 || location.pathname.get_untracked() != "/search/history"
@@ -192,7 +181,6 @@ pub fn HistoryPage() -> impl IntoView {
             goto_search(&query, 0, Mode::Snapshot, &[], &RangeSpec::default(), false),
         );
     };
-    // Save as Net retains its existing modal and stored-query behavior.
     let save_target = RwSignal::new(None::<String>);
     let on_modal_close = Callback::new(move |_saved: bool| save_target.set(None));
     let refetch = Callback::new(move |()| {
@@ -372,8 +360,6 @@ pub fn HistoryPage() -> impl IntoView {
                     <form class="history-search" on:submit=move |event| {
                         event.prevent_default();
                         // Ignore implicit IME submits until compositionend.
-                        // Once it clears the flag, both pointer and keyboard
-                        // Filter activation use the same admitted apply action.
                         if !composing.get_untracked() { apply.run((draft.get_untracked(), false)); }
                     }>
                         <label for="history-filter" class="sr-only">"Search query text"</label>
@@ -418,14 +404,8 @@ pub fn HistoryPage() -> impl IntoView {
                                 let rerun = on_rerun.clone();
                                 view! { <tr class="tbl-row">
                                     <td class="mono path" style="min-width:0">
-                                        // A command, not a destination: ADR-0027
-                                        // refuses stored queries that exceed the
-                                        // link bound before rerunning. An anchor
-                                        // cannot report that refusal.
                                         <button type="button" class="row-stretch" on:click=move |_| rerun(query.clone())>{entry.query}</button>
                                     </td>
-                                    // When uses Fleet's shared 30-second clock,
-                                    // so relative timestamps do not freeze at load.
                                     <td style="color:var(--ink-3)"><When ts=entry.executed_at/></td>
                                     <td class="num">{format_with_commas(entry.row_count as u64)}</td>
                                     <td style="text-align:right"><button type="button" class="link" on:click=move |_| save_target.set(Some(saved_query.clone()))>"Save as Net"</button></td>

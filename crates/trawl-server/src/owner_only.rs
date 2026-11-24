@@ -3,54 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! trawld's storage roots are owner-only (ADR-0052).
-//!
-//! trawld sets its umask to 077 before anything else runs, so whatever it
-//! creates under its roots is owner-only. An installation started under an
-//! older trawld, or a root another tool made, can still carry group or other
-//! bits. Boot closes each root to its owner before it reads or writes the
-//! corpus, and refuses to start when it cannot. A refused root does not
-//! stop the others closing. Closing the root is enough:
-//! an older 0644 file beneath a 0700 root cannot be reached by another user,
-//! so nothing beneath a root is ever chmodded. A recursive repair would race
-//! the writers and follow links planted under a directory trawld can write.
-//!
-//! The roots are those [`protected_roots`] lists: the data root on every
-//! node, the WAL directory on an ingest node unless the data root provably
-//! covers it, the repin shadow and aside siblings when they exist, and the
-//! results root (ADR-0057) when it exists. Boot and `trawld --doctor` walk
-//! the same list. The results root is closed again when boot holds it
-//! ([`crate::results::root::ResultsRoot::open_apart_from`]), which makes
-//! it 0700 when it is missing. A WAL directory is covered only
-//! when [`data_root_covers_wal`] reaches it from the data root by
-//! descriptor, through real directories in the data root's mount; a name
-//! under the data root is not enough, since a symlink or a mount there leads
-//! out of it.
-//!
-//! A root is opened no-follow as a directory, and its owner and mode are read
-//! from that handle. The chmod goes through the same handle, so the stat and
-//! the change cannot land on two different inodes. Only the final component
-//! of a configured path is held this way. Its ancestors are configuration
-//! the operator trusts, as ADR-0041 treats the storage roots themselves.
-//!
-//! A symlink as the final component refuses, and so does a WAL directory or
-//! repin sibling that is not a directory; a data root that is not one is
-//! the epoch gate's to refuse. So does a root that another
-//! user owns, even when trawld runs as root and could change it: trawld does
-//! not take over a directory it was not given, the rule `tls.rs` applies to
-//! its generated directories. A root the filesystem will not change refuses,
-//! and so does one whose change the filesystem accepts and then ignores,
-//! as a CIFS or FUSE mount with fixed modes does.
-//!
-//! A repin creates its shadow and aside roots while trawld serves, after
-//! boot's close. [`close_created`] closes each as soon as it exists, before
-//! anything is linked, written or renamed into it, and a refusal stops the
-//! repin.
-//!
-//! [`close`] and [`close_created`] are the only functions here that change
-//! anything, and the doctor calls neither. The doctor calls [`predict`], which also reads whether a root that needs
-//! closing sits on a read-only mount. That is a prediction: boot's chmod is
-//! authoritative, and an immutable attribute or a security module can still
-//! refuse a root the doctor expected to close.
 
 use std::fmt;
 use std::fs::File;
@@ -64,13 +16,10 @@ use rustix::io::Errno;
 
 use crate::repin::marker::{aside_root, shadow_root};
 
-/// The group and other permission bits, which an owner-only root lacks.
 const GROUP_OTHER: u32 = 0o077;
 
-/// The permission bits of a mode, setuid, setgid and sticky included.
 const PERMISSION_BITS: u32 = 0o7777;
 
-/// Which of trawld's storage roots a path is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootKind {
     /// `[data] path`.
@@ -86,15 +35,11 @@ pub enum RootKind {
 }
 
 impl RootKind {
-    /// Whether something other than a directory at this root is left for
-    /// the epoch gate, which refuses it with its own message. Only the data
-    /// root's is; any other root that is not a directory is refused here.
     #[must_use]
     pub const fn epoch_gate_judges_non_directory(self) -> bool {
         matches!(self, Self::DataRoot)
     }
 
-    /// The setting that names this root, or that the root is derived from.
     const fn setting(self) -> &'static str {
         match self {
             Self::DataRoot | Self::RepinShadow | Self::RepinAside => "[data] path",
@@ -116,23 +61,13 @@ impl fmt::Display for RootKind {
     }
 }
 
-/// One root trawld keeps owner-only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectedRoot {
-    /// Which root it is.
     pub kind: RootKind,
-    /// Its configured path.
     pub path: PathBuf,
 }
 
 /// The roots trawld keeps owner-only, in the order boot closes them.
-///
-/// The data root is always listed. On an ingest node the WAL directory is
-/// listed too, unless [`data_root_covers_wal`] proves the data root covers
-/// it. The repin siblings and the results root at `results_dir` are listed
-/// only when something exists at their path: the repin siblings' absence
-/// is the normal state, and the results root is absent until the first
-/// start makes it. Nothing here creates any of them.
 #[must_use]
 pub fn protected_roots(
     data_root: &Path,
@@ -165,35 +100,14 @@ pub fn protected_roots(
     roots
 }
 
-/// Whether closing `data_root` closes `wal_dir` too, so the WAL directory
-/// needs no closing of its own.
-///
-/// A name under the data root proves nothing: `data/wal` may be a symlink
-/// out of it, or a mount whose directory other users reach by another path.
-/// So the WAL path must be a plain descendant of the data root, compared
-/// component by component with no `..` in either path, and then be reached
-/// by descriptor. The walk opens the data root no-follow and each component
-/// below it with `openat(O_DIRECTORY | O_NOFOLLOW)` from the directory
-/// before, and every directory on the way must sit on the data root's
-/// filesystem and, on Linux, in its mount. A symlink, a non-directory, a
-/// mount boundary, a Linux kernel that does not name the mount, or any
-/// failure ends the walk unproven, and the WAL
-/// directory is then a root of its own: held no-follow at its final
-/// component and closed or refused like any other. Closing a directory the
-/// root already covered costs nothing; leaving one open would expose it.
-///
-/// A component that does not exist yet, below directories the walk reached,
-/// is covered: boot creates it there, inside the closed root, and checks
-/// the roots again once it exists. A data root that cannot be walked, such
-/// as one still absent, proves nothing.
+/// A component of `wal_dir` that does not exist yet, below the directories
+/// the walk from `data_root` reached, is covered: boot creates it there,
+/// inside the closed root, and checks the roots again once it exists.
 #[must_use]
 pub fn data_root_covers_wal(data_root: &Path, wal_dir: &Path) -> bool {
     covers_wal_with(data_root, wal_dir, Placement::of)
 }
 
-/// [`data_root_covers_wal`], reading each directory's placement with
-/// `placement`: [`Placement::of`] in production, and a stand-in in tests
-/// for a kernel that answers differently.
 fn covers_wal_with(
     data_root: &Path,
     wal_dir: &Path,
@@ -230,9 +144,6 @@ fn covers_wal_with(
     true
 }
 
-/// Where a directory lives: its filesystem and, where the kernel says, its
-/// mount. Two directories on one filesystem can sit in different mounts, as
-/// a bind mount does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Placement {
     device: u64,
@@ -240,18 +151,10 @@ struct Placement {
 }
 
 impl Placement {
-    /// Whether this placement can prove two directories share a mount. On
-    /// Linux it must name its mount: a bind mount keeps the device, so the
-    /// device alone cannot tell a directory in the data root's mount from a
-    /// mount of another directory on the same filesystem. Elsewhere the
-    /// platform names no mount, and the device is all there is.
     const fn names_its_mount(self) -> bool {
         !cfg!(any(target_os = "linux", target_os = "android")) || self.mount.is_some()
     }
 
-    /// The placement of the directory `fd` holds. The mount is read with
-    /// `statx(STATX_MNT_ID)`, which a kernel before 5.8 does not answer;
-    /// the mount is then unknown, and containment unproven.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
         use rustix::fs::{AtFlags, StatxFlags};
@@ -262,8 +165,6 @@ impl Placement {
         })
     }
 
-    /// The placement of the directory `fd` holds: its device alone, since
-    /// this platform names no mount.
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     fn of(fd: BorrowedFd<'_>) -> io::Result<Self> {
         Ok(Self {
@@ -273,27 +174,15 @@ impl Placement {
     }
 }
 
-/// What is at a root's path, read without following a final symlink and
-/// without changing anything.
 #[derive(Debug)]
 pub enum Observation {
-    /// Nothing is there. Boot creates a missing root later, under its umask.
     Absent,
-    /// Something other than a directory or a symlink is there. At the data
-    /// root the epoch gate refuses it with its own message; any other root
-    /// is refused here (see [`RootKind::epoch_gate_judges_non_directory`]).
     NotDirectory,
-    /// The final component is a symbolic link.
     Symlink,
-    /// The path does not end in a directory name: it is empty, `/`, or ends
-    /// in `..`.
     BadPath,
-    /// A directory, held open.
     Directory(Directory),
 }
 
-/// A root directory held open no-follow, with the owner and mode read from
-/// the handle.
 #[derive(Debug)]
 pub struct Directory {
     handle: File,
@@ -302,37 +191,25 @@ pub struct Directory {
 }
 
 impl Directory {
-    /// The directory's owner uid.
     #[must_use]
     pub const fn owner(&self) -> u32 {
         self.owner
     }
 
-    /// The directory's permission bits, setuid, setgid and sticky included.
     #[must_use]
     pub const fn mode(&self) -> u32 {
         self.mode
     }
 
-    /// Whether the directory sits on a filesystem mounted read-only.
-    ///
-    /// # Errors
-    /// The failed `fstatvfs`.
     pub fn read_only(&self) -> io::Result<bool> {
         let stats = rustix::fs::fstatvfs(&self.handle)?;
         Ok(stats.f_flag.contains(StatVfsMountFlags::RDONLY))
     }
 }
 
-/// Look at the root at `path` without following a final symlink.
-///
 /// The path is rebuilt from its components first, so a trailing `/` or `.`
 /// cannot turn a final symlink into an intermediate component that the open
 /// would follow.
-///
-/// # Errors
-/// An open or `fstat` that failed for any reason but absence, a symlink or
-/// a non-directory, such as a root trawld may not search.
 pub fn observe(path: &Path) -> io::Result<Observation> {
     let components: Vec<Component<'_>> = path.components().collect();
     if !matches!(components.last(), Some(Component::Normal(_))) {
@@ -365,24 +242,13 @@ pub fn observe(path: &Path) -> io::Result<Observation> {
     }))
 }
 
-/// The verdict on a directory owned by `owner` with permission bits `mode`,
-/// for a trawld running as `euid`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
-    /// Owned by trawld, with no group or other bit.
     OwnerOnly,
-    /// Owned by trawld, with a group or other bit to remove.
     WillTighten,
-    /// Owned by another user. Refused whatever its mode, even for euid 0.
-    ForeignOwner {
-        /// The directory's owner.
-        owner: u32,
-        /// The uid trawld runs as.
-        euid: u32,
-    },
+    ForeignOwner { owner: u32, euid: u32 },
 }
 
-/// Judge a directory from its owner and mode alone.
 #[must_use]
 pub const fn judge(owner: u32, mode: u32, euid: u32) -> Verdict {
     if owner != euid {
@@ -394,47 +260,23 @@ pub const fn judge(owner: u32, mode: u32, euid: u32) -> Verdict {
     }
 }
 
-/// Why a root cannot be kept owner-only, as the doctor predicts it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// The final component is a symbolic link.
     Symlink,
-    /// The path does not end in a directory name.
     BadPath,
-    /// Another user owns it.
-    ForeignOwner {
-        /// The directory's owner.
-        owner: u32,
-        /// The uid trawld would run as.
-        euid: u32,
-    },
-    /// It needs closing and sits on a read-only mount.
+    ForeignOwner { owner: u32, euid: u32 },
     ReadOnlyFilesystem,
 }
 
-/// What boot would do with a root, predicted without changing anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Prediction {
-    /// Nothing is there yet.
     Absent,
-    /// Not a directory. At the data root that is the epoch gate's verdict;
-    /// boot refuses any other root that is not a directory (see
-    /// [`RootKind::epoch_gate_judges_non_directory`]).
     NotDirectory,
-    /// Already owner-only.
     OwnerOnly,
-    /// Boot would close it.
     WillTighten,
-    /// Boot would refuse to start.
     Refused(Refusal),
 }
 
-/// Predict, read-only, what boot's [`close`] would do with the root at
-/// `path` for a trawld running as `euid`. This is the doctor's half: it
-/// opens and stats, and changes nothing.
-///
-/// # Errors
-/// What [`observe`] or [`Directory::read_only`] returns.
 pub fn predict(path: &Path, euid: u32) -> io::Result<Prediction> {
     let dir = match observe(path)? {
         Observation::Absent => return Ok(Prediction::Absent),
@@ -455,50 +297,18 @@ pub fn predict(path: &Path, euid: u32) -> io::Result<Prediction> {
     })
 }
 
-/// What boot's [`close`] did with one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Closed {
-    /// Nothing was there; boot creates it later, under its umask.
     Absent,
-    /// The data root is not a directory; left for the epoch gate to refuse.
     NotDirectory,
-    /// Already owner-only; unchanged.
     OwnerOnly,
-    /// Group and other bits removed.
-    Tightened {
-        /// The permission bits before.
-        from: u32,
-        /// The permission bits after, read back from the handle.
-        to: u32,
-    },
+    Tightened { from: u32, to: u32 },
 }
 
-/// Change the mode of the directory `fd` holds: the chmod boot passes to
-/// [`close`].
-///
-/// # Errors
-/// The failed `fchmod`.
 pub fn fchmod(fd: BorrowedFd<'_>, mode: Mode) -> io::Result<()> {
     rustix::fs::fchmod(fd, mode).map_err(io::Error::from)
 }
 
-/// Close every root in `roots` to its owner, for a trawld running as `euid`.
-/// Boot only: the doctor calls [`predict`].
-///
-/// Each root is judged and, when it can be, closed, whatever another root's
-/// verdict: a refused WAL directory or repin sibling never keeps the data
-/// root open, nor does a chmod that failed on one root stop the next. A
-/// root that is refused for its type, its owner or a failed open is left as
-/// it was. A root that needs closing gets
-/// `mode & !0o077` through `chmod` on its open handle, which keeps the
-/// owner's bits as they are and keeps setgid and sticky (a Kubernetes
-/// `fsGroup` sets setgid). The mode is read back afterwards, and a group or
-/// other bit that survived refuses. Every root it closes is logged as it
-/// closes, refusal or not. The result is in `roots` order.
-///
-/// # Errors
-/// The first root in `roots` order that cannot be kept owner-only, as an
-/// [`OwnerOnlyError`], once every other root has been closed.
 pub fn close<F>(
     roots: &[ProtectedRoot],
     euid: u32,
@@ -523,7 +333,6 @@ where
     refusal.map_or(Ok(closed), Err)
 }
 
-/// Judge one root and close it if it needs closing.
 fn close_one<F>(root: &ProtectedRoot, euid: u32, chmod: &mut F) -> Result<Closed, OwnerOnlyError>
 where
     F: FnMut(BorrowedFd<'_>, Mode) -> io::Result<()>,
@@ -591,7 +400,6 @@ pub fn close_created(kind: RootKind, path: &Path) -> Result<(), OwnerOnlyError> 
     }
 }
 
-/// Log a root [`close`] had to tighten, so the operator learns it was open.
 fn log_closed(root: &ProtectedRoot, closed: Closed) {
     if let Closed::Tightened { from, to } = closed {
         tracing::warn!(
@@ -606,8 +414,6 @@ fn log_closed(root: &ProtectedRoot, closed: Closed) {
     }
 }
 
-/// Remove `dir`'s group and other bits through its handle, then read the
-/// mode back and refuse if any survived.
 fn tighten<F>(
     root: &ProtectedRoot,
     dir: &Directory,
@@ -640,7 +446,6 @@ where
     })
 }
 
-/// `bits` as a rustix [`Mode`].
 #[allow(
     clippy::unnecessary_cast,
     clippy::cast_possible_truncation,
@@ -650,65 +455,33 @@ const fn permission_mode(bits: u32) -> Mode {
     Mode::from_raw_mode(bits as rustix::fs::RawMode)
 }
 
-/// Why boot refused a root.
 #[derive(Debug)]
 pub enum Cause {
-    /// The final component is a symbolic link.
     Symlink,
-    /// The path does not end in a directory name.
     BadPath,
-    /// Something other than a directory is there.
     NotDirectory,
-    /// Another user owns it.
     ForeignOwner,
-    /// It could not be opened or stat'ed.
     Inspect(io::Error),
-    /// The chmod was refused for permission (EPERM or EACCES).
     TightenDenied(io::Error),
-    /// The chmod was refused because the filesystem is read-only (EROFS).
     ReadOnlyFilesystem(io::Error),
-    /// The chmod failed for another reason.
     TightenFailed(io::Error),
-    /// The chmod reported success, and a group or other bit survived it.
-    Ineffective {
-        /// The permission bits read back after the chmod.
-        after: u32,
-    },
+    Ineffective { after: u32 },
 }
 
-/// What a refused root stops.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refuses {
-    /// trawld's start: boot's close, and a repin past its cutover marker,
-    /// whose failure ends the process and whose replay refuses the start.
     Start,
-    /// A repin before its cutover marker: the job fails with the corpus
-    /// untouched, and trawld keeps serving.
     Repin,
 }
 
-/// A storage root trawld could not keep owner-only. trawld refuses to start,
-/// or a repin refuses to stage, as [`Self::refuses`] says.
-///
-/// The message names the root, its path, its owner and mode when a handle
-/// was obtained, the uid trawld runs as, the cause, what is refused and a
-/// fix. It is for the log and stderr; the doctor's rows use fixed sentences
-/// instead.
 #[derive(Debug)]
 pub struct OwnerOnlyError {
-    /// Which root.
     pub kind: RootKind,
-    /// Its configured path.
     pub path: PathBuf,
-    /// Its owner uid, when a handle was obtained.
     pub owner: Option<u32>,
-    /// Its permission bits, when a handle was obtained.
     pub mode: Option<u32>,
-    /// The uid trawld runs as.
     pub euid: u32,
-    /// Why it was refused.
     pub cause: Cause,
-    /// What the refusal stops.
     pub refuses: Refuses,
 }
 
@@ -899,7 +672,6 @@ mod tests {
         }]
     }
 
-    /// A chmod that must never be reached.
     fn no_chmod(_: BorrowedFd<'_>, _: Mode) -> io::Result<()> {
         panic!("chmod reached")
     }
@@ -921,8 +693,6 @@ mod tests {
         ] {
             assert_eq!(judge(me, mode, me), want, "mode {mode:04o}");
         }
-        // Another owner refuses whatever the mode, and whatever trawld's uid,
-        // root included.
         for (owner, euid, mode) in [
             (0, me, 0o700),
             (0, me, 0o755),
@@ -969,13 +739,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path().join("data");
         std::fs::create_dir(&root).unwrap();
-        // The owner's bits stay as they are: a 0570 root does not gain the
-        // owner write bit it lacked.
         set_mode(&root, 0o570);
         close(&data_root(&root), euid(), fchmod).unwrap();
         assert_eq!(mode_of(&root), 0o500);
 
-        // A Kubernetes fsGroup root is setgid; the chmod asks to keep it.
         set_mode(&root, 0o2775);
         let before = mode_of(&root);
         let asked = Cell::new(None);
@@ -1024,9 +791,6 @@ mod tests {
         assert_eq!(mode_of(&root), 0o644);
     }
 
-    /// A WAL directory, repin sibling or results root that is not a
-    /// directory refuses, without a chmod, and is left as it was: only the
-    /// data root's non-directory is the epoch gate's to refuse.
     #[test]
     fn a_non_directory_wal_or_repin_sibling_refuses() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1184,11 +948,6 @@ mod tests {
         );
     }
 
-    /// A refused root keeps no other root open: every root that can be
-    /// closed is closed, and the first refusal in `roots` order is returned
-    /// afterwards. A data root left 0755 behind a refused WAL directory or
-    /// repin sibling would stay open to other users across every refused
-    /// restart.
     #[test]
     fn a_refused_root_leaves_every_closable_root_closed() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1227,8 +986,6 @@ mod tests {
         assert_eq!(mode_of(&shadow), 0o644, "the refused file is untouched");
     }
 
-    /// A chmod that fails on one root does not stop the next from closing,
-    /// and the failure is still the refusal.
     #[test]
     fn a_failed_chmod_does_not_stop_the_other_roots_closing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1301,11 +1058,6 @@ mod tests {
         }
     }
 
-    /// A repin shadow root that cannot be closed refuses the repin, not the
-    /// start: the job fails before anything enters it, and trawld keeps
-    /// serving. The aside root comes after the cutover marker, where a
-    /// refusal ends the process and the boot replay refuses the start, so
-    /// it keeps the start's wording.
     #[test]
     fn a_repin_staging_refusal_names_what_it_stops() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1387,10 +1139,6 @@ mod tests {
         ));
     }
 
-    /// A kernel that does not answer `STATX_MNT_ID` (before 5.8) leaves a
-    /// bind mount indistinguishable from a plain directory by device, so a
-    /// WAL directory really nested in the data root is unproven there and
-    /// gets closed on its own.
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[test]
     fn an_unknown_mount_id_leaves_wal_containment_unproven() {
@@ -1410,7 +1158,6 @@ mod tests {
         ));
     }
 
-    /// The kinds and paths `protected_roots` lists for an ingest node.
     fn listed(data: &Path, wal: &Path) -> Vec<(RootKind, PathBuf)> {
         protected_roots(data, wal, true, &data.with_extension("results"))
             .into_iter()
@@ -1429,8 +1176,6 @@ mod tests {
         let only_root = vec![(RootKind::DataRoot, data.clone())];
         let results = tmp.path().join("data.results");
 
-        // A real directory nested in the root is the root's, and is never
-        // chmodded (AC3), however deep, and while it is still absent.
         std::fs::create_dir_all(data.join("spool/wal")).unwrap();
         set_mode(&data.join("spool/wal"), 0o755);
         for wal in [
@@ -1448,8 +1193,6 @@ mod tests {
         assert!(closed.is_ok());
         assert_eq!(mode_of(&data.join("spool/wal")), 0o755);
 
-        // The WAL directory itself is a symlink out of the root: it is its
-        // own root, and the close refuses it without following it.
         let link = data.join("wal");
         std::os::unix::fs::symlink(elsewhere.join("wal"), &link).unwrap();
         let wal_root = |path: &Path| {
@@ -1468,8 +1211,6 @@ mod tests {
         assert_eq!(error.kind, RootKind::WalDir);
         assert!(matches!(error.cause, Cause::Symlink), "{error}");
 
-        // A directory on the way is a symlink out of the root: the WAL
-        // directory past it is its own root, and the close tightens it.
         let hop = data.join("hop");
         std::os::unix::fs::symlink(&elsewhere, &hop).unwrap();
         let through = hop.join("wal");
@@ -1491,9 +1232,6 @@ mod tests {
         );
         assert!(std::fs::symlink_metadata(&hop).unwrap().is_symlink());
 
-        // A non-directory on the way, a `..`, or a data root that cannot be
-        // walked (absent, or a symlink) proves nothing: the WAL directory
-        // is listed on its own.
         std::fs::write(data.join("file"), b"").unwrap();
         for wal in [
             data.join("file/wal"),
@@ -1550,9 +1288,6 @@ mod tests {
             "a query-only node has no WAL to close"
         );
 
-        // The repin siblings and the results root are listed only when
-        // something is there, and a dangling symlink counts, so the close
-        // refuses it.
         let shadow = tmp.path().join("data.repin-next");
         let aside = tmp.path().join("data.repin-aside");
         std::fs::create_dir(&shadow).unwrap();
@@ -1575,9 +1310,6 @@ mod tests {
         );
     }
 
-    /// The results root is closed like the WAL directory: a loose one is
-    /// tightened through its handle, and a symlink or a non-directory
-    /// refuses the start with a fix that names `[server] results_dir`.
     #[test]
     fn the_results_root_closes_like_the_wal_directory() {
         let tmp = tempfile::tempdir().unwrap();

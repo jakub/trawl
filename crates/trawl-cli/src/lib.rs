@@ -2,13 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `trawl` CLI, as a library.
-//!
-//! The binary target (`src/main.rs`) is a one-line shim over [`main`]; the
-//! command implementations live here so integration tests can drive them
-//! directly against a real server instead of shelling out. [`cli`],
-//! [`doctor`], [`preview_ingest`] and [`schema`] are public for exactly
-//! that reason — `config` and `tui` stay private.
+//! The command implementations live here so integration tests can drive
+//! them directly against a real server instead of shelling out.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -41,7 +36,6 @@ struct Cli {
     url: Option<String>,
 
     /// API token (direct value).
-    // Help names the variable but never prints its value.
     #[arg(long, env = "TRAWL_TOKEN", hide_env_values = true, global = true)]
     token: Option<String>,
 
@@ -302,7 +296,7 @@ struct AckArgs {
 /// and [`RepinArgs::flags`] is the one place the command line turns into the
 /// bundle [`schema::run_repin`] takes.
 #[derive(clap::Args)]
-#[allow(clippy::struct_excessive_bools)] // four independent CLI switches
+#[allow(clippy::struct_excessive_bools)]
 struct RepinArgs {
     /// Field name (folded to the catalog's ASCII-lowercase spelling).
     field: String,
@@ -431,7 +425,6 @@ enum DriverSubcommand {
     Quit,
 }
 
-/// Every way a `trawl` invocation can fail.
 #[derive(Debug, thiserror::Error)]
 pub enum CliError {
     #[error("{0}")]
@@ -468,14 +461,11 @@ impl From<connection::ConnectionError> for CliError {
     }
 }
 
-/// The binary's entry point: parse argv, run, and map errors to an exit code.
 #[tokio::main]
 pub async fn main() {
     let (args, sources) = parse_cli();
 
     match run(args, sources).await {
-        // Only `trawl doctor`, `trawl mcp` and `trawl preview-ingest` return
-        // a status other than 0.
         Ok(0) => {}
         Ok(status) => process::exit(i32::from(status)),
         Err(CliError::Arg(e)) => exit_on_arg_error(&e),
@@ -487,20 +477,10 @@ pub async fn main() {
 /// clap must never read the `TRAWL_*` environment for them.
 const ENVLESS: [&str; 2] = [doctor::NAME, mcp::NAME];
 
-/// Parse argv without letting clap read the environment for `trawl doctor`
-/// or `trawl mcp`.
-///
 /// clap reads `TRAWL_URL`, `TRAWL_TOKEN`, `TRAWL_INSECURE` and
-/// `TRAWL_PROFILE` while it parses, so a malformed value would fail as a
-/// clap error that quotes it, before the command could refuse the variable
-/// by name. The first pass therefore uses a copy of the command with every
-/// environment binding removed. When it selects one of [`ENVLESS`], its
-/// matches are the ones used, and the command refuses any of those
-/// variables that is present. Any other command is parsed again with the
-/// normal command, so it reads the environment exactly as before. A first
-/// pass that fails is reported as it stands when argv names one of
-/// [`ENVLESS`]; help and version output come from the normal command, which
-/// never prints an environment value.
+/// `TRAWL_PROFILE` while it parses, and a malformed value fails as a clap
+/// error that quotes it. So the first pass parses without those bindings,
+/// and an [`ENVLESS`] command refuses a present variable by name.
 ///
 /// The matches are kept long enough to read where `--url` and `--token`
 /// came from: the parsed values cannot tell a typed flag from an exported
@@ -546,7 +526,6 @@ fn parse_cli() -> (Cli, connection::Sources) {
     (cli, sources)
 }
 
-/// The command with no argument bound to an environment variable.
 fn envless_command() -> clap::Command {
     let mut command = Cli::command();
     let bound: Vec<clap::Id> = command
@@ -591,7 +570,6 @@ fn socket_help(default: &Path) -> String {
     )
 }
 
-/// Report `e` and exit 1.
 fn exit_on_error(e: &CliError) -> ! {
     // Broken pipe is expected (e.g. `trawl query ... | head`), exit quietly.
     if let CliError::Io(io_err) = e
@@ -611,9 +589,7 @@ fn exit_on_error(e: &CliError) -> ! {
 /// `mcp` and `preview-ingest` returns 0 on success and an error otherwise.
 async fn run(mut args: Cli, sources: connection::Sources) -> Result<u8, CliError> {
     // Trial verbs run before config.toml is read: a broken client config
-    // must not block `trawl trial up` or `down`. `doctor` and `mcp` select
-    // their own target and key, and never read config.toml the way other
-    // commands do.
+    // must not block `trawl trial up` or `down`.
     // `--token` typed beside `--token-file` is a usage error for every
     // command but `doctor` and `mcp`, which refuse a typed `--token` in
     // their own words.
@@ -641,8 +617,6 @@ async fn run(mut args: Cli, sources: connection::Sources) -> Result<u8, CliError
     run_configured(args, sources, command).await
 }
 
-/// Load the client config, resolve the connection, and run a command that
-/// reads it: everything but `trial` and `doctor`.
 async fn run_configured(
     args: Cli,
     sources: connection::Sources,
@@ -665,8 +639,7 @@ async fn run_configured(
     );
     let inputs = connection::Inputs::new(args.url, args.token, args.token_file, sources);
 
-    // Load the config file and apply the profile's trust. A profile's url
-    // and token stay in its table, bound to each other.
+    // A profile's url and token stay in its table, bound to each other.
     let mut cfg = config::Config::load(args.config.as_deref())?;
     let trial_profile = args.profile.as_deref() == Some(trial::PROFILE);
     if trial_profile {
@@ -724,7 +697,6 @@ async fn run_configured(
             format,
             output,
         }) => {
-            // For embedded mode (--data), no server connection needed.
             let conn = || -> Result<_, CliError> { data.is_none().then(required).transpose() };
             if format == Some(cli::OutputFormat::Parquet) {
                 // Parquet prints no instants, so it never reads the zone.
@@ -776,8 +748,6 @@ async fn run_configured(
     Ok(0)
 }
 
-/// Start the TUI on a display zone and a connection already resolved.
-/// `driver` is `--driver`, empty for the default socket.
 async fn run_tui(
     cfg: &config::Config,
     zone: trawl_api::zone::DisplayZone,
@@ -798,7 +768,6 @@ async fn run_tui(
         .with_ansi(false)
         .init();
 
-    // Resolve driver socket path.
     let driver_path: Option<PathBuf> = driver.map(|v| {
         if v.is_empty() {
             tui::driver::default_socket_path()
@@ -823,7 +792,6 @@ impl From<Cli> for doctor::Globals {
     }
 }
 
-/// The refusal for `trawl -p trial driver ...` (or `TRAWL_PROFILE=trial`).
 const DRIVER_UNDER_TRIAL: &str = "-p trial cannot select the trial for `trawl driver`: the driver \
      controls a TUI that is already running, whichever server that TUI is connected to. \
      Start the TUI with `trawl -p trial --driver`, then run `trawl driver` without -p trial \
@@ -841,14 +809,9 @@ fn warn_if_insecure(cfg: &config::Config, stderr: &mut impl Write) -> io::Result
     Ok(())
 }
 
-/// Dispatch `trawl schema <cmd>`. Connection resolution mirrors `query`,
-/// not `validate`: only `fields --data` has a serverless fallback, so
-/// everywhere else a resolution failure must surface as itself.
-/// Swallowing it into an `Option` would re-report a broken profile as
-/// "schema field requires a server".
-// Long because it is one arm per subcommand: every arm unpacks its flags
-// and calls its runner, and splitting the match would only move arms behind
-// a second name.
+/// Connection resolution mirrors `query`, not `validate`: only
+/// `fields --data` has a serverless fallback, so everywhere else a
+/// resolution failure must surface as itself.
 #[allow(clippy::too_many_lines)]
 async fn run_schema(
     cmd: SchemaSubcommand,
@@ -1014,7 +977,6 @@ async fn run_driver(socket: &str, cmd: DriverSubcommand) -> Result<(), CliError>
     Ok(())
 }
 
-/// Send a driver command and check for protocol-level errors.
 async fn driver_send(
     socket_path: &Path,
     request: &tui::driver::DriverRequest,
@@ -1109,7 +1071,6 @@ mod tui_log_tests {
     }
 }
 
-/// Render driver response data containing columns + rows.
 fn render_driver_data(
     data: &tui::driver::DriverData,
     format: Option<cli::OutputFormat>,
@@ -1135,18 +1096,11 @@ mod arg_tests {
     use super::*;
     use clap::{CommandFactory, Parser};
 
-    /// clap's own consistency check over the whole command tree: a
-    /// conflicting-argument name that does not exist is a runtime panic
-    /// otherwise, and `schema ack --clear` names `note`.
     #[test]
     fn the_command_tree_is_well_formed() {
         Cli::command().debug_assert();
     }
 
-    /// `--token-file` is one global flag with no environment variable.
-    /// Given before or after any subcommand, it fills the same field. A
-    /// subcommand that declared its own would shadow the global without a
-    /// word, so every copy clap propagates must be the global one.
     #[test]
     fn token_file_is_one_global_flag() {
         fn token_file_args(command: &clap::Command, path: &str, seen: &mut usize) {
@@ -1196,9 +1150,6 @@ mod arg_tests {
         }
     }
 
-    /// Where `--url` and `--token` came from, read off the top-level
-    /// matches. A flag typed after the subcommand counts as typed, even
-    /// when its variable is set too.
     #[test]
     fn sources_follow_the_command_line_over_globals() {
         use connection::Origin::{CommandLine, Environment};
@@ -1249,8 +1200,6 @@ mod arg_tests {
         );
     }
 
-    /// The repin ceilings parse as numbers and default to absent. Absent is
-    /// "let the server's scan decide", which is not the same as zero.
     #[test]
     fn repin_ceiling_flags_parse() {
         let cli = Cli::try_parse_from([
@@ -1277,7 +1226,6 @@ mod arg_tests {
         assert!(args.force);
         assert_eq!(args.max_nulled_rows, Some(250));
         assert_eq!(args.max_ambiguous_rows, Some(0));
-        // The bundle the command handler receives carries them unchanged.
         let flags = args.flags();
         assert_eq!(flags.max_nulled_rows, Some(250));
         assert_eq!(flags.max_ambiguous_rows, Some(0));
@@ -1309,9 +1257,6 @@ mod arg_tests {
         );
     }
 
-    /// `schema ack` takes a note or clears, never both: withdrawing an
-    /// acknowledgement writes no note, so accepting one would silently drop
-    /// what the operator typed.
     #[test]
     fn ack_note_and_clear_are_mutually_exclusive() {
         let cli = Cli::try_parse_from(["trawl", "schema", "ack", "duration", "--note", "fix due"])
@@ -1336,12 +1281,6 @@ mod arg_tests {
         );
     }
 
-    /// Embedded mode prints an engine refusal as its own sentence.
-    ///
-    /// `CliError` renders every engine failure through `{0}`, and the
-    /// refusal is trawl-authored and quotes only the tokens the reader
-    /// typed, so the one thing the exit path must not do is dress it up:
-    /// "trawl: " and the sentence, with no "query failed" in front of it.
     #[test]
     fn an_engine_refusal_prints_as_its_own_sentence() {
         let message = "timechart on 'hostname' is not a timestamp: VARCHAR";
@@ -1385,7 +1324,6 @@ mod arg_tests {
             help,
             "Path to the driver unix socket [default: /home/x\u{fffd}y\u{fffd}[2J/trawl.sock]"
         );
-        // clap shows this line and no second, raw default.
         let rendered = Cli::command()
             .try_get_matches_from(["trawl", "driver", "--help"])
             .expect_err("help is an early exit")

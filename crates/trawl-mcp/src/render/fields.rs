@@ -3,21 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The `fields` reply as one text block and its mirror (ADR-0058).
-//!
-//! The text block, top to bottom:
-//!
-//! 1. the outcome line;
-//! 2. a header naming the array layout, then one JSON array per field,
-//!    `[name, type, provenance, degraded, rows, nulls, distinct, last_seen,
-//!    values]`, with `null` for a fact the source does not report and
-//!    `values` a list of `[value, count]` pairs; a result's columns print
-//!    in position order;
-//! 3. the line saying how many fields did not fit, when any;
-//! 4. at most two proposed next calls.
-//!
-//! Every field name and value prints as JSON. The fitting drops fields from
-//! the end first, then the next calls; a reply that does not fit with all
-//! of those gone is an error.
 
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde_json::{Value as Json, json};
@@ -29,11 +14,9 @@ use super::rows::{as_u64, json_text, mirror};
 use super::{MAX_NEXT_ACTIONS, one_line};
 use crate::reply::{FieldView, FieldsReply, FieldsSource};
 
-/// The header line before the field arrays.
 pub const FIELDS_HEADER: &str =
     "fields: [name, type, provenance, degraded, rows, nulls, distinct, last_seen, values]";
 
-/// The `fields` reply as a tool result fitted under `budget`.
 #[must_use]
 pub fn fields(mut reply: FieldsReply, budget: Budget) -> CallToolResult {
     reply.next_actions.truncate(MAX_NEXT_ACTIONS);
@@ -51,7 +34,6 @@ pub fn fields(mut reply: FieldsReply, budget: Budget) -> CallToolResult {
     }
 }
 
-/// The text block of a `fields` reply, unfitted.
 #[must_use]
 pub fn fields_text(reply: &FieldsReply) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -74,7 +56,6 @@ pub fn fields_text(reply: &FieldsReply) -> String {
     lines.join("\n")
 }
 
-/// One field as a JSON array.
 fn field_line(field: &FieldView) -> String {
     let values: Vec<Json> = field
         .values
@@ -94,8 +75,6 @@ fn field_line(field: &FieldView) -> String {
     ]))
 }
 
-/// `reply` fitted under `budget`, or `None` when it does not fit with
-/// every field and next call gone.
 fn fit(mut reply: FieldsReply, budget: Budget) -> Option<(String, Json)> {
     let all = reply.fields.len();
     if let Some(fitted) = most_fields(&reply, all, budget) {
@@ -105,8 +84,6 @@ fn fit(mut reply: FieldsReply, budget: Budget) -> Option<(String, Json)> {
     most_fields(&reply, all, budget)
 }
 
-/// The reply with the most of its first `all` fields that fit, rendered;
-/// `None` when not even zero fields fit.
 fn most_fields(reply: &FieldsReply, all: usize, budget: Budget) -> Option<(String, Json)> {
     let attempt = |kept: usize| -> Option<(String, Json)> {
         let mut candidate = reply.clone();

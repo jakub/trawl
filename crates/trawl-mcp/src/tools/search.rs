@@ -4,44 +4,6 @@
 
 //! `search`: validate one DSL query, or execute it as a capture
 //! (ADR-0058, ADR-0057).
-//!
-//! `mode: validate` asks `/validate`. A query that does not validate is a
-//! successful call whose outcome says so, with a caret excerpt per error;
-//! only a refused request is an error. A query trawld calls valid gets the
-//! [`hints::advice`] on its text, which changes neither the verdict nor the
-//! proposed execution.
-//!
-//! `mode: execute` reads trawld's capabilities once, first, then captures
-//! the query (`POST /api/v1/results`) and reads the first page of the
-//! capture, because the capture answer carries the result's facts and no
-//! rows. The page asks for no more rows than `[capture] page_max_rows`, so
-//! a default call never strands its own capture behind a refused first
-//! page, and the same capabilities give the search URL its origin. The
-//! reply carries the four truncation facts (rows produced, rows captured,
-//! what the DSL itself cut, what this response left out), facets from the
-//! capture's column facts, at most two continuations, the search URL under
-//! trawld's `link_origin`, and the computed hints of [`crate::hints`], the
-//! advice on the sent text first.
-//! Nothing here runs the query twice: a later page is `read`.
-//!
-//! `mode: execute` with `investigation` attaches the capture to that
-//! investigation (ADR-0059): trawld records the search as a step, keeps
-//! the whole result as evidence, and answers with what other keys changed
-//! since the session's `seen_seq`, printed per [`crate::session`]'s rules.
-//! Once trawld accepted the capture, an error after it (the page, its
-//! encoding, the fitting) opens by naming the investigation and the kept
-//! result, since the step stands whatever the reply says. A capture
-//! answer nothing here can stand behind is an error before anything
-//! prints its result id: an id that is not 32 lowercase hex digits, which
-//! trawld never mints and no read can page, or, attached, a result trawld
-//! does not say it keeps for the investigation the call named. Its error
-//! names no result; an attached one says the step may stand and names the
-//! board read whose step entry names the result kept.
-//! The id's shape and the purpose's length are checked before any
-//! request. `mode: validate` runs nothing, so it ignores both and says
-//! which it ignored: beside the investigation's id when the call named
-//! one, else on the outcome line, so a purpose given alone is said too
-//! and the mirror names no investigation for it.
 
 use chrono::{DateTime, Utc};
 use rmcp::model::CallToolResult;
@@ -62,7 +24,6 @@ use crate::render::{self, Budget, MAX_FACETS, refusal};
 use crate::reply::{AttachedView, Facet, Link, NextAction, SearchMode, SearchReply};
 use crate::session::Seen;
 
-/// How `search` names itself when it attaches.
 const CALLER: Caller = Caller {
     tool: SEARCH,
     input: "search mode=execute",
@@ -97,7 +58,6 @@ pub async fn run<B: Backend>(
     }
 }
 
-/// `mode: validate`.
 async fn validate<B: Backend>(
     backend: &B,
     input: &SearchInput,
@@ -163,9 +123,6 @@ async fn validate<B: Backend>(
     render::search(reply, budget, rows)
 }
 
-/// `mode: execute`, reading the call's `rows` rows of the capture's first
-/// page, or the fewer trawld's page limit allows; attached to `attach`'s
-/// investigation, if any, under the session's lock for it.
 async fn execute<B: Backend>(
     backend: &B,
     seen: &Seen,
@@ -246,7 +203,6 @@ async fn execute<B: Backend>(
     attach::acknowledged(&acknowledgement, result)
 }
 
-/// The search URL, under the origin trawld's `capabilities` report.
 fn link(
     capabilities: &Result<CapabilitiesResponse, ClientError>,
     captured: &CapturedResult,
@@ -263,7 +219,6 @@ fn link(
     }
 }
 
-/// The outcome line.
 fn outcome(captured: &CapturedResult) -> String {
     let id = json_string(&captured.id);
     match (captured.total_rows, captured.captured_rows) {
@@ -276,10 +231,6 @@ fn outcome(captured: &CapturedResult) -> String {
     }
 }
 
-/// Facets over the captured rows: at most [`MAX_FACETS`] columns whose
-/// facts list every distinct value, in field display order, each with at
-/// most [`MAX_FACET_VALUES`] values, most frequent first.
-///
 /// Time columns and trailing metadata (`_raw`, `_ingested` and the rest)
 /// are not faceted, nor a column with a value too long to print whole.
 fn facets(captured: &CapturedResult) -> Vec<Facet> {
@@ -306,7 +257,6 @@ fn facets(captured: &CapturedResult) -> Vec<Facet> {
         .collect()
 }
 
-/// Whether a column's facts can be a facet.
 fn facetable(column: &ResultColumn, facts: &ColumnFacts) -> bool {
     !facts.distinct_capped
         && facts

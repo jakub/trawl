@@ -4,43 +4,14 @@
 
 //! Comments, and the one padding owner every whitespace-skipping site in
 //! the grammar goes through (ADR-0014).
-//!
-//! A comment is a grammar production — `'#' (!'\n')*` — admitted only
-//! where the grammar already sits between tokens. There is no pre-parse
-//! scanner and nothing re-derives "am I inside a string / regex /
-//! backtick name": the parser *is* inside them, so a `#` is only ever
-//! tested at a position the grammar already knows is a token boundary.
-//!
-//! The boundary is encoded structurally, with no lookback:
-//! [`ws`] is `(whitespace+ comment?)*`, so a comment is reachable only
-//! after consumed whitespace, and [`leading_ws`] adds the one other
-//! comment site — the start of the input. That whitespace must be ASCII
-//! ([`opens_comment_after`]), because the unquoted token charsets end on
-//! ASCII whitespace alone. Consequence, deliberate:
-//! `count(),# x` and `(#x` are parse errors, not comments (the "after a
-//! delimiter" case is unenumerable — admitting `=` would stop
-//! `color=#ff0000` erroring).
-//!
-//! Every padding site goes through [`Spaced::spaced`], and
-//! `chumsky::Parser::padded` is in clippy's `disallowed_methods` so a
-//! missed site — or a new one added later — fails the build rather than
-//! silently becoming a place comments do not work (ADR-0014 ruling 4).
 
 use chumsky::input::InputRef;
 use chumsky::prelude::*;
 
 use crate::parser::primitives::{ParserExtra, ParserInput};
 
-/// The one comment opener. `//` is not a second one (ADR-0014 ruling 3):
-/// it collides with every URL scheme, and blanking to end of line would
-/// delete sibling filters rather than truncate a single token.
 pub(crate) const OPENER: char = '#';
 
-/// The message a comment opener inside an unquoted token carries
-/// (ADR-0014 ruling 2). Never data, never a comment: quoted strings,
-/// backticked names and regex bodies carry `#` verbatim, so there is
-/// always an escape.
-///
 /// The rule is one rule, but the working spelling differs by position,
 /// and a hint whose advice changes what the query means is worse than no
 /// hint at all — quoting a whole `color=#ff0000` turns a field filter
@@ -61,16 +32,12 @@ pub(crate) const MSG_OPENER_IN_NEGATED_TERM: &str = "'#' inside a negated search
 /// quoting is no escape either: a stage name is grammar, not data.
 pub(crate) const MSG_OPENER_IN_COMMAND: &str = "'#' inside a pipe stage name";
 
-/// The message a search-stage bare term starting with `//` carries — the
-/// loud half of having exactly one opener (ADR-0014 ruling 3).
 pub(crate) const MSG_SLASHES_NOT_A_COMMENT: &str =
     "'//' does not start a comment — '#' is the comment character";
 
-/// The hint for [`MSG_SLASHES_NOT_A_COMMENT`].
 const HINT_SLASHES: &str =
     "write '#' to start a comment, or quote the term to search for the slashes";
 
-/// The `//` opener a search-stage bare term may not start with.
 pub(crate) const SLASHES: &str = "//";
 
 /// What counts as layout between tokens: `char::is_whitespace`, Unicode
@@ -83,27 +50,12 @@ pub(crate) const fn is_layout(c: char) -> bool {
 
 /// Whether a comment may open directly after `prev` — the character
 /// immediately before the `#`, or `None` at the start of the input.
-///
-/// The boundary is ASCII whitespace, deliberately narrower than
-/// [`is_layout`], because the unquoted token charsets end on ASCII
-/// whitespace and nothing else: a no-break space is an ordinary character
-/// inside a bare word or value. Reading `message="x"\u{a0}# last=1h` as a
-/// comment while the token grammar reads `foo\u{a0}#` as one token would
-/// be two answers to the same question. Both consequences are loud —
-/// `"x"\u{a0}# c` is a parse error at the `#`, `foo\u{a0}# c` is the
-/// inside-a-token error — never a silently different query.
-///
-/// [`skip_layout`] and [`crate::parser::scan`] both ask this predicate,
-/// of the same character.
 pub(crate) fn opens_comment_after(prev: Option<char>) -> bool {
     prev.is_none_or(|c| matches!(c, ' ' | '\t' | '\n' | '\r'))
 }
 
-/// Consume one comment if the cursor is sitting on its opener: the
-/// opener, then everything up to (not including) the newline that ends
-/// it. The line boundary is `\n` alone — a `\r` is an ordinary character
-/// that may sit inside a comment, and there is no CRLF machinery
-/// anywhere.
+/// The line boundary is `\n` alone — a `\r` is an ordinary character
+/// that may sit inside a comment.
 fn skip_comment<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra<'src>>) {
     if inp.peek() != Some(OPENER) {
         return;
@@ -117,14 +69,6 @@ fn skip_comment<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtr
     }
 }
 
-/// Consume the layout run `(whitespace+ comment?)*`.
-///
-/// Each iteration consumes at least one whitespace character, so the walk
-/// always terminates. A comment is reachable only after that whitespace —
-/// which is precisely the token-boundary rule, encoded structurally
-/// rather than tested by a lookback — and only when the last whitespace
-/// character consumed is one [`opens_comment_after`] admits, so the run
-/// `foo\u{a0}` leaves the following `#` to the token grammar.
 fn skip_layout<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra<'src>>) {
     loop {
         let mut last = None;
@@ -142,15 +86,9 @@ fn skip_layout<'src>(inp: &mut InputRef<'src, '_, ParserInput<'src>, ParserExtra
     }
 }
 
-/// The layout run, as a parser.
-///
 /// Written as a `custom` walk rather than a combinator tower on purpose:
-/// this parser is embedded at every padding call site, several of them
-/// inside the recursive expression grammar, and a combinator form
-/// (`filter+ then comment? repeated`) inflates the nested parser type
-/// enough to overflow the stack on a deep pipeline — the failure mode
-/// `expr.rs`'s `.boxed()` guards against. `custom` is one opaque type and
-/// allocates nothing.
+/// a combinator form inflates the nested parser type enough to overflow
+/// the stack on a deep pipeline.
 pub(crate) fn ws<'src>() -> impl Parser<'src, ParserInput<'src>, (), ParserExtra<'src>> + Clone {
     custom(|inp| {
         skip_layout(inp);
@@ -158,8 +96,6 @@ pub(crate) fn ws<'src>() -> impl Parser<'src, ParserInput<'src>, (), ParserExtra
     })
 }
 
-/// [`ws`] plus the one comment site whitespace cannot precede: the start
-/// of the input. Used exactly once, at the front of the query parser.
 pub(crate) fn leading_ws<'src>()
 -> impl Parser<'src, ParserInput<'src>, (), ParserExtra<'src>> + Clone {
     custom(|inp| {
@@ -169,30 +105,17 @@ pub(crate) fn leading_ws<'src>()
     })
 }
 
-/// Byte offset of the first comment opener in an unquoted token's text,
-/// or `None` when it carries none. The one place the validators on
-/// [`crate::parser::primitives::bare_value`] and the search-stage bare
-/// word ask the question.
 pub(crate) fn first_opener(text: &str) -> Option<usize> {
     text.find(OPENER)
 }
 
-/// Whether a search-stage bare term opens with `//` — a comment line in
-/// some other language, which must fail loudly instead of becoming AND-ed
-/// text terms that narrow the result set to nothing.
 pub(crate) fn starts_with_slashes(text: &str) -> bool {
     text.starts_with(SLASHES)
 }
 
-/// The byte that separates a position message from the exact token slice
-/// the emitting production held, inside one `Rich::custom` payload.
-///
-/// `Rich::custom` transports a string and nothing else, so a production
-/// that wants to hand the hint renderer more than its message has to
-/// spell both into that one string. A unit separator is the divider, and
-/// the split takes the first one: every message in this module is a
-/// `const` that carries none, so the head is always exactly the message,
-/// whatever control characters the user's own token carries after it.
+/// The split of a payload into message and token slice takes the first
+/// separator: every message in this module is a `const` that carries none,
+/// so the head is always exactly the message.
 const PAYLOAD_SEP: char = '\u{1f}';
 
 /// The messages a [`payload`] may be minted with — the one list
@@ -212,17 +135,10 @@ const PAYLOAD_MESSAGES: [&str; 5] = [
     crate::parser::primitives::MSG_UNKNOWN_ESCAPE,
 ];
 
-/// The payload an emitting production sends when it holds the offending
-/// token: the position message, plus the exact slice the grammar refused.
-///
 /// Passing the slice beats re-deriving it from the raw input. A left
 /// boundary re-derived by scanning backwards for `=`/`<`/`>`/`!` cuts
 /// `url=https://example.test/p?a=b#frag` at the query string's own `=`
-/// and hints `"b#frag"` — advice that, followed, means something else
-/// entirely. The production that emitted the error already knows where
-/// the value starts and ends, and an IN list's element is its own
-/// [`crate::parser::primitives::bare_value`], so the comma bounding the
-/// hint needs comes free with the slice.
+/// and hints `"b#frag"`.
 pub(crate) fn payload(msg: &str, exact: &str) -> String {
     // The call sites and [`PAYLOAD_MESSAGES`] must stay one set: a payload
     // minted with a message [`split_payload`] does not recognise comes back
@@ -234,12 +150,6 @@ pub(crate) fn payload(msg: &str, exact: &str) -> String {
     format!("{msg}{PAYLOAD_SEP}{exact}")
 }
 
-/// Split a [`payload`] back into its message and the exact token, if it
-/// carries one. A custom error from anywhere else (an overflowing
-/// literal, an invalid regex, a refused reserved name) comes back whole —
-/// including one whose own interpolated text carries a [`PAYLOAD_SEP`],
-/// because the head must be byte-equal to a message this module mints
-/// ([`PAYLOAD_MESSAGES`]).
 pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
     match raw.split_once(PAYLOAD_SEP) {
         Some((msg, exact)) if PAYLOAD_MESSAGES.contains(&msg) => (msg, Some(exact)),
@@ -247,12 +157,6 @@ pub(crate) fn split_payload(raw: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The message a parse error shows for a custom message: the message
-/// itself, except where a payload's slice belongs in it. An unknown
-/// escape names its pair (`unknown escape \s: …`) when the character after
-/// the backslash can be shown as itself ([`showable_escape`]), and its
-/// code point otherwise, so a control, whitespace or bidi character never
-/// reaches the message raw.
 pub(crate) fn message_for(msg: &str, exact: Option<&str>) -> String {
     if msg == crate::parser::primitives::MSG_UNKNOWN_ESCAPE
         && let Some(after) = exact.and_then(escaped_char)
@@ -270,24 +174,16 @@ pub(crate) fn message_for(msg: &str, exact: Option<&str>) -> String {
     msg.to_string()
 }
 
-/// The character after the backslash of an unknown-escape pair.
 fn escaped_char(pair: &str) -> Option<char> {
     let mut chars = pair.strip_prefix('\\')?.chars();
     let c = chars.next()?;
     chars.next().is_none().then_some(c)
 }
 
-/// Whether the character after a backslash may be printed as itself in an
-/// unknown-escape message or hint: printable, not whitespace, and not a
-/// character that renders as something else
-/// ([`crate::sanitize::is_unsafe_display_char`]).
 fn showable_escape(c: char) -> bool {
     !c.is_control() && !c.is_whitespace() && !crate::sanitize::is_unsafe_display_char(c)
 }
 
-/// The hint for an unknown escape: the doubled spelling of the pair, or
-/// of a backslash when the character cannot be shown, then the two
-/// positions where a backslash needs no doubling.
 fn unknown_escape_hint(exact: Option<&str>) -> String {
     let keep = match exact.and_then(escaped_char).filter(|c| showable_escape(*c)) {
         Some(c) => format!("write \\\\{c} to keep the backslash"),
@@ -300,30 +196,11 @@ fn unknown_escape_hint(exact: Option<&str>) -> String {
     )
 }
 
-/// The hint for one of this module's messages, for the search stage's
-/// pattern messages (ADR-0060), or for the admission errors (ADR-0061):
-/// the ordered-pattern ones share the payload route, and the rest have
-/// one fixed hint each.
-/// One owner: both emitters — the `validate` calls on the value and term
-/// productions, and the generic net in
-/// [`crate::parser::rich_to_parse_error`] — come here, so a position's
-/// working spelling is written down once.
-///
-/// Every hint offers something the user can follow, and says what
-/// following it costs, which is why the position rides in the message:
-/// quoting the whole of `color=#ff0000` is a phrase search, quoting a
-/// `-`-negated term spells literal quote characters, and quoting a value
-/// carrying `*`/`?` stops it being a pattern.
-///
 /// A concrete rewrite is offered only where the emitting production held
 /// the exact slice ([`payload`]) and the rewrite means what the hint
 /// claims. `exact` is `None` for the generic net in
-/// [`crate::parser::rich_to_parse_error`], which knows only an offset:
-/// the token run around it can span several grammar tokens, and the
-/// position is unknown — `| sort "a#b"` does not parse and
-/// `| where a#b > 1` quietly becomes a string literal, whose escape is a
-/// backticked name, not quotes. So the net names the escapes abstractly
-/// and mints no spelling.
+/// [`crate::parser::rich_to_parse_error`], which knows only an offset,
+/// so the net names the escapes abstractly and mints no spelling.
 pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
     match msg {
         MSG_SLASHES_NOT_A_COMMENT => Some(HINT_SLASHES.to_string()),
@@ -336,17 +213,9 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
         }),
         MSG_OPENER_IN_VALUE => Some(match exact.filter(|t| quotable_verbatim(t)) {
             // Quoting a value is not operator-neutral: an unquoted `*`/`?`
-            // is a glob pattern (`crate::parser::search::has_glob_chars`
-            // decides it) and quoted wildcards are data. Under `=`/`!=`
-            // quoting `f=#a*` turns a glob into an exact match; under an
-            // ordered operator the unquoted glob is refused (ADR-0060), so
-            // quoting `f>#a*` yields that operator's comparison of text.
-            // The advice is still the right one — a value carrying a `#`
-            // cannot stay unquoted — so it names the one cost true under
-            // every operator and every pin: a quoted value is never a
-            // pattern. It promises the `#` reaches the value, not that the
-            // field's pin admits it (`_severity="#warn*"` carries the `#`
-            // and is then refused by the severity vocabulary).
+            // is a glob pattern and quoted wildcards are data. The advice
+            // names the one cost true under every operator and every pin: a
+            // quoted value is never a pattern.
             Some(value) if crate::parser::search::has_glob_chars(value) => format!(
                 "quote the value (\"{value}\") to carry the '{OPENER}' \
                  (a quoted value is never a pattern), or {}",
@@ -386,8 +255,6 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
              `[A-Za-z0-9_]{3,30}`"
                 .to_string(),
         ),
-        // The five admission errors of ADR-0061, whose hints its rulings
-        // name.
         crate::parser::primitives::MSG_REGEX_LINE_BREAK => Some(HINT_REGEX_LINE_BREAK.to_string()),
         crate::parser::primitives::MSG_REGEX_PIPE_STAGE => Some(HINT_REGEX_PIPE_STAGE.to_string()),
         crate::parser::search::MSG_NESTED_TIME_CLAUSE => Some(HINT_NESTED_TIME_CLAUSE.to_string()),
@@ -411,26 +278,19 @@ pub(crate) fn hint_for(msg: &str, exact: Option<&str>) -> Option<String> {
     }
 }
 
-/// The hint for a `matches`, `like` or `ilike` pattern that is not
-/// literal text (ADR-0063).
 pub(crate) const HINT_PATTERN_NOT_LITERAL: &str =
     "write the pattern itself as quoted text, such as \"err%\", or as /err.*/ after matches";
 
-/// The hint for a regex body that nests a class or uses a class set
-/// operator (ADR-0063).
 pub(crate) const HINT_CLASS_SET_SYNTAX: &str = "the batch engine reads them as plain \
      characters, so write the class flat, as one list: `[a-c]` instead of `[a-z&&[a-c]]`, \
      `[abc]` instead of `[a[bc]]`, `[a-df-z]` instead of `[a-z--e]`. Escape a `[`, `]`, `&`, \
      `-` or `~` meant as itself, as in `[a\\&b]`; a POSIX class such as `[[:alpha:]]` is fine";
 
-/// The hint for a regex body the batch engine compiles past its cap
-/// (ADR-0063).
 pub(crate) const HINT_BATCH_TOO_LARGE: &str = "the batch engine compiles a class once per \
      count and per branch, and `\\pL`, `\\p{…}` and wide non-ASCII ranges are large there: \
      repeat them fewer times, write `+` or `*` instead of a count, or use an ASCII class such as \
      `[A-Za-z]`. `\\w`, `\\d` and `\\s` are ASCII in the batch engine and cost little";
 
-/// The hint for a pattern over the repeat budget (ADR-0063).
 pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: each character, \
      class, anchor, word boundary, capture group and `|` is one, a counted repeat multiplies its \
      positions by the count, and every repeat counts at least one more than it holds. Write `+` \
@@ -438,42 +298,31 @@ pub(crate) const HINT_REPEAT_BUDGET: &str = "a pattern may hold 64 positions: ea
      `{1000}`, `(?:…)` for a group you do not need to capture, or match a shorter run. For long \
      plain text, `contains(field, \"text\")` has no position limit";
 
-/// The hint for a query over the translation budget (ADR-0063).
 pub(crate) const HINT_TRANSLATION_BUDGET: &str = "large Unicode classes such as `\\p{…}`, `\\w` \
      and wide ranges cost the most to translate, and `(?i)` multiplies them: use fewer of \
      them, or ASCII classes such as `[A-Za-z]`";
 
-/// The hint for a regex a raw line break cuts.
 pub(crate) const HINT_REGEX_LINE_BREAK: &str = "write \\n";
 
-/// The hint for a regex that `|` after whitespace cuts.
 pub(crate) const HINT_REGEX_PIPE_STAGE: &str = "drop the spaces or write \\s";
 
-/// The hint for a time clause inside parentheses or under `NOT`.
 pub(crate) const HINT_NESTED_TIME_CLAUSE: &str =
     "time clauses apply to the whole search; write it outside the group";
 
-/// The hint for an `earliest=` or `latest=` bound that is not a
-/// timestamp both lanes can hold.
 pub(crate) const HINT_UNREADABLE_BOUND: &str = "write a date such as \"2026-03-14\", a time such \
      as \"2026-03-14T09:00:00\", or epoch, infinity or -infinity; years run up to 9999";
 
-/// The hint for `last=` beside `earliest=` or `latest=`.
 pub(crate) const HINT_LAST_WITH_BOUND: &str =
     "use last= alone, or earliest= and latest= without it";
 
-/// The hint for a bare value that opens with `"`.
 pub(crate) const HINT_QUOTE_OPENS_BARE_VALUE: &str = "close the quote";
 
-/// The hint for a group of only `OR` separators.
 pub(crate) const HINT_OR_ONLY_GROUP: &str =
     "put a search term or filter inside the group, or remove it";
 
-/// The hint for `NOT-` directly before a backtick.
 pub(crate) const HINT_NOT_DASH_BEFORE_BACKTICK: &str =
     "put a space after NOT to negate the field, or quote \"NOT-\" to search for the text";
 
-/// The half of an ordered-pattern hint that holds for globs and regexes.
 fn pattern_operators() -> String {
     "use `=` or `!=` to match the pattern".to_string()
 }
@@ -484,13 +333,6 @@ fn comment_half() -> String {
     format!("put whitespace before the '{OPENER}' to start a comment")
 }
 
-/// The position-blind advice: both escapes named, no spelling minted.
-///
-/// The generic net fires wherever the two validators do not — a sort key,
-/// an expression, a stage argument — and each of those positions escapes
-/// a `#` differently. Naming the two quoted contexts lets the user pick
-/// the one their position takes; printing `"a#b"` would pick for them,
-/// and pick wrong half the time.
 fn generic_advice() -> String {
     format!(
         "{}, or carry the '{OPENER}' inside a quoted value (\"…\") \
@@ -502,21 +344,10 @@ fn generic_advice() -> String {
 /// Whether `"{text}"` is a rewrite the grammar reads back as exactly
 /// `text` — the one gate on the quoting half of every hint here.
 ///
-/// Two ways it is not, and both are reachable. A `"` or a `\` inside the
-/// text needs an escape (`quoted_string` reads `\"` and `\\`) that the
-/// hint does not spell, so `message="x"\u{a0}# note` would advise pasting
-/// a string that ends at its own second quote. And a run carrying a
-/// character no unquoted token may contain — `( ) , |`, a backtick,
-/// whitespace — is not one token in the position that emitted it: a value
-/// stops at a `,` (it is the IN-list separator), so advising `"a,b"` there
-/// would name a value the unquoted spelling never held.
-///
 /// This is the double-quote counterpart of
 /// [`crate::parser::suggest::quote_dsl_field`], not a caller of it: that
 /// one answers how to spell a field name, whose escape is backticks with
-/// doubling, and a backticked rendering here would name a field where the
-/// user meant to search for text. The invisible-character half is shared
-/// — both go through [`crate::sanitize::is_unsafe_display_char`].
+/// doubling.
 fn quotable_verbatim(text: &str) -> bool {
     quotable(text, false)
 }
@@ -548,12 +379,6 @@ fn quotable(text: &str, comma_is_data: bool) -> bool {
 /// run of non-ASCII-whitespace, non-`|` bytes around it. Used to decide
 /// whether that token is a pipe stage name.
 ///
-/// It is deliberately not a hint source: a run recovered from an offset is
-/// a guess at both the token's bounds and its grammatical position, and a
-/// hint that quotes a guess would advise `"b#frag"` for
-/// `url=…?a=b#frag`. Every concrete rewrite comes from the production that
-/// held the slice ([`payload`]).
-///
 /// ASCII whitespace because that is where the unquoted token charsets end
 /// — a no-break space sits inside a bare word.
 pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
@@ -566,12 +391,6 @@ pub(crate) fn token_span(input: &str, offset: usize) -> (usize, &str) {
     (start, &rest[..end])
 }
 
-/// A negated term's working spelling under `NOT`: the term without its
-/// leading `-`, double-quoted — or `None` when quoting it is not a
-/// rewrite the user can paste ([`quotable_verbatim`]).
-///
-/// A term that is already double-quoted is unwrapped first, so
-/// `-"a#b"` is answered `NOT "a#b"` and not `NOT "\"a#b\""`.
 fn quoted_term(token: &str) -> Option<String> {
     let inner = token.strip_prefix('-').unwrap_or(token);
     let body = inner
@@ -597,16 +416,9 @@ pub(crate) fn opener_in_command_word(input: &str, offset: usize) -> Option<usize
     first_opener(token).map(|at| start + at)
 }
 
-/// The project-owned padding combinator: whitespace and comments on both
-/// sides of a token.
-///
-/// Padding is also what separates search tokens and pipeline stages, so
-/// routing every site through here is what makes `a=1 # note\nhost=x` and
-/// `| stats count()\n# note\n| sort -count` work with no special case.
 pub(crate) trait Spaced<'src, O>:
     Parser<'src, ParserInput<'src>, O, ParserExtra<'src>> + Clone + Sized
 {
-    /// Skip whitespace and comments before and after this parser.
     fn spaced(self) -> impl Parser<'src, ParserInput<'src>, O, ParserExtra<'src>> + Clone {
         self.padded_by(ws())
     }
@@ -631,8 +443,6 @@ mod tests {
         }
     }
 
-    /// A comment is reachable only after whitespace — the token-boundary
-    /// rule, structural and without lookback.
     #[test]
     fn ws_does_not_open_a_comment_without_whitespace() {
         assert!(
@@ -641,7 +451,6 @@ mod tests {
                 .into_result()
                 .is_err()
         );
-        // …and start-of-input is the one other site, spelled separately.
         assert!(
             leading_ws()
                 .then_ignore(end())
@@ -651,9 +460,6 @@ mod tests {
         );
     }
 
-    /// The boundary is ASCII whitespace: a no-break space is layout the
-    /// run consumes, but it does not open a comment, because the token
-    /// charsets carry it inside a bare word.
     #[test]
     fn only_ascii_whitespace_opens_a_comment() {
         for c in [' ', '\t', '\n', '\r'] {
@@ -664,21 +470,18 @@ mod tests {
         }
         assert!(opens_comment_after(None), "start of input");
 
-        // …and the layout run agrees: `\u{a0}#` leaves the `#` unconsumed
         assert!(
             ws().then_ignore(end())
                 .parse("\u{a0}# note")
                 .into_result()
                 .is_err()
         );
-        // while a following ASCII space re-opens the site
         assert!(
             ws().then_ignore(end())
                 .parse("\u{a0} # note")
                 .into_result()
                 .is_ok()
         );
-        // …and Unicode whitespace is still layout, consumed either way
         assert!(
             ws().then_ignore(end())
                 .parse("\u{a0}\u{2003}")
@@ -687,7 +490,6 @@ mod tests {
         );
     }
 
-    /// The line boundary is `\n` alone; `\r` sits inside a comment.
     #[test]
     fn carriage_return_is_comment_content() {
         assert!(
@@ -706,10 +508,6 @@ mod tests {
         assert_eq!(token_span("x|color=#f", 8).1, "color=#f");
     }
 
-    /// A hint the user can follow: the value position quotes the exact
-    /// slice its production held, whatever the surrounding token looks
-    /// like. Re-deriving that slice from the raw text would put a URL's
-    /// own query string inside the advice.
     #[test]
     fn a_value_hint_quotes_the_slice_the_production_held() {
         for exact in [
@@ -717,8 +515,6 @@ mod tests {
             "1#",
             "/foo#bar/",
             "#x",
-            // an IN list's element IS its own value production, so the
-            // comma bounding comes free
             "#a",
             "https://example.test/p?a=b#frag",
         ] {
@@ -730,20 +526,13 @@ mod tests {
         }
     }
 
-    /// The payload round-trips: the head is always the message, whatever
-    /// control characters the user's own token carries.
     #[test]
     fn a_payload_splits_back_into_its_halves() {
         let raw = payload(MSG_OPENER_IN_VALUE, "a\u{1f}b");
         assert_eq!(split_payload(&raw), (MSG_OPENER_IN_VALUE, Some("a\u{1f}b")));
-        // …and a custom error from anywhere else comes back whole
         assert_eq!(split_payload("regex too long"), ("regex too long", None));
     }
 
-    /// A foreign custom message carrying a separator round-trips whole:
-    /// other productions interpolate user-derived text into theirs (an
-    /// invalid regex's `Display`, a refused reserved name), so the
-    /// separator alone cannot decide.
     #[test]
     fn a_foreign_message_with_a_separator_is_not_split() {
         for raw in [
@@ -756,7 +545,6 @@ mod tests {
         }
     }
 
-    /// The quote half is offered only where `"…"` reads back unchanged.
     #[test]
     fn only_a_quotable_token_earns_the_quoting_half() {
         for text in ["#ff0000", "foo#bar", "https://a.b/c?d=e#f", "-x#y"] {
@@ -774,20 +562,15 @@ mod tests {
             assert!(!quotable_verbatim(text), "{text:?}");
         }
 
-        // …and a `,` is a word byte in a term, where nothing splits on it
         for text in ["foo,#bar", "#a,#b"] {
             assert!(quotable_as_term(text), "{text:?}");
             assert!(!quotable_verbatim(text), "{text:?}");
         }
 
-        // …and the hint drops that half rather than print it
         let hint = hint_for(MSG_OPENER_IN_VALUE, Some("a\"b#c")).expect("hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
-    /// The position-blind net mints no spelling: it does not know the
-    /// token's bounds, and it does not know whether the position takes a
-    /// quoted value or a backticked name.
     #[test]
     fn the_generic_net_names_the_escapes_without_spelling_one() {
         let hint = hint_for(MSG_OPENER_IN_TOKEN, None).expect("hint");
@@ -799,7 +582,6 @@ mod tests {
         assert!(!hint.contains("quote it"), "{hint:?}");
     }
 
-    /// Quoting is no escape under `-`: `-"a#b"` spells literal quotes.
     #[test]
     fn a_negated_term_hint_offers_the_not_spelling() {
         for (exact, want) in [("-\"a#b\"", "NOT \"a#b\""), ("-foo#bar", "NOT \"foo#bar\"")] {
@@ -807,13 +589,10 @@ mod tests {
             assert!(hint.starts_with(&format!("write it as {want}")), "{hint:?}");
         }
 
-        // …and a term no quoting can spell keeps only the comment half
         let hint = hint_for(MSG_OPENER_IN_NEGATED_TERM, Some("-a\"b#c")).expect("hint");
         assert_eq!(hint, "put whitespace before the '#' to start a comment");
     }
 
-    /// A stage name is grammar, not data — so the only advice is the
-    /// whitespace one.
     #[test]
     fn a_command_hint_offers_only_the_comment_spelling() {
         let hint = hint_for(MSG_OPENER_IN_COMMAND, None).expect("command hint");
@@ -825,14 +604,9 @@ mod tests {
         assert_eq!(opener_in_command_word("* | co#unt()", 4), Some(6));
         // the token holding the offset is `count(),#`, not the stage word
         assert_eq!(opener_in_command_word("* | stats count(),# x", 18), None);
-        // …and a stage word with no opener is not this diagnosis
         assert_eq!(opener_in_command_word("* | staats", 4), None);
     }
 
-    /// An unknown escape before a character that cannot be shown as
-    /// itself gets the generic hint, and neither the hint nor the message
-    /// carries that character raw. A printable character is shown, so the
-    /// doubled spelling is one the user can paste.
     #[test]
     fn unknown_escape_hint_never_prints_unsafe_chars() {
         for c in [
@@ -878,7 +652,6 @@ mod tests {
             );
         }
 
-        // a printable multibyte character is shown, doubled in the hint
         let errors = crate::parser::parse("\"a\\éb\"").expect_err("an unknown escape");
         let [one] = &errors[..] else {
             panic!("{errors:?}")
@@ -890,8 +663,6 @@ mod tests {
             "{hint:?}"
         );
 
-        // the payload splits at its own separator even when the pair holds
-        // one, so the head is always the message
         let raw = payload(crate::parser::primitives::MSG_UNKNOWN_ESCAPE, "\\\u{1f}");
         let (msg, exact) = split_payload(&raw);
         assert_eq!(msg, crate::parser::primitives::MSG_UNKNOWN_ESCAPE);

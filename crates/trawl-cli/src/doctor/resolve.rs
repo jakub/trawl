@@ -5,38 +5,14 @@
 //! Which server `trawl doctor` checks, with which key, under which trust
 //! (ADR-0047).
 //!
-//! Two steps, kept apart on purpose:
-//!
-//! - [`select`] turns the command line into a [`Selection`], or refuses it.
-//!   A refusal is a usage error (exit 2) that names the variable or flag and
-//!   never its value. Nothing is read from disk here.
-//! - [`resolve`] reads what the selection names, once, and produces the
-//!   `connection.config` check. A source that is missing or unusable fails
-//!   that check and leaves no [`Connection`], so no later check can contact
-//!   anything.
-//!
-//! The rules that keep a key where the user bound it:
-//!
-//! - The ambient environment never selects anything: `TRAWL_URL`,
-//!   `TRAWL_PROFILE`, `TRAWL_TOKEN` and `TRAWL_INSECURE` refuse the run when
-//!   present, even empty.
-//! - `--url` never reads `config.toml`, so a key saved for another server
-//!   cannot follow it. Its key comes only from `--token-env` or
-//!   `--token-file`.
-//! - A profile's key comes only from that profile's own table, never from
-//!   `[server].token`. Its trust (`ca_cert`, `insecure`) inherits as it does
-//!   for every other command: an inherited pin only adds verification, and an
-//!   inherited `insecure` only makes the TLS check fail.
-//! - `-p trial` resolves through the trial's own rules (ADR-0045).
 //! - A URL that carries userinfo is refused before anything is built: the
 //!   HTTP client would turn it into an `Authorization: Basic` header.
 //! - A URL with a query or a fragment is refused too. Request paths are
 //!   appended to the URL, so `https://h/x#frag` would send every request,
 //!   the keyed one included, to `/x`.
 //!
-//! Nothing here takes a profile's key from `[server].token`, and nothing
-//! renders the `Display` of a `ConfigError` or `TrialError`: every reason is
-//! written here, from names alone.
+//! Nothing here renders the `Display` of a `ConfigError` or `TrialError`:
+//! every reason is written here, from names alone.
 
 use std::path::PathBuf;
 
@@ -61,30 +37,20 @@ pub const CONNECTION_CONFIG: &str = "connection.config";
 /// refuses those variables before it trusts any of these.
 #[derive(Debug, Default)]
 pub struct Invocation {
-    /// `--url`.
     pub url: Option<String>,
-    /// Whether `--token` was given. Its value is never looked at.
     pub token: bool,
-    /// `--insecure`.
     pub insecure: bool,
-    /// `-p/--profile`.
     pub profile: Option<String>,
-    /// `-c/--config`.
     pub config: Option<String>,
-    /// `--token-env NAME`.
     pub token_env: Option<String>,
-    /// `--token-file PATH`.
     pub token_file: Option<PathBuf>,
-    /// `--web-url ORIGIN`.
     pub web_url: Option<String>,
 }
 
 /// A command line [`select`] refused: a usage error, exit 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Refusal {
-    /// The clap error kind it is reported as.
     pub kind: ErrorKind,
-    /// The message. It names variables and flags, never their values.
     pub message: String,
 }
 
@@ -107,23 +73,17 @@ impl Refusal {
 /// What the command line selected. Nothing has been read yet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Selection {
-    /// The API target and where its key comes from.
     pub target: TargetSelection,
-    /// The browser origin `--web-url` names, if any.
     pub web: Option<CheckedUrl>,
 }
 
-/// The one API target a doctor run checks.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TargetSelection {
-    /// `--url`: no config file, trust from system roots unless
-    /// `--insecure`, and a key only from a source named on the command line.
     Url {
         url: CheckedUrl,
         insecure: bool,
         key: KeySource,
     },
-    /// `--profile NAME` other than `trial`.
     Profile {
         name: String,
         config: Option<String>,
@@ -132,19 +92,13 @@ pub enum TargetSelection {
     Trial { config: Option<String> },
 }
 
-/// Where a `--url` run reads its key.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeySource {
-    /// No key: `api.identity` is `not_configured`.
     None,
-    /// `--token-env NAME`.
     Env(String),
-    /// `--token-file PATH`.
     File(PathBuf),
 }
 
-/// Turn the command line into a [`Selection`], or refuse it.
-///
 /// `refused_env` is every variable clap binds for `trawl doctor`, and
 /// `env_present` answers whether one is set in this process, empty or not.
 /// The first rule broken is the one reported.
@@ -284,22 +238,15 @@ fn check_web_url(raw: &str) -> Result<CheckedUrl, Refusal> {
     Ok(url)
 }
 
-/// A connection that resolved: everything the API checks need.
 #[derive(Debug)]
 pub struct Connection {
-    /// The API URL.
     pub url: CheckedUrl,
-    /// How the server's certificate is verified.
     pub trust: TlsTrust,
-    /// The key, when one was selected.
     pub key: Option<Key>,
 }
 
-/// The outcome of [`resolve`].
 pub struct Resolution {
-    /// What the report names as its target.
     pub target: Target,
-    /// The `connection.config` check.
     pub check: Check,
     /// Present only when `connection.config` is complete.
     pub connection: Option<Connection>,
@@ -321,7 +268,6 @@ impl std::fmt::Debug for Resolution {
     }
 }
 
-/// Read what the selection names and build the `connection.config` check.
 pub fn resolve(selection: &TargetSelection) -> Resolution {
     let (source, resolved) = match selection {
         TargetSelection::Url { url, insecure, key } => {
@@ -385,13 +331,10 @@ pub fn resolve(selection: &TargetSelection) -> Resolution {
     }
 }
 
-/// The config path as the user named it, for messages.
 fn config_path(config: Option<&str>) -> String {
     config.unwrap_or(config::DEFAULT_CONFIG_PATH).to_owned()
 }
 
-/// A resolved connection, the trust mode named, and the config it was read
-/// from.
 struct Resolved {
     connection: Connection,
     trust_detail: String,
@@ -441,7 +384,6 @@ fn key_from_env(name: &str) -> Result<Key, Failure> {
     key_from_text(&value, SOURCE).ok_or_else(|| fail("is empty"))
 }
 
-/// The `connection.config` failure for a config file that did not load.
 fn config_failure(err: &ConfigError, path: &str, profile: &str) -> Failure {
     let source = format!("config file {path}");
     match err {
@@ -564,7 +506,6 @@ fn resolve_profile(name: &str, config: Option<&str>, path: &str) -> Result<Resol
     })
 }
 
-/// Name the table each trust field comes from, after inheritance.
 fn trust_source(cfg: &Config, profile: &ProfileConfig, table: &str) -> String {
     let ca_cert = match profile.ca_cert {
         Some(ref path) if path.as_os_str().is_empty() => None,
@@ -628,7 +569,6 @@ fn resolve_trial(config: Option<&str>) -> Result<Resolved, Failure> {
     })
 }
 
-/// The `connection.config` failure for `-p trial`.
 fn trial_failure(err: &trial::TrialError, config: &str) -> Failure {
     use trial::TrialError as E;
     match err {
@@ -768,8 +708,6 @@ mod tests {
                 key: KeySource::None,
             }
         );
-        // With no key source, resolution holds no key, and it had no config
-        // file to fall back on.
         let resolution = resolve(&selection.target);
         let connection = resolution.connection.expect("resolves");
         assert!(connection.key.is_none());
@@ -807,14 +745,9 @@ mod tests {
             assert!(err.message.starts_with("--web-url carries credentials"));
             assert!(!err.message.contains("alice") && !err.message.contains("s3cret"));
         }
-        // An @ after the authority is a path, not userinfo.
         assert!(check_url("https://h:1/a@b").is_ok());
     }
 
-    /// Request paths are appended to the URL, so a `?` or `#` anywhere past
-    /// the authority, empty or not, or percent-encoded in the path, is
-    /// refused. `--url` and `--web-url` name only the flag; the URL's text
-    /// never appears.
     #[test]
     fn urls_with_a_query_or_fragment_are_refused_without_echo() {
         for raw in [
@@ -853,12 +786,10 @@ mod tests {
             );
             assert!(!err.message.contains("s3cret") && !err.message.contains("h:1"));
         }
-        // Credentials are still reported as such when a query follows.
         assert_eq!(
             check_url("https://alice@h:1/x?q").unwrap_err(),
             UrlProblem::Credentials
         );
-        // A path prefix stays supported, other percent-escapes included.
         let prefixed = check_url("https://h:1/trawl/api%2Dv1/").unwrap();
         assert_eq!(prefixed.base(), "https://h:1/trawl/api%2Dv1");
     }

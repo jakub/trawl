@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration coverage for `fleet-admin migrate` against a real Postgres.
-//!
-//! The `common::migrated_store` helper already runs `migrate` once, so
-//! this file verifies the canonical entry point — `fleet_auth::migrate` —
-//! is idempotent (a second run is a no-op against an already-migrated DB)
-//! and that the expected tables are present.
-
 mod common;
 
 use fleet_auth::{PrincipalKind, migrate};
@@ -18,7 +11,6 @@ use sqlx::Row as _;
 async fn migrator_is_idempotent_on_already_migrated_db(pool: sqlx::PgPool) {
     let store = common::migrated_store(pool).await;
 
-    // Helper already migrated once. Run again — must be a no-op.
     migrate(store.pool())
         .await
         .expect("second run is a no-op against migrated schema");
@@ -64,7 +56,6 @@ async fn migrator_creates_expected_tables(pool: sqlx::PgPool) {
     );
 }
 
-/// The CLI must refuse old history before either administrative write path.
 #[sqlx::test(migrations = false)]
 async fn cli_refuses_old_history_before_role_or_key_writes(pool: sqlx::PgPool) {
     let old = sqlx::migrate::Migrator::new(std::path::Path::new(concat!(

@@ -3,39 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Rollup markers: the record that lets a daily rollup be finished or
-//! abandoned after a crash from file identities alone (ADR-0041, #357).
-//!
-//! A rollup merges the hourly files of one service-day, and the prior daily
-//! file when there is one, into `{service}.parquet.tmp`, then renames it
-//! onto `{service}.parquet` and retires the hourly files it merged. Before
-//! the rename it writes `data/{env}/{date}/.rollup-{service}` durably. The
-//! marker records the size and BLAKE3 digest of the replacement, of the
-//! prior daily file it merged (if any) and of each hourly input, which it
-//! names relative to the day directory as `HH/{service}.parquet`.
-//!
-//! Recovery decides from what is at those paths now, with [`classify`]:
-//!
-//! - **a, [`Decision::Published`]**: the canonical file is the replacement.
-//!   Whatever the tmp is, the rename happened.
-//! - **b, [`Decision::Promote`]**: the tmp is the replacement, and the
-//!   canonical file is absent with no prior recorded, or is the prior. The
-//!   rename did not happen.
-//! - **c, [`Decision::Abort`]**: every input is at its path with its
-//!   recorded identity, and the canonical is absent with no prior recorded,
-//!   or is the prior. Nothing was retired, so the merge can be abandoned.
-//! - **d, [`Decision::Unresolved`]**: none of these is proven. Recovery
-//!   keeps every file and the marker, and names the [`Proof`] that failed.
-//!
-//! In a and b, every input that is still at its path must carry its
-//! recorded identity; an absent one was already retired. A present input
-//! that differs, or one that cannot be read, makes the marker unresolved,
-//! because retiring it would delete rows the replacement may not hold.
-//!
-//! [`classify`] reads only through the observer its caller passes, and
-//! never changes a file, so recovery and `trawld --doctor` share it. Both
-//! classify a marker only in a directory named as a canonical date
-//! ([`crate::env_dirs::parse_date`]). A marker found anywhere else is case
-//! d with [`Proof::DayNotCanonical`], decided before the marker is read.
+//! abandoned after a crash from file identities alone (ADR-0041).
 
 use std::collections::BTreeSet;
 use std::fmt;
@@ -47,42 +15,17 @@ use serde::{Deserialize, Serialize};
 use super::no_follow;
 use super::publication_marker::{OutputIdentity, parse_hex_digest};
 
-/// Marker file name prefix inside a day directory. Built by
-/// [`marker_file_name`] and stripped by [`marker_service`] only.
 const MARKER_PREFIX: &str = ".rollup-";
 
-/// The value of the record's `format` field.
 const FORMAT: &str = "trawl-rollup-marker";
 
-/// The record version this release writes and reads.
 const VERSION: u64 = 1;
 
-/// Most inputs one marker lists. A rollup merges at most one hourly file
-/// per hour directory, and an hour directory is named `00` to `23`
-/// ([`crate::env_dirs::parse_hour`]).
 pub const MAX_INPUTS: usize = 24;
 
-/// Largest marker the reader reads: 7168 bytes, 7 KiB.
-///
-/// [`RollupMarker::encode`] writes compact JSON, and validation bounds each
-/// part of it:
-///
-/// - The `format` and `version` fields, the replacement and prior
-///   identities, and the keys and punctuation around the input list take
-///   about 300 bytes. Each identity is `{"size":U,"blake3":"H"}`, with a
-///   `u64` of at most 20 digits and 64 hex digits: 105 bytes. 1 KiB covers
-///   this part.
-/// - Each input is `{"name":"HH/S.parquet","size":U,"blake3":"H"},`. Its
-///   keys and punctuation take 31 bytes, its comma 1, the `HH/` and
-///   `.parquet` around the service name 11, the size 20 and the digest 64:
-///   127 bytes plus the service name. 128 bytes plus the longest service
-///   name ([`trawl_config::MAX_SERVICE_NAME_LEN`]) covers one input.
-///
-/// So every marker a rollup writes fits, with [`MAX_INPUTS`] inputs.
 pub const MAX_ROLLUP_MARKER_BYTES: u64 =
     (1024 + MAX_INPUTS * (trawl_config::MAX_SERVICE_NAME_LEN + 128)) as u64;
 
-/// A size and digest, as the record spells them.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct IdentityRecord {
@@ -99,18 +42,16 @@ impl From<OutputIdentity> for IdentityRecord {
     }
 }
 
-/// One merged hourly input, as the record spells it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct InputRecord {
-    /// `HH/{service}.parquet`, relative to the day directory.
     name: String,
     size: u64,
     blake3: String,
 }
 
-/// The on-disk marker body. Every field is required, `prior` included,
-/// whose `null` records that no prior daily file was merged.
+/// The on-disk marker body. A `null` `prior` records that no prior daily
+/// file was merged.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Record {
@@ -130,7 +71,6 @@ fn required_nullable<'de, D: serde::Deserializer<'de>>(
     Option::deserialize(deserializer)
 }
 
-/// One hourly input of a validated marker.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Input {
     hour: [u8; 2],
@@ -138,19 +78,15 @@ pub struct Input {
 }
 
 impl Input {
-    /// The hour directory's name: two ASCII digits.
     pub fn hour(&self) -> &str {
         std::str::from_utf8(&self.hour).expect("validated as ASCII digits")
     }
 
-    /// The identity the input had when the rollup merged it.
     pub fn identity(&self) -> OutputIdentity {
         self.identity
     }
 }
 
-/// A rollup marker whose every part passed validation. Paths are built
-/// only from its parts and the day directory the caller found it in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollupMarker {
     service: String,
@@ -219,49 +155,40 @@ impl RollupMarker {
         Self::new(service, replacement, prior, inputs)
     }
 
-    /// The service the marker's file name names.
     pub fn service(&self) -> &str {
         &self.service
     }
 
-    /// The identity of the file the rollup wrote.
     pub fn replacement(&self) -> OutputIdentity {
         self.replacement
     }
 
-    /// The identity of the prior daily file the rollup merged, if any.
     pub fn prior(&self) -> Option<OutputIdentity> {
         self.prior
     }
 
-    /// The hourly inputs, in the order the rollup listed them.
     pub fn inputs(&self) -> &[Input] {
         &self.inputs
     }
 
-    /// `day_dir/{service}.parquet`.
     pub fn canonical(&self, day_dir: &Path) -> PathBuf {
         crate::env_dirs::daily_file(day_dir, &self.service)
     }
 
-    /// `day_dir/{service}.parquet.tmp`.
     pub fn tmp(&self, day_dir: &Path) -> PathBuf {
         day_dir.join(format!("{}.parquet.tmp", self.service))
     }
 
-    /// `day_dir/HH/{service}.parquet` for `input`.
     pub fn input_path(&self, day_dir: &Path, input: &Input) -> PathBuf {
         day_dir
             .join(input.hour())
             .join(format!("{}.parquet", self.service))
     }
 
-    /// `day_dir/.rollup-{service}`.
     pub fn marker_path(&self, day_dir: &Path) -> PathBuf {
         day_dir.join(marker_file_name(&self.service))
     }
 
-    /// The marker body: compact JSON that [`read`] reads back.
     pub fn encode(&self) -> String {
         let record = Record {
             format: FORMAT.to_owned(),
@@ -282,7 +209,6 @@ impl RollupMarker {
     }
 }
 
-/// `.rollup-{service}`.
 pub fn marker_file_name(service: &str) -> String {
     format!("{MARKER_PREFIX}{service}")
 }
@@ -303,9 +229,6 @@ fn validate_service(service: &str) -> Result<(), String> {
     }
 }
 
-/// The hour of `HH/{service}.parquet`, in exactly that spelling, with `HH`
-/// an hour directory name ([`crate::env_dirs::parse_hour`]). Anything else,
-/// an absolute path or one with `..` included, is `None`.
 fn parse_input_name(service: &str, name: &str) -> Option<[u8; 2]> {
     let (hour, file) = name.split_once('/')?;
     crate::env_dirs::parse_hour(hour)?;
@@ -313,29 +236,17 @@ fn parse_input_name(service: &str, name: &str) -> Option<[u8; 2]> {
     (file.strip_suffix(".parquet")? == service).then_some(hour)
 }
 
-/// Why [`read`] returned no marker.
 #[derive(Debug)]
 pub enum ReadError {
-    /// Nothing is at the path.
     Missing,
-    /// It could not be opened or read, or is not a regular file.
     Unreadable(io::Error),
-    /// It is over [`MAX_ROLLUP_MARKER_BYTES`].
     Oversized,
-    /// It is not a JSON object carrying this format's discriminator: a
-    /// marker from a release before #357, which lists bare paths.
     OldFormat,
-    /// It carries the discriminator with a version this release does not
-    /// read.
     UnsupportedVersion,
-    /// It carries the discriminator and version but fails parsing or
-    /// validation.
     Malformed(String),
 }
 
 impl ReadError {
-    /// The proof that failed, for a marker that is there. `None` when the
-    /// marker is gone.
     pub fn proof(&self) -> Option<Proof> {
         match self {
             Self::Missing => None,
@@ -364,8 +275,6 @@ impl fmt::Display for ReadError {
     }
 }
 
-/// Read and validate the rollup marker at `path`, opened with
-/// [`no_follow::open`]. The service comes from the file name.
 pub fn read(path: &Path) -> Result<RollupMarker, ReadError> {
     read_with(path, no_follow::open)
 }
@@ -413,7 +322,6 @@ pub fn read_with(
     decode(service, &body)
 }
 
-/// Parse and validate a marker body for `service`.
 pub fn decode(service: &str, body: &[u8]) -> Result<RollupMarker, ReadError> {
     // An older release wrote one absolute path per line, never JSON. So a
     // body that is not a JSON object carrying the discriminator is old.
@@ -433,10 +341,8 @@ pub fn decode(service: &str, body: &[u8]) -> Result<RollupMarker, ReadError> {
     RollupMarker::from_record(service, record).map_err(ReadError::Malformed)
 }
 
-/// What is at one path the marker names, as recovery's observer saw it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observation {
-    /// Nothing is there.
     Absent,
     /// A regular file with this identity.
     Identity(OutputIdentity),
@@ -451,39 +357,27 @@ impl Observation {
     }
 }
 
-/// The proof whose failure leaves a marker unresolved (case d). Each has a
-/// fixed label that logs and the doctor report.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Proof {
     /// The marker's directory is not named as a canonical date
-    /// ([`crate::env_dirs::parse_date`]), so the paths it names are not the
-    /// layout's. Recovery checks this first, and reads nothing there.
+    /// ([`crate::env_dirs::parse_date`]).
     DayNotCanonical,
-    /// The marker could not be opened or read, or is not a regular file.
     MarkerUnreadable,
-    /// The marker is over its size bound.
     MarkerOversized,
     /// The marker is from a release that recorded no identities.
     MarkerOldFormat,
-    /// The marker's version is not one this release reads.
     MarkerUnsupportedVersion,
-    /// The marker fails parsing or validation.
     MarkerMalformed,
-    /// The canonical daily file could not be read.
     CanonicalUnreadable,
     /// The canonical daily file is neither the replacement nor the prior
     /// the marker records, nor absent with no prior recorded.
     PriorMismatch,
-    /// A listed input is not at its path.
     InputMissing,
-    /// A listed input is at its path with another identity.
     InputMismatch,
-    /// A listed input could not be read.
     InputUnreadable,
 }
 
 impl Proof {
-    /// The fixed `snake_case` label.
     pub const fn label(self) -> &'static str {
         match self {
             Self::DayNotCanonical => "day_not_canonical",
@@ -507,8 +401,6 @@ impl fmt::Display for Proof {
     }
 }
 
-/// What recovery does with one marker. See the
-/// [module documentation](self).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Decision {
     /// Case a: the canonical file is the replacement.
@@ -535,8 +427,6 @@ pub fn classify(
         return present_inputs_match(marker, day_dir, &mut observe)
             .map_or(Decision::Published, Decision::Unresolved);
     }
-    // The rollup leaves the canonical file absent with no prior, or as the
-    // prior, until its rename.
     let before_rename = match (canonical, marker.prior) {
         (Observation::Absent, None) => true,
         (canonical, Some(prior)) => canonical.is(prior),
@@ -593,13 +483,11 @@ pub struct RawMarker {
     pub version: u64,
     pub replacement: OutputIdentity,
     pub prior: Option<OutputIdentity>,
-    /// Names as written, then identities.
     pub inputs: Vec<(String, OutputIdentity)>,
 }
 
 #[cfg(any(test, feature = "test-support"))]
 impl RawMarker {
-    /// This release's format and version, with these parts.
     pub fn new(
         replacement: OutputIdentity,
         prior: Option<OutputIdentity>,
@@ -614,7 +502,6 @@ impl RawMarker {
         }
     }
 
-    /// The body, in the encoding [`RollupMarker::encode`] writes.
     pub fn encode(&self) -> String {
         let record = Record {
             format: self.format.clone(),
@@ -670,8 +557,6 @@ mod tests {
             other => panic!("expected a malformed marker, got {other:?}"),
         }
     }
-
-    // ---- encoding and validation ----
 
     #[test]
     fn a_marker_round_trips_through_its_encoding() {
@@ -731,7 +616,6 @@ mod tests {
     fn validation_refuses_another_services_input() {
         let raw = RawMarker::new(id(1), None, vec![("03/web.parquet".to_owned(), id(2))]);
         assert_malformed(decode_raw(&raw), "is not HH/api.parquet");
-        // The same body read as the other service's marker is valid.
         assert!(decode("web", raw.encode().as_bytes()).is_ok());
     }
 
@@ -741,9 +625,6 @@ mod tests {
         assert_malformed(decode_raw(&raw), "listed twice");
     }
 
-    /// A rollup merges at most one input per hour, `00` to `23`: a marker
-    /// listing every hour is read, and one entry more is refused by its
-    /// count before any name is looked at.
     #[test]
     fn validation_bounds_the_input_count() {
         assert_eq!(MAX_INPUTS, 24, "one input per hour, 00 to 23");
@@ -761,9 +642,6 @@ mod tests {
         );
     }
 
-    /// Marker hours share the partition grammar: an input under an hour
-    /// directory past `23` makes the whole marker malformed, alone or
-    /// beside a valid hour.
     #[test]
     fn rejects_hours_past_23() {
         let last = RawMarker::new(id(1), None, vec![("23/svc.parquet".to_owned(), id(2))]);
@@ -869,11 +747,8 @@ mod tests {
         let marker = RollupMarker::new(&service, max, Some(max), inputs).unwrap();
         let len = marker.encode().len() as u64;
         assert!(len <= MAX_ROLLUP_MARKER_BYTES, "{len}");
-        // The bound is tight enough to mean something: within 2 KiB.
         assert!(MAX_ROLLUP_MARKER_BYTES - len < 2048, "{len}");
     }
-
-    // ---- the bounded reader ----
 
     fn write_marker(dir: &Path, body: &[u8]) -> PathBuf {
         let path = dir.join(marker_file_name(SERVICE));
@@ -912,7 +787,6 @@ mod tests {
             .set_len(1 << 40)
             .unwrap();
         assert!(matches!(read(&path), Err(ReadError::Oversized)));
-        // At the bound it is read; one byte more is refused.
         let body = RawMarker::new(id(1), None, vec![input("03", 2)]).encode();
         let at_bound = format!(
             "{body:<width$}",
@@ -951,10 +825,6 @@ mod tests {
         assert!(matches!(result, Err(ReadError::Unreadable(_))));
     }
 
-    // ---- classify ----
-
-    /// The states a test puts each path in. An input's state is relative
-    /// to its recorded identity.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum File {
         Absent,
@@ -1005,8 +875,6 @@ mod tests {
         }
     }
 
-    /// Classify with the canonical, the tmp and the two inputs in these
-    /// states, and return the decision and the paths observed in order.
     fn run(prior: bool, canonical: File, tmp: File, inputs: [In; 2]) -> (Decision, Vec<PathBuf>) {
         let marker = marker(prior);
         let day = day();
@@ -1028,10 +896,7 @@ mod tests {
         (decision, seen)
     }
 
-    /// The rules of the module documentation, restated case by case.
     fn expected(prior: bool, canonical: File, tmp: File, inputs: [In; 2]) -> Decision {
-        // In a and b, the first present input that differs or cannot be
-        // read is reported; an absent one was retired.
         let present_inputs_ok = || {
             inputs.iter().find_map(|state| match state {
                 In::Differs => Some(Proof::InputMismatch),
@@ -1057,7 +922,6 @@ mod tests {
                 Proof::PriorMismatch
             });
         }
-        // Only the first input that fails is reported.
         match inputs.iter().find(|state| **state != In::Matches) {
             None => Decision::Abort,
             Some(In::Absent) => Decision::Unresolved(Proof::InputMissing),
@@ -1090,9 +954,6 @@ mod tests {
                                 "prior {prior}, canonical {canonical:?}, tmp {tmp:?}, \
                                  inputs {inputs:?}"
                             );
-                            // The canonical is always looked at first, and
-                            // the tmp never once the canonical is the
-                            // replacement.
                             assert_eq!(seen[0], day().join("api.parquet"));
                             if canonical == File::Replacement {
                                 assert!(!seen.contains(&day().join("api.parquet.tmp")));
@@ -1109,9 +970,8 @@ mod tests {
     /// A named row: prior recorded, canonical, tmp, inputs, decision.
     type Row = (&'static str, bool, File, File, [In; 2], Decision);
 
-    /// The rows the acceptance criteria name, spelled out.
     #[test]
-    #[allow(clippy::too_many_lines)] // one table, a row per named case
+    #[allow(clippy::too_many_lines)]
     fn classify_named_rows() {
         use File as F;
         use In as I;
@@ -1261,8 +1121,6 @@ mod tests {
 
     #[test]
     fn a_merged_sibling_is_not_an_input_at_its_path() {
-        // Recovery observes only `HH/{service}.parquet`. A `.merged` file
-        // beside it is never looked at, so it cannot make case c hold.
         let marker = marker(false);
         let day = day();
         let mut seen = Vec::new();

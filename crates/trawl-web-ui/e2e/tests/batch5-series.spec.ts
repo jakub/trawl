@@ -26,8 +26,6 @@ for (const deviceScaleFactor of [1, 2]) {
       } }));
       await page.goto('/search?q=' + encodeURIComponent('service=nginx | timechart ' + labels.map(label => `count() as ${label}`).join(', ')));
       await page.getByRole('tab', { name: 'Visualization' }).click();
-      // x is the bucket instant, in UTC, and the legend's x row names
-      // the zone the ticks are printed in (ADR-0038).
       await expect(page.locator('.chart .u-legend')).toContainText('UTC');
       await expect(page.locator('.chart .series-key line')).toHaveCount(6);
       const indicators = await page.locator('.chart .series-key line').evaluateAll(lines => lines.map(line => ({
@@ -55,10 +53,6 @@ for (const deviceScaleFactor of [1, 2]) {
 }
 
 test('a wide grouped result draws the six largest and says what it left out', async ({ page }) => {
-  // Fourteen hosts, ranked by their total over the fetched rows. Six
-  // draw; the caption is what keeps the other eight from being a lie by
-  // omission (ADR-0038). `_time` here is the snapshot wire spelling: a
-  // `timestamp` cell at offset zero.
   const hosts = Array.from({ length: 14 }, (_, i) => `host-${String(i + 1).padStart(2, '0')}`);
   const rows = hosts.flatMap((host, i) => [
     ['2026-09-01T00:00:00.000000Z', host, String(i + 1)],
@@ -75,20 +69,16 @@ test('a wide grouped result draws the six largest and says what it left out', as
   await expect(page.locator(`${SEL.chartHost} canvas`)).toHaveCount(1);
   await expect(page.locator(`${SEL.chartHost} .series-key`)).toHaveCount(6);
   await expect(page.locator(SEL.chartHost)).toHaveAttribute('data-series', '6');
-  // The six largest, in label order, and nothing from the tail.
   await expect(page.locator(`${SEL.chartHost} .series-key`))
     .toHaveText(hosts.slice(8));
   await expect(page.locator('.visualization .chart-caption'))
     .toHaveText('6 of 14 series drawn; the 8 smallest by total are not, among them host-08, host-07 and host-06. Narrow host, or');
 
-  // The control beside the caption completes its sentence and names what
-  // Events holds; the note keeps only the bucket, the axis and the gaps.
   await expect(page.locator('.visualization button.btn-lnk'))
     .toHaveText('Open Events for exact times and values');
   await expect(page.locator('.visualization .chart-note'))
     .toHaveText('1 minute per bucket. Metrics over time on a UTC axis. Gaps mean no value was returned.');
 
-  // And the caption's own way to the rows it is talking about.
   await page.locator('.visualization button.btn-lnk').click();
   await expect(page.getByRole('tab', { name: /^Events/ })).toHaveAttribute('aria-selected', 'true');
 });

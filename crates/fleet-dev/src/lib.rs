@@ -3,9 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Trawl-owned local development controller.
-//!
-//! The crate intentionally supports exactly the Trawl and Coastwatch
-//! development stacks. It is not a general plugin runner.
 
 pub mod cli;
 pub mod command;

@@ -3,41 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `<RepinModal/>` — the dry-run-first repin ladder (ADR-0011).
-//!
-//! The CLI's `--dry-run` → `--yes` → `--force` ladder, rendered. The
-//! rules it exists to keep:
-//!
-//! 1. **Nothing runs before a plan.** Mounting POSTs `dry_run: true`;
-//!    the real run is reachable only from a plan the operator has seen.
-//!    Changing the target invalidates that plan rather than carrying its
-//!    numbers onto a different type.
-//! 2. **Force is reachable only after a refusal.** The server decides
-//!    lossiness — the modal never pre-empts it by offering force on a
-//!    plan whose `projected_nulls` looks non-zero. The checkbox appears
-//!    once `refused_needs_force` has come back, defaults off, and must
-//!    be checked before the forced run can be started.
-//! 3. **Force accepts a printed number, and binds that number.** The
-//!    ceilings a forced run is held to are resolved server-side from a
-//!    FORCED scan, so the dialog asks for a forced plan, shows the pair
-//!    that plan resolved, and the execution restates it as explicit
-//!    ceilings. Sending none and letting the server re-derive would bind
-//!    a limit nobody read, which is what ceilings exist to stop (issue
-//!    #111). It is the same rule the CLI's `--yes --force` preview
-//!    keeps. The acceptance opens for a forced scan this dialog asked
-//!    for and nothing else: a refusal carrying ceilings is a run that
-//!    busted them, not a consent to run it again, and a refusal for a
-//!    target the strip does not offer is not this dialog's plan at all.
-//! 4. **The plan is a snapshot, not a reservation.** Ingest keeps
-//!    running; the real run rescans, and its numbers can differ.
-//! 5. **An indeterminate outcome never offers to run again.** A real run
-//!    whose response was lost may have claimed a job; only a status
-//!    probe that can prove which job is ours resolves that, and the
-//!    absence of proof leaves the operator a re-probe, never a second
-//!    rewrite.
-//!
-//! Closing the modal does not cancel anything: past the claim the job
-//! runs detached server-side, so a dismissed dialog abandons the
-//! response, never the work.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -54,30 +19,21 @@ use crate::repin_flow::{
 use crate::service_card_fmt::{format_bytes, format_exact};
 use fleet_ui::{Btn, Icon, Modal, Segmented, SegmentedOption, Variant};
 
-/// The wire status a refusal carries — the one status this dialog has to
-/// act on rather than render. The vocabulary is
-/// `trawl-server/src/store/repin.rs`.
 const STATUS_REFUSED: &str = "refused_needs_force";
 
-/// Shown in the busy block when the slot re-check could not be read. The
-/// slot's state is then unknown, which is not "free".
 const SLOT_CHECK_FAILED: &str = "Couldn't read the repin status just now, so whether the slot is \
                                  still held is unknown. Try again.";
 
 #[derive(Debug, Clone)]
 enum Phase {
-    /// A dry run is in flight. An honest busy state: the scan is a
-    /// full-corpus pass and can take minutes.
     Planning,
     /// The shown plan no longer describes the selected target, so it is
     /// gone until the operator asks for a new one.
     NeedsPlan,
-    /// A plan is on screen and can be executed.
     Plan(Box<RepinJobResponse>),
     /// The real run came back `refused_needs_force`: the same plan,
     /// re-presented with the numbers the refusal was based on.
     NeedsForce(Box<RepinJobResponse>),
-    /// A real run is in flight.
     Submitting,
     /// The one-running slot is held elsewhere. No confirm from here —
     /// only a re-read of the slot, which returns to [`Phase::NeedsPlan`]
@@ -87,11 +43,8 @@ enum Phase {
     /// prove what became of it. The rewrite may be running right now, so
     /// this phase offers exactly one action: probe again.
     Indeterminate {
-        /// The failure that lost the response.
         lost: String,
-        /// What the last probe could not establish.
         why: Unproven,
-        /// The plan the run was started from, kept on screen.
         plan: Option<Box<RepinJobResponse>>,
         /// What was asked for, so a re-probe can recognise it.
         run: LostRun,
@@ -113,8 +66,6 @@ enum Phase {
     },
 }
 
-/// One request off this dialog: which rung of the ladder it is, and what
-/// it binds. (`Rung`, not `Run`, because `dry_run` is one of them.)
 #[derive(Debug, Clone, Copy)]
 struct Rung {
     dry_run: bool,
@@ -125,7 +76,6 @@ struct Rung {
 }
 
 impl Rung {
-    /// The plan, unforced. What mounting asks for.
     fn plan() -> Self {
         Self {
             dry_run: true,
@@ -166,9 +116,6 @@ impl Rung {
     }
 }
 
-/// The dialog's own reactive handles, carried to the out-of-line probes
-/// as one value. They are `Copy` handles; a probe that took eight
-/// positional signals is a probe that writes the wrong one.
 #[derive(Clone, Copy)]
 struct Handles {
     phase: RwSignal<Phase>,
@@ -193,17 +140,10 @@ struct Handles {
 }
 
 impl Handles {
-    /// Whether the dialog these handles belong to is still mounted. A
-    /// disposed `StoredValue` reads as `None`, which is the same answer
-    /// as the flag itself.
     fn is_alive(self) -> bool {
         self.alive.try_get_value() == Some(true)
     }
 
-    /// Whether a probe made for generation `turn` failed with a 401 that
-    /// sent the page to sign-in. Asked only of a mounted dialog whose
-    /// generation is still `turn`, so a stale or disposed probe never
-    /// navigates. A declined 401 is an ordinary failed read.
     fn leaves_for_sign_in(self, turn: u32, failure: Option<&ApiError>) -> bool {
         self.is_alive()
             && self.generation.try_get_untracked() == Some(turn)
@@ -211,10 +151,6 @@ impl Handles {
     }
 }
 
-/// One status read, as the dialog's decisions take it: the reduction,
-/// the row for a caller that may adopt it, and the failure itself, which
-/// the caller hands to the sign-in handler once it knows the read is
-/// still its own.
 struct Probed {
     probe: StatusProbe,
     job: Option<RepinJobResponse>,
@@ -228,27 +164,20 @@ struct Probed {
 #[allow(clippy::too_many_lines, clippy::needless_pass_by_value)]
 pub fn RepinModal(
     field: String,
-    /// The pin as it stands — excluded from the target strip.
     current_type: String,
-    /// The analyzer's suggestion; the selector's starting rung.
     suggested_to: String,
-    /// A refusal to re-present instead of planning afresh. `Some` when
-    /// the case file's poll watched a running job land
-    /// `refused_needs_force`: that job's scan is the plan, so asking for
-    /// a second one would be a second full-corpus pass for the same
-    /// answer.
+    /// A refusal to re-present instead of planning afresh: `Some` when the
+    /// case file's poll watched a running job land `refused_needs_force`.
+    /// That job's scan is the plan; a second one would be a second
+    /// full-corpus pass for the same answer.
     refused: Option<RepinJobResponse>,
     on_close: Callback<Option<RepinJobResponse>>,
 ) -> impl IntoView {
     let shown_field = sanitize_display_text(&field);
     let targets = repin_targets(&current_type);
-    // A refusal is the scan of ONE target. Re-presenting it under any
-    // other rung would put its counts, and the ceilings a forced run
-    // restates, against a cast that produced none of them — so a target
-    // this dialog does not offer (a CLI-started `SEVERITY` or
-    // resurrection repin) drops the plan here and the dialog starts from
-    // a fresh scan. The refusal itself is not lost: the case file keeps
-    // it as a receipt and points at the CLI.
+    // A refusal is the scan of ONE target, so a target this dialog does
+    // not offer drops the plan here and the dialog starts from a fresh
+    // scan.
     let refused = refused.filter(|job| refusal_is_reusable(&current_type, &job.to_type));
     let initial = refused.as_ref().map_or_else(
         || default_target(&current_type, &suggested_to).as_catalog(),
@@ -279,7 +208,6 @@ pub fn RepinModal(
     // probe mutates anything, but both own the primary action while they
     // run.
     let probing = RwSignal::new(false);
-    // Why the last slot re-check told us nothing.
     let slot_note = RwSignal::new(None::<String>);
     // Every initiating click bumps this; a response whose generation is
     // stale (the operator changed target and re-planned meanwhile) is
@@ -289,10 +217,6 @@ pub fn RepinModal(
     // say. Advisory: the busy message stands on its own without it.
     let busy_field = RwSignal::new(None::<String>);
 
-    // Modal-level liveness. Every request below outlives the click that
-    // issued it, and closing the dialog disposes the signals above: a
-    // read of one then panics, so each future re-checks this the moment
-    // it comes back from an await.
     let alive = StoredValue::new(true);
     on_cleanup(move || alive.set_value(false));
     let handles = Handles {
@@ -307,8 +231,6 @@ pub fn RepinModal(
     };
 
     let field_for_calls = field.clone();
-    // The one place a repin request is issued. The `Run` decides which
-    // rung of the ladder; nothing else varies.
     let submit = Callback::new(move |run: Rung| {
         let Rung {
             dry_run,
@@ -344,17 +266,9 @@ pub fn RepinModal(
             // gate: the job is claimed and running detached server-side,
             // so the one thing that must survive a dialog closed mid-claim
             // is the hand-up. `try_run` because the callback may be
-            // disposed too — the case-file drawer that owns it outlives
-            // this modal, and in the case where even that is gone, the
-            // drawer's mount-time status read adopts the running job the
-            // next time the case file is opened.
-            //
-            // A dry run's 202 is a scan that outlasted the server's answer
-            // bound (ADR-0054). Its report is the status route's to give,
-            // so the dialog follows the job there by its id and reads the
-            // terminal row as the 200 would have been read. Nothing is
-            // handed up: a dry run mutates nothing, and a dialog closed
-            // meanwhile simply stops following.
+            // disposed too. A dry run's 202 is a scan that outlasted the
+            // server's answer bound (ADR-0054), so the dialog follows the
+            // job on the status route by its id.
             let outcome = match outcome {
                 Ok(RepinOutcome::Started(job)) if !job.dry_run => {
                     on_close.try_run(Some(job));
@@ -380,14 +294,10 @@ pub fn RepinModal(
                 }
                 other => other,
             };
-            // Everything past here paints this dialog, so a closed one
-            // has nothing left to say — and reading a disposed signal
-            // panics where writing one is a silent no-op.
             if !handles.is_alive() {
                 return;
             }
             if generation.try_get_untracked() != Some(seq) {
-                // A newer request owns the dialog now.
                 return;
             }
             busy.set(false);
@@ -441,13 +351,8 @@ pub fn RepinModal(
                         return;
                     }
                     // A dry run mutates nothing, and a real run answered
-                    // a definitive 4xx was decided before the claim: a
-                    // 400's validation, a 403 from a permission that
-                    // expired between the plan and the confirm, a 404
-                    // for a name the catalog does not hold. Both keep
-                    // the plan and say what the server said — calling
-                    // either outcome unknown would send an operator
-                    // hunting a job that does not exist.
+                    // a definitive 4xx was decided before the claim. Both keep
+                    // the plan and say what the server said.
                     if dry_run || is_pre_claim_failure(e.http_status()) {
                         phase.set(Phase::Failed {
                             message: failure_text(&e),
@@ -482,9 +387,6 @@ pub fn RepinModal(
 
     let cancel = Callback::new(move |()| on_close.run(None));
 
-    // The primary action depends on the rung: plan, run, forced run, or
-    // — where the outcome is not this dialog's to decide — a status read
-    // that can never mutate anything.
     let primary = Callback::new(move |()| {
         if probing.get_untracked() {
             return;
@@ -622,11 +524,7 @@ pub fn RepinModal(
                         // Frozen while anything is outstanding. A real
                         // run's 202 is the only thing that can hand the
                         // job to the case file, so it must not be dropped
-                        // by a generation bump; a dry run's scan holds
-                        // the one-running slot until it terminalizes
-                        // server-side, so abandoning it here would leave
-                        // the follow-up plan 409-ing against our own
-                        // scan with no way back; and an indeterminate
+                        // by a generation bump, and an indeterminate
                         // run's target is the only record of what may be
                         // rewriting the corpus right now.
                         if target_locked.get_untracked() {
@@ -637,8 +535,6 @@ pub fn RepinModal(
                         // Ceilings are a function of the scan, and the
                         // scan was for another target.
                         previewed.set(false);
-                        // The plan on screen was scanned for a different
-                        // target. It is not adapted, it is discarded.
                         generation.update(|g| *g += 1);
                         busy.set(false);
                         phase.set(Phase::NeedsPlan);
@@ -813,9 +709,6 @@ pub fn RepinModal(
     }
 }
 
-/// Read a checkbox's state off its change event (the `fleet_ui::Toggle`
-/// idiom — this control is a plain checkbox, not a switch, because it is
-/// an acceptance and not a setting).
 fn checked_from_event(e: &leptos::ev::Event) -> bool {
     use wasm_bindgen::JsCast;
     e.target()
@@ -823,9 +716,6 @@ fn checked_from_event(e: &leptos::ev::Event) -> bool {
         .is_some_and(|el| el.checked())
 }
 
-/// The scan's numbers. `refused` swaps the copy from "what this will do"
-/// to "what the refusal is based on" — the numbers themselves are the
-/// same shape, produced by the same expressions the rewrite writes.
 fn plan_block(job: &RepinJobResponse, refused: bool) -> AnyView {
     // Exact digits, not the compact `format_count` the tables use: these
     // are numbers an operator accepts responsibility for, and "1.2k
@@ -904,7 +794,6 @@ impl Probed {
     }
 }
 
-/// One `/schema/repin/status` read.
 async fn status_probe() -> Probed {
     match api::repin_status().await {
         Ok(resp) => Probed::job(resp.job),
@@ -912,9 +801,6 @@ async fn status_probe() -> Probed {
     }
 }
 
-/// One `/schema/repin/status?id=` read of job `id`, reduced the way
-/// [`status_probe`] reduces the install-wide one. The route's 404 is
-/// [`StatusProbe::NoJob`]: it holds no such job.
 async fn job_probe(id: i64) -> Probed {
     match api::repin_job_status(id).await {
         Ok(job) => Probed::job(job),
@@ -922,15 +808,10 @@ async fn job_probe(id: i64) -> Probed {
     }
 }
 
-/// Follow the dry run a 202 answered with until its row is terminal,
-/// under the case file's own [`poll_decide`] rules.
-///
-/// The 202's row is the first read, as in the CLI's `wait_for_terminal`:
-/// a terminal one is classified at once, and only a running one is read
-/// again, by its id, once per [`REPIN_POLL_MS`]. By id, so another job in
-/// the one-running slot can never stand in for this one. `None` once the
-/// dialog is gone, or once a read of request `seq` sent the page to
-/// sign-in, which stops the reads.
+/// Follow the dry run a 202 answered with, under the case file's own
+/// [`poll_decide`] rules. By id, so another job in the one-running slot
+/// can never stand in for this one. `None` once the dialog is gone or a
+/// read sent the page to sign-in.
 async fn follow_plan(
     started: RepinJobResponse,
     seq: u32,
@@ -968,11 +849,6 @@ async fn follow_plan(
     }
 }
 
-/// A real run whose response was lost, or a re-probe of one. The status
-/// route gets to say exactly one thing: whether it holds a job that is
-/// provably this request's ([`recovery_verdict`]). It is adopted if so —
-/// anything else, including a probe that failed outright, leaves the
-/// dialog [`Phase::Indeterminate`], which offers no mutation at all.
 fn probe_recovery(
     run: LostRun,
     plan: Option<Box<RepinJobResponse>>,
@@ -1041,8 +917,6 @@ fn probe_slot(adopt_free: bool, handles: Handles) {
     let turn = handles.generation.get_untracked();
     spawn_local(async move {
         let read = status_probe().await;
-        // Nothing this read can decide matters to a dialog that is gone,
-        // and it mutates nothing server-side either way.
         if !handles.is_alive() {
             return;
         }
@@ -1075,9 +949,6 @@ fn probe_slot(adopt_free: bool, handles: Handles) {
     });
 }
 
-/// The sentence shown for a failed request. The server's own message
-/// where there is one, plus the one piece of context a bare 503 leaves
-/// out.
 fn failure_text(err: &ApiError) -> String {
     if err.http_status() == Some(503) {
         format!(

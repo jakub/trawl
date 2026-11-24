@@ -1,14 +1,9 @@
 #!/usr/bin/env bash
 #
 # postgres-no-durability.sh turns off durability on CI's throwaway postgres
-# service container: the settings docker-compose.dev.yml passes on the
-# command line, so per-test CREATE and DROP DATABASE stay cheap. Every DROP
-# DATABASE forces a checkpoint, and with fsync on, each one synced every file
-# of every database created since the last: 17-34 s stalls that held whole
-# batches of pg tests at teardown. GitHub service containers take no command
-# line, but all three settings apply on a configuration reload.
-#
-# Usage: ci/postgres-no-durability.sh <service-container-id>
+# service container, so per-test CREATE and DROP DATABASE stay cheap.
+# GitHub service containers take no command line, but the three settings
+# below apply on a configuration reload.
 set -euo pipefail
 
 container=$1

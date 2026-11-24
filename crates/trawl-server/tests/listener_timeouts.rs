@@ -3,16 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The listener's deadlines, protocol and bookkeeping, through the
-//! production TLS listener (ADR-0054, amended 2026-10-17).
-//!
-//! Every case boots a second server over the fixture's state through
-//! `serve_with_listener_and_timeouts`, with deadlines short enough to wait
-//! out, and talks to it over sockets of its own: a bare TCP stream for the
-//! handshake cases, a rustls client stream with hand-written HTTP/1.1 for
-//! the rest. The accept loop's own bookkeeping, how many connection tasks
-//! it holds and how many handshakes it dropped at their deadline, is read
-//! through the probe the seam reports to, so a case can tell a deadline
-//! from a parse refusal and a reaped task from one still held.
+//! production TLS listener (ADR-0054).
 
 mod common;
 
@@ -56,7 +47,6 @@ const PARTIAL_CLIENT_HELLO: [u8; 11] = [
     0x16, 0x03, 0x01, 0x02, 0x00, 0x01, 0x00, 0x01, 0xfc, 0x03, 0x03,
 ];
 
-/// A second server over `server`'s state at `timeouts`, with its probe.
 async fn spawn(
     server: &TestServer,
     timeouts: ConnectionTimeouts,
@@ -68,13 +58,10 @@ async fn spawn(
     (url, probe, task)
 }
 
-/// `host:port` of an `https://` URL.
 fn authority(url: &str) -> &str {
     url.strip_prefix("https://").expect("an https:// URL")
 }
 
-/// A rustls client config that trusts the fixture certificate and offers
-/// exactly `alpn`, in order; an empty list offers no ALPN at all.
 fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     use rustls::pki_types::pem::PemObject as _;
 
@@ -94,7 +81,6 @@ fn client_config(alpn: &[&[u8]]) -> Arc<rustls::ClientConfig> {
     Arc::new(config)
 }
 
-/// A TLS connection to `url` offering `alpn`, or the handshake's error.
 async fn tls(url: &str, alpn: &[&[u8]]) -> std::io::Result<TlsStream<TcpStream>> {
     let authority = authority(url);
     let host = authority.rsplit_once(':').expect("a URL with a port").0;
@@ -107,7 +93,6 @@ async fn tls(url: &str, alpn: &[&[u8]]) -> std::io::Result<TlsStream<TcpStream>>
         .await
 }
 
-/// A TLS connection to `url` speaking HTTP/1.1.
 async fn h1(url: &str) -> TlsStream<TcpStream> {
     let stream = tls(url, &[b"http/1.1"]).await.expect("TLS handshake");
     assert_eq!(stream.get_ref().1.alpn_protocol(), Some(&b"http/1.1"[..]));
@@ -133,9 +118,6 @@ async fn closed_within<S: tokio::io::AsyncRead + Unpin>(
     }
 }
 
-/// One HTTP/1.1 response: its status, its header block (lower-cased
-/// names, as sent otherwise) and its body, which must be delimited by
-/// `content-length`.
 async fn read_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> (u16, String, Vec<u8>) {
     let mut raw = Vec::new();
     let head_end = loop {
@@ -186,7 +168,6 @@ async fn read_response<S: tokio::io::AsyncRead + Unpin>(stream: &mut S) -> (u16,
     (status, headers, body)
 }
 
-/// Poll `done` every 5 ms until it holds, or fail after [`SLACK`].
 async fn wait_for(mut done: impl FnMut() -> bool, what: &str) {
     let reached = tokio::time::timeout(SLACK, async {
         while !done() {
@@ -210,9 +191,6 @@ async fn health_on_a_fresh_connection(url: &str) -> u16 {
         .as_u16()
 }
 
-/// A connection that sends part of a `ClientHello` and then nothing is
-/// dropped at the handshake deadline, counted as a handshake timeout, not
-/// refused by the parser.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_drops_slow_handshake() {
     let server = common::setup().await;
@@ -236,10 +214,6 @@ async fn listener_drops_slow_handshake() {
     task.abort();
 }
 
-/// What a stalled handshake held, its connection task and its socket, is
-/// given back when it is dropped: the tasks are reaped, and the server
-/// goes on serving. The listener has no handshake count of its own, so the
-/// slot here is the task.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_releases_handshake_slot_after_timeout() {
     let server = common::setup().await;
@@ -274,8 +248,6 @@ async fn listener_releases_handshake_slot_after_timeout() {
     task.abort();
 }
 
-/// The shutdown signal ends a handshake in progress at once, so a peer
-/// stalled in its handshake never holds the drain.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_shutdown_interrupts_handshake() {
     let server = common::setup().await;
@@ -331,8 +303,6 @@ async fn listener_shutdown_interrupts_handshake() {
     assert_eq!(probe.handshake_timeouts(), 0, "shutdown, not a timeout");
 }
 
-/// A request whose headers keep arriving one byte at a time is dropped at
-/// the header deadline all the same: progress does not move it.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_drops_partial_headers_despite_byte_progress() {
     let server = common::setup().await;
@@ -347,8 +317,7 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
     let trickle = Duration::from_millis(50);
     let mut trickled = 0_usize;
     let closed_after = loop {
-        // One byte of a header that never ends, then a short wait for the
-        // server's close. A write error after the close is the close.
+        // A write error after the close is the close.
         if stream.write_all(b"a").await.is_err() {
             break started.elapsed();
         }
@@ -380,8 +349,6 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
     task.abort();
 }
 
-/// After one complete exchange, a connection left idle is closed at the
-/// header deadline: hyper arms the timer again for the next request.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_closes_idle_keep_alive() {
     let server = common::setup().await;
@@ -415,8 +382,6 @@ async fn listener_closes_idle_keep_alive() {
     task.abort();
 }
 
-/// A server-sent event stream that sends nothing stays open past several
-/// header deadlines: no timer runs while a response is being written.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_keeps_quiet_sse_open() {
     let server = common::setup().await;
@@ -457,8 +422,6 @@ async fn listener_keeps_quiet_sse_open() {
     task.abort();
 }
 
-/// An ingest body that takes longer than the header deadline to send is
-/// read whole and answered: the timer stops once the headers are in.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_accepts_ingest_body_longer_than_header_timeout() {
     let server = common::setup().await;
@@ -484,7 +447,6 @@ async fn listener_accepts_ingest_body_longer_than_header_timeout() {
         server.ingest_token
     );
     stream.write_all(head.as_bytes()).await.unwrap();
-    // Six chunks 200 ms apart: 1.2 s of body, past two header deadlines.
     let pause = SHORT.header_read * 2 / 5;
     let started = Instant::now();
     for chunk in &chunks {
@@ -504,9 +466,6 @@ async fn listener_accepts_ingest_body_longer_than_header_timeout() {
     task.abort();
 }
 
-/// ALPN offers HTTP/1.1 alone: a client that also offers `h2` gets
-/// HTTP/1.1, and a client that offers only `h2` is refused at the
-/// handshake.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_negotiates_http11_only() {
     let server = common::setup().await;
@@ -534,8 +493,6 @@ async fn listener_negotiates_http11_only() {
     task.abort();
 }
 
-/// A connection task is reaped when its connection ends, without waiting
-/// for shutdown or for the next accept.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_reaps_completed_connections() {
     let server = common::setup().await;
@@ -545,8 +502,6 @@ async fn listener_reaps_completed_connections() {
         let status = health_on_a_fresh_connection(&url).await;
         assert!((200..600).contains(&status));
     }
-    // Every client is gone, so every connection task ends; the loop reaps
-    // them with no new connection to prompt it.
     wait_for(
         || probe.tracked_connections() == 0,
         "five finished connection tasks reaped",

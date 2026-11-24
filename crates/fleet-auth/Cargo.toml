@@ -23,19 +23,11 @@ http = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 sqlx = { workspace = true, optional = true }
-# tokio is needed for spawn_blocking — argon2id KDF runs ~200 ms in prod
-# params and must not block tokio worker threads. `rt` is the minimum surface
-# for spawn_blocking; `sync` brings the semaphore that caps how many argon2id
-# checks run at once (ADR-0054).
 tokio = { workspace = true, optional = true, features = ["rt", "sync"] }
 tracing = { workspace = true, optional = true }
 
 [features]
 default = ["keystore"]
-# Postgres-backed KeyStore + token + cache + migration export. Pure types
-# (PrincipalKind, RoleAssignment) are always available; future re-export
-# consumers that need to stay wasm-clean can disable the default to drop the
-# native deps (sqlx, argon2, blake3, rand, chrono, tracing).
 keystore = [
     "dep:argon2",
     "dep:base64ct",
@@ -46,56 +38,31 @@ keystore = [
     "dep:tokio",
     "dep:tracing",
 ]
-# Session cookie AEAD (XChaCha20-Poly1305), SessionConfig, and cookie header
-# builders. Independent of `keystore` so consumers that only need the pure
-# AEAD/config surface (e.g. a renderer that decodes an unwrapped
-# SessionPayload) can take just this feature.
 session = [
     "dep:base64ct",
     "dep:chacha20poly1305",
     "dep:chrono",
     "dep:cookie",
-    # `http::HeaderMap` is what `check_origin` takes: the guard reads the
-    # `Origin` field set itself (ADR-0016), because "how many Origin headers
-    # are there" and "is this value UTF-8" are questions a caller must not be
-    # left to answer differently. `http` is a lightweight, wasm-clean types
-    # crate, so it stays fine for session-only (e.g. renderer) consumers.
     "dep:http",
     "dep:rand",
     "dep:serde_json",
-    # `check_origin` emits the canonical cross-origin-rejection log so the
-    # fields/message live in one place; tracing is a lightweight, wasm-clean
-    # facade, so this stays fine for session-only (e.g. renderer) consumers.
     "dep:tracing",
 ]
-# Axum middleware (RequireSession, RequireBearer) + login/logout handler
-# factories. Pulls keystore (verify_key on the request path) and session
-# (cookie AEAD) transitively — there's no middleware without both.
 axum = [
     "keystore",
     "session",
     "dep:axum",
     "dep:tracing",
 ]
-# Test-time argon2id with very low cost so the suite doesn't burn CPU on KDF.
 fast-hash = []
 
 [dev-dependencies]
 # Self dev-dependency: enables the axum + fast-hash features for fleet-auth's
-# OWN test targets without putting them on the default feature path. dev-deps
-# are only built for this crate's tests/examples/benches, so this never leaks
-# into the shipped `--workspace --release` binaries.
+# OWN test targets without putting them on the default feature path.
 fleet-auth = { path = ".", features = ["axum", "fast-hash"] }
 tempfile = { workspace = true }
 tokio = { workspace = true }
-# Already a workspace dependency (trawl-server, trawl-web, trawl-cli). Here it
-# only backs the capture layer that pins the cross-origin rejection log's
-# fields — the claim that a hostile header never reaches the log needs a
-# subscriber to read the emitted line back.
 tracing-subscriber = { workspace = true }
-# Used by integration tests for `Router::oneshot` — only needed under the
-# `axum` feature, but dev-dependencies don't support feature-gating cleanly,
-# so it's unconditional here. The test files themselves are gated.
 tower = { workspace = true }
 
 [lints]

@@ -2,40 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<TopBar/>` — the application command bar.
-//!
-//! nav toggle · page title · spacer · command palette · account menu.
-//! Navigation itself belongs to [`crate::sidebar`] (ADR-0032); the bar
-//! names the current page and carries the two chrome affordances that
-//! are not destinations. The theme choices read the `UiPrefs` context
-//! the consumer provides from `fleet_ui::install()`. The bar knows
-//! nothing about auth, `/me`, or app-specific endpoints: `on_logout` is
-//! a callback the consumer wires to its own logout flow.
-//!
-//! The nav toggle is the compact-width opener for the sidebar overlay.
-//! It is always rendered (CSS shows it below 900px) and always reports
-//! whether the overlay is open, so its state never disagrees with the
-//! shell's.
-//!
-//! The account menu is a native trigger plus the shared menu panel
-//! ([`crate::menu`]), the same contract `ActionsMenu` mounts: the panel
-//! is an overlay layer, so Escape closes it only while it is topmost, a
-//! modal opened from it arbitrates properly, exactly one item is
-//! tabbable, and focus returns to the trigger on every cause but an
-//! outside press. Its trigger's accessible name is the visible user
-//! name — the avatar and the chevron are `aria-hidden`, so nothing
-//! reads "JD" aloud — and it is `disabled` until the consumer's `user`
-//! signal resolves. One predicate decides both whether the panel is on
-//! the page and what `aria-expanded` reports, and losing the identity
-//! closes the menu rather than leaving it open behind an unmounted
-//! panel.
-//!
-//! ADR-0025 and ADR-0028 retired the notifications bell, disabled Profile
-//! and API tokens rows, and theme shortcut hint. No theme shortcut is bound.
-//! The Theme group offers explicit Light, Dark and System preferences, with
-//! initial focus on the checked choice. Shell owns the command palette and
-//! supplies its trigger callback, availability and open state here.
-
 use leptos::html::{Button, Div};
 use leptos::prelude::*;
 
@@ -45,9 +11,6 @@ use crate::kbd::Kbd;
 use crate::menu::{MenuEntry, MenuItem, MenuPanel, MenuRadioItem};
 use crate::theme::{ThemePreference, UiPrefs};
 
-/// User identity for the avatar + dropdown header. `detail` is the
-/// app-supplied secondary line (trawl uses role, coastwatch may use
-/// email — fleet-ui doesn't care).
 #[derive(Debug, Clone, Default)]
 pub struct UserInfo {
     pub name: String,
@@ -56,18 +19,13 @@ pub struct UserInfo {
 
 #[component]
 pub fn TopBar(
-    /// The active destination's label, rendered as the page crumb.
-    #[prop(into)]
-    page_title: Signal<String>,
-    /// Whether the compact sidebar overlay is open, reported by the toggle.
-    #[prop(into)]
-    nav_open: Signal<bool>,
+    #[prop(into)] page_title: Signal<String>,
+    #[prop(into)] nav_open: Signal<bool>,
     on_toggle_nav: Callback<()>,
     /// Focus returns here when the sidebar overlay closes.
     nav_toggle: NodeRef<Button>,
     #[prop(into)] user: Signal<Option<UserInfo>>,
     on_logout: Callback<()>,
-    /// Shell owns the dialog. Required props prevent a decorative dead trigger.
     on_open_palette: Callback<()>,
     #[prop(into)] palette_open: Signal<bool>,
     #[prop(into)] palette_available: Signal<bool>,
@@ -117,11 +75,6 @@ pub fn TopBar(
     }
 }
 
-/// The account menu: native trigger plus the shared menu panel.
-///
-/// Split out of [`TopBar`] as a unit because it is the one part of the
-/// bar with state of its own — the open flag, the wrapper the outside
-/// press is measured against, and the trigger focus returns to.
 fn account_menu(
     user: Signal<Option<UserInfo>>,
     prefs: Option<UiPrefs>,
@@ -132,11 +85,7 @@ fn account_menu(
     let trigger_ref = NodeRef::<Button>::new();
 
     // The one predicate: the panel mounts under it and the trigger
-    // reports it. Deriving `aria-expanded` from `menu_open` alone let
-    // the two disagree, because the panel also needs an identity to
-    // render a header for: losing the user while the menu was open
-    // unmounted the panel (disposing its layer and its focused item)
-    // and left a disabled trigger claiming aria-expanded="true".
+    // reports it, because the panel also needs an identity to render a header for.
     let panel_open = Signal::derive(move || menu_open.get() && user.get().is_some());
 
     // Losing the identity closes the menu for good. Without this the
@@ -155,8 +104,6 @@ fn account_menu(
         );
     }
 
-    // Checked state names the stored preference, even when System resolves to
-    // the same appearance as a fixed choice. Opening does not change it.
     let entries = move || {
         let mut entries = Vec::new();
         if let Some(prefs) = prefs {
@@ -193,9 +140,6 @@ fn account_menu(
                 type="button"
                 node_ref=trigger_ref
                 aria-haspopup="menu"
-                // Rendered unconditionally, including while disabled,
-                // where it reads false: a trigger that only sometimes
-                // reports its state is worse than one that always does.
                 aria-expanded=move || panel_open.get().to_string()
                 disabled=move || user.get().is_none()
                 on:click=move |_| menu_open.update(|v| *v = !*v)

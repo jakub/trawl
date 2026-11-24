@@ -2,19 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `proxy.upstream.trust` and `proxy.upstream.health`.
-//!
-//! Each test runs the doctor against real rustls upstreams: a
-//! [`TlsFront`] that counts the connections it accepted and the handshakes
-//! that failed, relaying to a wiremock server whose log keeps every request
-//! the probe sent. Each run is one report, so the counts are exact: one
-//! probe is one connection and one request, and a refused certificate is one
-//! failed handshake and no request.
-//!
-//! The upstream's URL and host, the connect address, the CA's subject and
-//! the leaf's names are planted: none may reach the output. The CA's subject
-//! and the leaf's DNS names carry [`SECRET`] as well.
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -30,31 +17,23 @@ use crate::support::{
 };
 use crate::test_support::{LOOPBACK_SANS, TestCa, TlsFront, TlsUpstream};
 
-/// The subject of every test CA here.
 const CA_SUBJECT: &str = "trawl doctor private-secret upstream CA";
 
 /// The subject rcgen gives a leaf that names none: every [`TlsFront`]'s.
 const LEAF_SUBJECT: &str = "rcgen self signed cert";
 
-/// A DNS name the upstream's certificate covers, reached through
-/// `upstream_connect_addr`.
 const UPSTREAM_NAME: &str = "upstream.private-secret.test";
 
-/// A DNS name no test's URL uses.
 const OTHER_NAME: &str = "elsewhere.private-secret.test";
 
-/// A test's home directory and its configuration, with the planted values
-/// every run checks the output for.
 struct Setup {
     home: tempfile::TempDir,
     config: WebDoctorConfig,
-    /// The environment besides `HOME`.
     env: Vec<(&'static str, OsString)>,
     planted: Vec<String>,
 }
 
 impl Setup {
-    /// A proxy in a fresh home that dials `url` and pins `ca`.
     fn pinned(url: String, ca: &Arc<TestCa>) -> Self {
         let home = tempfile::tempdir().expect("home");
         let mut config = WebDoctorConfig::in_dir(home.path());
@@ -76,7 +55,6 @@ impl Setup {
         self.planted.push(value.into());
     }
 
-    /// Run the doctor once, as JSON, and return its exit status and report.
     /// The run happens off the runtime's threads, so the fronts keep
     /// serving while it waits.
     async fn run(&self) -> (i32, Report) {
@@ -92,7 +70,6 @@ impl Setup {
         (observed.code, parsed)
     }
 
-    /// Run the doctor once in `format`, checked for every planted value.
     async fn run_format(&self, format: &'static str) -> Observed {
         let config_path = write_config(self.home.path(), &self.config);
         let mut env = home_env(self.home.path());
@@ -118,8 +95,6 @@ fn args(config: &Path, format: &str) -> [OsString; 5] {
     ]
 }
 
-/// Every row passed or was not configured; trust and health completed, and
-/// each check trawld reports has a row that completed.
 fn assert_passes(code: i32, report: &Report) {
     assert_eq!(code, 0, "{report:?}");
     for check in report.checks() {
@@ -148,7 +123,6 @@ fn assert_passes(code: i32, report: &Report) {
     }
 }
 
-/// The health row failed with `why`, and the run exits 1.
 fn assert_health_failed(code: i32, report: &Report, why: &str) {
     assert_eq!(code, 1, "{report:?}");
     assert_eq!(
@@ -165,9 +139,6 @@ fn assert_health_failed(code: i32, report: &Report, why: &str) {
     );
 }
 
-/// A pinned CA, a real rustls upstream serving trawld's health answer, and
-/// a whole, correct configuration with a 32-byte key file: every check
-/// passes, in both forms, and each run is one connection and one request.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_pinned_upstream_passes() {
     let upstream = healthy_upstream().await;
@@ -202,9 +173,6 @@ async fn web_doctor_pinned_upstream_passes() {
     assert_anonymous_probes(upstream.mock(), 2).await;
 }
 
-/// `upstream_connect_addr`: the URL names a DNS name the leaf covers and no
-/// resolver knows, the connection goes to the address, and TLS verifies
-/// the name.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_connect_addr_passes() {
     let ca = TestCa::named(CA_SUBJECT);
@@ -232,10 +200,6 @@ async fn web_doctor_connect_addr_passes() {
     assert_anonymous_probes(&mock, 1).await;
 }
 
-/// A leaf for another name, from the pinned CA: the trust itself resolves,
-/// and the probe fails on the certificate, once. One connection, one failed
-/// handshake, no retry, no request. The URL's name is checked whether it is
-/// an IP literal or a DNS name dialled through `upstream_connect_addr`.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_wrong_name_fails_once() {
     for through_connect_addr in [false, true] {
@@ -274,13 +238,8 @@ async fn web_doctor_wrong_name_fails_once() {
     }
 }
 
-/// A session key in the environment, as fleet-dev sets it; it carries
-/// nothing the output may show.
 const ENV_KEY: &str = "ZG9jdG9yLXByb2JlLWFub255bW91cy1rZXktMzJieXQ=";
 
-/// The probe carries nothing of a session or a key, whatever the proxy
-/// holds: a key file, a key in the environment, and an upstream URL with
-/// a trailing slash. It sends exactly `GET /api/v1/health`, once.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_probe_is_anonymous() {
     let upstream = healthy_upstream().await;
@@ -300,9 +259,6 @@ async fn web_doctor_probe_is_anonymous() {
     assert_anonymous_probes(upstream.mock(), 1).await;
 }
 
-/// A URL with a user name and password fails trust with a fixed sentence
-/// before anything is sent: health is blocked, and the upstream the URL
-/// names sees no connection.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_userinfo_refused() {
     let upstream = healthy_upstream().await;
@@ -333,9 +289,6 @@ async fn web_doctor_userinfo_refused() {
     assert_anonymous_probes(upstream.mock(), 0).await;
 }
 
-/// The upstream answers the probe with a 307 to a second listener the pin
-/// also trusts: the probe fails `redirect_refused`, and the second listener
-/// sees no connection at all.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_redirect_refused() {
     let ca = TestCa::named(CA_SUBJECT);
@@ -366,13 +319,6 @@ async fn web_doctor_redirect_refused() {
     assert_anonymous_probes(elsewhere.mock(), 0).await;
 }
 
-/// trawld's request-limit refusal, under the regular or the probe message,
-/// is a capacity refusal and not a foreign answer: `proxy.upstream.health`
-/// is `not_sampled`/`request_limit_reached` with the shared text and a
-/// retry with backoff, no per-check row is invented, no row says another
-/// service answers, and the run is incomplete. One probe, no retry. The
-/// same code under a 200, and an unrelated 503 envelope, still fail as
-/// answers that are not trawld's (ADR-0054).
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_request_limit_refusal_is_not_sampled() {
     let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
@@ -419,8 +365,6 @@ async fn web_doctor_request_limit_refusal_is_not_sampled() {
         assert_anonymous_probes(upstream.mock(), 1).await;
     }
 
-    // Controls: the code under a status trawld does not pair it with, and
-    // an unrelated envelope or body under a 503, are still not trawld's.
     for (status, body) in [
         (200, regular),
         (503, r#"{"error":{"code":"internal_error","message":"x"}}"#),
@@ -445,9 +389,8 @@ async fn web_doctor_request_limit_refusal_is_not_sampled() {
     }
 }
 
-/// Nothing accepts connections at the upstream's address. The port is held
-/// by a socket bound without listening for the whole run, so no other
-/// process can take it and answer: a connection to it is refused.
+/// The port is held by a socket bound without listening for the whole
+/// run, so no other process can take it and answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_upstream_down() {
     let held = tokio::net::TcpSocket::new_v4().expect("a socket");
@@ -465,8 +408,6 @@ async fn web_doctor_upstream_down() {
     drop(held);
 }
 
-/// The pin names a file trawld has not written yet: trust could not look,
-/// health is blocked on it, and the run is incomplete, exit 3.
 #[tokio::test(flavor = "multi_thread")]
 async fn web_doctor_ca_not_present_is_incomplete() {
     let ca = TestCa::named(CA_SUBJECT);
@@ -502,10 +443,7 @@ async fn web_doctor_ca_not_present_is_incomplete() {
 
 /// With no pin, building the probe's client loads the platform's roots,
 /// from `SSL_CERT_FILE` when it is set. There it names a FIFO with no
-/// writer, as a CA bundle on a stalled mount would hold the read: the
-/// doctor bounds that load, trust still reports the platform roots, the
-/// probe could not look, and the run is incomplete, exit 3. The FIFO's
-/// path is planted: the report does not name it.
+/// writer, as a CA bundle on a stalled mount would hold the read.
 #[cfg(unix)]
 #[test]
 fn web_doctor_platform_roots_stall_is_incomplete() {

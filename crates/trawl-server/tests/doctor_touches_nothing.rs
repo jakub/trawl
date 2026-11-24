@@ -5,20 +5,8 @@
 //! `trawld --doctor` calls nothing that writes, locks, migrates, or boots
 //! (ADR-0047, #269 D20).
 //!
-//! A doctor that repairs what it inspects has changed the installation it
-//! was asked to describe. The doctor's code lives in `src/doctor/`, and this
-//! test reads every file there for the calls that would do that: the boot's
-//! admission and recovery steps, the pool and keystore owners, the
-//! advisory-lock and migration calls, TLS generation, boot's closing of the
-//! storage roots, and the filesystem calls that create, write, rename,
-//! remove, or change modes.
-//!
 //! This is a tripwire, not the proof. The proof that nothing changes is
-//! `doctor_writes_nothing` in `tests/trawld_doctor/proof.rs`, which runs
-//! the doctor against a read-only data tree and a `SELECT`-only role and
-//! compares snapshots. This scan catches the ordinary way the rule would be
-//! broken, a helper from the boot path reused in a check, at the line that
-//! does it.
+//! `doctor_writes_nothing` in `tests/trawld_doctor/proof.rs`.
 //!
 //! The same limits as `no_exec_after_seal.rs` hold: comment lines are
 //! skipped, a needle in a string literal or a trailing comment counts, and a
@@ -28,15 +16,11 @@
 
 use std::path::{Path, PathBuf};
 
-/// What the doctor's code may not call, as spelled in Rust.
 const FORBIDDEN: &[&str] = &[
-    // Locks and migrations (ADR-0047 amendment: observed, never taken).
     "advisory_lock(",
     "advisory_unlock",
     "try_advisory",
     "migrate(",
-    // The boot's owners and admission steps, which lock, migrate, create,
-    // or repair (the issue's list of code the doctor must never call).
     "StorageState",
     "KeyStore",
     "AppState",
@@ -56,7 +40,6 @@ const FORBIDDEN: &[&str] = &[
     "init_tracing",
     "FileLog",
     "trawl_crashdump::init",
-    // Filesystem writes.
     "create_dir",
     "fs::write",
     "remove_file",
@@ -79,8 +62,6 @@ fn doctor_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("src/doctor")
 }
 
-/// Every `.rs` file under `dir`, recursively, refusing symlinks as
-/// `no_exec_after_seal.rs` does.
 fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let entries = std::fs::read_dir(dir).unwrap_or_else(|error| {
@@ -114,12 +95,6 @@ fn rust_sources(dir: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// `source` without its trailing `#[cfg(test)] mod tests { .. }`.
-///
-/// The test module must be the file's last item: every line after its
-/// opening line is blank, indented, or the one closing `}` that ends the
-/// file. Anything else fails, so production code placed after a test module
-/// cannot hide from the scan.
 fn production_part(source: &str) -> Result<&str, String> {
     let lines: Vec<&str> = source.lines().collect();
     let Some(at) = lines
@@ -148,8 +123,6 @@ fn production_part(source: &str) -> Result<&str, String> {
     Ok(&source[..offset.min(source.len())])
 }
 
-/// The 1-based lines of `source` that name one of `needles`, with the
-/// needle. Comment lines are skipped.
 fn hits(source: &str, needles: &[&'static str]) -> Vec<(usize, &'static str)> {
     let mut found = Vec::new();
     for (index, line) in source.lines().enumerate() {
@@ -233,7 +206,6 @@ mod tests {
         ]
     );
 
-    // Production code after a test module does not hide from the scan.
     let hidden = "#[cfg(test)]\nmod tests {\n}\nfn later() { std::fs::write(p, b) }\n";
     assert!(production_part(hidden).is_err());
     let hidden = "#[cfg(test)]\nmod tests {\n    fn t() {}\nfn later() {}\n}\n";

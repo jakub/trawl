@@ -89,15 +89,8 @@ pub fn resolve(
                 login_url: format!("https://{host}:{}{}", web.tailscale_port, web.login_path),
                 backend_authority: format!("{host}:{}", web.backend_port),
                 // Not loopback: the SPA proxy reaches the backend by the
-                // same MagicDNS authority the browser uses, so one name
-                // covers the whole dev stack. The origin guard no longer
-                // has an opinion here. ADR-0016 compares the browser's
-                // `Origin` against FLEET_SESSION_PUBLIC_ORIGINS and reads
-                // no `Host` header at all. The cost is unchanged: every
-                // tailnet peer can reach the backend directly, bypassing
-                // Serve. See ADR-0010.
+                // same MagicDNS authority the browser uses. See ADR-0010.
                 api_bind: format!("{}:{}", node.ipv4, web.backend_port),
-                // Serve terminates TLS and reaches Trunk over loopback.
                 spa_bind: vec!["127.0.0.1".to_owned(), "::1".to_owned()],
                 spa_port: web.local_port,
                 cookie_domain: None,

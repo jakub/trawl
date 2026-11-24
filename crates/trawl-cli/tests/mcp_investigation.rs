@@ -3,31 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Two principals share one investigation through `trawl mcp` against a
-//! real trawld (ADR-0059, #310).
-//!
-//! Principal A is an agent: the real `trawl mcp --profile agent` child
-//! (`common::mcp`) under a key holding the recipe's permissions, `query`,
-//! `schema_read`, `validate`, `investigation_read` and
-//! `investigation_write`. Principal B is a second key of the same
-//! permissions, driven through `trawl-client` the way the web UI's proxy
-//! would drive trawld. Every call A makes is held to the MCP text
-//! contract: one text block, and on success a mirror valid under the
-//! tool's `outputSchema`.
-//!
-//! The session prints what B wrote exactly once: in the activity of A's
-//! next write after it, or on a board A reads, and never again in that
-//! session. A second session starts following where its first touch finds
-//! the investigation. B's close refuses A's next write with the way to
-//! reopen, and a write sent against a moved sequence prints both
-//! sequences and the read that catches up.
-//!
-//! An attached search records a step whose result trawld keeps from
-//! birth: B reads the result before A keeps any of its rows, and then
-//! reads the step and its outcome. An attached compare is a step on B's
-//! board the same way.
-//!
-//! Without `DATABASE_URL` these tests fail rather than skip. The binary is
-//! in the ADR-0021 `postgres` nextest group.
+//! real trawld (ADR-0059).
 
 mod common;
 
@@ -49,11 +25,8 @@ const INVESTIGATOR_PERMISSIONS: [&str; 5] = [
     "investigation_write",
 ];
 
-/// The `checkout` events the search finds: one a second, newest at boot.
 const EVENTS: usize = 40;
 
-/// A server that accepts `prod`, with [`EVENTS`] of `checkout` in it,
-/// compacted; and the tokens of principals A and B.
 async fn server() -> (Server, String, String) {
     let server = Server::start_with(Options {
         envs: vec!["prod".to_owned()],
@@ -85,13 +58,11 @@ async fn server() -> (Server, String, String) {
     (server, a, b)
 }
 
-/// The investigation id an `investigation` mirror names.
 fn id_of(mirror: &Value) -> InvestigationId {
     InvestigationId::parse(mirror["investigation"]["id"].as_str().expect("an id"))
         .expect("a well-formed id")
 }
 
-/// B's note `text`, appended without a `seen_seq`; returns its seq.
 async fn b_note(b: &trawl_client::HttpClient, id: &InvestigationId, text: &str) -> u64 {
     b.append_entry(
         id.as_str(),
@@ -106,9 +77,6 @@ async fn b_note(b: &trawl_client::HttpClient, id: &InvestigationId, text: &str) 
     .seq
 }
 
-/// Two principals, one investigation: create, activity printed exactly
-/// once, a board read, a second session's first touch, close and a stale
-/// sequence, all through the real `trawl mcp` child.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one shared investigation, each turn asserted in order
 async fn two_principals_share_an_investigation_through_trawl_mcp() {
@@ -119,8 +87,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     a.open().await;
     a.list_tools().await;
 
-    // orient names the investigation permissions and lists no open
-    // investigation yet.
     let orient = a.call("orient", json!({})).await;
     assert!(!orient.is_error, "{}", orient.text);
     let mirror = orient.structured.as_ref().unwrap();
@@ -136,7 +102,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         orient.text
     );
 
-    // A creates; the minted id prints first.
     let created = a
         .call(
             "investigation",
@@ -154,7 +119,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         created.text
     );
 
-    // B reads A's investigation and writes into it.
     let board = b
         .read_investigation(id.as_str(), 0, None)
         .await
@@ -163,7 +127,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     assert_eq!(board.investigation.created_by.name, "investigator-a-key");
     let b1 = b_note(&b, &id, "B: the pool limit is 10").await;
 
-    // A's next write prints B's note in its activity.
     let first = a
         .call(
             "investigation",
@@ -192,7 +155,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     let activity = &first.structured.as_ref().unwrap()["activity"];
     assert_eq!(activity["printed_through"], json!(b1), "{}", first.text);
 
-    // and never again in this session.
     let second = a
         .call(
             "investigation",
@@ -207,7 +169,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         second.text
     );
 
-    // A board read prints B's next note; the write after it does not.
     let b2 = b_note(&b, &id, "B: the limit came from the 09:00 deploy").await;
     let read = a
         .call(
@@ -243,7 +204,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         .as_u64()
         .expect("the finding's seq");
 
-    // The `read` tool reads the same board.
     let through_read = a
         .call(
             "read",
@@ -257,8 +217,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         through_read.text
     );
 
-    // A attaches a compare; B's board read shows it as A's step, with the
-    // result trawld kept for it.
     let now = Utc::now();
     let bound = |at: chrono::DateTime<Utc>| at.to_rfc3339_opts(SecondsFormat::Micros, true);
     let compared = a
@@ -304,8 +262,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     };
     assert_eq!(purpose.as_deref(), Some("did the 502s start recently"));
 
-    // B moves the finding; A's write against the old seq is refused with
-    // both sequences and the read that catches up.
     let at = b
         .read_investigation(id.as_str(), 0, None)
         .await
@@ -352,7 +308,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         "{}",
         stale.text
     );
-    // A close sent against the same old seq is refused the same way.
     let stale_close = a
         .call(
             "investigation",
@@ -374,7 +329,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         stale_close.text
     );
 
-    // An open investigation is listed by orient.
     let orient = a.call("orient", json!({})).await;
     assert!(!orient.is_error, "{}", orient.text);
     assert_eq!(
@@ -384,7 +338,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
         orient.text
     );
 
-    // B closes it; A's next write names the way to reopen.
     let at = b
         .read_investigation(id.as_str(), 0, None)
         .await
@@ -447,8 +400,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     );
     a.finish().await.assert_clean("session one");
 
-    // A second session starts following at its first touch: B's notes are
-    // on the board, not in its activity.
     let b3 = b_note(&b, &id, "B: before the second session").await;
     let mut again = Mcp::spawn(home.path(), Era::Discover);
     again.open().await;
@@ -493,7 +444,6 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     assert!(b4 > b3);
     again.finish().await.assert_clean("session two");
 
-    // trawld recorded every entry once, each under the key that wrote it.
     let log = b.read_investigation(id.as_str(), 0, None).await.unwrap();
     let mine: Vec<&str> = log
         .entries
@@ -516,10 +466,8 @@ async fn two_principals_share_an_investigation_through_trawl_mcp() {
     server.stop().await;
 }
 
-/// More activity than one answer carries: trawld sends at most 50 entries
-/// with `more`, the reply prints what fits and proposes the read that
-/// continues, and following it prints the rest; every entry B wrote is
-/// printed exactly once in the session (#310 AC7).
+/// One answer carries at most 50 activity entries, then `more`, so `NOTES`
+/// needs a continued read.
 #[tokio::test(flavor = "multi_thread")]
 async fn activity_past_one_answer_continues_and_prints_every_entry_once() {
     const NOTES: usize = 60;
@@ -589,9 +537,6 @@ async fn activity_past_one_answer_continues_and_prints_every_entry_once() {
     server.stop().await;
 }
 
-/// A key whose role is unassigned between two appends is refused the
-/// second as a 403 naming the permissions, and the board still names it
-/// by the `{prefix, name}` snapshot its first append recorded (#310 AC2).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_revoked_role_refuses_the_next_append_and_the_board_keeps_the_snapshot() {
     let (server, token_a, token_b) = server().await;
@@ -654,7 +599,6 @@ async fn a_revoked_role_refuses_the_next_append_and_the_board_keeps_the_snapshot
     server.stop().await;
 }
 
-/// The key prefix trawld records for the writer of entry `seq`.
 async fn board_prefix(b: &trawl_client::HttpClient, id: &InvestigationId, seq: u64) -> String {
     b.read_investigation(id.as_str(), 0, None)
         .await
@@ -667,8 +611,6 @@ async fn board_prefix(b: &trawl_client::HttpClient, id: &InvestigationId, seq: u
         .prefix
 }
 
-/// An attached search records a step and keeps its result from birth: A
-/// keeps rows of it, and B reads the step, its outcome and the result.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_search_is_a_step_whose_result_both_principals_read() {
     let (server, token_a, token_b) = server().await;

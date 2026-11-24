@@ -7,14 +7,7 @@
 //! wrote (ADR-0040).
 //!
 //! Its own test binary because `.init()` installs the global subscriber
-//! and the global `log` bridge, exactly as `trawld` does: the production
-//! subscriber from `telemetry::build_subscriber`, with a stdout capture and
-//! a WAL layer. Tests tell their events apart by request id.
-//!
-//! Two kinds of request: through a booted server (real TLS, postgres,
-//! `DuckDB` and data directory), and through [`with_edge_layers`] around a
-//! route of the test's own, for failures no production route can be made
-//! to produce on demand (a bare 500, a handler panic, a 502).
+//! and the global `log` bridge. Tests tell their events apart by request id.
 
 mod common;
 
@@ -44,9 +37,6 @@ use trawl_server::transport::http::with_edge_layers;
 
 const ENV: &str = "default";
 
-// -- the production subscriber, captured ------------------------------------
-
-/// Everything the global subscriber writes to stdout.
 #[derive(Clone, Default)]
 struct Stdout(Arc<Mutex<Vec<u8>>>);
 
@@ -75,8 +65,6 @@ struct Sinks {
     wal_dir: tempfile::TempDir,
 }
 
-/// The production subscriber under the default directives, installed once
-/// for the whole binary.
 fn sinks() -> &'static Sinks {
     static SINKS: OnceLock<Sinks> = OnceLock::new();
     SINKS.get_or_init(|| {
@@ -109,7 +97,6 @@ fn sinks() -> &'static Sinks {
     })
 }
 
-/// Every stdout line so far.
 fn stdout_lines() -> Vec<String> {
     let bytes = sinks().stdout.0.lock().unwrap().clone();
     String::from_utf8(bytes)
@@ -119,8 +106,6 @@ fn stdout_lines() -> Vec<String> {
         .collect()
 }
 
-/// A field's value on a formatted stdout line: `name="quoted"` or
-/// `name=bare`.
 fn field(line: &str, name: &str) -> Option<String> {
     let at = line.find(&format!(" {name}="))? + name.len() + 2;
     let rest = &line[at..];
@@ -131,7 +116,6 @@ fn field(line: &str, name: &str) -> Option<String> {
     }
 }
 
-/// Every `http_failure` stdout line.
 fn stdout_failures() -> Vec<String> {
     stdout_lines()
         .into_iter()
@@ -139,7 +123,6 @@ fn stdout_failures() -> Vec<String> {
         .collect()
 }
 
-/// The `http_failure` stdout lines for one request.
 fn stdout_failures_for(request_id: &str) -> Vec<String> {
     stdout_failures()
         .into_iter()
@@ -147,7 +130,6 @@ fn stdout_failures_for(request_id: &str) -> Vec<String> {
         .collect()
 }
 
-/// Every record the telemetry WAL holds so far.
 fn wal_records() -> Vec<serde_json::Value> {
     // Tests flush concurrently. Without this lock one test could find the
     // queue already drained by another whose WAL write has not landed yet.
@@ -174,7 +156,6 @@ fn read_wal(dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Every persisted `http_failure` record.
 fn wal_failures() -> Vec<serde_json::Value> {
     wal_records()
         .into_iter()
@@ -182,7 +163,6 @@ fn wal_failures() -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// The persisted `http_failure` records for one request.
 fn wal_failures_for(request_id: &str) -> Vec<serde_json::Value> {
     wal_failures()
         .into_iter()
@@ -190,8 +170,6 @@ fn wal_failures_for(request_id: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Assert no `http_failure` line or record, on either sink, holds any of
-/// `sentinels`.
 fn assert_no_failure_carries(sentinels: &[&str]) {
     let lines = stdout_failures();
     let records: Vec<String> = wal_failures().iter().map(ToString::to_string).collect();
@@ -212,10 +190,6 @@ fn assert_no_failure_carries(sentinels: &[&str]) {
     }
 }
 
-// -- requests -----------------------------------------------------------------
-
-/// A client that adds the shared test certificate, whose SAN covers
-/// `127.0.0.1` and `localhost`, to its trusted roots, with validation on.
 fn raw_client() -> reqwest::Client {
     let (cert_path, _) = common::ensure_test_cert();
     let certificate = reqwest::Certificate::from_pem(&std::fs::read(cert_path).unwrap()).unwrap();
@@ -234,7 +208,6 @@ fn request_id_of(headers: &reqwest::header::HeaderMap) -> String {
         .to_owned()
 }
 
-/// The HTTP config the fixture server runs with, for the edge-layer tests.
 fn http_config() -> HttpConfig {
     HttpConfig {
         max_request_body_bytes: 128 * 1024,
@@ -248,13 +221,10 @@ fn http_config() -> HttpConfig {
 
 const HANDLER_PANIC_SENTINEL: &str = "zz-handler-panic-sentinel";
 
-/// A handler that panics with a sentinel payload.
 async fn panicking_handler() -> StatusCode {
     panic!("{HANDLER_PANIC_SENTINEL}")
 }
 
-/// Test routes under the production edge layers. Every route but
-/// `/bare-unmarked` is marked the way production marks its handlers;
 /// `/bare-unmarked` is added after the marker, so a 5xx from it never got
 /// past admission.
 fn edge_app() -> Router {
@@ -281,7 +251,6 @@ fn edge_app() -> Router {
     with_edge_layers(app, &http_config())
 }
 
-/// Send one request through the edge app; answer its response.
 async fn edge_call(request: Request<Body>) -> axum::response::Response {
     sinks();
     edge_app().oneshot(request).await.unwrap()
@@ -297,7 +266,6 @@ fn edge_request_id(response: &axum::response::Response) -> String {
         .to_owned()
 }
 
-/// The level a formatted stdout line was logged at.
 fn level(line: &str) -> &'static str {
     ["ERROR", "WARN", "INFO", "DEBUG", "TRACE"]
         .into_iter()
@@ -305,8 +273,6 @@ fn level(line: &str) -> &'static str {
         .unwrap_or("none")
 }
 
-/// Plant an unreadable parquet file over the `nginx` fixture, so a query
-/// over it fails inside `DuckDB`.
 fn corrupt_nginx(dir: &Path) {
     let file = dir
         .join("data")
@@ -318,12 +284,6 @@ fn corrupt_nginx(dir: &Path) {
     std::fs::write(&file, b"zz-not-a-parquet-file").unwrap();
 }
 
-// -- AC1 ------------------------------------------------------------------------
-
-/// A real `DuckDB` failure on `POST /api/v1/query` is one persisted
-/// `http_failure` that names the request, the route template, the
-/// handler-error stage, the engine's class and cause, and the query id the
-/// request's own `query_failed` carries.
 #[tokio::test(flavor = "multi_thread")]
 async fn duckdb_failure_names_request_route_stage_cause_and_query_id() {
     sinks();
@@ -376,11 +336,6 @@ async fn duckdb_failure_names_request_route_stage_cause_and_query_id() {
     assert_eq!(stdout_failures_for(&request_id).len(), 1);
 }
 
-// -- AC2 ------------------------------------------------------------------------
-
-/// A 5xx whose producer recorded nothing still emits one `http_failure`,
-/// with the request id, the route template, the stage that says so, and
-/// how far the request got: here, the handler.
 #[tokio::test]
 async fn a_bare_500_is_logged_as_unrecorded() {
     let response = edge_call(Request::get("/bare").body(Body::empty()).unwrap()).await;
@@ -417,8 +372,6 @@ async fn a_bare_500_is_logged_as_unrecorded() {
     assert_eq!(records[0]["reached"], "handler");
 }
 
-/// An unrecorded 5xx from a route no marker reached says so: it never got
-/// past admission.
 #[tokio::test]
 async fn an_unrecorded_500_before_the_handler_reached_pre_admission() {
     let response = edge_call(Request::get("/bare-unmarked").body(Body::empty()).unwrap()).await;
@@ -440,11 +393,6 @@ async fn an_unrecorded_500_before_the_handler_reached_pre_admission() {
     );
 }
 
-// -- AC3 ------------------------------------------------------------------------
-
-/// A handler panic caught by the outer catcher answers the same 500 as
-/// ever, under the same hardening headers, and emits one `http_failure`
-/// with the panic stage. The payload reaches neither sink.
 #[tokio::test]
 async fn a_caught_handler_panic_records_the_panic_stage() {
     let response = edge_call(Request::get("/panic").body(Body::empty()).unwrap()).await;
@@ -490,9 +438,6 @@ async fn a_caught_handler_panic_records_the_panic_stage() {
     );
 }
 
-/// A panic caught inside the executor pool reaches the query handler as a
-/// typed error, and the request's one `http_failure` records the panic
-/// stage. The payload reaches neither sink.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_pool_panic_records_the_panic_stage() {
     sinks();
@@ -532,10 +477,6 @@ async fn a_pool_panic_records_the_panic_stage() {
     );
 }
 
-// -- AC7 and one-per-5xx -----------------------------------------------------------
-
-/// 503 and 504 are expected pressure outcomes and log at WARN; 500 and
-/// every other 5xx log at ERROR.
 #[tokio::test]
 async fn five_xx_levels_map_503_504_to_warn() {
     for (code, expected) in [
@@ -565,7 +506,6 @@ async fn five_xx_levels_map_503_504_to_warn() {
     }
 }
 
-/// Exactly one `http_failure` per 5xx, and none for anything else.
 #[tokio::test]
 async fn exactly_one_http_failure_per_5xx() {
     for code in [200, 400, 404, 413, 429, 499] {
@@ -601,11 +541,6 @@ async fn exactly_one_http_failure_per_5xx() {
     }
 }
 
-/// `/api/v1/health` is in scope: an engine sample that reads `error` makes
-/// it answer 503 `unavailable`, and that 503 is one WARN failure on the
-/// unmetered target, carrying the peer address, since no key was metered.
-/// The record names the failed sample: class `service_unavailable`, cause
-/// `engine_sample_failed`, staged as the handler's own error (ADR-0056).
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_sample_error_is_one_unmetered_warn_503() {
     sinks();
@@ -652,7 +587,6 @@ async fn engine_sample_error_is_one_unmetered_warn_503() {
     let peer = field(line, "peer_addr").expect("an unmetered failure names its peer");
     assert!(peer.starts_with("127.0.0.1:"), "{line}");
 
-    // Unmetered, and well under the cap: persisted, peer included.
     let records = wal_failures_for(&request_id);
     assert_eq!(records.len(), 1, "{records:?}");
     let record = &records[0];
@@ -666,9 +600,6 @@ async fn engine_sample_error_is_one_unmetered_warn_503() {
     assert_eq!(record["peer_addr"], peer.as_str());
 }
 
-/// An engine sample past its budget is a warning, not an outage: health
-/// answers 200 `degraded` with `duckdb: slow`, and records no failure
-/// (ADR-0056).
 #[tokio::test(flavor = "multi_thread")]
 async fn engine_sample_slow_answers_200_degraded() {
     sinks();
@@ -693,13 +624,6 @@ async fn engine_sample_slow_answers_200_degraded() {
     assert!(wal_failures_for(&request_id).is_empty());
 }
 
-/// Health reads the sample and starts no `DuckDB` work: 50 concurrent
-/// health requests, with the sampler held so it starts no probe of its own,
-/// all answer `duckdb: ok` from the latest sample. The held sampler would
-/// hang any request that waited for a probe; the sampler thread alone owns
-/// the diagnostic connection, so no request can run one; and no executor
-/// worker is reached, so none took a permit.
-///
 /// The requests call the production handler directly: the probe allowance
 /// (3) would refuse most of 50 concurrent requests at the edge, before the
 /// handler this pins.
@@ -741,15 +665,6 @@ async fn engine_sample_fifty_health_requests_start_no_duckdb_work() {
     drop(hold);
 }
 
-// -- #304 AC12 ----------------------------------------------------------------------
-
-/// Health takes no executor permit, so a full pool never fails it (ADR-0056).
-///
-/// Every permit is held: one by a search that timed out and stays
-/// retained while its worker is parked, the rest by searches still
-/// running. Health answers 200 with `duckdb: ok` at once, and the pool is
-/// still full when it does. Live tail is not a lever: its streams take no
-/// permit.
 #[tokio::test(flavor = "multi_thread")]
 async fn health_ignores_a_full_pool() {
     const PERMITS: usize = 3;
@@ -793,7 +708,6 @@ async fn health_ignores_a_full_pool() {
     );
     assert_eq!(pool.retained(), 1);
 
-    // The rest are searches still running, through the query route.
     let running: Vec<_> = (1..PERMITS)
         .map(|_| {
             let url = format!("{}/api/v1/query", server.url);
@@ -840,7 +754,6 @@ async fn health_ignores_a_full_pool() {
     .await;
 }
 
-/// Poll `cond` until it holds, failing after a generous bound.
 async fn until(what: &str, cond: impl Fn() -> bool) {
     tokio::time::timeout(std::time::Duration::from_secs(30), async {
         while !cond() {
@@ -851,11 +764,6 @@ async fn until(what: &str, cond: impl Fn() -> bool) {
     .unwrap_or_else(|_| panic!("timed out waiting for: {what}"));
 }
 
-// -- AC4 ------------------------------------------------------------------------
-
-/// The auth backend down is a server fault before any key was metered: the
-/// 503 persists on the unmetered target, staged before admission, with the
-/// peer address as its only lead.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_auth_backend_503_persists_before_admission_with_its_peer() {
     sinks();
@@ -891,9 +799,6 @@ async fn an_auth_backend_503_persists_before_admission_with_its_peer() {
     assert_eq!(stdout_failures_for(&request_id).len(), 1);
 }
 
-/// A 401 and a 403 are the caller's fault, decided before any limiter: the
-/// rejections reach stdout, and nothing on an unmetered target reaches the
-/// WAL.
 #[tokio::test(flavor = "multi_thread")]
 async fn unmetered_401_403_never_reach_the_wal() {
     sinks();
@@ -960,11 +865,6 @@ async fn unmetered_401_403_never_reach_the_wal() {
     }
 }
 
-// -- AC5 ------------------------------------------------------------------------
-
-/// Sentinels planted in the DSL, a database error's text, request headers,
-/// the request path and the method reach no `http_failure`, on stdout or in
-/// the WAL.
 #[tokio::test(flavor = "multi_thread")]
 async fn sentinels_never_reach_http_failure() {
     const DSL: &str = "zzdslsentinel";
@@ -1026,13 +926,9 @@ async fn sentinels_never_reach_http_failure() {
     assert_no_failure_carries(&[DSL, DB_ERROR, HEADER, USER_AGENT, PATH, METHOD]);
 }
 
-// -- #293: the request-limit refusal --------------------------------------------
-
-/// The regular refusal's message, word for word.
 const REQUEST_LIMIT_MESSAGE: &str = "trawld is at its HTTP request limit \
      ([server] max_concurrent_requests); the request was not processed; retry later with backoff";
 
-/// The probe refusal's message, word for word.
 const PROBE_MESSAGE: &str = "trawld is at its HTTP probe allowance; the request was not processed; retry later with backoff";
 
 /// A request through the production router, carrying the peer the accept
@@ -1048,7 +944,6 @@ fn production_request(uri: &str, token: &str, body: Body) -> Request<Body> {
     request
 }
 
-/// Every `trawl_auth_failures_total` sample a recorder renders.
 fn auth_failure_samples(handle: &metrics_exporter_prometheus::PrometheusHandle) -> Vec<String> {
     handle
         .render()
@@ -1058,8 +953,6 @@ fn auth_failure_samples(handle: &metrics_exporter_prometheus::PrometheusHandle) 
         .collect()
 }
 
-/// Assert `request_id` emitted exactly one request-limit `http_failure`,
-/// on stdout and persisted, naming `route` when the request matched one.
 fn assert_one_request_limit_failure(request_id: &str, route: Option<&str>) {
     let lines = stdout_failures_for(request_id);
     assert_eq!(lines.len(), 1, "{lines:?}");
@@ -1087,19 +980,11 @@ fn assert_one_request_limit_failure(request_id: &str, route: Option<&str>) {
     assert_eq!(records[0]["stage"], "pre_admission");
 }
 
-/// Each request-limit refusal is exactly one `http_failure`: class
-/// `service_unavailable`, cause `request_limit_reached`, stage
-/// `pre_admission`, at WARN, on the unmetered target, and persisted under
-/// the unmetered cap. On an authenticated route with a bad token the
-/// refusal is not rewritten to an auth answer, and
-/// `trawl_auth_failures_total` does not move.
-///
 /// ONE production router serves every request, so the request holding the
 /// count and the refused ones share it. The auth-failure counter is read
 /// from a recorder of this thread's own: the requests whose metrics it
 /// reads are driven on the test's own thread, and no other test in the
-/// process can move it. The same bad token with the count free is the
-/// control that the counter counts.
+/// process can move it.
 #[tokio::test(flavor = "multi_thread")]
 async fn request_limit_refusal_is_one_unmetered_warn() {
     const BAD_TOKEN: &str = "flt_zzzzzzzz_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz";
@@ -1146,8 +1031,6 @@ async fn request_limit_refusal_is_one_unmetered_warn() {
         .expect("the held body was polled before the deadline")
         .unwrap();
 
-    // Two refusals: one unauthenticated, one with a bad token on an
-    // authenticated route.
     let mut refused_ids = Vec::new();
     for (uri, token) in [("/zz-nowhere", ""), ("/api/v1/whoami", BAD_TOKEN)] {
         let response = app
@@ -1177,7 +1060,6 @@ async fn request_limit_refusal_is_one_unmetered_warn() {
     assert_one_request_limit_failure(&refused_ids[0].1, None);
     assert_one_request_limit_failure(&refused_ids[1].1, Some("/api/v1/whoami"));
 
-    // The refusals counted no auth failure: still the control's one.
     assert_eq!(auth_failure_samples(&handle), counted);
 
     release.notify_one();
@@ -1189,13 +1071,6 @@ async fn request_limit_refusal_is_one_unmetered_warn() {
     assert_eq!(held.status(), StatusCode::OK);
 }
 
-/// A probe refusal is one `http_failure` like every request-limit refusal:
-/// three held `GET /api/v1/health` requests fill the probe allowance under
-/// the production edge layers, and the fourth is refused before its
-/// handler with the probe message, at WARN on the unmetered target, stage
-/// `pre_admission`, the route named, and persisted under the unmetered
-/// cap.
-///
 /// Health is a test handler at the production route template: the
 /// production handler never waits on anything a test could hold, since it
 /// reads the latest engine sample.

@@ -4,8 +4,6 @@
 
 // Reproducible stub-only captures for issue #188. Build the SPA first, then:
 // E2E_PORT=8188 node crates/trawl-web-ui/e2e/scripts/issue188-visual-evidence.mjs /tmp/issue188-captures
-// Owns its harness process and browser, refuses a busy port, and records
-// the served bundle digest. Real-daemon evidence is a separate experiment.
 import { spawn, execFileSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
@@ -83,7 +81,6 @@ async function capture(browser, scene, theme, width) {
     const errors = [];
     page.on('pageerror', error => errors.push(String(error)));
     if (scene.name === 'runs-result') {
-      // The committed wide fixture exercises nested scroll and preview paging.
       await page.route('**/api/v1/saved/1/runs/501', route => route.fulfill({ json: wire('run-result-wide') }));
     }
     await page.goto(`${BASE}${scene.route}`);

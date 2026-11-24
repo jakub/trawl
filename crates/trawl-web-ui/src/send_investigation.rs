@@ -3,34 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! What "Send to investigation" sends from Search (ADR-0057, ADR-0059).
-//!
-//! The Search page sends the search it ran, never the editor's draft: the
-//! accepted response's own query state and its server start instant,
-//! taken once when the dialog opens ([`SendSnapshot`]). The server runs
-//! the capture itself, attached to the chosen investigation under the
-//! session's key, so the server attests the evidence and the browser
-//! only names it.
-//!
-//! [`plan`] reads that state as a capture request through the shared
-//! codec ([`capture_parts`]): the range-free text and a half-open window
-//! for a fixed absolute range, or the text alone when an absolute
-//! `earliest=` and `latest=` in it close it. A clause in the text that
-//! moves (`last=`, or a bound with no other end) is refused: the range
-//! control cannot pin text, and rewriting the query is not the page's to
-//! do, so the person removes the clause and picks the range instead.
-//! A range that moves (a quick range, or an open end) is never sent: a
-//! capture is immutable, so the page first pins it to the instant the
-//! search ran ([`pin_range`], from the response's `execution.started_at`,
-//! the server's clock), runs Search again on the pinned absolute range,
-//! and sends that execution. A `from saved` search takes no bounds at all
-//! and is not offered ([`offers_send`]).
-//!
-//! A capture is a write: an answer that never arrived, or a server error,
-//! is an unknown
-//! outcome ([`SendFailure::Unknown`]), and nothing here sends it again.
-//!
-//! Pure and ungated so its tests run natively; the dialog that drives it
-//! is wasm32-only.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -49,29 +21,22 @@ use crate::query_merge::{
 /// edits to the draft, or a later URL, never change it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SendSnapshot {
-    /// The URL's query text the response ran (`q`).
     pub base: String,
-    /// The URL's filters the response ran.
     pub filters: Vec<Filter>,
-    /// The URL's range the response ran.
     pub range: RangeSpec,
     /// When the server started the execution, as `execution.started_at`.
     pub started_at: String,
 }
 
-/// What the dialog can do with a [`SendSnapshot`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SendPlan {
-    /// Send these parts now.
     Ready(CaptureParts),
     /// The range moves. Pinning it to the instant the search ran gives
     /// this absolute range, which Search runs before anything is sent.
     Pin(RangeSpec),
-    /// Nothing can be sent, for this reason.
     Refused(String),
 }
 
-/// Why a search is not sent, as the dialog says it.
 const EMPTY_QUERY: &str = "There is no query to send.";
 
 /// The line for a range past the capture span limit, the limit in the
@@ -121,7 +86,6 @@ pub fn plan(snapshot: &SendSnapshot, max_span_secs: Option<u64>) -> SendPlan {
     }
 }
 
-/// The dialog's sentence for a capture the codec refuses.
 fn refused(refusal: CaptureRefusal) -> SendPlan {
     SendPlan::Refused(match refusal {
         CaptureRefusal::EmptyQuery => EMPTY_QUERY.to_owned(),
@@ -132,10 +96,6 @@ fn refused(refusal: CaptureRefusal) -> SendPlan {
     })
 }
 
-/// Whether Search offers to send the search that ran `effective`. A
-/// `from saved` search reads a stored run, takes no bounds and no window
-/// (ADR-0057), so the control is absent for it. Text the parser refuses
-/// never reaches an accepted response, and is not offered either.
 #[must_use]
 pub fn offers_send(effective: &str) -> bool {
     trawl_core::parser::parse(effective).is_ok_and(|query| {
@@ -146,7 +106,6 @@ pub fn offers_send(effective: &str) -> bool {
     })
 }
 
-/// Why a purpose is not sent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PurposeProblem {
     /// Longer than the server takes, in bytes of UTF-8.
@@ -156,7 +115,6 @@ pub enum PurposeProblem {
 }
 
 impl PurposeProblem {
-    /// The sentence the dialog shows under the field.
     #[must_use]
     pub fn copy(self) -> String {
         match self {
@@ -189,7 +147,6 @@ pub fn purpose(text: &str) -> Result<Option<&str>, PurposeProblem> {
     }
 }
 
-/// One investigation the dialog offers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Choice {
     pub id: InvestigationId,
@@ -220,7 +177,6 @@ pub fn open_choices(list: &InvestigationList) -> Vec<Choice> {
         .collect()
 }
 
-/// Why a send did not land.
 #[derive(Debug, Clone, PartialEq)]
 pub enum SendFailure {
     /// 409 `investigation_closed`: it was closed when the capture reached
@@ -268,7 +224,6 @@ pub fn send_refusal(status: u16, body: &str, retry_after_ms: f64) -> SendFailure
     }
 }
 
-/// The dialog's line for a busy answer, in whole seconds, never below one.
 #[must_use]
 pub fn busy_copy(message: &str, retry_after_ms: f64) -> String {
     // A pause is a few seconds at most; the cast cannot truncate.
@@ -324,8 +279,6 @@ mod tests {
         );
     }
 
-    /// The pin is anchored on the server's start instant, never the
-    /// browser's clock, and is the whole-second hull of what ran.
     #[test]
     fn a_moving_range_pins_to_the_instant_the_search_ran() {
         assert_eq!(
@@ -357,8 +310,6 @@ mod tests {
         );
     }
 
-    /// A closed absolute clause in the text is fixed: it is sent as it
-    /// is, with no window, whatever the range control says.
     #[test]
     fn a_closed_text_time_clause_sends_without_a_window_whatever_the_range() {
         let plan = plan(
@@ -374,9 +325,6 @@ mod tests {
         assert_eq!(parts.window, None);
     }
 
-    /// Send never sends a moving range. A moving clause in the query text
-    /// is not the range control's to pin, so nothing is offered: neither
-    /// Send nor Pin and re-run, whatever the range is.
     #[test]
     fn a_moving_text_time_clause_is_refused() {
         for base in [
@@ -396,10 +344,6 @@ mod tests {
         }
     }
 
-    /// The server refuses a capture longer than its `max_span_secs`, so a
-    /// range that would cover more is neither pinned nor sent: the 7-day
-    /// preset pins to seven days and a microsecond. The range is never
-    /// narrowed to fit, and an unknown limit refuses nothing.
     #[test]
     fn a_range_past_the_capture_span_limit_offers_nothing() {
         let week = Some(604_800);
@@ -472,7 +416,6 @@ mod tests {
         assert!(offers_send("*"));
         assert!(!offers_send("| from saved nightly"));
         assert!(!offers_send("| from saved nightly | stats count() by host"));
-        // The words in a value are a value.
         assert!(offers_send("message=\"| from saved nightly\""));
         assert!(!offers_send(
             "service=nginx // filter by service\n| stats count()"
@@ -540,16 +483,12 @@ mod tests {
             SendFailure::Refused("expected a value".into())
         );
         assert_eq!(send_refusal(401, "", 0.0), SendFailure::Unauthorized);
-        // A lost answer is not a refusal.
         assert_eq!(send_refusal(502, "", 0.0), SendFailure::Unknown);
         assert_eq!(send_refusal(500, "<html>", 0.0), SendFailure::Unknown);
-        // Nor is a server error, envelope or not: the step may have been
-        // appended before it failed.
         let internal = r#"{"error":{"code":"internal_error","message":"internal server error"}}"#;
         assert_eq!(send_refusal(500, internal, 0.0), SendFailure::Unknown);
         let exhausted = r#"{"error":{"code":"query_resource_exhausted","message":"out of room"}}"#;
         assert_eq!(send_refusal(503, exhausted, 0.0), SendFailure::Unknown);
-        // A refusal at admission ran nothing.
         let limit = r#"{"error":{"code":"request_limit_reached","message":"at the limit"}}"#;
         assert_eq!(
             send_refusal(503, limit, 0.0),

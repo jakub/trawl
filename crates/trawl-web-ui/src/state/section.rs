@@ -2,14 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The sidebar's destinations, grouped. Every group ships at once (the
-//! sidebar lists them all); `AppMode` stays the grouping key, and the
-//! active section is derived from the current pathname.
-//!
-//! `RailItem`, `SidebarGroupSpec`, `groups`, `items_for` and
-//! `default_for` are pure `&'static` data and build on every target so
-//! they can be unit-tested natively; `from_url` (the reactive `Memo`)
-//! is wasm32-only.
+//! The sidebar's destinations, grouped.
 
 // On native, only the tests consume `items_for` / `default_for`.
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
@@ -22,34 +15,22 @@ use leptos_router::hooks::use_location;
 
 use crate::state::app_mode::AppMode;
 
-/// Single destination in the sidebar — a `&'static` descriptor; the
-/// `AuthShell` maps these onto owned `fleet_ui::RailItem`s at the Shell
-/// boundary. Icons are `fleet_ui::Icon` (ADR-0030: apps never inline
-/// raw SVG for chrome).
 #[derive(Debug, Clone, Copy)]
 pub struct RailItem {
     pub id: &'static str,
     pub label: &'static str,
     pub icon: Icon,
     pub path: &'static str,
-    /// The permission predicate the destination needs, from
-    /// [`crate::perms`]; `None` for one every session reaches. A gated
-    /// entry is absent, not disabled, for a session without it
-    /// (ADR-0025, ADR-0059).
     pub requires: Option<fn(&[String]) -> bool>,
 }
 
 impl RailItem {
-    /// Whether a session holding `permissions` sees this entry.
     #[must_use]
     pub fn visible_to(&self, permissions: &[String]) -> bool {
         self.requires.is_none_or(|allowed| allowed(permissions))
     }
 }
 
-/// One labelled run of destinations. `label: None` renders with no
-/// heading; `mode` is the `AppMode` the run belongs to, which is what
-/// `items_for` matches on.
 #[derive(Debug, Clone, Copy)]
 pub struct SidebarGroupSpec {
     pub label: Option<&'static str>,
@@ -57,9 +38,6 @@ pub struct SidebarGroupSpec {
     pub items: &'static [RailItem],
 }
 
-/// Every sidebar group, in render order. Schema is listed once, under
-/// Search: the Settings group carries Health alone. A group whose every
-/// entry is gated away from a session is not rendered for it.
 const GROUPS: &[SidebarGroupSpec] = &[
     SidebarGroupSpec {
         label: None,
@@ -86,9 +64,7 @@ const GROUPS: &[SidebarGroupSpec] = &[
                 path: "/search/schema",
                 requires: None,
             },
-            // Reading an investigation is reading captured events, so it
-            // sits with the other read destinations. `/investigations`
-            // falls to the Search mode in `app_mode`.
+            // `/investigations` falls to the Search mode in `app_mode`.
             RailItem {
                 id: "investigations",
                 label: "Investigations",
@@ -152,10 +128,6 @@ pub fn default_for(mode: AppMode) -> &'static str {
     items_for(mode)[0].id
 }
 
-/// `Memo<String>` for the current section, derived from the URL
-/// pathname matched against the active mode's rail items. Prefers
-/// exact matches, then longest-prefix match, to avoid `/search`
-/// shadowing `/search/history`.
 #[cfg(target_arch = "wasm32")]
 #[must_use]
 pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
@@ -165,7 +137,6 @@ pub fn from_url(mode: Memo<AppMode>) -> Memo<String> {
         let path = location.pathname.get();
         let valid: &[RailItem] = items_for(m);
 
-        // Exact match first.
         if let Some(item) = valid.iter().find(|item| path == item.path) {
             return item.id.to_string();
         }
@@ -199,8 +170,6 @@ mod tests {
             groups().iter().map(|g| g.mode).collect::<Vec<_>>(),
             AppMode::ALL.to_vec()
         );
-        // Schema is one destination, under Search: the Settings group
-        // used to list it a second time.
         let schema = groups()
             .iter()
             .flat_map(|g| g.items.iter())
@@ -226,13 +195,11 @@ mod tests {
         assert!(!item.visible_to(&perms(&["investigation_read"])));
         assert!(!item.visible_to(&perms(&["query", "server_manage"])));
         assert!(!item.visible_to(&[]));
-        // Every other entry shows to a session holding nothing.
         for item in groups().iter().flat_map(|g| g.items.iter()) {
             if item.requires.is_none() {
                 assert!(item.visible_to(&[]), "{}", item.id);
             }
         }
-        // The defaults `from_url` falls back to are never gated.
         for mode in AppMode::ALL {
             assert!(items_for(mode)[0].requires.is_none(), "{mode:?}");
         }
@@ -244,15 +211,12 @@ mod tests {
             let items = items_for(mode);
             assert!(!items.is_empty(), "{mode:?} has no rail items");
 
-            // `default_for` indexes `items_for(mode)[0]` — assert it holds so
-            // the `from_url` fallback branch can never panic.
             assert_eq!(
                 default_for(mode),
                 items[0].id,
                 "{mode:?} default should be its first item's id",
             );
 
-            // Each section has one id and one destination within its mode.
             let mut ids = HashSet::new();
             let mut paths = HashSet::new();
             for item in items {

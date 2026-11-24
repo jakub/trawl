@@ -3,14 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! TCP syslog listener with RFC 6587 framing support.
-//!
-//! Accepts TCP connections and reads syslog messages using either
-//! newline-delimited framing (most common) or RFC 6587 octet-counting.
-//!
-//! A failed `accept()`, such as EMFILE when the process is out of file
-//! descriptors, does not end the listener: it logs under a throttle, waits
-//! out the shared backoff and accepts again on the same socket (see
-//! `listener_error`). Only a failed bind is fatal.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -30,12 +22,8 @@ use super::convert::SyslogDoor;
 use super::listener_error::{Incoming, Listener, ListenerErrors};
 use crate::shutdown::shutdown_observed;
 
-/// Maximum size for a single TCP syslog message (64 KB).
 const MAX_MESSAGE_SIZE: usize = 65_536;
 
-/// Run the TCP syslog listener until shutdown.
-///
-/// Only a failed bind returns `Err`.
 pub async fn run_tcp_listener(
     config: &SyslogConfig,
     door: &Arc<SyslogDoor>,
@@ -72,7 +60,6 @@ impl Incoming<TcpListener> {
     }
 }
 
-/// Accept on a bound listener until shutdown.
 async fn serve_tcp(
     mut incoming: Incoming<TcpListener>,
     config: &SyslogConfig,
@@ -93,9 +80,6 @@ async fn serve_tcp(
             () = shutdown_observed(&mut shutdown_rx) => break,
 
             result = incoming.accept() => {
-                // Any error, such as EMFILE when the process is out of file
-                // descriptors, ends nothing: log it under the throttle, wait
-                // out the backoff, and ask the same socket again.
                 let (stream, src_addr) = match result {
                     Ok(done) => done,
                     Err(error) => {
@@ -185,25 +169,9 @@ async fn shutdown_signalled(shutdown_rx: &mut watch::Receiver<bool>) {
     }
 }
 
-/// Handle a single TCP syslog connection.
-///
-/// Reads messages using newline-delimited framing. Also supports
-/// RFC 6587 octet-counting if the first byte is a digit.
-///
-/// Each admitted frame is handed to the batcher with an awaited send. While
-/// the batcher is blocked on hot-buffer admission (ADR-0043) that send
-/// waits, the connection stays open and unread, and TCP flow control pushes
-/// back on the client; nothing is dropped and the client is not
-/// disconnected for it.
-///
-/// The connection is closed when:
-/// - the client disconnects or sends EOF
-/// - the idle timeout fires (no data received within the timeout); it
-///   covers reads only, never the wait for batcher capacity
-/// - `max_events` events have been processed
-/// - shutdown is signalled (a frame still waiting for capacity is counted
-///   dropped)
-/// - the batcher has gone away
+/// The idle timeout covers reads only, never the wait for batcher
+/// capacity. On shutdown, a frame still waiting for capacity is counted
+/// dropped.
 #[allow(clippy::too_many_arguments)]
 async fn handle_tcp_connection(
     stream: tokio::net::TcpStream,
@@ -221,8 +189,6 @@ async fn handle_tcp_connection(
     let mut event_count: usize = 0;
 
     loop {
-        // Wrap the read in an idle timeout — if the client sends nothing
-        // for this long, close the connection to free the permit.
         let read_result = tokio::select! {
             biased;
 
@@ -241,7 +207,7 @@ async fn handle_tcp_connection(
                 break;
             }
             Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => break, // EOF
+            Ok(Ok(None)) => break,
             Ok(Err(e)) => {
                 tracing::debug!(
                     event_type = "syslog_tcp_read_error",
@@ -257,11 +223,8 @@ async fn handle_tcp_connection(
             continue;
         }
 
-        // The one door: parse, then canonicalize under the syslog
-        // profile. A refusal is counted as a profile reject and the frame
-        // dropped (a TCP sender has no reply channel to be told on), but it
-        // still spends the connection's event budget, so a client that
-        // somehow provokes refusals cannot hold a permit forever.
+        // A refusal still spends the connection's event budget, so a client
+        // that provokes refusals cannot hold a permit forever.
         if let Some(event) =
             door.admit(&line, source_ip, source_service_map, default_service, "tcp")
         {
@@ -297,23 +260,17 @@ async fn handle_tcp_connection(
     }
 }
 
-/// Read a single syslog message from a TCP stream.
-///
-/// Auto-detects framing mode: if the first byte is a digit, tries
-/// RFC 6587 octet-counting; otherwise uses newline-delimited framing.
 async fn read_message(
     reader: &mut BufReader<tokio::net::TcpStream>,
 ) -> Result<Option<String>, std::io::Error> {
-    // Peek at the first byte to detect framing mode
     let buf = reader.fill_buf().await?;
     if buf.is_empty() {
-        return Ok(None); // Connection closed
+        return Ok(None);
     }
 
     let first_byte = buf[0];
 
     if first_byte.is_ascii_digit() {
-        // Might be octet-counting: "123 <...message...>"
         match read_octet_counted_or_line(reader).await {
             Ok(result) => Ok(result),
             Err(e) => {
@@ -327,8 +284,6 @@ async fn read_message(
     }
 }
 
-/// Read a newline-delimited message from the stream.
-///
 /// If the message exceeds `MAX_MESSAGE_SIZE`, the remainder of the line
 /// is drained and discarded. Returns an empty string so the caller skips
 /// the oversized message without silently splitting it into fragments.
@@ -362,9 +317,6 @@ async fn read_line(
     Ok(Some(trimmed))
 }
 
-/// Drain bytes from the reader until a newline is found or EOF.
-///
-/// Used to skip the remainder of an oversized line-delimited message.
 async fn drain_to_newline(
     reader: &mut BufReader<tokio::net::TcpStream>,
 ) -> Result<(), std::io::Error> {
@@ -381,18 +333,9 @@ async fn drain_to_newline(
     Ok(())
 }
 
-/// Try to read an octet-counted message (RFC 6587).
-///
-/// Format: `<length> <syslog-message>` where length is the byte count
-/// of the message (not including the length prefix and space).
-///
-/// Falls back to newline-delimited reading if the prefix doesn't match
-/// the octet-counting pattern.
 async fn read_octet_counted_or_line(
     reader: &mut BufReader<tokio::net::TcpStream>,
 ) -> Result<Option<String>, std::io::Error> {
-    // Read one byte at a time up to the space or newline that ends the
-    // potential length prefix.
     let mut prefix = String::new();
 
     loop {
@@ -409,16 +352,13 @@ async fn read_octet_counted_or_line(
         }
 
         if byte == b'\n' {
-            // It was a newline-delimited message that started with a digit
             let trimmed = prefix.trim_end_matches('\r').to_owned();
             return Ok(Some(trimmed));
         }
 
         prefix.push(byte as char);
 
-        // If we've read too many characters without a separator, treat as newline-delimited
         if prefix.len() > 10 || (!byte.is_ascii_digit() && byte != b'\r') {
-            // Read the rest of the line (bounded to prevent oversized message splitting)
             let mut rest = String::new();
             let remaining_budget = MAX_MESSAGE_SIZE.saturating_sub(prefix.len());
             reader
@@ -427,7 +367,6 @@ async fn read_octet_counted_or_line(
                 .await?;
             prefix.push_str(&rest);
 
-            // If the combined message was truncated, drain the remainder
             if !prefix.ends_with('\n') {
                 drain_to_newline(reader).await?;
                 metrics::counter!(crate::metrics::SYSLOG_PARSE_ERRORS_TOTAL, "transport" => "tcp")
@@ -440,7 +379,6 @@ async fn read_octet_counted_or_line(
         }
     }
 
-    // Octet-counting mode: parse the length prefix
     let length: usize = prefix
         .parse()
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid octet count"))?;
@@ -471,14 +409,12 @@ mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
 
-    /// Helper: bind a TCP listener on a free port, return the address.
     async fn bind_free() -> (TcpListener, std::net::SocketAddr) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         (listener, addr)
     }
 
-    /// Helper: connect to the listener, return (client, server) stream pair.
     async fn connect(
         listener: &TcpListener,
         addr: std::net::SocketAddr,
@@ -489,7 +425,6 @@ mod tests {
         (client_result.unwrap(), accept_result.unwrap().0)
     }
 
-    /// Poll `fut` once: `true` if it is still pending.
     async fn pending_after_one_poll<F: std::future::Future + Unpin>(fut: &mut F) -> bool {
         crate::test_timing::until_polling("one poll", fut, || true)
             .await
@@ -521,7 +456,6 @@ mod tests {
         let (mut client, server) = connect(&listener, addr).await;
         let mut reader = BufReader::new(server);
 
-        // Send a message that exceeds MAX_MESSAGE_SIZE, followed by a normal one
         let oversized = "x".repeat(MAX_MESSAGE_SIZE + 100);
         client
             .write_all(format!("{oversized}\nnormal message\n").as_bytes())
@@ -529,11 +463,9 @@ mod tests {
             .unwrap();
         client.shutdown().await.unwrap();
 
-        // First read should return empty (oversized was discarded)
         let result1 = read_line(&mut reader).await.unwrap();
         assert_eq!(result1.as_deref(), Some(""));
 
-        // Second read should get the normal message
         let result2 = read_line(&mut reader).await.unwrap();
         assert_eq!(result2.as_deref(), Some("normal message"));
     }
@@ -544,7 +476,7 @@ mod tests {
         let (client, server) = connect(&listener, addr).await;
         let mut reader = BufReader::new(server);
 
-        drop(client); // Close connection immediately
+        drop(client);
 
         let result = read_line(&mut reader).await.unwrap();
         assert!(result.is_none());
@@ -570,7 +502,6 @@ mod tests {
         let (mut client, server) = connect(&listener, addr).await;
         let mut reader = BufReader::new(server);
 
-        // Claim a message of MAX_MESSAGE_SIZE + 1 bytes
         let length = MAX_MESSAGE_SIZE + 1;
         client
             .write_all(format!("{length} ").as_bytes())
@@ -588,7 +519,6 @@ mod tests {
         let (mut client, server) = connect(&listener, addr).await;
         let mut reader = BufReader::new(server);
 
-        // A message starting with digits but followed by a newline (not octet-counting)
         client.write_all(b"42\n").await.unwrap();
         client.shutdown().await.unwrap();
 
@@ -611,7 +541,7 @@ mod tests {
             &test_door(),
             &std::collections::HashMap::new(),
             "syslog",
-            Duration::from_millis(50), // very short timeout for test
+            Duration::from_millis(50),
             100_000,
             None,
             shutdown_rx,
@@ -619,7 +549,6 @@ mod tests {
         .await;
         let elapsed = start.elapsed();
 
-        // Should have disconnected after ~50ms idle timeout
         assert!(elapsed >= Duration::from_millis(40));
         assert!(elapsed < Duration::from_secs(2));
     }
@@ -631,7 +560,6 @@ mod tests {
         let (tx, mut rx) = SyslogSender::channel_for_test(100);
         let (_shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        // Send 5 events, set limit to 3
         let handle = tokio::spawn(async move {
             handle_tcp_connection(
                 server,
@@ -641,7 +569,7 @@ mod tests {
                 &std::collections::HashMap::new(),
                 "syslog",
                 Duration::from_secs(5),
-                3, // max 3 events
+                3,
                 None,
                 shutdown_rx,
             )
@@ -654,7 +582,6 @@ mod tests {
 
         handle.await.unwrap();
 
-        // Should have received at most 3 events
         let mut count = 0;
         while rx.try_recv().is_ok() {
             count += 1;
@@ -662,11 +589,6 @@ mod tests {
         assert_eq!(count, 3);
     }
 
-    /// AC11: while hot-buffer admission refuses the batcher, a TCP sender
-    /// is held, not disconnected, past the idle timeout; once compaction
-    /// drains space, every frame lands exactly once, in the WAL and in the
-    /// hot buffer.
-    ///
     /// Time is paused and the test polls the connection itself, so every
     /// step is ordered by an event: the parked channel send, a timer the
     /// runtime has fired, a hot-buffer count. Nothing waits on the clock.
@@ -804,7 +726,6 @@ mod tests {
         assert_eq!(hot.event_count(), N, "shutdown adds nothing");
     }
 
-    /// Shutdown closes a connection that is waiting for batcher capacity.
     #[tokio::test]
     async fn shutdown_releases_a_connection_waiting_for_capacity() {
         let (listener, addr) = bind_free().await;
@@ -840,9 +761,6 @@ mod tests {
             .unwrap();
     }
 
-    /// Spawn `serve_tcp` on a bound loopback listener whose first accepts
-    /// answer `faults`. Returns the listener's address, its attempt count,
-    /// the batcher's receiving end, the shutdown sender and the task.
     #[allow(clippy::type_complexity)]
     async fn spawn_faulty(
         faults: Vec<Fault>,
@@ -873,9 +791,6 @@ mod tests {
         (addr, attempts, rx, shutdown_tx, task)
     }
 
-    /// AC1: after injected accept errors the listener still holds its
-    /// socket, and a real connection to that same address delivers its one
-    /// line exactly once.
     #[tokio::test]
     async fn tcp_accept_recovers() {
         const FAULTS: usize = 3;
@@ -932,9 +847,6 @@ mod tests {
         assert_eq!(more, 0, "the line was delivered more than once");
     }
 
-    /// Drive `serve_tcp` through `n` injected accept errors on the paused
-    /// clock, until a connection that waited in the backlog delivers its
-    /// line, and return the socket-error lines it logged.
     async fn tcp_burst(n: usize) -> Vec<Line> {
         let capture = Capture::default();
         let _guard = capture.install();
@@ -959,8 +871,6 @@ mod tests {
         capture.lines()
     }
 
-    /// AC3: in every way shutdown can reach a listener in or out of its
-    /// backoff, it returns at once with no further accept.
     #[tokio::test(start_paused = true)]
     async fn listener_shutdown_during_backoff() {
         let config = SyslogConfig::default();
@@ -984,7 +894,6 @@ mod tests {
         }
     }
 
-    /// AC4: a bind to a port a real socket holds is the one fatal error.
     #[tokio::test]
     async fn listener_bind_failure_is_fatal() {
         let (_held, addr) = bind_free().await;
@@ -1002,7 +911,6 @@ mod tests {
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
     }
 
-    /// AC5: 650 accept errors, 65 s of backoffs, log four lines.
     #[tokio::test(start_paused = true)]
     async fn listener_error_logs_are_bounded() {
         let lines = tcp_burst(650).await;
@@ -1014,8 +922,6 @@ mod tests {
         );
     }
 
-    /// AC6: the first failure, a summary and the recovery line from the
-    /// real loop all carry the pre-auth target, which is never persisted.
     #[tokio::test(start_paused = true)]
     async fn listener_error_events_use_nonpersisted_target() {
         let lines = tcp_burst(302).await;
@@ -1038,8 +944,6 @@ mod tests {
         }
     }
 
-    /// Faults belong to one listener: a second listener in the same process
-    /// accepts at once while the first waits out its errors.
     #[tokio::test]
     async fn listener_faults_are_instance_local() {
         let hang = crate::test_timing::HANG_GUARD;

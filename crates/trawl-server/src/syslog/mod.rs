@@ -3,16 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Native syslog listener for receiving logs from network appliances.
-//!
-//! Appliances like `UniFi` consoles that can't run Vector send syslog
-//! (RFC 3164/5424) directly to trawld. This module provides UDP and TCP
-//! listeners that parse syslog messages and feed them into the existing
-//! WAL → hot buffer → parquet pipeline.
-//!
-//! The peer settings (`default_timezone`, `sender_timezones`,
-//! `source_service_map`, `allow_cidrs`) resolve through one contract,
-//! [`SyslogPeers::resolve`], which boot, `trawld --check-config` and the
-//! doctor's `server.config` check all run, listener enabled or not.
 
 pub mod batch;
 pub mod convert;
@@ -38,24 +28,9 @@ use self::batch::SyslogBatcher;
 use self::convert::SyslogDoor;
 use self::zone::{SyslogZone, SyslogZones, ZoneRefused};
 
-/// Spawn all syslog listeners and the batcher task.
-///
-/// `door` carries everything the listeners need to reach
-/// `envelope::canonicalize`: the env allowlist and `default_env`, the
-/// `trusted_relays` CIDRs (the peer check that decides whether a
-/// hostname-less frame is peer-filled or kept host-less) and the
-/// boot-resolved derivation policy.
-///
-/// `peers` is the boot-resolved [`SyslogPeers`]: the folded
-/// `source_service_map` and the strictly parsed `allow_cidrs` replace the
-/// raw settings in `config`.
-///
 /// `blocked_poll` is the batcher's retry poll while hot-buffer admission
 /// refuses it (`ingest.compaction_interval_secs`); a release of hot-buffer
 /// charge wakes it sooner.
-///
-/// Returns join handles that complete when all listeners and the batcher
-/// have shut down. Send `true` on `shutdown_tx` to initiate graceful shutdown.
 pub fn spawn_syslog(
     config: &SyslogConfig,
     peers: &SyslogPeers,
@@ -153,23 +128,12 @@ pub fn spawn_syslog(
 /// The syslog peer settings, resolved once under one contract (ADR-0050).
 #[derive(Debug, Clone)]
 pub struct SyslogPeers {
-    /// `source_service_map` with its keys folded to canonical peers.
     pub source_service_map: HashMap<String, String>,
-    /// The zone each peer's zone-less timestamps are read in.
     pub zones: SyslogZones,
-    /// `allow_cidrs`, every entry parsed. Empty admits every peer.
     pub allow_cidrs: Arc<[CidrEntry]>,
 }
 
 impl SyslogPeers {
-    /// Parse the zones, fold the keys of `sender_timezones` and
-    /// `source_service_map`, and parse `allow_cidrs`, refusing the first
-    /// fault. Boot, `trawld --check-config` and the doctor all call this,
-    /// whether or not the listener is enabled.
-    ///
-    /// # Errors
-    /// The first [`SyslogPeerFault`], which names the setting and never
-    /// its value.
     pub fn resolve(config: &SyslogConfig) -> Result<Self, SyslogPeerFault> {
         let default = match &config.default_timezone {
             None => SyslogZone::UTC,
@@ -200,12 +164,9 @@ impl SyslogPeers {
     }
 }
 
-/// A syslog setting keyed by peer address.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerMap {
-    /// `syslog.sender_timezones`.
     SenderTimezones,
-    /// `syslog.source_service_map`.
     SourceServiceMap,
 }
 
@@ -218,30 +179,16 @@ impl PeerMap {
     }
 }
 
-/// Why the syslog peer settings do not resolve.
-///
-/// It carries no key, value, service or zone, so neither `Display` nor
-/// `Debug` can echo configuration (ADR-0047). The `allow_cidrs` index is
-/// the only thing it adds to the setting path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyslogPeerFault {
-    /// `syslog.default_timezone` is not a zone.
     DefaultZone,
-    /// A `syslog.sender_timezones` value is not a zone.
     SenderZone,
-    /// A key of the map is not an IP address.
     KeyNotAddress(PeerMap),
-    /// Two keys of the map name one peer with different values.
     FoldConflict(PeerMap),
-    /// The `syslog.allow_cidrs` entry at `index` does not parse.
-    Cidr {
-        /// The entry's zero-based position in the list.
-        index: usize,
-    },
+    Cidr { index: usize },
 }
 
 impl SyslogPeerFault {
-    /// The setting at fault, without any index.
     #[must_use]
     pub const fn setting(self) -> &'static str {
         match self {
@@ -252,7 +199,6 @@ impl SyslogPeerFault {
         }
     }
 
-    /// The `allow_cidrs` index, for the one fault that has one.
     #[must_use]
     pub const fn index(self) -> Option<usize> {
         match self {
@@ -261,7 +207,6 @@ impl SyslogPeerFault {
         }
     }
 
-    /// Why the setting is refused.
     #[must_use]
     pub const fn reason(self) -> &'static str {
         match self {
@@ -302,7 +247,6 @@ pub fn canonical_peer(ip: IpAddr) -> IpAddr {
     }
 }
 
-/// A parsed CIDR entry for allowlist checking.
 #[derive(Debug, Clone)]
 pub struct CidrEntry {
     addr: IpAddr,
@@ -330,17 +274,11 @@ impl CidrEntry {
                     .unwrap_or(0);
                 u128::from(net) & mask == u128::from(host) & mask
             }
-            _ => false, // v4/v6 mismatch
+            _ => false,
         }
     }
 }
 
-/// Fold a peer-keyed map's keys to the [`canonical_peer`] spelling the
-/// listeners look up, so a mapped-form key (`::ffff:10.1.2.3`) keeps
-/// matching its v4 peer. A key that is not an IP address could never
-/// match a peer, so it is refused. Two keys folding to one peer with
-/// different values is a contradiction the operator must resolve, so it is
-/// refused rather than silently picked; equal values dedup.
 fn fold_peer_map<V: Clone + PartialEq>(
     map: &HashMap<String, V>,
     which: PeerMap,
@@ -376,9 +314,6 @@ pub(crate) fn mapped_cover_twin(entry: &CidrEntry) -> Option<CidrEntry> {
         })
 }
 
-/// Parse `allow_cidrs`, refusing the whole list at the index of its first
-/// malformed entry. Skipping one would fail open: a list whose every entry
-/// was skipped is empty, and an empty list admits every peer.
 fn parse_allow_cidrs(cidrs: &[String]) -> Result<Arc<[CidrEntry]>, usize> {
     let mut entries = Vec::with_capacity(cidrs.len());
     for (index, cidr) in cidrs.iter().enumerate() {
@@ -401,7 +336,6 @@ pub(crate) fn parse_cidr(cidr: &str) -> Option<CidrEntry> {
         }
         Some(canonicalize_entry(CidrEntry { addr, prefix_len }))
     } else {
-        // Bare IP without prefix — treat as host address (/32 or /128)
         let addr: IpAddr = cidr.parse().ok()?;
         let prefix_len = if addr.is_ipv4() { 32 } else { 128 };
         Some(canonicalize_entry(CidrEntry { addr, prefix_len }))
@@ -424,8 +358,6 @@ fn canonicalize_entry(entry: CidrEntry) -> CidrEntry {
     entry
 }
 
-/// Check if a source IP is allowed by the CIDR allowlist.
-/// Empty allowlist means all IPs are accepted.
 pub fn is_allowed(cidrs: &[CidrEntry], ip: IpAddr) -> bool {
     if cidrs.is_empty() {
         return true;
@@ -444,8 +376,6 @@ mod tests {
             .collect()
     }
 
-    /// The listener is off in every config these tests resolve: the
-    /// contract applies whether or not syslog runs.
     fn disabled(edit: impl FnOnce(&mut SyslogConfig)) -> SyslogConfig {
         let mut config = SyslogConfig::default();
         edit(&mut config);
@@ -455,9 +385,6 @@ mod tests {
 
     #[test]
     fn source_service_map_keys_fold_with_the_peer() {
-        // A mapped-form key folds to the spelling the listeners produce,
-        // and a genuine v6 key normalizes its rendering (case,
-        // compression).
         let peers = SyslogPeers::resolve(&disabled(|c| {
             c.source_service_map = map(&[("::ffff:10.1.2.3", "ap"), ("2001:DB8::1", "router")]);
         }))
@@ -469,7 +396,6 @@ mod tests {
             Some("router")
         );
         assert_eq!(folded.len(), 2);
-        // A key that is not an address could never match a peer.
         let fault = SyslogPeers::resolve(&disabled(|c| {
             c.source_service_map = map(&[("host.local", "printer")]);
         }))
@@ -480,8 +406,6 @@ mod tests {
         );
     }
 
-    /// Every refusal names the setting and a reason, and neither `Display`
-    /// nor `Debug` carries the key, value, service or zone at fault.
     #[test]
     fn syslog_peer_settings_refuse_with_the_setting_and_never_the_value() {
         type Edit = fn(&mut SyslogConfig);
@@ -643,10 +567,8 @@ mod tests {
         assert!(twin.contains("10.0.0.5".parse::<IpAddr>().unwrap()));
         let listed = parse_allow_cidrs(&["::ffff:0:0/95".into()]).unwrap();
         assert!(is_allowed(&listed, "10.0.0.5".parse().unwrap()));
-        // A narrow or non-covering v6 entry earns no twin.
         assert!(mapped_cover_twin(&parse_cidr("2001:db8::/32").unwrap()).is_none());
         assert!(mapped_cover_twin(&parse_cidr("::ffff:10.0.0.0/104").unwrap()).is_none());
-        // Genuine v6 peers pass through untouched.
         let v6: IpAddr = "2001:db8::1".parse().unwrap();
         assert_eq!(canonical_peer(v6), v6);
     }

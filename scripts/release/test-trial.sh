@@ -21,11 +21,6 @@
 #   TRIAL_E2E_DIR  the directory whose node_modules holds @playwright/test
 #                  (default: crates/trawl-web-ui/e2e in this checkout).
 #
-# The script creates two trials in turn and deletes both. It refuses to start
-# when the engine already holds trial resources or a trial port is taken, and
-# on exit it removes the fixtures it planted. It prints every token file's
-# path but never a secret.
-#
 # Nothing the script or a command prints goes straight to stdout. Every byte
 # is captured in PRIVATE/capture.log first, and `release` passes it on:
 # harvest-trial-secrets.py records every secret that exists at that moment
@@ -85,9 +80,6 @@ released=0     # bytes of the capture already printed
 withheld=false # a scan found a secret: nothing is printed from then on
 harvest=false  # set once this run may have created a trial
 
-# Record the secrets that exist, scan the whole capture for every recorded
-# secret, and print what is new. Returns non-zero, and prints no captured
-# byte, when a secret cannot be read or a value is found.
 release() {
   [[ $withheld == false ]] || return 1
   # DOCKER_HOST is unset: `release` also runs inside a command that sets it
@@ -144,14 +136,11 @@ fail() {
 note() { printf '  %s\n' "$*"; }
 indent() { sed 's/^/   /'; }
 
-# trawl with the trial's HOME and state, and no connection override.
 t() {
   env -u TRAWL_URL -u TRAWL_TOKEN -u TRAWL_PROFILE -u TRAWL_INSECURE -u TRAWL_CONFIG \
     -u XDG_CONFIG_HOME HOME="$TRIAL_HOME" XDG_STATE_HOME="$STATE_HOME" "$TRAWL_BIN" "$@"
 }
 
-# Run a command with its output in $WORK/NAME.out and .err, then print both.
-# `ok` requires exit 0; `refused` requires a non-zero exit.
 capture() {
   local name=$1
   shift
@@ -171,8 +160,6 @@ says() { # says NAME TEXT: the command's stdout or stderr contains TEXT
   grep -qF -- "$2" "$WORK/$1.out" "$WORK/$1.err" || fail "$1: the output does not contain '$2'"
 }
 
-# Every resource in the trial's ownership union: the Compose project label,
-# the trial id label, and the claim's reserved name.
 listing() {
   {
     for filter in "label=com.docker.compose.project=$PROJECT" "label=$LABEL" "name=^trawl-trial-claim\$"; do
@@ -191,7 +178,6 @@ show_listing() {
   indent <<<"${current:-(none)}"
 }
 
-# The id of the one running-or-stopped container of a trial service.
 cid() {
   local ids
   ids=$(docker ps -aq --filter "label=com.docker.compose.project=$PROJECT" \
@@ -202,8 +188,6 @@ cid() {
 
 state() { jq -r "$1" "$STATE_DIR/state.json"; }
 
-# `release` records secrets as they appear; after an `up` that exits 0,
-# this asserts that every secret of the trial is in the private list.
 collect_secrets() {
   python3 "$here/harvest-trial-secrets.py" --require "$SECRETS" "$STATE_DIR" "$IMAGE" 2>&1 >&3 ||
     fail "not every secret of the trial could be read"
@@ -222,7 +206,6 @@ publish() {
   cp -R "$1" "$EVIDENCE/$2"
 }
 
-# Counts per sample service, as `service count` lines.
 sample_counts() {
   t -p trial query '* | stats count() as events by service' -f json |
     jq -r --argjson s "$SAMPLE_SERVICES" 'select(.service as $x | $s | index($x)) | "\(.service) \(.events)"' |
@@ -230,8 +213,7 @@ sample_counts() {
 }
 sample_total() { sample_counts | awk '{ total += $2 } END { print total + 0 }'; }
 
-# The hashes of the token files and the recorded prefixes, for a private
-# comparison. The result is never printed.
+# The result is never printed.
 key_fingerprint() {
   {
     sha256sum "$STATE_DIR/operator.token" "$STATE_DIR/ingest.token"
@@ -243,8 +225,6 @@ psql_as_superuser() { # psql_as_superuser DB: SQL on stdin, one row per line
   docker exec -i "$(cid postgres)" psql -U postgres -d "$1" -At -v ON_ERROR_STOP=1
 }
 
-# Start `trawl trial up` in its own process group, wait until state.json
-# reaches CONDITION (`keys` or `intent`), and SIGKILL the whole group.
 up_until_killed() { # up_until_killed NAME CONDITION TIMEOUT-SECONDS [ARGS...]
   local name=$1 condition=$2 timeout=$3 pid status=0
   shift 3
@@ -299,13 +279,11 @@ PY
   [[ $code -eq 137 ]] || fail "$name: trawl exited $code, not by SIGKILL"
 }
 
-# -- background helpers and cleanup ---------------------------------------------
-
 planted=()    # containers and volumes this script created, as "kind id"
 background=() # process groups this script started
 
 # Start a command in its own process group, so that stopping it also stops
-# any child a wrapper started. The group's id is left in $spawned.
+# any child a wrapper started.
 spawn() {
   setsid "$@" </dev/null &
   spawned=$!
@@ -356,8 +334,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# -- preconditions -------------------------------------------------------------
-
 step "preconditions"
 version=$(t --version | awk '{ print $2 }')
 # The published tag drops semver build metadata (scripts/release/release_version.py).
@@ -388,15 +364,11 @@ printf '[profiles.unrelated]\nurl = "https://unrelated.invalid:5514"\n' >"$TRIAL
 config_hash=$(sha256sum <"$TRIAL_HOME/.config/trawl/config.toml")
 note "config.toml with one unrelated profile: sha256 ${config_hash%% *}"
 
-# An unlabelled container and volume that share the project's name prefix.
-# `down` must leave them alone.
 by_volume=$(docker volume create trawl-trial_bystander)
 planted+=("volume $by_volume")
 by_container=$(docker container create --name trawl-trial-bystander --volume "$by_volume:/data" "$IMAGE" true)
 planted+=("container $by_container")
 note "planted an unlabelled container trawl-trial-bystander and volume $by_volume"
-
-# -- refusals before anything exists --------------------------------------------
 
 step "preflight: DOCKER_HOST=tcp://example.invalid:2375 is refused before anything is created"
 DOCKER_HOST=tcp://example.invalid:2375 refused preflight t trial up "${IMAGE_ARGS[@]}"
@@ -437,8 +409,6 @@ says orphaned "trawl-trial-intruder"
 [[ ! -e "$STATE_DIR" ]] || fail "the refused up created $STATE_DIR"
 docker container rm "$intruder" >/dev/null
 unset 'planted[-1]'
-
-# -- trial A: the default ports ---------------------------------------------------
 
 step "trial A: kill the first up once both keys are recorded"
 up_until_killed up-killed-after-keys keys 600 "${IMAGE_ARGS[@]}"
@@ -524,8 +494,6 @@ for file in operator.token ingest.token; do
   [[ "$(stat -c '%a %U' "$STATE_DIR/$file")" == "600 $(id -un)" ]] || fail "$file is not 0600 and mine"
 done
 note "the lock file lives outside the trial directory: $(stat -c '%a %n' "$STATE_HOME/trawl/trial.lock")"
-# The TLS private key stays in the trawld volume: whoever holds it can
-# serve the pinned certificate on the API port while the trial is stopped.
 scan --classes password,cookie,key "$STATE_HOME" "$TRIAL_HOME"
 note "no database password, superuser password, cookie key, or TLS private key is on the host"
 scan --classes token,password,cookie "$STATE_DIR/state.json"
@@ -649,9 +617,7 @@ ok documented t -p trial query "$DOCUMENTED_QUERY" -f json
 note "exact row: $DOCUMENTED_ROW"
 
 step "trial A: a capture writes the results root and its file owner-only, and the page decodes"
-# The trial leaves [server] results_dir at its default, beside the data root
-# on the trawld volume (ADR-0057). The documented query has rows and columns,
-# so the capture always writes a file.
+# The trial leaves [server] results_dir at its default (ADR-0057).
 RESULTS_ROOT=/var/lib/trawl/data.results
 printf 'Authorization: Bearer %s\n' "$(<"$STATE_DIR/operator.token")" >"$WORK/operator.header"
 results_call() { # results_call NAME PATH [CURL-ARG...]: HTTP 200, body in $WORK/NAME.json
@@ -775,8 +741,6 @@ spawn python3 "$WORK/impostor.py" "$WORK/impostor.pem" "$WORK/impostor.key" 1551
 impostor=$spawned
 wait_listening 15514
 openssl x509 -in "$WORK/impostor.pem" -noout -subject -ext subjectAltName | indent
-# Controls: a client that trusts the impostor reaches it, and curl pinned to
-# the trial certificate names the reason it refuses.
 curl --silent --max-time 30 --cacert "$WORK/impostor.pem" https://127.0.0.1:15514/ >/dev/null 2>&1 || true
 grep -q 'an HTTP request arrived' "$WORK/impostor.log" || fail "the impostor does not serve TLS on 15514"
 : >"$WORK/impostor.log"
@@ -860,8 +824,6 @@ ok down-again t trial down
 note "a second down exits 0"
 [[ "$(sha256sum <"$TRIAL_HOME/.config/trawl/config.toml")" == "$config_hash" ]] || fail "config.toml changed"
 note "config.toml is byte-identical across up and down"
-
-# -- trial B: port overrides, no samples, and a kill during seeding -----------------
 
 step "trial B: --api-port 25514 --web-port 28090 --no-sample-data"
 ok up-b t trial up --api-port 25514 --web-port 28090 --no-sample-data "${IMAGE_ARGS[@]}"

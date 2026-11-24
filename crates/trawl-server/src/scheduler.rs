@@ -2,17 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Background scheduler for periodic query execution.
-//!
-//! Polls [`ScheduleStore`] for due schedules and spawns query execution
-//! tasks on the [`ExecutorPool`], no more at once than the pool's
-//! scheduled-run leases allow. Results are written as exact-typed parquet
-//! files (with a typed zstd-JSON blob for what parquet cannot hold and for a
-//! failed write) and recorded as report runs in the app-state database.
-//!
-//! The hourly retention tick that prunes report runs also sweeps captured
-//! results ([`crate::results::sweep::sweep`], ADR-0018 as amended by
-//! ADR-0057).
+//! Background scheduler for periodic query execution (ADR-0018).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -36,11 +26,6 @@ use crate::store::{
     ClaimedRun, DUE_SCHEDULE_PAGE, DueClaim, FinishOutcome, FlipOutcome, RunStatus, ScheduleStore,
 };
 
-/// Spawn the scheduler background task.
-///
-/// The task exits on the first change to `shutdown_rx`, or when its sender
-/// is dropped; the value itself is never read. Its retention tick sweeps
-/// `results` with the report runs.
 pub fn spawn_scheduler(
     schedule_store: ScheduleStore,
     key_store: KeyStore,
@@ -74,13 +59,7 @@ async fn scheduler_loop(
     let mut tick = tokio::time::interval(poll_interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Runs a process that ended left `running` were marked by
-    // `boot::prepare_corpus` before this task was spawned. This task must
-    // not mark any: the listener can admit a manual run before its first
-    // statement, and that run is live.
-
     let mut retention_counter: u64 = 0;
-    // Run retention every ~360 ticks (roughly hourly at 10s poll interval).
     let retention_interval = 3600 / config.poll_interval_secs.max(1);
 
     tracing::info!(
@@ -105,10 +84,8 @@ async fn scheduler_loop(
         corpus.observe(pool.publication().unsettled());
 
         // ONE clock reading per tick, truncated to the microsecond every
-        // stored bound shares (postgres TIMESTAMPTZ, DuckDB TIMESTAMP, and
-        // the rendered `earliest=`/`latest=` text). Sampling per schedule
-        // would let two schedules in the same poll disagree about which
-        // boundary has passed.
+        // stored bound shares. Sampling per schedule would let two schedules in
+        // the same poll disagree about which boundary has passed.
         let now = truncate_to_micros(chrono::Utc::now());
         // Dropping the handles detaches the executions: each records its own
         // outcome through `finish_run`, so the loop never waits on one.
@@ -124,7 +101,6 @@ async fn scheduler_loop(
             .await,
         );
 
-        // Periodic retention cleanup.
         retention_counter += 1;
         if retention_counter >= retention_interval {
             retention_counter = 0;
@@ -133,7 +109,6 @@ async fn scheduler_loop(
                 .await
             {
                 Ok((_count, paths)) => {
-                    // Clean up parquet files from disk for deleted runs.
                     // Paths from the DB are relative (e.g. "scheduled/foo/run_1.parquet"),
                     // resolved against the data directory by remove_result_file.
                     let base = pool.base_dir();
@@ -163,18 +138,12 @@ async fn scheduler_loop(
     }
 }
 
-/// The corpus state the scheduler loop last logged, so it logs each change
-/// once rather than once per poll: a pause naming the reason when the
-/// corpus becomes unsettled (or the reason changes), a resume when it
-/// settles. A loop that starts settled logs nothing.
 #[derive(Debug, Default)]
 struct CorpusWatch {
     logged: Option<CorpusUnsettled>,
 }
 
 impl CorpusWatch {
-    /// Log `now` if it differs from the state last logged. Returns whether
-    /// it logged.
     fn observe(&mut self, now: Option<CorpusUnsettled>) -> bool {
         if now == self.logged {
             return false;
@@ -196,42 +165,6 @@ impl CorpusWatch {
     }
 }
 
-/// One scheduler tick: claim and spawn the schedules due at `now`, as many
-/// as there are free scheduled-run leases.
-///
-/// `now` is a parameter rather than a clock reading, and [`scheduler_loop`]
-/// samples it once per tick, so every schedule in a poll is judged against
-/// the same instant. Tests drive this function directly with an explicit
-/// instant: tiling, catch-up clamping and lag are all statements about
-/// hours of coverage, and there is no other way to make them fast.
-///
-/// Returns the spawned execution tasks. The loop drops them — each run
-/// records its own outcome through `finish_run` — and tests await them.
-///
-/// At most `max(1, max_concurrent_queries / 2)` scheduled runs are in
-/// flight (ADR-0018, amended 2026-11-09). The tick reads the due schedules
-/// in pages of [`DUE_SCHEDULE_PAGE`], oldest fire cursor first, and takes
-/// a lease ([`ExecutorPool::try_lease_scheduled`]) before each claim. When
-/// no lease is free the tick ends. A schedule it did not reach keeps its
-/// cursor, watermark, run rows and run budget, is among the oldest due at
-/// a later tick, and its missed boundaries coalesce there (ruling 9). A
-/// page of the listing that waits [`crate::store::CLAIM_WAIT`] on the
-/// database and gives up ends the tick the same way (ADR-0018, amended
-/// 2026-11-11).
-///
-/// Each schedule's owning key is checked before its claim. A key found
-/// unusable is remembered for the rest of the tick and logged once, as one
-/// `scheduler_skip` counting the schedules the tick skipped for it. A key
-/// found usable is checked again at its next claim.
-///
-/// While the corpus is unsettled (ADR-0041) the poll claims nothing. A
-/// claim moves the fire cursor in the transaction that plans the window,
-/// so a run the corpus gate refused afterwards would lose that window. The
-/// cursor stays put instead, and the first poll after the corpus settles
-/// covers every boundary that passed in one claim. The check holds no
-/// guard: the run's own read is still the one door to the corpus, and a
-/// rollup that starts between this check and that read still fails the
-/// run, as it could before.
 pub async fn poll_and_execute(
     schedule_store: &ScheduleStore,
     key_store: &KeyStore,
@@ -264,19 +197,12 @@ pub async fn poll_and_execute(
     tick.spawned
 }
 
-/// What one tick did, for [`poll_and_execute`] to hand back and log.
 #[derive(Default)]
 struct Tick {
-    /// The executions the tick spawned.
     spawned: Vec<JoinHandle<()>>,
-    /// Each owning key the tick found unusable, with how many of the
-    /// schedules it listed were skipped for that key. Only an unusable
-    /// answer is remembered, and only for this tick.
     unusable: BTreeMap<i64, u64>,
 }
 
-/// The claim pass of [`poll_and_execute`], recording into `tick`. Every
-/// return here is a tick exit; the caller logs `tick` after any of them.
 async fn claim_due(
     schedule_store: &ScheduleStore,
     key_store: &KeyStore,
@@ -328,17 +254,6 @@ async fn claim_due(
         after = page.last().map(|due| (due.next_fire_at, due.id));
 
         for due in page {
-            // Key liveness comes BEFORE the claim, so an unusable key leaves
-            // the fire cursor exactly where it was. The cursor is the
-            // coverage boundary: skipping the claim means a `since_last`
-            // schedule covers the whole outage in one window once the key is
-            // usable again, instead of losing every boundary that passed
-            // while it was not.
-            //
-            // An unusable answer holds for the rest of the tick, so a key
-            // with many due schedules is looked up once. A usable answer is
-            // never remembered: each claim asks again, so a key revoked
-            // between two claims of one tick refuses the second.
             if let Some(skipped) = tick.unusable.get_mut(&due.key_id) {
                 *skipped += 1;
                 continue;
@@ -354,9 +269,6 @@ async fn claim_due(
                 KeyCheck::LookupFailed => continue,
             }
 
-            // The lease comes before the claim too: a claim moves the cursor
-            // and starts a run row, which needs a lease to run under. No
-            // free lease ends the tick.
             let Some(lease) = pool.try_lease_scheduled() else {
                 return;
             };
@@ -408,15 +320,6 @@ async fn claim_due(
     }
 }
 
-/// Plan, materialize and claim `schedule_id`'s due run, and move its
-/// cursor, in one transaction ([`ScheduleStore::claim_due_run`]), under
-/// `lease`.
-///
-/// A started run comes back with the lease, for its task to keep. Every
-/// other outcome, a failed claim included, starts no run and drops the
-/// lease here, before the tick asks the next schedule. That includes a
-/// claim that waited [`crate::store::CLAIM_WAIT`] on the database and gave
-/// up, as `wait_expired`: the tick goes on to the next schedule.
 async fn claim_leased(
     schedule_store: &ScheduleStore,
     schedule_id: i64,
@@ -436,9 +339,6 @@ async fn claim_leased(
             | DueClaim::MaxRunsReached,
         ) => None,
         Err(e) => {
-            // The class, never the message: a window failure's Display
-            // can quote the saved DSL and the parser's own text, and
-            // this event lands in the retained `service=trawld` corpus.
             tracing::error!(
                 event_type = "scheduler_error",
                 schedule_id,
@@ -450,13 +350,9 @@ async fn claim_leased(
     }
 }
 
-/// Count and announce a claimed window whose start was clamped forward;
-/// a complete window is not news and records nothing.
-///
-/// One spelling for both claimants, the scheduler tick and a manual run
-/// (ADR-0018 amended 2026-09-23): an operator watching
-/// `trawl_scheduler_window_truncated_total` has to see every uncovered
-/// span, whichever door the run came through.
+/// One spelling for both claimants, the scheduler tick and a manual run:
+/// an operator watching `trawl_scheduler_window_truncated_total` has to see
+/// every clamped window, whichever door the run came through.
 pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &ReportWindow) {
     if !window.truncated {
         return;
@@ -475,30 +371,14 @@ pub(crate) fn note_truncated_window(schedule_id: i64, run_id: i64, window: &Repo
     );
 }
 
-/// What a tick learned about a schedule's owning key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum KeyCheck {
-    /// Live, with both permissions: the claim may go ahead. Never
-    /// remembered, so the next claim of the same key asks again.
     Usable,
-    /// Revoked, expired, gone, or short of a permission. Remembered for
-    /// the rest of the tick and logged once per key when the tick ends.
     Unusable,
-    /// The keystore could not answer. Logged for each schedule and never
-    /// remembered: an outage is no proof that the key is gone.
+    /// An outage is no proof that the key is gone.
     LookupFailed,
 }
 
-/// Whether the schedule's owning key may still run scheduled queries.
-///
-/// It must be live in the fleet keystore (active and unexpired) and its
-/// roles must still resolve both [`Permission::Query`] and
-/// [`Permission::SavedQuery`], the two authorities a scheduled saved-query
-/// run exercises. Revocation, expiry and role changes (analyst to
-/// reader/ingest) therefore all stop scheduled execution: a key that
-/// cannot create or run saved queries interactively must not keep running
-/// them on a schedule. Lookup failures skip conservatively, as
-/// [`KeyCheck::LookupFailed`].
 async fn owning_key(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> KeyCheck {
     let live = match key_store.get_live_key_by_id(key_id).await {
         Ok(live) => live,
@@ -536,14 +416,6 @@ async fn owning_key(key_store: &KeyStore, schedule_id: i64, key_id: i64) -> KeyC
     }
 }
 
-/// Execute one claimed run and record its outcome on its run row.
-///
-/// `lease` is the run's place among the scheduled or the manual runs in
-/// flight (ADR-0018, amended 2026-11-09 and 2026-11-11). This frame keeps
-/// it to its last statement, through writing the result and finishing the
-/// run row, and the run's preparation job and its executor work each keep
-/// it until they stop, so the lease returns when the last of the three
-/// ends: a run that timed out still holds it while its work runs.
 pub(crate) async fn execute_scheduled_query(
     schedule_store: ScheduleStore,
     pool: ExecutorPool,
@@ -556,25 +428,14 @@ pub(crate) async fn execute_scheduled_query(
     let lease = lease.into_hold();
     let start = std::time::Instant::now();
     // One budget for this attempt, stamped before the first pool wait
-    // (ADR-0024): a scheduled run that spends its whole timeout queueing
-    // does not then get another one to execute in.
+    // (ADR-0024).
     let deadline = crate::deadline::Deadline::after(Duration::from_secs(timeout_secs));
 
     // The run's timing account (ADR-0046), keyed by an id allocated before
-    // the admission check so a refused run is accounted for too. Manual
-    // runs take this same path.
+    // the admission check so a refused run is accounted for too.
     let query_id = pool.allocate_query_id();
     let timing = TimingGuard::for_run(query_id, run_id, start);
 
-    // The same admission door the HTTP entry points use (ADR-0024). A
-    // query stored before that door existed can be over a cap, and this
-    // is where it stops: THIS attempt fails with the diagnostic, recorded
-    // as the run's error. The schedule keeps its row and its cursor, so
-    // the operator repairs the saved DSL rather than re-enabling a
-    // schedule the server disabled behind their back. The check runs on
-    // the blocking pool behind the preparation allowance, and its wait for
-    // a slot spends this attempt's deadline (ADR-0063). Its job keeps the
-    // lease until it ends.
     let checked = {
         let _check = timing
             .clock()
@@ -585,8 +446,7 @@ pub(crate) async fn execute_scheduled_query(
     let result = if let Err(refusal) = checked {
         Err(refusal)
     } else {
-        // Execute the query on the pool (no debug capture, UTC timestamps).
-        // The work keeps the lease until it stops.
+        // No debug capture, UTC timestamps.
         let work = crate::pool::WorkContext::system(crate::pool::WorkKind::Scheduled)
             .with_timing(timing.timing().clone())
             .holding(Arc::clone(&lease));
@@ -615,7 +475,6 @@ pub(crate) async fn execute_scheduled_query(
             #[cfg(any(test, feature = "test-support"))]
             reach_run_writing(&pool);
 
-            // Write result as parquet file.
             let (result_path, result_data) =
                 match write_result_parquet(&pool, run_id, &query_result) {
                     Ok(persisted) => persisted,
@@ -656,9 +515,6 @@ pub(crate) async fn execute_scheduled_query(
         Err(e) => {
             let status = record_failed_run(&schedule_store, run_id, duration_ms, &e).await;
 
-            // The class only: the error's text can quote the saved query
-            // (ADR-0040). The run row stores the error's public message,
-            // the one the wire sends (ADR-0046, amended 2026-11-08).
             tracing::warn!(
                 event_type = "scheduled_query_failed",
                 run_id,
@@ -688,9 +544,6 @@ fn reach_run_writing(pool: &ExecutorPool) {
     }
 }
 
-/// Record a run whose query failed: a timeout as `timeout`, anything else
-/// as `error`, with the error's public message as the run's text. Returns
-/// the status it recorded.
 async fn record_failed_run(
     schedule_store: &ScheduleStore,
     run_id: i64,
@@ -742,8 +595,7 @@ async fn fail_unpersisted_run(
     );
 }
 
-/// Record a run as failed with `error_msg`, which every reader of the run
-/// sees. A store error is logged; the run then stays `running` until
+/// A store error is logged; the run then stays `running` until
 /// boot-time cleanup.
 async fn finish_failed_run(
     schedule_store: &ScheduleStore,
@@ -768,9 +620,6 @@ async fn finish_failed_run(
     }
 }
 
-/// Log a store failure the scheduler swallows: the class and the cause
-/// kind at ERROR, and the driver's text, which can quote paths and
-/// diagnostics, at DEBUG only (ADR-0040, amended 2026-11-08).
 fn log_store_fault(run_id: i64, err: crate::store::StoreError, what: &'static str) {
     tracing::debug!(event_type = "scheduler_error", run_id, error = %err, "{what}");
     let fault = ServerError::from(err);
@@ -783,17 +632,6 @@ fn log_store_fault(run_id: i64, err: crate::store::StoreError, what: &'static st
     );
 }
 
-/// Persist a successful run's result, then reconcile the parquet file on disk
-/// with whatever the store actually committed.
-///
-/// Owns the unlink-vs-preserve decision for the success outcome:
-/// - [`FinishOutcome::Persisted`]  — the run row was updated; the file it points
-///   at stays.
-/// - [`FinishOutcome::RunDeleted`] — the row was cascade-deleted mid-flight (its
-///   saved query or schedule is gone); the file we just wrote is orphaned, so
-///   remove it.
-/// - `Err(_)`    — an ambiguous commit; recovery is delegated to
-///   [`recover_ambiguous_finish`].
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn finish_run_or_recover(
     schedule_store: &ScheduleStore,
@@ -818,8 +656,6 @@ pub(crate) async fn finish_run_or_recover(
     {
         Ok(FinishOutcome::Persisted) => {}
         Ok(FinishOutcome::RunDeleted) => {
-            // The run row was cascade-deleted mid-flight: the file we just
-            // wrote is orphaned — remove it.
             if let Some(relative) = result_path
                 && remove_result_file(base_dir, relative)
             {
@@ -832,12 +668,9 @@ pub(crate) async fn finish_run_or_recover(
             }
         }
         Err(e) => {
-            // A transient app-state DB error (pg restart/failover) is an
-            // ambiguous commit: for a single autocommit UPDATE the COMMIT can
-            // land server-side while the client's ack is lost, so sqlx returns
-            // Err even though the row was written to status='success' with
-            // result_path set. So the parquet must not be deleted here —
-            // recovery flips the row only while it is still 'running'.
+            // An ambiguous commit: the COMMIT can land server-side while the client's
+            // ack is lost. So the parquet must not be deleted here — recovery flips
+            // the row only while it is still 'running'.
             recover_ambiguous_finish(
                 schedule_store,
                 base_dir,
@@ -851,30 +684,11 @@ pub(crate) async fn finish_run_or_recover(
     }
 }
 
-/// The text a run row stores when its result could not be persisted. The
-/// store's error is not part of it: its text is the driver's, which the run's
-/// readers never see (ADR-0046, amended 2026-11-08).
 const RESULT_PERSISTENCE_FAILED: &str = "result persistence failed";
 
-/// Recover from an ambiguous `finish_run` commit and reconcile the parquet on
-/// disk, without ever destroying a success that actually committed. `err` is
-/// the ambiguous commit's failure, which is logged and never stored.
-///
-/// Guarded state transition: flip the row to `error` only while it is still
-/// `running`. If the success commit actually landed (status is already
-/// `success`), the flip matches zero rows and the committed result is
-/// preserved rather than unlinking the file it points at. If the DB is still
-/// down the flip also fails, and the next boot's `boot::prepare_corpus`
-/// marks the run `error`.
-///
-/// Owns the unlink-vs-preserve decision for the recovery outcome:
-/// - [`FlipOutcome::FlippedToError`] — the success never committed (row was
-///   `running`); the parquet we wrote is now orphaned — remove it.
-/// - [`FlipOutcome::NotRunning`]     — no running row matched: either the
-///   ambiguous success committed (its `result_path` is live) or the run was
-///   cascade-deleted (a bounded on-disk leak). Either way, leave the file.
-/// - `Err(_)`    — the flip itself failed (DB still down); the run stays wedged
-///   until restart and the file is left in place.
+/// Flip the row to `error` only while it is still `running`. If the success
+/// commit actually landed, the flip matches zero rows and the committed
+/// result is preserved rather than unlinking the file it points at.
 pub(crate) async fn recover_ambiguous_finish(
     schedule_store: &ScheduleStore,
     base_dir: &str,
@@ -923,27 +737,14 @@ pub(crate) async fn recover_ambiguous_finish(
     }
 }
 
-/// Best-effort removal of a report-run parquet file from disk.
-///
-/// `relative` is a DB-stored path like `scheduled/foo/run_1.parquet`; it is
-/// resolved against the executor's `base_dir`. Returns `true` if the file was
-/// removed, `false` on anything else. Shared by retention cleanup,
-/// mid-flight orphan cleanup, and the run-deletion handler.
-///
-/// A file that was already gone is not a failure and does not log like one:
-/// it is the ordinary state after a `data_dir` repoint, and it is the same
-/// absence every read surface answers as a named unavailable result. Gone
-/// means confirmed absent ([`crate::env_dirs::is_absent`]). A `NotFound`
-/// below a dangling link, a permission error or an I/O error keeps the
-/// warning, because the file may still be there and that one is the
-/// operator's to fix.
+/// A file confirmed absent is not a failure and does not log like one: it is
+/// the ordinary state after a `data_dir` repoint. A `NotFound` below a
+/// dangling link, a permission error or an I/O error keeps the warning,
+/// because the file may still be there.
 pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     let full = format!("{}/{relative}", base_dir.trim_end_matches('/'));
     match std::fs::remove_file(&full) {
         Ok(()) => true,
-        // The default-level events name the file relative to the data root;
-        // the absolute path and the error text go to DEBUG (ADR-0040,
-        // amended 2026-11-08).
         Err(e)
             if e.kind() == std::io::ErrorKind::NotFound
                 && crate::env_dirs::is_absent(std::path::Path::new(&full)) =>
@@ -979,11 +780,6 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
     }
 }
 
-/// Write a `QueryResult` to a parquet file under `{data_dir}/scheduled/`, keyed only by the stable run ID.
-///
-/// Returns `(Some(relative_path), None)` for the file, or `(None,
-/// Some(blob))` for the typed zstd-JSON blob [`zstd_fallback`] encodes.
-///
 /// The file is the ordinary representation, zero-row results included:
 /// `write_query_result_to_parquet` stores every column in an exact type,
 /// so an empty file still carries the run's schema, and `from saved` reads
@@ -999,11 +795,6 @@ pub(crate) fn remove_result_file(base_dir: &str, relative: &str) -> bool {
 /// `get_report_run` serves the blob as the same typed result. `from saved`
 /// resolves a zero-column blob to a source with no rows and refuses the
 /// rest by name.
-///
-/// `Err` when the blob itself cannot be encoded or compressed. A run
-/// persisted with neither a path nor a blob would be a success nothing can
-/// read, which `run=latest` would then resolve and refuse to look past
-/// (ADR-0018 ruling 13), so the caller fails the run instead.
 fn write_result_parquet(
     pool: &ExecutorPool,
     run_id: i64,
@@ -1014,9 +805,6 @@ fn write_result_parquet(
     let full_path = format!("{base}/{relative}");
     let temp_path = format!("{full_path}.tmp");
 
-    // The fallback events name the error's kind, never its text, which
-    // can carry host paths and engine diagnostics; the text goes to DEBUG
-    // (ADR-0040, amended 2026-11-08).
     if let Err(e) = std::fs::create_dir_all(format!("{base}/{}", trawl_config::SCHEDULED_DIR_NAME))
     {
         tracing::debug!(
@@ -1048,7 +836,6 @@ fn write_result_parquet(
         }
     };
 
-    // Write to temp file, then atomic rename.
     let temp = std::path::Path::new(&temp_path);
     let final_path = std::path::Path::new(&full_path);
     match executor.write_query_result_to_parquet(result, temp) {
@@ -1101,15 +888,10 @@ fn write_result_parquet(
     Ok((Some(relative), None))
 }
 
-/// Where run `run_id`'s result parquet lives, relative to the data root:
-/// in the reserved scheduled-results directory.
 fn result_relative_path(run_id: i64) -> String {
     format!("{}/run_{run_id}.parquet", trawl_config::SCHEDULED_DIR_NAME)
 }
 
-/// Log an engine failure that sends a run's result to the blob: its class
-/// and cause kind at WARN, its text, which can quote `DuckDB` diagnostics or
-/// an `io::Error`, at DEBUG.
 fn log_parquet_engine_fault(run_id: i64, err: trawl_engine::error::EngineError, what: &str) {
     tracing::debug!(event_type = "scheduler_parquet_error", run_id, error = %err, "{what}");
     let fault = ServerError::from(err);
@@ -1122,10 +904,6 @@ fn log_parquet_engine_fault(run_id: i64, err: trawl_engine::error::EngineError, 
     );
 }
 
-/// Compress a `QueryResult` as a zstd blob of its typed wire JSON, the
-/// representation for a result parquet cannot hold exactly and the
-/// fallback when a parquet write fails. `Err` names what failed: the
-/// encoding (a cell its column's type refuses) or the compression.
 fn zstd_fallback(
     result: &trawl_api::value::QueryResult,
 ) -> Result<(Option<String>, Option<Vec<u8>>), String> {
@@ -1135,13 +913,6 @@ fn zstd_fallback(
     Ok((None, Some(blob)))
 }
 
-/// Read back what [`zstd_fallback`] wrote: a zstd-compressed JSON
-/// `QueryResult`, or `None` for an absent or unreadable blob.
-///
-/// Lives beside the writer so the two halves of the representation are one
-/// pair. Both readers call it: `get_report_run`, which serves the run over
-/// HTTP, and `from_saved`, which resolves a zero-column blob to a source
-/// with no rows and refuses any other blob by the run's name.
 pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::value::QueryResult> {
     let compressed = blob?;
     let decompressed = zstd::decode_all(compressed.as_slice())
@@ -1180,13 +951,6 @@ pub(crate) fn decode_result_blob(blob: Option<Vec<u8>>) -> Option<trawl_api::val
         .ok()
 }
 
-/// Pg-backed coverage for the ambiguous-commit recovery *wiring* — the
-/// orchestration that pairs each store outcome with an unlink-or-preserve file
-/// action. The store primitives (`finish_run`, `fail_run_if_running`) are unit
-/// tested in `tests/store_pg.rs`; these tests pin the file-cleanup decision the
-/// store outcome alone doesn't prove (swapping the arms would leak files or
-/// destroy committed results with the store tests still green). The Err/Err
-/// double-fault arm is driven through a closed pool, for its events only.
 #[cfg(test)]
 mod pg_tests {
     use sqlx::PgPool;
@@ -1198,8 +962,6 @@ mod pg_tests {
     use crate::error::ServerError;
     use crate::store::{RunClaim, RunStatus, SavedQueryStore, ScheduleStore, StoreError};
 
-    /// Seed a saved query + schedule + started (`running`) run, returning the
-    /// schedule store, the owning saved-query id, and the run id.
     pub(super) async fn seed_run(pool: &PgPool, name: &str) -> (ScheduleStore, i64, i64) {
         let saved_store = SavedQueryStore::new(pool.clone());
         let sched_store = ScheduleStore::new(pool.clone());
@@ -1219,7 +981,6 @@ mod pg_tests {
         (sched_store, saved.id, rid)
     }
 
-    /// Write a dummy result file at `base_dir/rel`.
     fn touch(base_dir: &str, rel: &str) {
         let full = format!("{base_dir}/{rel}");
         std::fs::create_dir_all(std::path::Path::new(&full).parent().unwrap()).unwrap();
@@ -1230,7 +991,6 @@ mod pg_tests {
         std::path::Path::new(&format!("{base_dir}/{rel}")).exists()
     }
 
-    /// `finish_run` → `Persisted`: the committed result's file is preserved.
     #[sqlx::test]
     async fn finish_run_or_recover_keeps_file_on_committed_success(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "kept").await;
@@ -1247,8 +1007,6 @@ mod pg_tests {
         assert_eq!(run.result_path.as_deref(), Some(rel));
     }
 
-    /// `finish_run` → `RunDeleted`: a run cascade-deleted mid-flight orphans
-    /// the file just written, so the wiring must unlink it.
     #[sqlx::test]
     async fn finish_run_or_recover_unlinks_orphan_after_cascade_delete(pool: PgPool) {
         let saved_store = SavedQueryStore::new(pool.clone());
@@ -1258,7 +1016,6 @@ mod pg_tests {
         let rel = "scheduled/orphan/run.parquet";
         touch(base, rel);
 
-        // Cascade-delete the run row mid-flight.
         saved_store.delete(saved_id, 1).await.unwrap();
 
         finish_run_or_recover(&store, base, rid, 10, 1, None, Some(rel)).await;
@@ -1269,9 +1026,6 @@ mod pg_tests {
         );
     }
 
-    /// Recovery `fail_run_if_running` → `FlippedToError`: the success never
-    /// committed (row still `running`), so the parquet is orphaned and must
-    /// be unlinked.
     #[sqlx::test]
     async fn recover_ambiguous_finish_unlinks_when_run_still_running(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "wedged").await;
@@ -1292,9 +1046,6 @@ mod pg_tests {
         assert_eq!(run.result_path, None);
     }
 
-    /// Recovery `fail_run_if_running` → `NotRunning`: the ambiguous success
-    /// already committed, so the guard matches zero rows and the live file is
-    /// preserved.
     #[sqlx::test]
     async fn recover_ambiguous_finish_preserves_committed_success(pool: PgPool) {
         let (store, _saved, rid) = seed_run(&pool, "committed").await;
@@ -1303,7 +1054,6 @@ mod pg_tests {
         let rel = "scheduled/committed/run.parquet";
         touch(base, rel);
 
-        // The ambiguous commit actually landed: the row is already 'success'.
         store
             .finish_run(rid, RunStatus::Success, 10, Some(7), None, None, Some(rel))
             .await
@@ -1328,8 +1078,6 @@ mod pg_tests {
 
     const MARKER: &str = "/var/lib/trawl/data/MARKER-sched/prod/x.parquet";
 
-    /// The run as both runs reads serve it: the run itself, and the saved
-    /// query's run list.
     async fn read_back(
         store: &ScheduleStore,
         saved_id: i64,
@@ -1346,9 +1094,6 @@ mod pg_tests {
         vec![one, listed]
     }
 
-    /// A run that fails in `DuckDB` stores the public message the wire
-    /// sends, not the driver's or the `io::Error`'s text (ADR-0046,
-    /// amended 2026-11-08).
     #[sqlx::test]
     async fn scheduled_execution_errors_store_the_public_message(pool: PgPool) {
         use trawl_engine::error::EngineError;
@@ -1386,8 +1131,6 @@ mod pg_tests {
         }
     }
 
-    /// A run whose result persistence failed stores a fixed summary, never
-    /// the store driver's text.
     #[sqlx::test]
     async fn scheduled_persistence_recovery_stores_a_fixed_summary(pool: PgPool) {
         let (store, saved_id, rid) = seed_run(&pool, "persistence").await;
@@ -1446,7 +1189,6 @@ mod pg_tests {
         }
     }
 
-    /// Every event `work` emits on this thread, at every level.
     async fn events_of(work: impl std::future::Future<Output = ()>) -> Vec<LoggedEvent> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -1458,11 +1200,6 @@ mod pg_tests {
         std::mem::take(&mut *log.0.lock().unwrap())
     }
 
-    /// The scheduler's store-fault events say which failure it was and
-    /// what it came from, at ERROR, and keep the driver's text at DEBUG
-    /// only (ADR-0040, amended 2026-11-08). The ambiguous commit is driven
-    /// with a planted marker; a failed finish and a failed flip run
-    /// against a closed pool, whose own text must stay at DEBUG too.
     #[sqlx::test]
     async fn scheduler_fault_events_carry_no_error_text(pool: PgPool) {
         use tracing::Level;
@@ -1578,8 +1315,6 @@ mod off_reactor_tests {
     use crate::report_window::{ScheduleWindow, truncate_to_micros};
     use crate::store::{DueClaim, ManualRunClaim, SavedQueryStore, ScheduleStore};
 
-    /// Run `work`, and check that it parsed text holding `marker` and that
-    /// no such parse ran on this thread.
     async fn parsed_off_the_reactor<F: Future>(marker: &str, work: F) -> F::Output {
         let log = trawl_core::parser::ParseLog::watch(marker);
         let out = work.await;
@@ -1720,8 +1455,6 @@ mod tests {
     };
     use crate::publication::CorpusUnsettled::{RestartBacklog, RollupPending};
 
-    /// Scheduled results land in the reserved `scheduled/` root entry,
-    /// which the env listing skips.
     #[test]
     fn reserved_root_entries_agree_across_consumers() {
         let relative = result_relative_path(42);
@@ -1734,9 +1467,6 @@ mod tests {
         assert!(trawl_config::RESERVED_ROOT_DIRS.contains(&trawl_config::SCHEDULED_DIR_NAME));
     }
 
-    /// The loop logs a change of corpus state once, never a poll that
-    /// finds the same state: a settled start is silent, a reason switch is
-    /// a change, and settling is logged once.
     #[test]
     fn corpus_watch_logs_each_change_once() {
         let mut watch = CorpusWatch::default();
@@ -1755,7 +1485,6 @@ mod tests {
         assert_eq!(logged, [false, true, false, true, false, true, false]);
     }
 
-    /// An existing file is unlinked and the removal reports `true`.
     #[test]
     fn remove_result_file_removes_existing_and_returns_true() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1773,8 +1502,6 @@ mod tests {
         assert!(!std::path::Path::new(&full).exists(), "file must be gone");
     }
 
-    /// A dangling link AT the result's name is the entry itself, not a
-    /// path below one: it is unlinked, and that is a removal.
     #[cfg(unix)]
     #[test]
     fn remove_result_file_unlinks_a_dangling_link_at_the_name() {
@@ -1791,7 +1518,6 @@ mod tests {
         );
     }
 
-    /// A missing file is a no-op that reports `false` (gates orphan logging).
     #[test]
     fn remove_result_file_returns_false_when_missing() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1803,13 +1529,6 @@ mod tests {
         );
     }
 
-    /// Both cleanup events name the result by its data-root-relative path
-    /// and never carry the absolute host path or the `io::Error` text,
-    /// which go to a DEBUG event (ADR-0040, amended 2026-11-08). Only a
-    /// file confirmed absent is the INFO event. The failures are a
-    /// directory where the file should be, which `remove_file` refuses
-    /// with something other than `NotFound`, and a file below a dangling
-    /// link, which answers `NotFound` without being absent.
     #[cfg(unix)]
     #[test]
     fn result_file_cleanup_events_carry_no_host_path_or_io_text() {
@@ -1888,11 +1607,6 @@ mod tests {
         }
     }
 
-    /// A scheduled run times itself: one `query_timing` of kind
-    /// `scheduled` per run, keyed by its `query_id` and `run_id`, whose
-    /// id the lifecycle events carry too. A failed run's event says its
-    /// class and never its text. The run row stores the error's public
-    /// message, which for an emit error names the caller's function.
     #[sqlx::test]
     async fn scheduled_run_emits_query_timing_and_no_error_text(pool: sqlx::PgPool) {
         use std::collections::HashMap;
@@ -2026,13 +1740,11 @@ mod tests {
         );
     }
 
-    /// A scheduled run whose request timed out while its preparation job
-    /// still ran keeps its lease until the job ends (ADR-0018, amended
-    /// 2026-11-09). The job is parked twice: before its work runs, and
-    /// after its work returned, when everything the work captured has
-    /// dropped and only the job is left holding its slot. On a pool of two
-    /// permits the one lease is the run's, so no other lease is free until
-    /// the job lets it go.
+    /// The preparation job is parked twice: before its work runs, and after
+    /// its work returned, when everything the work captured has dropped and
+    /// only the job is left holding its slot. On a pool of two permits the
+    /// one lease is the run's, so no other lease is free until the job lets
+    /// it go.
     #[sqlx::test]
     async fn a_preparation_job_holds_its_lease(pool: sqlx::PgPool) {
         use crate::pool::seam::Seam;
@@ -2080,12 +1792,6 @@ mod tests {
         }
     }
 
-    /// A pool of 1 permit has 1 scheduled-run lease, and pools of 1 to 5
-    /// permits have 1, 1, 1, 2 and 2 (ADR-0018, amended 2026-11-09). A
-    /// pool's clones share its leases, and a lease returns when its last
-    /// clone drops. A claim through [`super::claim_leased`] that starts no
-    /// run, `NotDue`, `Advanced`, `AlreadyRunning`, `MaxRunsReached` or a
-    /// failed claim, returns its lease at once; a started run keeps it.
     #[sqlx::test]
     #[allow(clippy::too_many_lines)] // one fixture per claim outcome
     async fn lease_count_and_return(pool: sqlx::PgPool) {
@@ -2095,8 +1801,6 @@ mod tests {
         use crate::report_window::{ScheduleWindow, truncate_to_micros};
         use crate::store::{DueClaim, RunClaim, RunStatus, SavedQueryStore, ScheduleStore};
 
-        /// A saved query over `dsl` and its hourly schedule, firing first
-        /// at `fire`. Returns the schedule id.
         async fn net(
             pool: &sqlx::PgPool,
             name: &str,
@@ -2270,7 +1974,6 @@ mod tests {
         assert_eq!(executors.scheduled_leases_available(), 1);
     }
 
-    /// The blob is the typed wire, and decodes back to the same result.
     #[test]
     fn the_blob_round_trips_a_typed_result() {
         use trawl_api::value::{Column, ColumnType, QueryResult, Value};
@@ -2286,9 +1989,6 @@ mod tests {
         assert_eq!(decode_result_blob(blob), Some(result));
     }
 
-    /// A result the codec refuses has no blob either, and the fallback
-    /// says so instead of handing back nothing: the caller then fails the
-    /// run rather than record a success nothing can read.
     #[test]
     fn the_blob_refuses_a_result_the_codec_refuses() {
         use trawl_api::value::{Column, ColumnType, QueryResult, Value};
@@ -2303,10 +2003,6 @@ mod tests {
         );
     }
 
-    /// A run whose result has no exact parquet form stores a blob, and
-    /// the default-level event says so without the refusal's reason: the
-    /// reason names the column, which is query or sender content (a
-    /// renamed field, an `extract kv` key). The reason goes to DEBUG.
     #[test]
     fn result_blob_event_carries_no_column_name() {
         use crate::test_events::events_of;
@@ -2363,16 +2059,6 @@ mod tests {
         );
     }
 
-    /// Each parquet fallback the test can provoke falls back to the blob
-    /// with a WARN that names the error's kind and class but carries
-    /// neither its text nor the data root, which go to a DEBUG event
-    /// beside it (ADR-0040, amended 2026-11-08). The arms: the result
-    /// directory blocked by a file, the engine's ndjson staging path
-    /// blocked by a directory (an [`EngineError::Io`]), and the final path
-    /// blocked by a non-empty directory, so the rename fails. The detached
-    /// executor arm takes the same engine path and is not provoked here.
-    ///
-    /// [`EngineError::Io`]: trawl_engine::error::EngineError::Io
     #[test]
     fn parquet_fallback_events_carry_no_error_text() {
         use crate::test_events::events_of;

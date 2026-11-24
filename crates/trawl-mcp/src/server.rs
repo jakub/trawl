@@ -4,12 +4,9 @@
 
 //! [`TrawlServer`], the hand-written `rmcp::ServerHandler` (ADR-0058).
 //!
-//! The handler keeps rmcp's default protocol version set and its default
-//! `server/discover`, so a 2025-11-25 client's `initialize` and a
-//! 2026-07-28 client's `server/discover` both work. It does not use rmcp's
-//! tool router macros: those sort tools by name and turn a typed result
-//! into a JSON dump, where ADR-0058 wants a fixed order and a text block
-//! that stands alone.
+//! It does not use rmcp's tool router macros: those sort tools by name and
+//! turn a typed result into a JSON dump, where ADR-0058 wants a fixed order
+//! and a text block that stands alone.
 
 use rmcp::model::{
     CacheScope, CallToolRequestParams, CallToolResponse, Implementation, ListResourcesResult,
@@ -25,11 +22,8 @@ use crate::backend::Backend;
 use crate::session::Seen;
 use crate::{dsl, tools};
 
-/// The name the server reports in `serverInfo`.
 pub const SERVER_NAME: &str = "trawl";
 
-/// The instructions the server sends a client at `initialize` and
-/// `server/discover`.
 pub const INSTRUCTIONS: &str = "Call orient first: it describes this trawl installation \
 and the query language in one call.";
 
@@ -47,16 +41,10 @@ pub const RESOURCES_TTL_MS: u64 = TOOLS_TTL_MS;
 pub struct TrawlServer<B> {
     backend: B,
     display_zone: DisplayZone,
-    /// The `seen_seq` of each investigation this session touched
-    /// (ADR-0059, [`crate::session`]).
     seen: Seen,
 }
 
 impl<B: Backend> TrawlServer<B> {
-    /// A server whose every tool call goes to `backend`, displaying times
-    /// in `display_zone`: the `ui.timezone` of the CLI config on the
-    /// machine that runs `trawl mcp`, parsed before the server starts,
-    /// which `orient` labels as that machine's setting next to UTC.
     pub fn new(backend: B, display_zone: DisplayZone) -> Self {
         Self {
             backend,
@@ -65,17 +53,14 @@ impl<B: Backend> TrawlServer<B> {
         }
     }
 
-    /// The backend the tools call.
     pub fn backend(&self) -> &B {
         &self.backend
     }
 
-    /// The display zone the server was built with.
     pub fn display_zone(&self) -> DisplayZone {
         self.display_zone
     }
 
-    /// What this session has seen of each investigation.
     pub fn seen(&self) -> &Seen {
         &self.seen
     }
@@ -108,8 +93,6 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
             .with_cache_scope(CacheScope::Private)))
     }
 
-    /// Run one tool, racing it against the request's cancellation token.
-    ///
     /// rmcp cancels the token when the client sends
     /// `notifications/cancelled` for the request or the session ends, so
     /// the tool's future, and the trawld request inside it, is dropped
@@ -136,7 +119,6 @@ impl<B: Backend + 'static> ServerHandler for TrawlServer<B> {
         }
     }
 
-    /// The DSL reference sections, in page order.
     fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,

@@ -5,92 +5,9 @@
 //! The `compare` read (ADR-0058): one filter's group rates in a
 //! foreground window against a baseline window, from one statement.
 //!
-//! The statement is trawl-core's [`correlate::compare_query`]: one scan
-//! over the hull of both windows, each event labelled with the window it
-//! falls in, counted per group for both at once, then rates per minute,
-//! their change and each group's status, ranked by absolute rate change,
-//! then count, then group key. The captured rows ARE the ranked table, so
-//! the executed text reproduces the answer and `read` pages it like any
-//! capture. The statement aggregates, so the capture is whole-shaped.
-//!
-//! Both windows come from one snapshot: the one execution takes one
-//! hot-buffer snapshot and one catalog pin set, under the publication read
-//! guard the capture holds for the statement, so an event ingested while
-//! it runs counts in neither window; two separate reads are not covered,
-//! and retention or compaction may change the corpus between them.
-//!
-//! # Before the capture
-//!
 //! Every refusal of the request runs before [`service::run`], so it takes
-//! nothing:
-//!
-//! 1. The authority ([`service::authorize`]): the `query` permission and,
-//!    for a read attached to an investigation (ADR-0059), the write
-//!    authority and the purpose's bound.
-//! 2. The group fields: at most [`COMPARE_MAX_GROUP_FIELDS`], each at most
-//!    [`MAX_FIELD_NAME_BYTES`], none twice under the DSL field fold, each
-//!    refused as `bad_request` naming the cap and at most
-//!    [`ERROR_EXCERPT_BYTES`] of the value sent. A name the statement
-//!    assigns is refused by the builder (`correlation_invalid`).
-//! 3. The windows, each resolved as a capture's window is
-//!    ([`bounds::window_bounds`]) at the results clock: `last` back from
-//!    now, both becoming a concrete `[start, end)`. The baseline defaults
-//!    to the window of equal duration immediately before the foreground.
-//!    Windows may touch; overlapping ones (`max(starts) < min(ends)`) are
-//!    `windows_overlap`.
-//! 4. The filter, parsed by the builder: search tokens only, so a pipe
-//!    stage or a time clause is `correlation_invalid`, naming it.
-//!
-//! The capture's window is the hull of the two, so the span limit applies
-//! to the hull through the capture's own bounds.
-//!
-//! An attached read is kept as a search capture is ([`service`]'s module
-//! docs, "An attached capture"), so a refusal above records no step, and
-//! one after the scan (the partitions that cannot be listed included)
-//! ends its step as a failed search capture's does.
-//!
-//! # The facts
-//!
-//! `rows_ranked` counts the ranked rows. More than
-//! [`CORRELATION_MAX_GROUPS`] is refused as `result_too_large`, with the
-//! hint to raise `min_count` or drop a group field; a capture whose
-//! `max_rows` is lower refuses earlier, as any whole-shaped capture over
-//! its cut does.
-//!
-//! The warnings say what the read cannot vouch for, never that anything
-//! is complete:
-//!
-//! - `retention_reach`: a window starts before the oldest date partition
-//!   retention kept for an env the filter selects (the env it pins, else
-//!   every env on disk). At most one per window: it counts the envs the
-//!   window starts before, names the first eight by name with the day each
-//!   is kept from, counts the rest, and says data before the latest of
-//!   those days may be missing, which holds for every one of them.
-//!   Partitions are named by the day they were written, not by their
-//!   events' `_time`, so the warning says data before that day may be
-//!   missing, not that data after it is all there. The partitions are
-//!   listed on the worker after the statement ran, so one retention
-//!   removed meanwhile is seen. Finding the selected envs is one pass
-//!   over the data root's entries that counts every env but keeps only
-//!   the first [`REACH_MAX_ENVS_SCANNED`] names. The walk is then one pass
-//!   over those in name order that keeps only each window's count, latest
-//!   day and first names. A selected env with no directory yet has no
-//!   partitions under a data root that is a directory. A data root, or a
-//!   selected env's directory, that cannot be listed for any other reason
-//!   fails the compare (`env_listing`) rather than reading as reached,
-//!   since no warning would then claim more than was checked. Both read
-//!   the work's cancellation latch: discovery between the data root's
-//!   entries, the walk between envs and between the entries of each env's
-//!   directory. Past the cap the warning says it checked the first N of
-//!   M, and a window that starts before none of those still warns, since
-//!   the rest were not checked.
-//! - `degraded_pin`: a group field whose pin is degraded (ADR-0011), so
-//!   events whose value was shelved group under null. Read from the
-//!   in-process set the schema-refresh tick maintains, up to one tick
-//!   stale, as the query notice reads it.
-//!
-//! So a compare carries at most four warnings, two of each code, whatever
-//! the number of envs on disk.
+//! nothing. The capture's window is the hull of the two, so the span limit
+//! applies to the hull through the capture's own bounds.
 
 use std::path::Path;
 use std::time::Duration;
@@ -119,14 +36,6 @@ use crate::pool::ExecutorPool;
 use crate::prepare::Door;
 use crate::state::AppState;
 
-/// Compare a filter's group rates across two windows (module docs).
-///
-/// # Errors
-/// 403 without the `query` permission, or attached without write
-/// authority on investigations; 400 for the attachment's purpose, the
-/// group fields, a window, `windows_overlap` or `correlation_invalid`;
-/// then every refusal a capture makes, an attached capture's included, and
-/// `result_too_large` over the group cap.
 pub async fn compare(
     state: &AppState,
     verified: &VerifiedKey,
@@ -234,8 +143,7 @@ pub async fn compare(
 
 /// Compose the compare statement in one preparation job (ADR-0063):
 /// building it parses the filter and compiles its patterns, which never
-/// runs on the reactor. The job's own refusal escapes as is, and the
-/// build reads the job's stop ([`build`]).
+/// runs on the reactor.
 pub(crate) async fn compose(
     pool: &ExecutorPool,
     deadline: Deadline,
@@ -273,10 +181,6 @@ fn build(
     .map_err(ServerError::from)
 }
 
-/// Step 2: the group fields' cap, their lengths, and their distinctness
-/// under the fold. A name over [`MAX_FIELD_NAME_BYTES`] is refused by its
-/// length alone; the duplicate refusal quotes at most
-/// [`ERROR_EXCERPT_BYTES`] of each name.
 fn check_groups(groups: &[String]) -> Result<(), ServerError> {
     if groups.len() > COMPARE_MAX_GROUP_FIELDS {
         return Err(ServerError::BadRequest(format!(
@@ -310,7 +214,6 @@ fn input(window: CaptureWindow) -> WindowInput {
     }
 }
 
-/// A resolved window as the builder takes it, in microseconds.
 fn window((start, end): Span) -> Window {
     Window {
         start_us: start.timestamp_micros(),
@@ -326,28 +229,16 @@ fn wire_window((start, end): Span) -> CompareWindow {
     }
 }
 
-/// An instant as the wire spells it: RFC 3339 UTC with microseconds.
 fn micros(at: DateTime<Utc>) -> String {
     at.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-/// Why [`oldest_partition`] has no answer.
 #[derive(Debug)]
 enum PartitionsError {
-    /// The work's cancellation latch was set during the listing.
     Cancelled,
-    /// The directory, or one of its entries, could not be read.
     Io(std::io::Error),
 }
 
-/// The oldest date partition retention kept in `dir`, the directory of
-/// `env`; `None` when the env has none, or no directory yet (a cold start).
-/// An entry that vanished during the listing is skipped. The listing reads
-/// `cancel` between entries, so a large env directory cannot hold a
-/// cancelled capture.
-///
-/// # Errors
-/// [`PartitionsError::Cancelled`] once `cancel` is latched.
 /// [`PartitionsError::Io`] when the directory, or one of its entries,
 /// cannot be read for a reason other than not existing: the env's
 /// partitions are then unknown, not absent. The directory, or one above
@@ -394,7 +285,6 @@ fn oldest_partition(
 /// A resolved window, `[start, end)`.
 type Span = (DateTime<Utc>, DateTime<Utc>);
 
-/// The compare read's selection (module docs, "The facts").
 struct Ranking {
     base_dir: String,
     filter: String,
@@ -406,26 +296,10 @@ struct Ranking {
     facts: CompareFacts,
 }
 
-/// The most envs a `retention_reach` warning names; the rest are counted.
 const REACH_MAX_NAMED_ENVS: usize = 8;
 
-/// The most selected envs whose partitions retention reach lists; past it
-/// the warning says how many it checked (module docs, "The facts").
-///
-/// Ingest bounds an env's name (32 bytes) but not how many there are, so
-/// the cap comes from the walk's cost. Each env is one directory listing,
-/// about 10 µs once the capture's own source walk has warmed it (10,000
-/// envs measured at about 95 ms in a debug build), so 1024 add about 10 ms
-/// to a capture with a 15-second default deadline. A cold listing can cost
-/// a disk seek. Finding the envs still reads every entry of the data root,
-/// to count them, but keeps no more than this many names. Both passes read
-/// the work's cancellation latch, which the deadline sets: discovery
-/// between entries, the walk between envs and between an env directory's
-/// entries.
 const REACH_MAX_ENVS_SCANNED: usize = 1024;
 
-/// What retention reach found for one window: the envs whose oldest kept
-/// day is after the window's start.
 #[derive(Debug, Default)]
 struct Reached {
     count: usize,
@@ -435,11 +309,6 @@ struct Reached {
 }
 
 impl Ranking {
-    /// At most one warning per window: the selected envs whose oldest
-    /// partition starts after the window does (module docs).
-    ///
-    /// # Errors
-    /// The capture is cancelled, by its caller or its deadline, or
     /// [`ServerError::EnvListing`] when the data root's envs, or a selected
     /// env's partitions, cannot be listed: no warning would then mean "none
     /// checked", not "none due". A pinned env is not found by listing the
@@ -455,8 +324,6 @@ impl Ranking {
         self.reach_over(envs.total, envs.names.iter().map(String::as_str), cancel)
     }
 
-    /// The [`ServerError`] for a failed env discovery, logging a listing
-    /// failure once with the path it failed on.
     fn unlisted(&self, error: FirstEnvNamesError) -> ServerError {
         match error {
             FirstEnvNamesError::Cancelled => ServerError::Engine(EngineError::Cancelled),
@@ -493,12 +360,6 @@ impl Ranking {
         }
     }
 
-    /// [`Self::retention_reach`] over `envs`, `selected` of them, in name
-    /// order: one pass, at most [`REACH_MAX_ENVS_SCANNED`] listed, nothing
-    /// kept per env but each window's count, latest day and first names.
-    /// An env with no directory yet has no partitions and is passed; one
-    /// whose partitions cannot be listed refuses the pass, through
-    /// [`Self::unlisted`].
     fn reach_over<'a>(
         &self,
         selected: usize,
@@ -586,8 +447,6 @@ impl Ranking {
 }
 
 impl Selection for Ranking {
-    /// Count the ranked rows, refused over the group cap; the statement's
-    /// order stays.
     fn before_cut(&mut self, result: &mut QueryResult, _: &PhaseClock) -> Result<(), ServerError> {
         self.ranked = u64::try_from(result.rows.len()).unwrap_or(u64::MAX);
         if self.ranked > CORRELATION_MAX_GROUPS {
@@ -719,9 +578,6 @@ mod tests {
         );
     }
 
-    /// A compare whose stop the preparation guard requested ends as the
-    /// work's cancellation, not as a refused filter: the caller left, and
-    /// the filter was not judged.
     #[test]
     fn a_cancelled_compare_is_a_cancellation() {
         let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
@@ -747,8 +603,6 @@ mod tests {
             .with_timezone(&Utc)
     }
 
-    /// A ranking over `base` with every env selected and the two windows
-    /// starting at `foreground` and `baseline`.
     fn reaching(base: &Path, foreground: &str, baseline: &str) -> Ranking {
         let span = |start: &str| (instant(start), instant(start) + chrono::TimeDelta::hours(1));
         let (fg, bl) = (span(foreground), span(baseline));
@@ -776,9 +630,6 @@ mod tests {
         }
     }
 
-    /// One warning per window, listing every env it starts before in name
-    /// order with its oldest day, and the latest of those days as the one
-    /// before which data may be missing.
     #[test]
     fn retention_reach_is_one_warning_per_window_listing_the_envs() {
         let tmp = tempfile::tempdir().unwrap();
@@ -813,7 +664,6 @@ mod tests {
         );
     }
 
-    /// At most eight envs are named; the rest are counted.
     #[test]
     fn retention_reach_names_eight_envs_and_counts_the_rest() {
         let tmp = tempfile::tempdir().unwrap();
@@ -841,10 +691,6 @@ mod tests {
         }
     }
 
-    /// Past [`REACH_MAX_ENVS_SCANNED`] selected envs the walk stops, and
-    /// the warning counts and names only what it checked and says so: the
-    /// first eight names in order, the count of the first 1024, and their
-    /// latest day, not that of an env past the cap.
     #[test]
     fn retention_reach_checks_the_first_envs_and_says_how_many() {
         let tmp = tempfile::tempdir().unwrap();
@@ -874,8 +720,6 @@ mod tests {
         );
     }
 
-    /// A capped walk that finds no env the window starts before still
-    /// warns, since the envs past the cap were not checked.
     #[test]
     fn a_capped_walk_that_finds_nothing_says_what_it_did_not_check() {
         let tmp = tempfile::tempdir().unwrap();
@@ -908,7 +752,6 @@ mod tests {
         );
     }
 
-    /// A latched cancellation stops the walk at the next env.
     #[test]
     fn a_cancelled_latch_stops_the_walk() {
         use std::sync::Arc;
@@ -939,9 +782,6 @@ mod tests {
         );
     }
 
-    /// A latched cancellation stops the walk inside one env directory too,
-    /// between its entries: it refuses as cancelled, neither a date nor an
-    /// I/O failure.
     #[test]
     fn a_cancelled_latch_stops_the_walk_inside_an_env_directory() {
         use std::sync::Arc;
@@ -964,8 +804,6 @@ mod tests {
         );
     }
 
-    /// A latched cancellation refuses retention reach as a whole, envs
-    /// found from disk included, not only the walk over envs it is given.
     #[test]
     fn a_cancelled_latch_stops_retention_reach_finding_envs() {
         use std::sync::Arc;
@@ -982,8 +820,6 @@ mod tests {
         );
     }
 
-    /// A data root retention reach cannot list fails the compare rather
-    /// than reading as no envs, which would raise no warning.
     #[test]
     fn retention_reach_over_an_unreadable_root_is_an_env_listing_failure() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1003,10 +839,6 @@ mod tests {
             if error.kind() == std::io::ErrorKind::NotFound)
     }
 
-    /// A data root that is a symlink to nothing is not a cold start,
-    /// listed through the wildcard or below a pin: `read_dir` says
-    /// `NotFound` for the root and for a pinned env below it alike, but
-    /// the link is there, so the envs' partitions are unknown.
     #[cfg(unix)]
     #[test]
     fn retention_reach_over_a_dangling_data_root_is_an_env_listing_failure() {
@@ -1019,7 +851,6 @@ mod tests {
         }
     }
 
-    /// As above with the dangling link further up, above the data root.
     #[cfg(unix)]
     #[test]
     fn retention_reach_below_a_dangling_ancestor_of_the_data_root_is_an_env_listing_failure() {
@@ -1033,8 +864,6 @@ mod tests {
         }
     }
 
-    /// A data root not created yet, under a directory, is a cold start:
-    /// no env, no warning, no refusal.
     #[test]
     fn retention_reach_passes_a_missing_data_root_as_a_cold_start() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1047,8 +876,6 @@ mod tests {
         }
     }
 
-    /// A data root that is a symlink to a directory reads as that
-    /// directory: `prod` warns, and a pinned env not written yet passes.
     #[cfg(unix)]
     #[test]
     fn retention_reach_through_a_symlinked_data_root_warns_and_passes_an_unwritten_pin() {
@@ -1084,10 +911,6 @@ mod tests {
         }
     }
 
-    /// The readable layout the unreadable cases below lock: `prod` kept
-    /// from 2024-01-19 warns for both windows, through the wildcard and
-    /// the pin alike, and a pinned env with no directory yet is a cold
-    /// start, neither warned for nor refused.
     #[test]
     fn retention_reach_warns_for_a_readable_env_and_passes_one_not_written_yet() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1110,10 +933,7 @@ mod tests {
         assert!(warnings.is_empty(), "{warnings:?}");
     }
 
-    /// A pinned env directory that is a dangling symlink is not an env not
-    /// written yet: `read_dir` says `NotFound` for both, but something is
-    /// there, so its partitions are unknown and the compare fails. The
-    /// wildcard never selects the link (the root listing skips a dangling
+    /// The wildcard never selects the link (the root listing skips a dangling
     /// entry as not an env), so it reaches only `lab`.
     #[cfg(unix)]
     #[test]
@@ -1161,9 +981,6 @@ mod tests {
             if error.kind() == std::io::ErrorKind::PermissionDenied)
     }
 
-    /// A pin selects its env without listing the data root, so an
-    /// unreadable root under `env=prod` refuses at `prod`'s partitions
-    /// rather than reading as an env with none.
     #[cfg(unix)]
     #[test]
     fn retention_reach_over_an_unreadable_root_under_a_pin_is_an_env_listing_failure() {
@@ -1178,8 +995,6 @@ mod tests {
         assert!(is_denied(&refused), "{refused:?}");
     }
 
-    /// A selected env whose partitions cannot be listed fails the compare,
-    /// found through the wildcard or pinned, rather than reading as reached.
     #[cfg(unix)]
     #[test]
     fn retention_reach_over_an_unreadable_selected_env_is_an_env_listing_failure() {

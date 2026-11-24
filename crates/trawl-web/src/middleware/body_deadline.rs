@@ -2,29 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! One deadline for every request body the proxy reads (ADR-0054,
-//! amended 2026-10-17).
-//!
-//! The deadline is a layer over the whole router, not a step in each
-//! handler. It wraps the request body before any extractor or handler
-//! reads it, so login's `Json`, the forwarder's own collection and any
-//! route added later all read under
-//! [`ProxyLimits::body_read_timeout`](crate::config::ProxyLimits). The
-//! deadline is armed when the request enters the layer, which is once
-//! hyper has the head, and it covers the whole body: progress does not
-//! reset it. A body that is not whole by the deadline fails its next
-//! read, and the layer answers the request 408 `timeout` with the
-//! envelope whatever the extractor or handler made of the failed read.
-//! The count the request holds is released with that response head, as
-//! with any other answer. A body nobody reads never fires the deadline,
-//! and a handler that has its body whole is not timed by it. The wrapped
-//! body keeps the size hint hyper framed the original with, so the
-//! forwarder's body budget (`crate::body_budget`) still sees a declared
-//! length, and no body at all, through the layer.
-//!
-//! Without this, a client needs no token to hold one of the proxy's
-//! counts for as long as it likes: it sends a login head, which is
-//! unauthenticated by definition, and never finishes the body.
+//! One deadline for every request body the proxy reads (ADR-0054).
 
 use std::future::Future as _;
 use std::pin::Pin;
@@ -43,10 +21,6 @@ use tokio::time::Sleep;
 
 use crate::error::ProxyError;
 
-/// The error a request body yields once its deadline has passed. The
-/// forwarder classifies it as [`ProxyError::BodyTimeout`]; an axum
-/// extractor turns it into whatever refusal it has, which
-/// [`bound_body_read`] then replaces.
 #[derive(Debug)]
 pub struct BodyDeadlineElapsed;
 
@@ -58,8 +32,6 @@ impl std::fmt::Display for BodyDeadlineElapsed {
 
 impl std::error::Error for BodyDeadlineElapsed {}
 
-/// Read the request body under `deadline`, and answer 408 `timeout` when
-/// it passes before the body is whole.
 pub async fn bound_body_read(
     State(deadline): State<Duration>,
     request: Request,
@@ -82,8 +54,6 @@ pub async fn bound_body_read(
     response
 }
 
-/// The request body, frame for frame, until the deadline passes. Its
-/// size hint and end-of-stream are the wrapped body's own.
 struct DeadlineBody {
     inner: Body,
     deadline: Pin<Box<Sleep>>,
@@ -137,7 +107,6 @@ mod tests {
 
     use super::*;
 
-    /// A body of `first` and then nothing, forever.
     fn stalled_after(first: &'static str) -> Body {
         let stalled =
             futures::stream::once(async move { Ok::<_, std::io::Error>(Bytes::from(first)) })
@@ -149,10 +118,6 @@ mod tests {
         Request::post(path).body(body).unwrap()
     }
 
-    /// A route on axum's own `Bytes` extractor, which has no deadline of
-    /// its own, is answered 408 with the envelope when its body stalls,
-    /// and sees its body when it arrives whole. The layer covers a route
-    /// whoever writes it, so a future route cannot forget the deadline.
     #[tokio::test]
     async fn any_route_reading_a_body_is_answered_408_at_the_deadline() {
         let app = Router::new()
@@ -201,10 +166,6 @@ mod tests {
         );
     }
 
-    /// The body under the layer keeps the size hint it came with: a
-    /// declared length stays exact and no body stays zero, so the
-    /// forwarder's budget reserves what the body declares and nothing
-    /// for a request without one.
     #[tokio::test]
     async fn the_body_under_the_deadline_keeps_its_size_hint() {
         let app = Router::new()
@@ -233,9 +194,6 @@ mod tests {
         }
     }
 
-    /// The deadline is on the body, not the handler: a handler that
-    /// never reads its stalled body and answers after the deadline has
-    /// passed is answered as it chose.
     #[tokio::test]
     async fn an_unread_body_never_fires_the_deadline() {
         let app = Router::new()

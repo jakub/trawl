@@ -3,28 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The `api.*` checks: transport, TLS, health, and identity (ADR-0047).
-//!
-//! One unkeyed `GET /api/v1/health` decides `api.transport`, `api.tls` and
-//! `api.health`. It is sent under the connection's own trust and carries no
-//! key. A key goes out only in `GET /api/v1/whoami`, and only through a
-//! client built from a [`witness::VerifiedApi`]. That takes two steps:
-//! `api.tls` mints a [`witness::VerifiedTls`] when the URL is `https`, the
-//! trust verifies, and an HTTP answer arrived under that trust; `api.health`
-//! turns it into a `VerifiedApi` only when that answer parsed as a trawl
-//! health body carrying trawl's signature: a `checks` map and a `version`,
-//! which trawld always sends, under the HTTP status trawld pairs with the
-//! body's `status` (200 with `ok` or `degraded`, 503 with `unavailable`).
-//! An untrusted certificate, an `insecure` trust, a plain `http` URL, a
-//! redirect, or any answer that is not trawl's health body therefore never
-//! sees a key.
-//!
-//! Every outcome is decided from [`ClientError::network_kind`] or a
-//! [`ClientError::Server`] status and typed error code, never from an
-//! error's text, and no error's `Display` or `Debug` reaches the report.
-//! Strings the server sent pass through [`display_safe`] first, which also
-//! redacts any run of the selected key: a server that echoes the key, or its
-//! prefix, in a name, a permission, a check name or value, or its version
-//! does not get it into the report.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
@@ -38,22 +16,15 @@ use trawl_client::{ClientError, NetworkKind, TlsTrust};
 use super::resolve::{Connection, Scheme};
 use super::{display_safe, display_safe_within, holds_key};
 
-/// `api.transport`.
 pub const API_TRANSPORT: &str = "api.transport";
-/// `api.tls`.
 pub const API_TLS: &str = "api.tls";
-/// `api.health`.
 pub const API_HEALTH: &str = "api.health";
-/// `api.identity`.
 pub const API_IDENTITY: &str = "api.identity";
-/// Prefix of the one row per check name the health answer reports.
 pub const API_HEALTH_KEY_PREFIX: &str = "api.health.";
-/// The one row that stands for every check name that is not an identifier.
 /// Its last part starts with `_`, which no check name may, so it cannot
 /// collide with a server's check.
 pub const API_HEALTH_INVALID_KEY: &str = "api.health._invalid";
 
-/// The deadline for each request the doctor sends.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub(super) fn row(id: &str, outcome: Outcome) -> Check {
@@ -88,28 +59,18 @@ mod witness {
     use super::super::resolve::{CheckedUrl, Connection, Key, Scheme};
     use super::REQUEST_TIMEOUT;
 
-    /// The unkeyed health request and what came back. Only [`probe`]
-    /// builds one, so a `Probe` that says an answer arrived is one that did.
     pub(super) struct Probe {
-        /// Whether the request went out under the connection's own trust.
-        /// A plain `http` URL is probed without TLS, so it is false there.
         under_configured_trust: bool,
-        /// What the request returned, with the HTTP status (200 or 503) of
-        /// an answer. `Err` from building the client too.
         pub(super) result: Result<(u16, HealthResponse), ClientError>,
-        /// The client could not be built; nothing was sent.
         pub(super) not_built: bool,
     }
 
     impl Probe {
-        /// An HTTP answer arrived: a status line, whatever it said.
         pub(super) fn answered(&self) -> bool {
             super::answered(&self.result)
         }
     }
 
-    /// Every client here is built on a [`CheckedUrl`], which cannot hold
-    /// userinfo; the assertion restates that at the point of use.
     fn client(url: &CheckedUrl, token: &str, trust: &TlsTrust) -> Result<HttpClient, ClientError> {
         debug_assert!(
             !url.origin().contains('@'),
@@ -118,10 +79,7 @@ mod witness {
         HttpClient::with_trust_timeout(url.base(), token, trust, REQUEST_TIMEOUT)
     }
 
-    /// Send the one unkeyed `GET /api/v1/health`.
-    ///
-    /// The client holds an empty token, and `health()` sends no
-    /// `Authorization` header at all. A plain `http` URL involves no TLS,
+    /// A plain `http` URL involves no TLS,
     /// so it is probed with system trust: a pin would refuse to send it,
     /// and there is no certificate for any trust to judge.
     pub(super) async fn probe(connection: &Connection) -> Probe {
@@ -145,20 +103,12 @@ mod witness {
         }
     }
 
-    /// An API whose certificate verified under the connection's trust, and
-    /// the probe's answer observed under it. Only [`verify_tls`] mints one.
-    /// It cannot build a keyed client; [`VerifiedTls::into_api`] decides
-    /// whether the answer came from trawl.
     pub(super) struct VerifiedTls<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
         answer: Result<(u16, HealthResponse), ClientError>,
     }
 
-    /// Mint the TLS witness when, and only when, the URL is `https`, the
-    /// trust verifies certificates, and the probe got an HTTP answer under
-    /// that trust. The probe is consumed, so its answer is the one the
-    /// witness carries.
     pub(super) fn verify_tls(connection: &Connection, probe: Probe) -> Option<VerifiedTls<'_>> {
         let verifies = matches!(connection.trust, TlsTrust::System | TlsTrust::PinnedCa(_));
         if connection.url.scheme() == Scheme::Https
@@ -177,33 +127,18 @@ mod witness {
         }
     }
 
-    /// An API that answered as trawl under verified TLS: its health answer
-    /// parsed as a trawl health body with both a `checks` map and a
-    /// `version`, under the HTTP status trawld sends with that body's
-    /// `status`. Only [`VerifiedTls::into_api`] mints one.
     pub(super) struct VerifiedApi<'a> {
         url: &'a CheckedUrl,
         trust: &'a TlsTrust,
     }
 
-    /// Why a health answer minted no [`VerifiedApi`].
     pub(super) enum NotTrawl {
-        /// The request failed or its answer did not parse.
         Answer(ClientError),
-        /// The body parsed, but lacks the `checks` map or the `version`
-        /// that trawld always sends: a status alone is anyone's answer.
         Unsigned,
-        /// The HTTP status and the body's `status` are not a pair trawld
-        /// sends: 200 goes with `ok` or `degraded`, 503 with `unavailable`.
         Disagrees,
     }
 
     impl<'a> VerifiedTls<'a> {
-        /// The health answer, and with it the API witness when that answer
-        /// is trawl's health body. A redirect, another status, a body that
-        /// does not parse, one without both `checks` and `version`, or one
-        /// whose `status` disagrees with the HTTP status comes back as the
-        /// refusal, and no witness.
         pub(super) fn into_api(self) -> Result<(VerifiedApi<'a>, HealthResponse), NotTrawl> {
             let (http_status, health) = self.answer.map_err(NotTrawl::Answer)?;
             if health.checks.is_none() || health.version.is_none() {
@@ -223,14 +158,13 @@ mod witness {
     }
 
     impl VerifiedApi<'_> {
-        /// The only place a client that carries a key is built.
         pub(super) fn keyed_client(&self, key: &Key) -> Result<HttpClient, ClientError> {
             client(self.url, key.secret(), self.trust)
         }
     }
 }
 
-/// Whether `result` holds an HTTP answer, whatever its status. A body too
+/// A body too
 /// large to read, one that stalled after the headers, or one that broke
 /// off after them still followed an answer's status line.
 fn answered<T>(result: &Result<T, ClientError>) -> bool {
@@ -246,7 +180,6 @@ fn answered<T>(result: &Result<T, ClientError>) -> bool {
     }
 }
 
-/// The trust mode, named as the report names it.
 const fn trust_name(trust: &TlsTrust) -> &'static str {
     match trust {
         TlsTrust::System => "system roots",
@@ -255,7 +188,6 @@ const fn trust_name(trust: &TlsTrust) -> &'static str {
     }
 }
 
-/// The state the `api.*` steps share, in the order the runner calls them.
 pub struct ApiRun<'a> {
     connection: &'a Connection,
     probe: Option<witness::Probe>,
@@ -266,8 +198,6 @@ pub struct ApiRun<'a> {
     notes: Vec<String>,
 }
 
-/// Names the origin and how far the run got; a probe's error and the key
-/// never reach it.
 impl std::fmt::Debug for ApiRun<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ApiRun")
@@ -292,8 +222,6 @@ impl<'a> ApiRun<'a> {
         }
     }
 
-    /// `api.transport`: send the health probe and say whether a connection
-    /// opened.
     pub async fn transport(&mut self) -> Check {
         let probe = witness::probe(self.connection).await;
         let check = transport_row(&probe);
@@ -301,8 +229,6 @@ impl<'a> ApiRun<'a> {
         check
     }
 
-    /// `api.tls`: judge the certificate from the probe, and mint the TLS
-    /// witness when it verified.
     pub fn tls(&mut self) -> Check {
         let probe = self
             .probe
@@ -358,7 +284,6 @@ impl<'a> ApiRun<'a> {
         }
     }
 
-    /// The selected key's secret, for redaction.
     fn secret(&self) -> Option<&'a str> {
         self.connection
             .key
@@ -366,13 +291,6 @@ impl<'a> ApiRun<'a> {
             .map(super::resolve::Key::secret)
     }
 
-    /// `api.health` and its `api.health.<key>` rows, from the probe's
-    /// answer. The runner calls it only after `api.tls` completed. A trawl
-    /// health body, one that parses, carries both `checks` and `version`,
-    /// and came under the HTTP status trawld sends with its `status`, mints
-    /// the API witness, the only way `api.identity` can send the key;
-    /// anything else, trawld's request-limit refusal included, fails or is
-    /// not sampled here and blocks it.
     pub fn health(&mut self) -> Vec<Check> {
         let tls = self
             .tls
@@ -429,9 +347,6 @@ impl<'a> ApiRun<'a> {
         rows
     }
 
-    /// `api.identity`: prove the key with `whoami`. The runner calls it
-    /// only after `api.health` completed, which is when the API witness
-    /// exists.
     pub async fn identity(&mut self) -> Check {
         let mut check = row(API_IDENTITY, Outcome::NotConfigured);
         let Some(key) = &self.connection.key else {
@@ -485,8 +400,6 @@ impl<'a> ApiRun<'a> {
         }
     }
 
-    /// Report-level notes gathered along the way, plus the ones that need
-    /// both health and identity.
     pub fn into_notes(mut self) -> Vec<String> {
         if let (Some(health), Some(who)) = (&self.health, &self.identity) {
             let capacity_ok = health
@@ -506,7 +419,6 @@ impl<'a> ApiRun<'a> {
     }
 }
 
-/// `api.transport` from the probe.
 fn transport_row(probe: &witness::Probe) -> Check {
     let check = row(API_TRANSPORT, Outcome::Complete);
     if probe.not_built {
@@ -547,9 +459,6 @@ fn transport_row(probe: &witness::Probe) -> Check {
     }
 }
 
-/// `api.transport` when the probe client could not be built. Only a pinned
-/// CA that holds no usable certificate points at `ca_cert`; any other build
-/// failure, including every one under `--url`'s system trust, does not.
 fn not_built_row(check: Check, error: Option<&ClientError>) -> Check {
     let (reason, next) = match error {
         Some(ClientError::InvalidCa(_)) => (
@@ -573,8 +482,6 @@ fn not_built_row(check: Check, error: Option<&ClientError>) -> Check {
     )
 }
 
-/// The outcome of a request that got something other than the answer it
-/// wanted. `what` names the endpoint in the reason.
 fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
     check.outcome = Outcome::Failed;
     match e {
@@ -585,10 +492,6 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
                 "wait a minute, then run trawl doctor again",
             )
         }
-        // trawld's own capacity refusal (ADR-0054), told apart by its 503
-        // and typed code only: the doctor could not look, and the server
-        // is not another service. No witness was minted, so the key stays
-        // home.
         ClientError::Server {
             status: 503, error, ..
         } if error.code == ErrorCode::RequestLimitReached => {
@@ -629,8 +532,6 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
                     "run trawl doctor again; no answer came within 10 s",
                 )
             }
-            // The server answered, so transport and TLS stand; only this
-            // answer could not be read.
             Some(NetworkKind::BodyTimeout) => {
                 check.outcome = Outcome::NotSampled;
                 with_next(
@@ -657,9 +558,6 @@ fn answer_failure(mut check: Check, e: &ClientError, what: &str) -> Check {
     }
 }
 
-/// One row per check name the server reports, sorted by name. Names that
-/// are not identifiers, or that hold a run of the key, become one
-/// `api.health._invalid` row, and none of them is echoed.
 fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Check> {
     let mut named = BTreeMap::new();
     let mut invalid = 0usize;
@@ -689,9 +587,6 @@ fn health_rows(checks: &HashMap<String, String>, secret: Option<&str>) -> Vec<Ch
     rows
 }
 
-/// One `api.health.<name>` row. The value's meaning comes from the
-/// classifier every doctor shares ([`health::classify`]); the wording is
-/// this CLI's.
 fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
     let class = health::classify(name, value);
     let check = row(&format!("{API_HEALTH_KEY_PREFIX}{name}"), class.outcome());
@@ -700,9 +595,6 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
             detail: Some("reported ok".to_owned()),
             ..check
         },
-        // A slow engine answered its latest sample past the budget, and
-        // answered within the last minute: the server is degraded, not down
-        // (ADR-0056).
         ValueClass::Degraded => with_next(
             Check {
                 detail: Some(format!("reported {value}")),
@@ -712,8 +604,6 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
                 "the server is degraded, not down; read the server's log if {name} stays {value}"
             ),
         ),
-        // A recovering corpus is not a failure: the server cannot yet vouch
-        // for what it holds, so the doctor could not look (ADR-0047).
         ValueClass::Recovering => with_next(
             Check {
                 detail: Some(format!("reported {value}")),
@@ -739,11 +629,8 @@ fn health_row(name: &str, value: &str, secret: Option<&str>) -> Check {
     }
 }
 
-/// The most characters of the key's name the report shows.
 const NAME_MAX_CHARS: usize = 32;
 
-/// The key's name, kind and permissions, never its prefix.
-///
 /// Only the name is the server's own text. `kind` is already one of
 /// trawl's principal kinds: whoami's `kind` decodes only as `human` or
 /// `service`, so any other value fails the whole answer. Permissions are
@@ -770,14 +657,6 @@ fn identity_detail(who: &WhoAmIResponse, secret: &str) -> String {
     if unrecognized > 0 {
         write!(permissions, "; {unrecognized} unrecognized").expect("writing to a String");
     }
-    // The name is shown as the server sent it, stripped of control
-    // characters, with every literal run of the key redacted, and capped
-    // at NAME_MAX_CHARS. Redaction catches only the key's own characters:
-    // a server that already holds the key could still echo it encoded
-    // (base64, hex, reversed) in the name, and up to NAME_MAX_CHARS of
-    // that encoding would reach the report. That residual risk is
-    // accepted: such a server already has the key, and the cap bounds how
-    // much of it one report can carry.
     format!(
         "name: {}; kind: {}; permissions: {permissions}",
         display_safe_within(&who.name, Some(secret), NAME_MAX_CHARS),

@@ -2,18 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `proxy.public_origins`, `proxy.cookie_settings` and `proxy.cookie_key`
-//! (#271 AC1, AC6, AC8, AC9; D7, D8, D12).
-//!
-//! Every run goes through [`doctor`] or [`run_web_doctor_in_userns`], so
-//! the leak check sees every report, with the origins, the shared domain,
-//! the key and its base64 planted. These tests assert only the settings
-//! rows: the upstream rows belong to the upstream group. Where a test needs
-//! the run not to fail on the upstream, it pins a CA file that does not
-//! exist, so the upstream is incomplete (`ca_not_present`) and nothing is
-//! dialled. The root-run test needs every other row complete instead, so
-//! it pins a healthy upstream ([`healthy_upstream`]).
-
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
@@ -25,13 +13,10 @@ use crate::support::{
     home_env, report, row, run_web_doctor_in_userns, verdict, write_config, write_key,
 };
 
-/// A doctor run's environment.
 type Env = Vec<(&'static str, OsString)>;
 
-/// The spec's words for the next action when no key persists.
 const PERSIST_KEY: &str = "set `cookie_secret_path` so sessions survive restarts";
 
-/// The base64 of [`PLANTED_KEY`], as an operator would set it.
 fn planted_key_base64() -> String {
     fleet_auth::SessionKey::from_bytes(*PLANTED_KEY)
         .to_base64url()
@@ -39,7 +24,6 @@ fn planted_key_base64() -> String {
         .to_owned()
 }
 
-/// `home_env(home)` plus `extra`.
 fn env_with(home: &Path, extra: &[(&'static str, &str)]) -> Env {
     let mut env = home_env(home);
     env.extend(
@@ -50,8 +34,6 @@ fn env_with(home: &Path, extra: &[(&'static str, &str)]) -> Env {
     env
 }
 
-/// Run the doctor over `fixture`, written in `home`, with `env`, planting
-/// the fixture's values, the key's base64, and `extra`.
 fn run(home: &Path, fixture: &WebDoctorConfig, env: &Env, extra: &[&str]) -> (i32, Report) {
     let config = write_config(home, fixture);
     let mut planted = fixture.planted();
@@ -66,24 +48,18 @@ fn absent_ca(home: &Path) -> PathBuf {
     home.join("tls-absent").join("cert.pem")
 }
 
-/// [`write_key`] of `len` bytes at `path`, then chmod it to `mode`.
 fn write_key_with_mode(path: &Path, len: usize, mode: u32) {
     use std::os::unix::fs::PermissionsExt as _;
     write_key(path, len);
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
 }
 
-/// One `proxy.cookie_key` case: the key source a test configures, and
-/// what the row must say.
 struct KeyCase {
     label: &'static str,
     /// `cookie_secret_path`, as a file of this many bytes and this mode.
     file: Option<(usize, u32)>,
-    /// `cookie_secret_path` naming a path where nothing is.
     missing_file: bool,
-    /// `cookie_secret_env`.
     secret_env: Option<String>,
-    /// Variables for the run.
     env: Vec<(&'static str, String)>,
     expect: (Outcome, Option<&'static str>),
     /// Text the row's source must contain.
@@ -104,14 +80,6 @@ impl KeyCase {
     }
 }
 
-/// Every cookie key source and what its row says (AC6, D7): a 32-byte key
-/// from `FLEET_SESSION_AEAD_KEY`, from the variable `cookie_secret_env`
-/// names, or in the `cookie_secret_path` file is `complete`, naming its
-/// source; a file of another length, or none, is `failed`; a file the
-/// running user may not read is `not_sampled`, `permission_denied`; an
-/// invalid `FLEET_SESSION_AEAD_KEY` fails with no fallback to a good file;
-/// and no source is `not_configured`, `ephemeral_each_start`, which does
-/// not fail the run.
 #[test]
 fn web_doctor_cookie_key_sources() {
     for case in key_cases(&planted_key_base64()) {
@@ -161,8 +129,6 @@ fn web_doctor_cookie_key_sources() {
         }
     }
 
-    // No source: `not_configured`, with the spec's next action; the row
-    // does not fail the run, whose upstream here is incomplete.
     let home = tempfile::tempdir().unwrap();
     let mut fixture = WebDoctorConfig::in_dir(home.path());
     fixture.upstream_ca_path = Some(absent_ca(home.path()));
@@ -180,9 +146,6 @@ fn web_doctor_cookie_key_sources() {
     assert_ne!(code, 1, "no key source failed the run: {report:?}");
 }
 
-/// The cases of [`web_doctor_cookie_key_sources`], whose good key is the
-/// base64 `key`. The unreadable-file case is left out, saying so, when
-/// this test runs as real root, which reads a mode-000 file.
 fn key_cases(key: &str) -> Vec<KeyCase> {
     let good = |label, source: &str| {
         let mut case = KeyCase::new(label, (Outcome::Complete, None));
@@ -273,8 +236,6 @@ fn key_cases(key: &str) -> Vec<KeyCase> {
     case.source = Some("FLEET_SESSION_AEAD_KEY".to_owned());
     cases.push(case);
 
-    // Root reads a mode-000 file, so only a run as another user can see
-    // the refusal.
     if nix::unistd::geteuid().is_root() {
         eprintln!(
             "SKIPPED: web_doctor_cookie_key_sources: the unreadable-file case, because this \
@@ -292,8 +253,6 @@ fn key_cases(key: &str) -> Vec<KeyCase> {
     cases
 }
 
-/// One `proxy.public_origins` case: the file's list, the variable, and
-/// what the row must say.
 struct OriginCase<'a> {
     label: &'a str,
     file: Vec<String>,
@@ -304,8 +263,6 @@ struct OriginCase<'a> {
     source: &'a str,
 }
 
-/// Run `case` with `planted` and check its rows: a complete list lets the
-/// cookie settings look; a failed one blocks them and fails the run.
 fn check_origin_case(case: OriginCase<'_>, planted: &[&str]) {
     let label = case.label;
     let home = tempfile::tempdir().unwrap();
@@ -356,11 +313,6 @@ fn check_origin_case(case: OriginCase<'_>, planted: &[&str]) {
     }
 }
 
-/// Where the origin allowlist came from, never what it holds (AC8, D1):
-/// the file's list; `FLEET_SESSION_PUBLIC_ORIGINS` replacing it, reported
-/// as replaced even when the two lists match; the variable with no file
-/// list. An empty or invalid list, in either place, is `failed`, naming
-/// only the entry's index, and blocks the cookie settings.
 #[test]
 #[expect(
     clippy::too_many_lines,
@@ -481,10 +433,6 @@ fn web_doctor_origin_sources() {
     }
 }
 
-/// With no key source the doctor generates no key and writes nothing
-/// (AC1, D15): the row is `not_configured`, `ephemeral_each_start`, and
-/// HOME, which holds the configuration, is unchanged. A key path with
-/// nothing at it fails, and nothing is created there either.
 #[test]
 fn web_doctor_generates_no_key() {
     let home = tempfile::tempdir().unwrap();
@@ -526,22 +474,14 @@ fn web_doctor_generates_no_key() {
     assert_eq!(code, 1);
 }
 
-/// One root-run case: the key file, or the Fleet variable, and the row.
 struct RootCase {
     label: &'static str,
     /// `cookie_secret_path`, as a file of this many bytes and this mode.
     file: Option<(usize, u32)>,
-    /// A good `FLEET_SESSION_AEAD_KEY` instead.
     fleet_env: bool,
     expect: (Outcome, Option<&'static str>),
 }
 
-/// Run as root, `proxy.identity` and the key file's readability are
-/// `not_sampled`, `ran_as_root`, and the run cannot exit 0 (AC9, D12),
-/// even for a file no other user could open. A content failure still
-/// fails, and a key from the environment is content, so it stays
-/// `complete`. HOME is mounted read-only for each run.
-///
 /// Every case pins a real rustls upstream serving a healthy answer, so
 /// every row but identity and the key completes: with a key from the
 /// environment, root alone is what keeps the run from exiting 0.
@@ -584,8 +524,6 @@ async fn web_doctor_root_run_is_incomplete() {
     assert_anonymous_probes(upstream.mock(), cases.len()).await;
 }
 
-/// One case of [`web_doctor_root_run_is_incomplete`], as root in `userns`,
-/// with the upstream at `upstream_url` pinned to `upstream_ca`.
 fn root_run(userns: &Userns, upstream_url: &str, upstream_ca: &Path, case: &RootCase) {
     let &RootCase {
         label,
@@ -663,12 +601,9 @@ fn root_run(userns: &Userns, upstream_url: &str, upstream_ca: &Path, case: &Root
     assert_eq!(i32::from(report.verdict().exit_code()), run.code, "{label}");
 }
 
-/// One `proxy.cookie_settings` case.
 struct CookieCase<'a> {
     label: &'a str,
-    /// `[web] public_origins`.
     origins: Vec<String>,
-    /// `allow_insecure_cookies = true` in the file.
     insecure: bool,
     variables: Vec<(&'static str, &'a str)>,
     expect: (Outcome, Option<&'a str>),
@@ -676,12 +611,6 @@ struct CookieCase<'a> {
     text: &'a str,
 }
 
-/// Cookies without Secure on an origin that is not loopback fail (D8),
-/// judged on the effective origins after the environment replaced the
-/// file's list; on loopback origins they pass. A `FLEET_SESSION_COOKIE_*`
-/// value that does not parse fails, naming the variable and the rule, not
-/// the value. Each setting is reported with its source, and a shared
-/// domain as such, never by value.
 #[test]
 fn web_doctor_insecure_cookie_off_loopback_fails() {
     for case in cookie_cases() {
@@ -744,7 +673,6 @@ fn web_doctor_insecure_cookie_off_loopback_fails() {
     );
 }
 
-/// The cases of [`web_doctor_insecure_cookie_off_loopback_fails`].
 fn cookie_cases() -> Vec<CookieCase<'static>> {
     let off_loopback = (
         Outcome::Failed,

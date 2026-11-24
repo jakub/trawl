@@ -4,42 +4,13 @@
 
 //! `<CopyButton/>` — click-to-copy wired to the toast system.
 //!
-//! The trigger is a secondary [`Btn`](crate::button::Btn) by default;
-//! passing `class` renders a bare `<button class=…>` instead — for
-//! app-styled inline triggers like trawl's editor `.tool` links,
-//! keeping app classes out of fleet-ui. Bare mode is still a native
-//! button (ADR-0028), and the caller's class owns the ENTIRE look,
-//! including the button reset: fleet-ui ships no rule for a class it
-//! does not name, so a bare trigger whose class only sets colour and
-//! font arrives with the browser's grey fill and bevel. trawl's
-//! `.editor-tools button.tool` already resets both.
-//!
-//! Success and error report through the
-//! [`ToastBus`](crate::toast::ToastBus) the `Shell` provides via
-//! context, with the canonical "Copied" / "Copy failed" titles;
-//! `success_detail` is the optional app-flavored second line.
-//!
-//! The "which toast fires" decision lives in the pure [`copy_toast`]
-//! function so the click → toast outcome is a native `nextest` fact
-//! (see this module's tests), mirroring [`crate::toast::stack`], where
-//! the toast *stack* transitions are likewise unit-tested off-target.
-//! The wasm component below is the DOM glue that runs the async
-//! clipboard write and pushes the pure decision onto the bus.
+//! Passing `class` renders a bare `<button class=…>`, and the caller's
+//! class owns the ENTIRE look, including the button reset: fleet-ui ships
+//! no rule for a class it does not name, so a bare trigger whose class only
+//! sets colour and font arrives with the browser's grey fill and bevel.
 
 use crate::toast::ToastKind;
 
-/// Map a clipboard-write result to the toast the `CopyButton` fires.
-///
-/// `Ok` → a `Success` toast titled `"Copied"`, carrying the optional
-/// app-flavored `success_detail` as its second line. `Err` → an
-/// `Error` toast titled `"Copy failed"`, carrying the browser's reject
-/// reason so a failed copy leaves a visible trace instead of nothing.
-///
-/// Pure and target-agnostic: the wasm component feeds it
-/// `write_clipboard(&text).await` and pushes the tuple straight onto
-/// the [`ToastBus`](crate::toast::ToastBus), so testing this function
-/// against a [`ToastStack`](crate::toast::ToastStack) exercises the
-/// exact toast a real copy produces.
 pub fn copy_toast(
     result: Result<(), String>,
     success_detail: Option<String>,
@@ -60,9 +31,8 @@ mod component {
     use crate::clipboard::write_clipboard;
     use crate::toast::ToastBus;
 
-    /// Click-to-copy trigger. `text` resolves lazily at click time (derive
-    /// it for values that change under the trigger, e.g. the current URL);
-    /// `children` is the trigger's label/icon slot.
+    /// `text` resolves lazily at click time (derive it for values that change
+    /// under the trigger, e.g. the current URL).
     #[component]
     pub fn CopyButton(
         #[prop(into)] text: Signal<String>,
@@ -82,11 +52,8 @@ mod component {
         };
 
         match class {
-            // Bare mode: an app-styled inline trigger, still a native
-            // button. The click stops here for the same reason Btn takes
-            // the flag: a consumer may nest this trigger inside an
-            // ancestor that handles pointer events. trawl-web-ui no
-            // longer does (ADR-0029); coastwatch still can.
+            // The click stops here: a consumer may nest this trigger inside an
+            // ancestor that handles pointer events.
             Some(cls) => view! {
                 <button
                     type="button"
@@ -118,8 +85,6 @@ mod tests {
     use super::copy_toast;
     use crate::toast::{ToastKind, ToastStack};
 
-    /// A successful copy pushes exactly one `Success`/"Copied" toast
-    /// onto the bus's stack, carrying the app's success detail line.
     #[test]
     fn copy_success_fires_a_copied_toast() {
         let (kind, title, detail) = copy_toast(Ok(()), Some("share URL copied".into()));
@@ -133,10 +98,6 @@ mod tests {
         assert_eq!(items[0].detail(), Some("share URL copied"));
     }
 
-    /// A rejected clipboard write fires an `Error`/"Copy failed" toast
-    /// carrying the browser's reason — a failed copy leaves a trace
-    /// rather than silently doing nothing, and the success detail line
-    /// must not leak into it.
     #[test]
     fn copy_failure_fires_an_error_toast_carrying_the_reason() {
         let (kind, title, detail) = copy_toast(

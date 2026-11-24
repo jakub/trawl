@@ -2,13 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Periodic server stats emitter.
-//!
-//! Emits a `server_stats` INFO event at a fixed interval with
-//! key metrics (pool utilization, hot buffer, uptime). With internal
-//! telemetry enabled, `WalLayer` persists the event like any other
-//! trawld log record, so these stats are queryable with trawl's own DSL.
-
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -18,11 +11,6 @@ use tokio::time::MissedTickBehavior;
 
 use crate::state::AppState;
 
-/// Spawn the periodic stats emitter.
-///
-/// Emits `server_stats` and refreshes the shared gauges every `interval`.
-/// A gauge collection that panics is logged and the next tick collects
-/// again. Stops when `shutdown_rx` receives a signal.
 pub fn spawn_stats_emitter(
     state: &AppState,
     interval: Duration,
@@ -72,15 +60,9 @@ pub fn spawn_stats_emitter(
     }))
 }
 
-/// Run `on_tick` every `interval`, skipping the immediate first tick, and
-/// run the blocking work it returns on the blocking pool.
-///
 /// Storage scans and competing collection attempts can block, so the work
 /// is awaited inside the tick: ticks never overlap, and shutdown waits for
-/// the collection in flight before leaving the loop. Work that panics or is
-/// cancelled emits `stats_collection_failed` and the loop goes on. The
-/// caches keep their last complete sample (ADR-0033), so nothing is cleared
-/// or zeroed here.
+/// the collection in flight.
 async fn run<F, W>(interval: Duration, mut shutdown_rx: watch::Receiver<bool>, mut on_tick: F)
 where
     F: FnMut() -> W,
@@ -119,7 +101,6 @@ where
     }
 }
 
-/// Emit a single `server_stats` event.
 fn emit_stats(
     start_time: Instant,
     total_queries: &std::sync::atomic::AtomicU64,
@@ -158,7 +139,6 @@ fn emit_stats(
     );
 }
 
-/// Event capture for the loop tests below.
 #[cfg(test)]
 mod support {
     use std::collections::HashMap;
@@ -192,10 +172,7 @@ mod support {
     }
 }
 
-/// The first collection panics with a payload that names a path; the
-/// next tick collects again, the failure event quotes neither, and
-/// shutdown still ends the loop. The panic's default stderr report is
-/// expected test output.
+/// The injected panic's default stderr report is expected test output.
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn a_failed_collection_does_not_end_the_loop() {
@@ -254,7 +231,6 @@ async fn a_failed_collection_does_not_end_the_loop() {
     );
 }
 
-/// Shutdown sent while a collection runs waits for that collection.
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn shutdown_waits_for_the_collection_in_flight() {
@@ -271,7 +247,6 @@ async fn shutdown_waits_for_the_collection_in_flight() {
     let on_tick = {
         let finished = Arc::clone(&finished);
         move || {
-            // Only the first collection holds; any later one is a no-op.
             let gate = release_rx.lock().unwrap().take();
             let started_tx = started_tx.clone();
             let finished = Arc::clone(&finished);
@@ -301,11 +276,9 @@ async fn shutdown_waits_for_the_collection_in_flight() {
     assert_eq!(finished.load(Ordering::SeqCst), 1);
 }
 
-/// A collection that overruns its interval leaves the next tick ready. When
-/// shutdown arrives during that collection, the loop leaves without starting
-/// another. `select!` picks among ready arms at random unless biased, so one
-/// trial would pass half the time; across 32 trials a wrong order slips
-/// through once in 2^32 runs.
+/// Shutdown and the next tick are ready together when the overrun ends, and
+/// `select!` picks among ready arms at random unless biased: one trial would
+/// pass half the time, 32 let a wrong order through once in 2^32 runs.
 #[cfg(test)]
 #[tokio::test(start_paused = true)]
 async fn shutdown_during_an_overrun_starts_no_new_collection() {

@@ -1,7 +1,6 @@
 // This Source Code Form is subject to the terms of the Mozilla Public
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
-// Shared only by the experiment runner and its attached evidence scenario.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { createReadStream } from 'node:fs';
@@ -113,8 +112,6 @@ export async function verifyRunIdentity(run, instance, record, { served = true }
   assert.ok(config.includes(`upstream_url = "${instance.upstream}"`), 'run upstream differs from config');
   assert.equal(await spaHash(spaDirectory), record.build.spaHash, 'owned SPA differs from run build');
   if (served) assert.equal(await spaHash(spaDirectory, origin.origin), record.build.spaHash, 'served SPA differs from run build');
-  // Bracket the HTTP requests with a process-generation check too. These
-  // checks detect drift; they are not isolation from a hostile local user.
   for (const name of ['trawld', 'web']) {
     const expected = instance.processIdentity[name];
     assert.deepEqual(await processStart(expected.pid), { bootId: expected.bootId, startTicks: expected.startTicks }, 'process changed during SPA verification');

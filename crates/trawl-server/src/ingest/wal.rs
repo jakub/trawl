@@ -19,10 +19,8 @@ use parking_lot::Mutex;
 use super::publication_marker;
 use crate::error::CauseKind;
 
-/// How many names one write tries before it gives up. A name is taken
-/// when an entry already holds it or a pending publication marker claims
-/// it. Every fresh name carries a new random nonce, so a second taken name
-/// is already unlikely; the bound keeps a write from looping.
+/// How many names one write tries before it gives up. Every fresh name
+/// carries a new random nonce; the bound keeps a write from looping.
 const MAX_NAME_ATTEMPTS: usize = 8;
 
 /// A WAL write that was not acknowledged.
@@ -64,16 +62,12 @@ impl WalWriteError {
         matches!(self, Self::LeftVisible { .. })
     }
 
-    /// The closed kind of the failed operation's I/O error: the write's own
-    /// error, or the directory fsync that left the file visible.
     pub fn cause_kind(&self) -> CauseKind {
         match self {
             Self::NotPublished(e) | Self::LeftVisible { sync: e, .. } => CauseKind::of_io(e),
         }
     }
 
-    /// The closed kind of the failed withdrawal, when the file was left
-    /// visible.
     pub fn withdraw_cause_kind(&self) -> Option<CauseKind> {
         match self {
             Self::NotPublished(_) => None,
@@ -104,9 +98,7 @@ pub struct WalName {
 }
 
 impl WalName {
-    /// Parse a file name the writer could have produced, and nothing else:
-    /// a valid service name, the millis in decimal without a sign or
-    /// leading zeros, exactly four lowercase hex digits, and `.ndjson`.
+    /// Parse a file name the writer could have produced, and nothing else.
     pub fn parse(file_name: &str) -> Option<Self> {
         let stem = file_name.strip_suffix(".ndjson")?;
         let (rest, nonce) = stem.rsplit_once('_')?;
@@ -122,7 +114,6 @@ impl WalName {
             .then_some(name)
     }
 
-    /// `{service}_{millis}_{nonce:04x}.ndjson`.
     pub fn file_name(&self) -> String {
         format!("{}.ndjson", self.stem())
     }
@@ -158,14 +149,11 @@ type DirIdentity = (u64, u64);
 static ACK_ORDER: std::sync::LazyLock<Mutex<HashMap<PathBuf, u64>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
-/// The position of `path` in the process-wide acknowledgement order, or
-/// `None` if no [`WalWriter`] acknowledged it.
 #[cfg(test)]
 pub(crate) fn ack_sequence_for_test(path: &Path) -> Option<u64> {
     ACK_ORDER.lock().get(path).copied()
 }
 
-/// Atomic WAL file writer for ingest events.
 #[derive(Debug)]
 pub struct WalWriter {
     wal_dir: PathBuf,
@@ -183,10 +171,8 @@ pub struct WalWriter {
     fail_next_withdraw: std::sync::atomic::AtomicBool,
     #[cfg(test)]
     fail_next_tmp_unlink: std::sync::atomic::AtomicBool,
-    /// Names the next writes take, in order, before generated ones.
     #[cfg(test)]
     forced_names: Mutex<std::collections::VecDeque<WalName>>,
-    /// Every directory this writer tried to fsync, in call order.
     #[cfg(test)]
     synced_dirs: Mutex<Vec<PathBuf>>,
     /// Parks the next write that creates an env directory, after the
@@ -239,43 +225,17 @@ impl WalWriter {
     /// Write events durably under a name no other file holds: stage them in
     /// a new `.tmp`, fsync its data, link it under a free `.ndjson` name,
     /// unlink the `.tmp`, then fsync the parent directory so the link
-    /// survives a crash. `Ok` is the acknowledgement: every step,
-    /// directory fsyncs included, has succeeded.
+    /// survives a crash. `Ok` is the acknowledgement: every step but the `.tmp`
+    /// unlink, directory fsyncs included, has succeeded.
     ///
     /// The fsync *before* the link prevents a torn write: without it the
     /// link can be journaled before the data blocks reach the device, so a
     /// hard kill / power loss leaves a full-length `.ndjson` of NUL bytes
     /// that head-of-line-blocks compaction.
     ///
-    /// The writer never replaces an existing file (ADR-0041). The `.tmp` is
-    /// created exclusively, and the final name is published with a hard
-    /// link, which fails on an existing entry where a rename would replace
-    /// it. A taken name, or one that the pending publication marker of this
-    /// `(env, service)` lists, gets a fresh name ([`Self::link_free_name`]).
-    /// A marker of this `(env, service)` that is invalid or cannot be read
-    /// refuses the write as [`WalWriteError::NotPublished`], so the sender
-    /// retries once recovery or an operator resolves it.
-    ///
-    /// The parent-directory fsync makes the link durable. Without it, a
-    /// power loss can drop an acknowledged batch. When it fails, the file
-    /// is withdrawn (unlinked) and the unlink synced before the error
-    /// returns, so a caller that retries cannot duplicate the batch. If the
-    /// withdrawal or its sync fails too, [`WalWriteError::LeftVisible`] says
-    /// so. A `.tmp` that cannot be unlinked after the link is logged and
-    /// left behind: only `.ndjson` names are WAL files, so it changes no
-    /// outcome.
-    ///
-    /// The first write into an environment directory in this process,
-    /// including one recreated after removal, also fsyncs `wal_dir`, which
-    /// holds the env directory's own entry, and fails before writing
-    /// anything if that sync fails. A write that finds `wal_dir` itself
-    /// gone recreates it through the same barrier as [`Self::ensure_dir`].
-    ///
-    /// Files land in `wal_dir/{env}/` (lazily created), named
-    /// `{service}_{unix_millis}_{4_hex}.ndjson` ([`WalName`]) with the
-    /// service name verbatim — path encoding is injective by validation
-    /// (ADR-0009): both `env` and `service` were validated at ingest, so
-    /// `api.v2` and `api_v2` are distinct files and pruning stays exact.
+    /// The writer never replaces an existing file (ADR-0041). The final name is
+    /// published with a hard link, which fails on an existing entry where a
+    /// rename would replace it.
     pub fn write(&self, env: &str, service: &str, events: &[u8]) -> Result<PathBuf, WalWriteError> {
         let env_dir = self.wal_dir.join(env);
         self.ensure_env_dir(env, &env_dir)?;
@@ -416,13 +376,7 @@ impl WalWriter {
     }
 
     /// Link the staged file at `tmp_path` under a free final name, trying
-    /// the staging file's own name first. A name is taken when an entry
-    /// already holds it, which the link detects without replacing anything,
-    /// or when the pending publication marker of its service lists it
-    /// ([`claimed_by_marker`]). A taken name gets a fresh one. After
-    /// [`MAX_NAME_ATTEMPTS`] taken names the write fails with
-    /// `AlreadyExists`, having published nothing. A marker whose claims
-    /// cannot be established fails the write before any link.
+    /// the staging file's own name first.
     fn link_free_name(
         &self,
         env_dir: &Path,
@@ -450,8 +404,6 @@ impl WalWriter {
         ))
     }
 
-    /// The next name to try for `service`: a forced one in tests, otherwise
-    /// a fresh [`Self::generate_filename`].
     #[cfg_attr(not(test), allow(clippy::unused_self))]
     fn next_name(&self, service: &str) -> std::io::Result<WalName> {
         #[cfg(test)]
@@ -524,14 +476,10 @@ impl WalWriter {
         Ok(())
     }
 
-    /// [`crate::epoch::create_dir_all_durably`] through this writer's
-    /// directory barrier.
     fn create_dir_all_durably(&self, dir: &Path) -> std::io::Result<()> {
         crate::epoch::create_dir_all_durably(dir, |parent| self.sync_or_count(parent))
     }
 
-    /// Sync a directory that holds the WAL root or one of its ancestors,
-    /// counting and logging a failure.
     fn sync_or_count(&self, dir: &Path) -> std::io::Result<()> {
         self.sync_directory(dir).inspect_err(|e| {
             Self::count_directory_sync_failure();
@@ -618,29 +566,23 @@ impl WalWriter {
             .store(1, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Fail this writer's next `count` directory barriers.
     #[cfg(test)]
     pub(crate) fn fail_next_directory_syncs_for_test(&self, count: usize) {
         self.failing_directory_syncs
             .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Drain the directories this writer tried to fsync, in call order.
     #[cfg(test)]
     pub(crate) fn take_synced_dirs_for_test(&self) -> Vec<PathBuf> {
         std::mem::take(&mut *self.synced_dirs.lock())
     }
 
-    /// Fail the next withdrawal of a file whose directory sync failed,
-    /// leaving that file visible under its final name.
     #[cfg(test)]
     pub(crate) fn fail_next_withdraw_for_test(&self) {
         self.fail_next_withdraw
             .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Fail the next unlink of a staging file after its link, leaving the
-    /// `.tmp` behind.
     #[cfg(test)]
     pub(crate) fn fail_next_tmp_unlink_for_test(&self) {
         self.fail_next_tmp_unlink
@@ -655,7 +597,6 @@ impl WalWriter {
         self.forced_names.lock().extend(names);
     }
 
-    /// Panic after this many completed durable writes on this writer only.
     #[cfg(test)]
     pub(crate) fn panic_after_writes_for_test(&self, count: usize) {
         assert!(count > 0);
@@ -663,9 +604,6 @@ impl WalWriter {
             .store(count, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Generate a fresh name: `{service}_{unix_millis}_{4_hex_random}`.
-    ///
-    /// The service name is carried verbatim — it was validated at ingest.
     fn generate_filename(service: &str) -> std::io::Result<WalName> {
         let millis = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
@@ -675,21 +613,13 @@ impl WalWriter {
         Ok(WalName {
             service: service.to_owned(),
             millis: u64::try_from(millis).map_err(std::io::Error::other)?,
-            // 4 hex chars of randomness to avoid collisions within the same ms.
             nonce: rand::random(),
         })
     }
 }
 
 /// Whether the pending publication marker of `service` in `env_dir` lists
-/// `file_name` among its consumed WAL files. Recovery retires every file a
-/// marker lists, so a new file under such a name would be retired as if it
-/// had been merged. A missing marker claims nothing.
-///
-/// A marker that exists but whose claims cannot be established is an
-/// error, which refuses the write: one that is invalid, over the size
-/// bound, or that cannot be read. It may claim any name, and it may yet be
-/// repaired and recovered, so no name is safe to take until it resolves.
+/// `file_name` among its consumed WAL files. A missing marker claims nothing.
 /// The error names the service, not the path: it can reach the sender.
 fn claimed_by_marker(env_dir: &Path, service: &str, file_name: &str) -> std::io::Result<bool> {
     let marker = env_dir.join(publication_marker::marker_file_name(service));
@@ -712,7 +642,6 @@ mod tests {
     const DIR_SYNC_FAILURES: &str =
         "trawl_wal_durability_failures_total{operation=\"parent_directory_sync\"}";
 
-    /// Every `.ndjson` and `.tmp` name under `dir`, sorted.
     fn wal_names(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
@@ -754,7 +683,6 @@ mod tests {
             assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
             assert_eq!(std::fs::read(healthy).unwrap(), b"{\"id\":1}\n");
             assert_eq!(std::fs::read(next).unwrap(), b"{\"id\":3}\n");
-            // The writer rejects; the caller's lane owns the event count.
             assert_eq!(
                 sample(&handle, crate::metrics::SYSLOG_WAL_EVENTS_DISCARDED_TOTAL),
                 0
@@ -787,8 +715,6 @@ mod tests {
                 wal_names(&writer.dir().join("lab")).is_empty(),
                 "the write stops before creating any file"
             );
-            // The env was not remembered as durable, so this write syncs
-            // the root again, and it succeeds.
             let next = writer.write("lab", "first", b"{\"id\":2}\n").unwrap();
             assert_eq!(std::fs::read(next).unwrap(), b"{\"id\":2}\n");
             assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
@@ -851,7 +777,6 @@ mod tests {
         assert_eq!(chain[..2], [tmp_dir.join("state"), tmp_dir]);
         assert_eq!(writer.take_synced_dirs_for_test(), chain);
 
-        // A failed ancestor sync fails `ensure_dir`, which fails boot.
         writer.fail_next_directory_sync_for_test();
         writer.ensure_dir().unwrap_err();
     }
@@ -925,12 +850,10 @@ mod tests {
         use std::sync::{Arc, Barrier};
         let tmp = tempfile::tempdir().unwrap();
         let writer = Arc::new(WalWriter::new(tmp.path().join("wal")));
-        // `prod` is recorded as durable, then its directory goes away.
         std::fs::remove_file(writer.write("prod", "first", b"{}\n").unwrap()).unwrap();
         std::fs::remove_dir(writer.dir().join("prod")).unwrap();
         writer.take_synced_dirs_for_test();
 
-        // Writer A recreates `prod` and parks before its root sync.
         let barrier = Arc::new(Barrier::new(2));
         *writer.pause_after_create.lock() = Some(Arc::clone(&barrier));
         let a = std::thread::spawn({
@@ -977,10 +900,6 @@ mod tests {
             );
             assert_eq!(sample(&handle, DIR_SYNC_FAILURES), 1);
 
-            // Both syncs fail: the name is gone now, but a power loss may
-            // bring it back for compaction or hydration to find. The write
-            // is rejected as `LeftVisible`, not `NotPublished`, because a
-            // retry could then duplicate it. Each failed sync is counted.
             writer.fail_next_directory_syncs_for_test(2);
             let err = writer.write("prod", "lost", b"{\"id\":2}\n").unwrap_err();
             assert!(err.left_visible(), "{err:?}");
@@ -1030,9 +949,6 @@ mod tests {
 
     #[test]
     fn filename_carries_service_verbatim() {
-        // api.v2 and api_v2 must be distinct files: path encoding is
-        // injective by validation, with no sanitizer to collapse them
-        // (ADR-0009).
         let dotted = WalWriter::generate_filename("api.v2").unwrap().file_name();
         let underscored = WalWriter::generate_filename("api_v2").unwrap().file_name();
         assert!(dotted.starts_with("api.v2_"), "got {dotted}");
@@ -1118,7 +1034,6 @@ mod tests {
         encode_line(map, &mut line).unwrap();
         assert_eq!(line, expected);
 
-        // It appends, so consecutive lines concatenate into ndjson.
         let mut two = b"prefix\n".to_vec();
         encode_line(map, &mut two).unwrap();
         encode_line(map, &mut two).unwrap();
@@ -1155,9 +1070,6 @@ mod tests {
     }
 }
 
-/// The writer never replaces an existing name and never answers a failure
-/// after its final name exists with a retryable [`WalWriteError::NotPublished`]
-/// while that name may still reach compaction (ADR-0041).
 #[cfg(test)]
 mod no_clobber {
     use super::*;
@@ -1182,7 +1094,6 @@ mod no_clobber {
         writer
     }
 
-    /// Every entry name in `dir`, sorted.
     fn entries(dir: &Path) -> Vec<String> {
         let mut names: Vec<_> = std::fs::read_dir(dir)
             .unwrap()
@@ -1192,7 +1103,6 @@ mod no_clobber {
         names
     }
 
-    /// Run `f` with a thread-local subscriber and return what it logged.
     fn logged<T>(f: impl FnOnce() -> T) -> (T, String) {
         #[derive(Clone)]
         struct Sink(std::sync::Arc<Mutex<Vec<u8>>>);
@@ -1250,7 +1160,6 @@ mod no_clobber {
         let tmp = tempfile::tempdir().unwrap();
         let writer = warmed(tmp.path());
         let env_dir = writer.dir().join("prod");
-        // Another writer's staging file, or one a crash left behind.
         let staging = env_dir.join("svc_1000_abcd.tmp");
         std::fs::write(&staging, b"staged by someone else").unwrap();
 
@@ -1337,10 +1246,6 @@ mod no_clobber {
         assert_eq!(path, env_dir.join(named.file_name()));
     }
 
-    /// Plant `.publish-svc.json` with `body`, try a write for `svc`, and
-    /// check that it was refused as retryable with nothing published: the
-    /// `.tmp` is gone and no `.ndjson` name holds the batch. Returns the
-    /// refusal's text.
     fn refused_by_marker(writer: &WalWriter) -> String {
         let env_dir = writer.dir().join("prod");
         writer.force_names_for_test([forced("svc", 1_000, 0xabcd)]);
@@ -1367,22 +1272,15 @@ mod no_clobber {
         let env_dir = writer.dir().join("prod");
         std::fs::write(env_dir.join(".publish-svc.json"), b"not json").unwrap();
 
-        // The writer cannot tell which names the marker claims, and
-        // recovery may yet retire them: taking any name could lose the
-        // batch.
         let refusal = refused_by_marker(&writer);
         assert!(refusal.contains("is invalid"), "{refusal}");
         assert!(!refusal.contains(tmp.path().to_str().unwrap()), "{refusal}");
 
-        // Other services write as before, and so does this one once the
-        // marker is resolved.
         writer.write("prod", "other", b"{\"id\":2}\n").unwrap();
         std::fs::remove_file(env_dir.join(".publish-svc.json")).unwrap();
         writer.write("prod", "svc", b"{\"id\":3}\n").unwrap();
     }
 
-    /// A marker far over the size bound refuses the write from `fstat` on
-    /// its descriptor, before any read. It is sparse, so it costs no disk.
     #[cfg(unix)]
     #[test]
     fn an_oversized_marker_refuses_the_write_without_being_read() {
@@ -1398,8 +1296,6 @@ mod no_clobber {
         assert!(refusal.contains("is invalid"), "{refusal}");
     }
 
-    /// A FIFO at the marker path refuses the write at once: the writer
-    /// never waits for a FIFO writer to come.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_fifo_marker_refuses_the_write_without_blocking() {
@@ -1413,9 +1309,6 @@ mod no_clobber {
         assert!(refusal.contains("is invalid"), "{refusal}");
     }
 
-    /// A symlink at the marker path refuses the write, even to a valid
-    /// marker that claims no name the write would take: the writer never
-    /// follows it.
     #[cfg(unix)]
     #[test]
     fn a_symlinked_marker_refuses_the_write() {
@@ -1434,7 +1327,6 @@ mod no_clobber {
         assert!(refusal.contains("is invalid"), "{refusal}");
     }
 
-    /// A marker that exists but cannot be read may claim any name.
     #[cfg(target_os = "linux")]
     #[test]
     fn a_marker_that_cannot_be_read_refuses_the_write() {
@@ -1519,7 +1411,6 @@ mod no_clobber {
             logs.contains("event_type=\"wal_tmp_unlink_failed\""),
             "{logs}"
         );
-        // The staging name stays; compaction and hydration never read it.
         assert_eq!(
             entries(&env_dir),
             ["svc_1000_abcd.ndjson", "svc_1000_abcd.tmp"]
@@ -1607,8 +1498,6 @@ mod no_clobber {
             writer.fail_next_directory_syncs_for_test(2);
             let err = writer.write("prod", "svc", b"{\"id\":1}\n").unwrap_err();
 
-            // The name is gone now, but a power loss may restore it, so a
-            // retry could duplicate the batch.
             assert!(err.left_visible(), "{err:?}");
             let WalWriteError::LeftVisible { path, .. } = err else {
                 unreachable!()

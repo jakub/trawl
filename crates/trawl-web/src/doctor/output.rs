@@ -2,20 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What a `trawl-web --doctor` row may say, and the two renderings of the
-//! report (#271, D11).
-//!
-//! A row is a [`Row`], and every string in it is built here from parts
-//! that cannot carry a value the report must not show: `&'static str`
-//! literals, integers, a [`SelectedPath`] the operator chose, the running
-//! user's [`UserName`], a [`HealthKey`] from trawld's closed set, and an
-//! [`EnvName`] that passed its filter. A [`SettingSource`] is shown through
-//! its fixed wording; the variable names it carries are this crate's and
-//! fleet-auth's constants. No constructor takes a `String`, a `Display`, or
-//! an error, so the text of a configuration, OS, TOML, TLS or HTTP error,
-//! an origin, an upstream URL or host, a certificate name, or a key has no
-//! way into a row. The runner in [`super`] turns rows into
-//! [`trawl_api::doctor::Check`]s; nothing else builds one.
+//! Every string in a [`Row`] is built here from parts that cannot carry a
+//! value the report must not show. No constructor takes a `String`, a
+//! `Display`, or an error.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -37,8 +26,6 @@ pub enum Format {
 }
 
 impl Format {
-    /// The format when `--format` is absent: table on a terminal, JSON
-    /// otherwise, as `trawl doctor` picks.
     #[must_use]
     pub fn detect() -> Self {
         if io::IsTerminal::is_terminal(&io::stdout()) {
@@ -49,21 +36,15 @@ impl Format {
     }
 }
 
-/// Which operator selection a [`SelectedPath`] is. ADR-0047 lets a report
-/// name the configuration, credential and CA files the operator selected,
-/// and no other path.
+/// ADR-0047 lets a report name the configuration, credential and CA files
+/// the operator selected, and no other path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Selection {
-    /// The file `--config` names.
     ConfigFlag,
-    /// `[web] cookie_secret_path`.
     CookieSecretPath,
-    /// `[web] upstream_ca_path` or `TRAWL_WEB_UPSTREAM_CA_PATH`.
     UpstreamCaPath,
 }
 
-/// A path the operator selected, as the report may show it: control and
-/// bidirectional-formatting characters are replaced by `?`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SelectedPath {
     selection: Selection,
@@ -71,7 +52,6 @@ pub struct SelectedPath {
 }
 
 impl SelectedPath {
-    /// The path `selection` names.
     #[must_use]
     pub fn new(selection: Selection, path: &Path) -> Self {
         Self {
@@ -80,20 +60,17 @@ impl SelectedPath {
         }
     }
 
-    /// Which selection this is.
     #[must_use]
     pub const fn selection(&self) -> Selection {
         self.selection
     }
 
-    /// The path as the report shows it.
     #[must_use]
     pub fn as_shown(&self) -> &str {
         &self.shown
     }
 }
 
-/// `text` with every [`is_hidden`] character replaced by `?`.
 fn without_hidden(text: &str) -> String {
     text.chars()
         .map(|c| if is_hidden(c) { '?' } else { c })
@@ -116,14 +93,10 @@ fn is_hidden(c: char) -> bool {
         )
 }
 
-/// The running user's name, as the password database returned it, when it
-/// is a plain account name: `[A-Za-z0-9._-]`, then up to 31 more of those
-/// or `$`. Any other name is not shown; the uid still is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserName(String);
 
 impl UserName {
-    /// `name`, when it is a plain account name.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
         let plain = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-');
@@ -135,23 +108,14 @@ impl UserName {
     }
 }
 
-/// A health check name the report may show: one of the names trawld's
-/// health endpoint reports ([`HEALTH_CHECK_NAMES`]). The set is closed, so
-/// no name an upstream sends is ever shown as sent, not even one shaped
-/// like an identifier; any other name belongs to the one
-/// [`HealthKey::invalid`] row.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HealthKey(&'static str);
 
 impl HealthKey {
-    /// The last part of the one row that stands for every check name that
-    /// trawld does not report. It starts with `_`, which no check name
-    /// does, so it cannot collide with a server's check.
+    /// It starts with `_`, which no check name does, so it cannot collide
+    /// with a server's check.
     pub const INVALID: &'static str = "_invalid";
 
-    /// The key for `name`, when trawld's health endpoint reports a check
-    /// of that name. The key holds this doctor's copy of the name, never
-    /// the text that arrived.
     #[must_use]
     pub fn new(name: &str) -> Option<Self> {
         HEALTH_CHECK_NAMES
@@ -160,29 +124,20 @@ impl HealthKey {
             .map(Self)
     }
 
-    /// The key of the row for names trawld does not report.
     #[must_use]
     pub const fn invalid() -> Self {
         Self(Self::INVALID)
     }
 }
 
-/// The variable `[web] cookie_secret_env` names, as the report may show
-/// it.
-///
-/// The name is operator text, and an operator may have pasted the key
-/// itself where its variable's name belongs. So the name is shown only
-/// when it looks like a variable name, `[A-Za-z_][A-Za-z0-9_]{0,63}`, and
-/// does not decode as a session key; otherwise the report says "the
-/// variable named by `cookie_secret_env`".
+/// An operator may have pasted the key itself where its variable's name
+/// belongs, so a name that decodes as a session key is never shown.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EnvName(Option<String>);
 
 impl EnvName {
-    /// What stands for the variable in the report.
     pub const WITHHELD: &'static str = "the variable named by `cookie_secret_env`";
 
-    /// `name`, filtered.
     #[must_use]
     pub fn new(name: &str) -> Self {
         let bytes = name.as_bytes();
@@ -195,7 +150,6 @@ impl EnvName {
         Self(shown.then(|| name.to_owned()))
     }
 
-    /// Whether the name itself is shown.
     #[must_use]
     pub const fn is_shown(&self) -> bool {
         self.0.is_some()
@@ -206,63 +160,51 @@ impl EnvName {
     }
 }
 
-/// Text for a row's detail, source or next action, built only from parts
-/// the report may show.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Text(String);
 
 impl Text {
-    /// Start with a literal.
     #[must_use]
     pub fn new(literal: &'static str) -> Self {
         Self(literal.to_owned())
     }
 
-    /// Append a literal.
     #[must_use]
     pub fn lit(mut self, literal: &'static str) -> Self {
         self.0.push_str(literal);
         self
     }
 
-    /// Append an integer.
     #[must_use]
     pub fn int(mut self, n: impl Into<i128>) -> Self {
         self.0.push_str(&n.into().to_string());
         self
     }
 
-    /// Append a path the operator selected.
     #[must_use]
     pub fn path(mut self, path: &SelectedPath) -> Self {
         self.0.push_str(path.as_shown());
         self
     }
 
-    /// Append the running user's name.
     #[must_use]
     pub fn user(mut self, name: &UserName) -> Self {
         self.0.push_str(&name.0);
         self
     }
 
-    /// Append a health check name.
     #[must_use]
     pub fn key(mut self, key: &HealthKey) -> Self {
         self.0.push_str(key.0);
         self
     }
 
-    /// Append the `cookie_secret_env` variable, or what stands for it.
     #[must_use]
     pub fn env(mut self, name: &EnvName) -> Self {
         self.0.push_str(name.as_shown());
         self
     }
 
-    /// Append where a setting came from, in fixed words. An
-    /// [`SettingSource::Environment`] name is a crate constant, never
-    /// operator text.
     #[must_use]
     pub fn setting(self, source: SettingSource) -> Self {
         match source {
@@ -276,24 +218,17 @@ impl Text {
         }
     }
 
-    /// The text as the report shows it.
     #[must_use]
     pub fn as_str(&self) -> &str {
         &self.0
     }
 
-    /// The text as the report shows it, owned.
     #[must_use]
     pub fn into_string(self) -> String {
         self.0
     }
 }
 
-/// One row of the report, before the runner places it.
-///
-/// A row names its [`WebCheck`]; a per-key health row also names its
-/// [`HealthKey`]. `blocked_by` is not settable: only the runner writes a
-/// row for a check whose prerequisite did not complete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Row {
     check: WebCheck,
@@ -322,38 +257,31 @@ impl Row {
         }
     }
 
-    /// The assertion held.
     #[must_use]
     pub fn complete(check: WebCheck) -> Self {
         Self::new(check, Outcome::Complete, None)
     }
 
-    /// The assertion held, for a reason that is part of the contract.
     #[must_use]
     pub fn complete_because(check: WebCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::Complete, Some(reason))
     }
 
-    /// Evidence against the assertion, said as a fixed sentence or code.
     #[must_use]
     pub fn failed(check: WebCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::Failed, Some(reason))
     }
 
-    /// The doctor could not look; `reason` is a code from
-    /// [`trawl_api::doctor::reason`].
     #[must_use]
     pub fn not_sampled(check: WebCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::NotSampled, Some(reason))
     }
 
-    /// The operator did not select what the check needs.
     #[must_use]
     pub fn not_configured(check: WebCheck, reason: &'static str) -> Self {
         Self::new(check, Outcome::NotConfigured, Some(reason))
     }
 
-    /// A per-key row of `check`, such as `proxy.upstream.health.duckdb`.
     #[must_use]
     pub fn for_key(
         check: WebCheck,
@@ -367,19 +295,14 @@ impl Row {
         }
     }
 
-    /// Mark this row as one whose `complete` says the running user may read
-    /// something, such as the `cookie_secret_path` file. A root run cannot
-    /// observe that, so the runner reports such a `complete` as
-    /// `not_sampled`, reason `ran_as_root` (D12). Only an access check's
-    /// own row may carry the mark ([`WebCheck::is_access`]).
+    /// Only an access check's own row may carry the access mark
+    /// ([`WebCheck::is_access`]).
     #[must_use]
     pub const fn access(mut self) -> Self {
         self.access = true;
         self
     }
 
-    /// The row for a check whose prerequisite `by` did not complete. Only
-    /// the runner writes one.
     pub(super) fn blocked(check: WebCheck, by: WebCheck) -> Self {
         Self {
             blocked_by: Some(by),
@@ -391,9 +314,6 @@ impl Row {
         }
     }
 
-    /// This row as a root run reports it, when it asserts access: a
-    /// `complete` becomes `not_sampled`, reason `ran_as_root`, keeping what
-    /// it observed. Only the runner applies it.
     pub(super) fn into_root_run(self) -> Self {
         if !self.access || self.outcome != Outcome::Complete {
             return self;
@@ -408,58 +328,49 @@ impl Row {
         }
     }
 
-    /// Whether this is a per-key row.
     #[must_use]
     pub const fn is_keyed(&self) -> bool {
         self.key.is_some()
     }
 
-    /// Whether this row carries the [`Row::access`] mark.
     #[must_use]
     pub const fn is_access(&self) -> bool {
         self.access
     }
 
-    /// Set the observed, sanitized facts.
     #[must_use]
     pub fn detail(mut self, detail: Text) -> Self {
         self.detail = Some(detail);
         self
     }
 
-    /// Name the setting or input the check read.
     #[must_use]
     pub fn source(mut self, source: Text) -> Self {
         self.source = Some(source);
         self
     }
 
-    /// Say what the operator should do next.
     #[must_use]
     pub fn next(mut self, next: Text) -> Self {
         self.next = Some(next);
         self
     }
 
-    /// The check this row reports.
     #[must_use]
     pub const fn check(&self) -> WebCheck {
         self.check
     }
 
-    /// The row's outcome.
     #[must_use]
     pub const fn outcome(&self) -> Outcome {
         self.outcome
     }
 
-    /// The row's reason.
     #[must_use]
     pub const fn reason(&self) -> Option<&'static str> {
         self.reason
     }
 
-    /// The report's form of this row.
     pub(super) fn into_check(self) -> Check {
         let id = match &self.key {
             Some(key) => format!("{}.{}", self.check.id(), key.0),
@@ -477,11 +388,6 @@ impl Row {
     }
 }
 
-/// Render the report once: JSON is the report serialized, text is one line
-/// per check, then the notes and the verdict, as `trawl doctor` prints them.
-///
-/// # Errors
-/// When writing to `out` fails.
 pub fn render(report: &Report, format: Format, out: &mut impl Write) -> io::Result<()> {
     match format {
         Format::Json => {
@@ -512,8 +418,6 @@ pub fn render(report: &Report, format: Format, out: &mut impl Write) -> io::Resu
     }
 }
 
-/// One text line: id, outcome, then reason, detail, source, what blocked
-/// it, and the next action, each when present.
 fn check_line(check: &Check, width: usize) -> String {
     let outcome = match check.outcome {
         Outcome::Complete => "complete",
@@ -578,8 +482,6 @@ mod tests {
         }
     }
 
-    /// A `cookie_secret_env` name is shown only when it is shaped like a
-    /// variable name and is not itself a key.
     #[test]
     fn only_variable_shaped_env_names_are_shown() {
         for name in ["TRAWL_WEB_COOKIE_KEY", "_KEY", "k", &"A".repeat(64)] {
@@ -680,8 +582,6 @@ mod tests {
         );
     }
 
-    /// Only a `complete` row marked as asserting access turns into
-    /// `ran_as_root`; any other row is left as it is.
     #[test]
     fn only_a_complete_access_row_becomes_ran_as_root() {
         let check = WebCheck::CookieKey;

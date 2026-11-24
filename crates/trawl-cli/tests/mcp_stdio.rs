@@ -6,13 +6,9 @@
 //! command-line target that is not the named profile, and its stdout
 //! carries protocol messages and nothing else.
 //!
-//! Every run starts from an empty environment (`env_clear`, keeping only
-//! the dynamic loader's search path, see `loader_path`) with a temp
-//! `HOME`, so the default config path is one the test wrote. Tests cannot
-//! set the environment in-process (`unsafe_code = forbid`), so every case
-//! is a subprocess. A session is driven over the child's pipes with
-//! hand-written JSON-RPC lines; no trawld runs, so the profile points at a
-//! loopback port and a tool that needs the server answers with a tool
+//! Tests cannot set the environment in-process (`unsafe_code = forbid`),
+//! so every case is a subprocess. No trawld runs, so the profile points at
+//! a loopback port and a tool that needs the server answers with a tool
 //! error.
 
 use std::io::{BufRead as _, BufReader, Read as _, Write as _};
@@ -24,13 +20,10 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-/// A key value that must never appear in any output.
 const SENTINEL: &str = "flt_s3ntinelsecretvalue";
 
-/// The key the profile holds.
 const PROFILE_TOKEN: &str = "flt_profiletokenvalue";
 
-/// The variables `trawl mcp` refuses.
 const REFUSED: [&str; 4] = [
     "TRAWL_URL",
     "TRAWL_TOKEN",
@@ -38,10 +31,8 @@ const REFUSED: [&str; 4] = [
     "TRAWL_INSECURE",
 ];
 
-/// How long one session may take before the test gives up on it.
 const SESSION_DEADLINE: Duration = Duration::from_secs(60);
 
-/// A temp `HOME` (and `XDG_STATE_HOME`) for one test.
 struct Sandbox {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -61,7 +52,6 @@ impl Sandbox {
         }
     }
 
-    /// Write the default config file, `~/.config/trawl/config.toml`.
     fn default_config(&self, toml: &str) {
         let dir = self.home.join(".config/trawl");
         std::fs::create_dir_all(&dir).unwrap();
@@ -85,7 +75,6 @@ impl Sandbox {
         cmd
     }
 
-    /// Run to completion with stdin closed.
     fn run(&self, args: &[&str], env: &[(&str, &str)]) -> Output {
         self.command(args, env)
             .stdin(Stdio::null())
@@ -94,11 +83,10 @@ impl Sandbox {
     }
 }
 
-/// The dynamic loader's search path, kept when the rest of the environment
-/// is cleared. It is not configuration trawl reads: the test runner sets it
-/// so a binary built in this target directory finds the libraries it links
-/// (libduckdb in CI's archive), and a child that lost it would die before
-/// reading its first frame. Every other variable stays cleared.
+/// The dynamic loader's search path. The test runner sets it so a binary
+/// built in this target directory finds the libraries it links (libduckdb
+/// in CI's archive), and a child that lost it would die before reading its
+/// first frame.
 fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
     [
         "LD_LIBRARY_PATH",
@@ -122,15 +110,12 @@ impl ClosedPort {
     }
 }
 
-/// A port with nothing listening on it, held for as long as the guard lives.
 fn closed_port() -> ClosedPort {
     let socket = tokio::net::TcpSocket::new_v4().expect("socket");
     socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
     ClosedPort(socket)
 }
 
-/// A config with `[profiles.home]` at `url`, with or without a token, and
-/// a `[server]` token that must never be used.
 fn profile_config(url: &str, token: bool) -> String {
     let token = if token {
         format!("token = \"{PROFILE_TOKEN}\"\n")
@@ -151,8 +136,6 @@ fn text(output: &Output) -> String {
     )
 }
 
-/// A refusal: exit 2, nothing on stdout, one line on stderr that holds
-/// every `needle` and no sentinel.
 fn assert_refused(output: &Output, needles: &[&str], case: &str) {
     let all = text(output);
     assert_eq!(output.status.code(), Some(2), "{case}: {all}");
@@ -280,17 +263,14 @@ fn the_key_comes_from_exactly_one_source() {
     assert_refused(&output, &["[profiles.elsewhere]"], "unknown profile");
 }
 
-/// One session's output.
 struct Session {
     status: Option<i32>,
-    /// Every stdout line, each with its trailing newline removed.
     lines: Vec<String>,
     /// Bytes after the last newline: a partial message.
     trailing: Vec<u8>,
     stderr: String,
 }
 
-/// Send one JSON-RPC message as a line.
 fn send(stdin: &mut ChildStdin, message: &Value) {
     let mut line = serde_json::to_vec(message).unwrap();
     line.push(b'\n');
@@ -298,7 +278,6 @@ fn send(stdin: &mut ChildStdin, message: &Value) {
     stdin.flush().unwrap();
 }
 
-/// Read stdout lines on a thread, so the test can wait with a deadline.
 fn stdout_lines(child: &mut Child) -> mpsc::Receiver<Result<String, Vec<u8>>> {
     let (tx, rx) = mpsc::channel();
     let mut stdout = BufReader::new(child.stdout.take().unwrap());
@@ -322,9 +301,6 @@ fn stdout_lines(child: &mut Child) -> mpsc::Receiver<Result<String, Vec<u8>>> {
     rx
 }
 
-/// Run one session: `initialize` (2025-11-25), `notifications/initialized`,
-/// `tools/list`, a `tools/call` of `orient`, then close stdin and read
-/// stdout to EOF.
 fn session(home: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Session {
     let mut child = home
         .command(args, env)
@@ -344,7 +320,6 @@ fn session(home: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Session {
     let deadline = Instant::now() + SESSION_DEADLINE;
     let mut lines = Vec::new();
     let mut trailing = Vec::new();
-    // Read until the response with `id` arrives.
     let wait_for = |id: u64, lines: &mut Vec<String>, trailing: &mut Vec<u8>| loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
@@ -399,7 +374,6 @@ fn session(home: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Session {
     wait_for(3, &mut lines, &mut trailing);
     drop(stdin);
 
-    // stdout to EOF.
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(left) {
@@ -430,9 +404,6 @@ fn session(home: &Sandbox, args: &[&str], env: &[(&str, &str)]) -> Session {
     }
 }
 
-/// Every stdout line is one JSON-RPC 2.0 message and nothing follows the
-/// last newline; the three requests were answered, and the process exited
-/// 0 after EOF.
 fn assert_pure(session: &Session, case: &str) {
     let context = format!(
         "{case}\nstatus {:?}\nstdout: {:#?}\ntrailing: {:?}\nstderr: {}",
@@ -513,7 +484,6 @@ fn stdout_carries_protocol_messages_only() {
     assert_pure(&quiet, "default log level");
     assert!(quiet.stderr.is_empty(), "nothing to log: {}", quiet.stderr);
 
-    // Debug logging goes to stderr, never stdout.
     let debug = session(&home, &["-p", "home", "mcp"], &[("RUST_LOG", "debug")]);
     assert_pure(&debug, "RUST_LOG=debug");
     assert!(
@@ -603,11 +573,8 @@ fn startup_contacts_no_server() {
     }
 }
 
-/// A stdout the client stopped reading after the session started is a
-/// transport failure: exit 1, one `trawl:` line on stderr naming the
-/// direction and the error's kind, and no bytes of the stream. Rust
-/// ignores SIGPIPE, so the write fails with EPIPE instead of killing the
-/// process.
+/// Rust ignores SIGPIPE, so a write to the closed stdout fails with EPIPE
+/// instead of killing the process.
 #[test]
 fn a_broken_stdout_after_initialize_exits_one() {
     let home = Sandbox::new();
@@ -650,7 +617,6 @@ fn a_broken_stdout_after_initialize_exits_one() {
         .expect("the initialize response");
     let response: Value = serde_json::from_slice(&line).expect("a JSON-RPC line");
     assert_eq!(response["id"], 1, "{response}");
-    // Close the only read end of the child's stdout.
     drop(stdout);
 
     send(
@@ -693,7 +659,6 @@ fn a_broken_stdout_after_initialize_exits_one() {
     }
 }
 
-/// `trawl mcp --help` names the variables and never prints their values.
 #[test]
 fn help_never_prints_environment_values() {
     let home = Sandbox::new();
@@ -707,8 +672,6 @@ fn help_never_prints_environment_values() {
     }
 }
 
-/// A tracing line as `trawl mcp` writes it without ANSI colour: an RFC 3339
-/// timestamp, then the level.
 fn is_tracing_line(line: &str) -> bool {
     let mut words = line.split_whitespace();
     let stamped = words.next().is_some_and(|stamp| {
@@ -730,11 +693,7 @@ fn is_unicode_line_break(c: char) -> bool {
 }
 
 /// A JSON-RPC id is client-controlled, and rmcp logs it raw at the default
-/// `warn` level when it refuses a `tools/call`. stderr still carries one
-/// line per log event and no terminal control sequence: no forged line, no
-/// ESC, and no Unicode line or paragraph separator, so a reader that
-/// splits lines the Unicode way reads the same lines as one that splits on
-/// `\n`.
+/// `warn` level when it refuses a `tools/call`.
 #[test]
 fn a_hostile_request_id_cannot_forge_stderr_lines() {
     const HOSTILE_ID: &str =

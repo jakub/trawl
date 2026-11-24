@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Live streaming (SSE tail) — toggle, start, stop, and helper functions.
-
 use std::time::Duration;
 
 use futures::StreamExt;
@@ -13,7 +11,6 @@ use super::state::{Execution, LiveBuffer, RunSource, TabStatus};
 use super::{App, QueryError, QueryResult};
 
 impl App {
-    /// Toggle live tail mode (F9).
     pub(crate) fn toggle_live_mode(&mut self) {
         if self.live_mode {
             self.stop_live_stream();
@@ -22,7 +19,6 @@ impl App {
         }
     }
 
-    /// Start live streaming with the current query.
     #[allow(clippy::too_many_lines)]
     pub(crate) fn start_live_stream(&mut self) {
         let query = self.active_tab().editor.text().trim().to_owned();
@@ -34,11 +30,10 @@ impl App {
 
         tracing::info!("starting live stream for query: {}", query);
 
-        // End the earlier run. An earlier stream's last snapshot's rows stay
-        // drawn until a replacement result arrives (a quiet restarted stream
-        // may send none), so the cap report stays with them; every result
-        // replaces it. A batch's Running status goes: nothing is left to
-        // cancel.
+        // An earlier stream's last snapshot's rows stay drawn until a
+        // replacement result arrives (a quiet restarted stream may send
+        // none), so the cap report stays with them. A batch's Running status
+        // goes: nothing is left to cancel.
         let was_batch = self.active_tab().execution.is_batch();
         self.end_run("replaced by live stream");
         if was_batch {
@@ -46,7 +41,6 @@ impl App {
         }
         let generation = self.tab.next_generation();
 
-        // Extract field order from the DSL so the live buffer preserves it.
         let field_order = extract_field_order(&query);
 
         let client = self.client.clone();
@@ -90,7 +84,6 @@ impl App {
                     }
                     Ok(StreamEvent::Snapshot { result, capped }) => {
                         buffer.replace_with_snapshot(&result, &capped);
-                        // Each snapshot replaces the whole result — send immediately.
                         let response = buffer.to_query_response();
                         let _ = tx.send(QueryResult {
                             result: Ok(response),
@@ -116,7 +109,6 @@ impl App {
                     }
                 }
 
-                // Send snapshot every 10 events.
                 if event_count.is_multiple_of(10) && event_count > 0 {
                     let response = buffer.to_query_response();
                     tracing::debug!(
@@ -134,7 +126,6 @@ impl App {
                 }
             }
 
-            // Flush remaining events.
             if !buffer.is_empty() {
                 let response = buffer.to_query_response();
                 let _ = tx.send(QueryResult {
@@ -156,7 +147,6 @@ impl App {
         self.live_mode = true;
     }
 
-    /// Stop live streaming. A running batch is not a stream and keeps going.
     pub(crate) fn stop_live_stream(&mut self) {
         tracing::info!("stopping live stream");
 
@@ -168,10 +158,6 @@ impl App {
     }
 }
 
-/// Extract the user-specified field order from a `fields`/`table` pipe stage.
-///
-/// Returns the column names verbatim, in the order the user wrote them, or an empty
-/// vec when the query has no such stage or fails to parse.
 fn extract_field_order(query: &str) -> Vec<String> {
     let Ok(ast) = trawl_core::parser::parse(query) else {
         return Vec::new();
@@ -192,9 +178,6 @@ fn extract_field_order(query: &str) -> Vec<String> {
 mod tests {
     use super::extract_field_order;
 
-    /// Zero-alias contract (ADR-0013): the live column order carries the user's
-    /// own spellings verbatim. An alias mapping here would make `table
-    /// timestamp` consume `_time` while the batch lane stayed green.
     #[test]
     fn table_field_names_are_verbatim_and_distinct() {
         assert_eq!(extract_field_order("* | table _time"), vec!["_time"]);

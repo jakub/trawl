@@ -2,17 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Zero-npm-dependency static + API stub server for the Playwright e2e
-// suite. node:http only, on purpose — this file ships no third-party
-// surface at all, so `npm audit` never has anything to say about it.
-//
-// Serves the built trawl-web-ui `dist/` (SPA fallback on extensionless
-// paths) and stands in for trawl-web's `/api/*` surface with canned,
-// wire-shape-accurate responses (see fixtures.mjs). Single mutable
-// "current scenario" — set via POST /__ctl/reset — because each
-// Playwright worker starts its own process (the `stubOrigin` fixture in
-// fixtures.ts) and a worker runs one test at a time, so exactly one spec
-// talks to this process at a time.
+// node:http only, on purpose: this file ships no third-party surface at
+// all.
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -68,9 +59,6 @@ import {
 } from './fixtures.mjs';
 
 const HOST = '127.0.0.1';
-// E2E_PORT lets parallel worktrees and workers run without colliding.
-// fixtures.ts sets it per worker and derives `baseURL` from the same
-// number, so server and baseURL can't disagree.
 const PORT = Number(process.env.E2E_PORT ?? 8123);
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -87,11 +75,9 @@ if (!fs.existsSync(path.join(BUILD_DIST, 'index.html'))) {
   process.exit(1);
 }
 
-// Serve a private copy, so a `trunk serve` sharing this checkout's dist
-// cannot rewrite the SPA mid-run — see harness/dist-snapshot.mjs. The copy
-// is taken after the port is bound (see `server.listen` below): snapshots
-// are keyed by port, so a second server launched on a port already in use
-// must fail with EADDRINUSE before it replaces the running server's copy.
+// The dist copy is taken after the port is bound: snapshots are keyed by
+// port, so a second server launched on a port already in use must fail
+// with EADDRINUSE before it replaces the running server's copy.
 let DIST;
 
 const MIME = {
@@ -109,41 +95,26 @@ const MIME = {
   '.txt': 'text/plain; charset=utf-8',
 };
 
-// ---- mutable test-scoped state -------------------------------------------
-
 /** @type {'default'|'unauth'|'query-500'|'stream-chart'|'stream-burst'|'populated'|'corpus'|'schedule'|'schedule-spent'} */
 let scenario = 'default';
 
 function savedScenario() { return scenario === 'saved-success' || scenario === 'saved-retry'; }
 let savedRequests = [];
 
-// `PUT /api/v1/saved/{id}/schedule` bodies, and the one-shot refusal a
-// spec arms before pressing Save. The window and lag halves are ABSENT
-// keys rather than nulls when the form drops them, so the bodies are
-// recorded raw: a normalising read here would erase the very distinction
-// the schedule spec asserts.
+// The window and lag halves are ABSENT keys rather than nulls when the
+// form drops them, so schedule bodies are recorded raw.
 let scheduleRequests = [];
 /** @type {null|'conflict'|'fail'} */
 let scheduleRefusal = null;
-// `POST /api/v1/saved/{id}/run` (Run now) under `schedule`: every saved id
-// asked for, the one-shot 409 a spec arms, and the runs the stub claimed,
-// which the net's run list then shows newest first like trawld does.
 let runRequests = [];
 let runRefusal = false;
 /** @type {Array<{ savedId: number, run: object }>} */
 let startedRuns = [];
-// The run whose stored result file is gone: `GET .../runs/{id}` answers
-// the server's 409 envelope for it, the way trawld does once the operator
-// repoints `data_dir` out from under a recorded run (issue #227).
 /** @type {null|number} */
 let unavailableRunId = null;
-// Every `GET /api/v1/saved/{id}/runs/{run_id}`, in order. The preview
-// pages rows the response already carried, so "no second read while
-// paging" is the claim; a counter is what can say it.
 let runDetailReads = [];
 let runListReads = [];
 
-// History scenarios own their held responses and request counters.
 const history = { offsets: [], requests: [], deletes: 0, cleared: false, pending: null, loadPending: [], hold: false, nextStatus: 200, entries: null };
 function historyScenario() { return scenario.startsWith('history-'); }
 function historyEntries() {
@@ -170,68 +141,8 @@ let healthHits = {};
 let cancelRequests = [];
 function healthScenario() { return scenario.startsWith('health-'); }
 
-// The investigation pages (ADR-0059). `investigations` signs in a reader
-// holding `query` and `investigation_read`; every other scenario's
-// session holds neither grant, so a page that asks anyway is answered
-// the server's 403 and counted. The read pages the board's entries the
-// way trawld does (store/investigations.rs `read_page`): `since`
-// excludes, `limit` bounds, entries come in `updated_seq` order, and
-// `through_seq` is the last entry's `updated_seq` while more remain,
-// else the investigation's own `seq` (never below `since`). `pageCap` (a
-// reset knob) bounds a read further so a spec can reach Load more.
-//
-// The served board is a copy of its wire fixture that a spec can write
-// to while a page is open, standing in for an agent writing through the
-// API: `POST /__ctl/investigation/write` appends entries, or replaces the
-// entry whose `seq` it names (a step gaining its outcome), and advances
-// the investigation's `seq` once per entry, as trawld does.
-// `POST /__ctl/investigation/fail` answers the next `count` reads of the
-// investigation with `status` (`'network'` drops the connection instead);
-// a 429 carries `Retry-After: retryAfter`. Every read is recorded with
-// its `since`, served or failed.
-//
-// `investigationBoard: 'long'` serves `investigation-read-long`, 102
-// entries whose latest finding and a refutation lie past the first
-// read of 100.
-//
-// Reset knobs for the evidence queue: `investigationBoard: 'many'` serves
-// `investigation-read-many` instead, whose 32 cited results are each a
-// copy of the evidence page under that result's id; `throttle` answers
-// the next N result reads 429 with `Retry-After: retryAfter` (default
-// `1`, as trawld's rate limiter sends); a reset that lowers `throttle`
-// while a page is open lets that page's next reads through; `resultDelayMs` holds every result answer that long, so
-// reads overlap and `maxResultsInFlight` (the most result reads the stub
-// held at once) shows how many the page runs together.
-// `investigationResultFail: { id, status, count }` answers the next
-// `count` reads of result `id` with `status` (409 or 500) and trawld's
-// envelope for it.
-// Every result read is recorded with its `offset` and its `limit`, `null`
-// when the page sent none. `refuse` answers
-// the list and every read 403 although `/me` still grants both
-// permissions, as trawld does once a role is revoked between the two.
-//
-// Send to investigation (#311): `POST /api/v1/results` with an
-// `investigation` is a capture attached to it under the session's key. It
-// is recorded with its body in `captures`, then answered in trawld's
-// order: a session without `investigation_write` is 403, an id the list
-// does not hold is 404, a closed investigation is 409
-// `investigation_closed`. Otherwise the capture keeps the `query-send-rows`
-// events inside its window, newest first as trawld sorts raw events
-// (`captureRows`), and its answer is `capture-attached` with a fresh
-// result id, the request's text and window, the kept count, and the
-// step's `seq`.
-// On the served board the step is appended as the human's, carrying the
-// text the stub records as executed (the request's text with the window
-// spelled as `earliest=`/`latest=` before any pipeline, as the fixture
-// board's steps read), the window as its bounds, the purpose, and a
-// success outcome naming the result; the result then pages like any
-// stored one. `drop-write` cuts a capture's answer short too.
-// `investigationSearch: true` answers every `/api/v1/query` with the
-// same events inside the `_time` bounds of the query text, in stored order
-// (`sendSearchResponse`), so a capture keeps what Search showed only when
-// the request carries the window Search ran. A list
-// read reports the served board's own status and seq, so a board closed
-// through `/__ctl/investigation/write` reads closed in the list too.
+// The investigation pages (ADR-0059). The read pages the board's entries
+// the way trawld does (store/investigations.rs `read_page`).
 const capabilities = { maxSpanSecs: null, fail: false };
 let capabilityReads = 0;
 const investigation = {
@@ -240,29 +151,6 @@ const investigation = {
   refuse: false, served: null, fail: null, resultFail: null, writes: [], dropWrite: false,
   holdWrite: false, heldWrite: null, captures: [], captured: {}, search: false,
 };
-// `investigations-writer` signs in a writer: both read grants and
-// `investigation_write`. Two more sessions hold other authority and no
-// read grant: `investigations-write-only` (`query` and
-// `investigation_write`) and `investigations-manage-only`
-// (`server_manage`, whose status bar streams the dashboard); the
-// investigation pages must ask nothing for either.
-//
-// A writer's keep (`POST .../entries`) and close or reopen (`PATCH`) are
-// recorded with their bodies in `writes` and applied to the served board
-// in trawld's order: an unknown id is 404, then a closed investigation
-// takes nothing but a reopen (409 `investigation_closed`), then a PATCH
-// whose `expected_seq` is not the board's `seq` is 409
-// `sequence_conflict` with both numbers. Their bodies are the
-// `investigation-closed` and `investigation-sequence-conflict` fixtures.
-// A landed keep answers its entry; a landed PATCH answers the
-// investigation as it now stands and the entry, with no activity, since
-// the board sends no `seen_seq`.
-// `POST /__ctl/investigation/drop-write` makes the next write land and
-// then cuts its answer short, as a connection lost on the way back does;
-// with `{ status, code }` the landed write is answered with that status
-// and trawld's envelope instead, as a failure after the commit is.
-// `POST /__ctl/investigation/hold-write` lands the next keep or close and
-// holds its successful answer until `/__ctl/investigation/release-write`.
 const INVESTIGATION_SESSIONS = {
   investigations: ['query', 'investigation_read'],
   'investigations-writer': ['query', 'investigation_read', 'investigation_write'],
@@ -286,18 +174,14 @@ const STORED_RESULTS = {
   '0ddba11c0ffee0d15ea5e0ba5eba1100': 'result-page-truncated',
 };
 const RESULT_PAGE_MAX_ROWS = 3;
-// What a result read fails with, by status, under the
-// `investigationResultFail` knob: the codes trawld answers.
 const RESULT_FAILURES = {
   409: { code: 'result_unavailable', message: "the result's file is missing" },
   500: { code: 'result_corrupt', message: "the result's file does not match its digest" },
 };
-/** The board the stub serves: the fixture, as the spec has written to it. */
 function servedBoard() {
   investigation.served ??= wire(investigation.board);
   return investigation.served;
 }
-/** The result ids the served board's steps captured. */
 function boardResults() {
   return new Set(servedBoard().entries.map(entry => entry.payload.outcome?.result_id).filter(Boolean));
 }
@@ -316,11 +200,6 @@ function investigationRead(since, limit) {
     more,
   };
 }
-/** Write entries to the served board as trawld would: each one advances
- * the investigation's `seq` and takes it as its `updated_seq`. An entry
- * naming the `seq` of one already held replaces it in place; any other
- * is appended at the next `seq`. A status, title or question entry
- * changes the investigation's field too. Answers what was written. */
 function writeBoard(writes) {
   const board = servedBoard();
   const head = board.investigation;
@@ -344,7 +223,6 @@ function writeBoard(writes) {
   return written;
 }
 const ERROR_CODES = { 403: 'forbidden', 404: 'not_found', 429: 'rate_limited', 503: 'service_unavailable' };
-/** Answer one armed failure for an investigation read. */
 function failRead(res, fail) {
   if (fail.status === 'network') {
     res.destroy();
@@ -356,8 +234,6 @@ function failRead(res, fail) {
   res.writeHead(fail.status, headers);
   res.end(text);
 }
-/** The list as the stub holds it: the fixture, with the served board's
- * own status, seq and last change on its row once a spec has touched it. */
 function investigationList() {
   const list = wire('investigations-list');
   const head = investigation.served?.investigation;
@@ -367,8 +243,6 @@ function investigationList() {
   }
   return list;
 }
-/** The text the stub records as a step's executed query: the request's
- * text with its window before any pipeline, then trawld's raw-event sort. */
 function executedText(query, window) {
   if (!window) return query;
   const bar = query.indexOf('|');
@@ -382,10 +256,8 @@ function micros(instant) {
   const m = /^(.*T\d\d:\d\d:\d\d)(?:\.(\d+))?Z$/.exec(instant);
   return m ? `${m[1]}.${(m[2] ?? '').padEnd(6, '0').slice(0, 6)}Z` : instant;
 }
-/** Search under `investigationSearch`: the `query-send-rows` events whose
- * `_time` lies inside the `_time>="…"` and `_time<="…"` bounds the range
- * merger writes into the text, in stored order. Those two clauses are all
- * it reads; it evaluates no other DSL. */
+/** The `_time>="…"` and `_time<="…"` clauses are all it reads; it
+ * evaluates no other DSL. */
 function sendSearchResponse(query) {
   const response = wire('query-send-rows');
   const lower = /_time>="([^"]+)"/.exec(query)?.[1];
@@ -395,11 +267,6 @@ function sendSearchResponse(query) {
   response.pagination = { ...response.pagination, returned: response.rows.length, total: response.rows.length };
   return response;
 }
-/** The rows a capture keeps: the `query-send-rows` events inside its
- * half-open window `[earliest, latest)`, every one when it has none, and,
- * for a text with no pipeline, in the order trawld imposes on raw events
- * (`| sort -_time, -_ingested`, newest first). Like Search's answer, it
- * reads time and nothing else of the query. */
 function captureRows(body) {
   const { columns, rows } = wire('query-send-rows');
   const window = body.window;
@@ -408,8 +275,6 @@ function captureRows(body) {
   if (!body.query.includes('|')) kept.sort(([a], [b]) => micros(b).localeCompare(micros(a)));
   return { columns, rows: kept };
 }
-/** Run an attached capture: store its rows under a fresh id, append the
- * step to the served board when it is the target, and answer it. */
 function captureAttached(body, target) {
   const rows = captureRows(body);
   const answer = wire('capture-attached');
@@ -496,28 +361,12 @@ function serveDashboard(res) {
 }
 
 
-/** `corpus` is `populated` plus data. Every place that used to ask
- * "is this `populated`?" asks this instead, so the two scenarios cannot
- * drift apart on a body they share. The services route is the one
- * exception and says so where it splits. */
 function hasCorpus() {
   return scenario === 'populated' || scenario === 'corpus' || scenario === 'pagination';
 }
 
-// Only the `aggregate` scenario reads these. `total` is the count the
-// execution produced before any window was cut from it: `null` means the
-// generated rows ARE the whole result, which is the ordinary case.
-// `hosts` is how many series a `by`-grouped timechart carries, so a
-// grouped request answers `buckets` × `hosts` rows.
 const aggregate = { buckets: 12, groups: 5, hosts: 2, total: null };
 
-// Only the pagination scenario uses these counts and held reads.
-// `holdQueryNumber` is one query number or a list of them: each of those
-// queries waits in `heldQueries` until `/__ctl/pagination/query-release`.
-// `histogramFixtures` is a list of `[substring, wire name]` pairs: a query
-// whose text contains the substring is answered from that fixture, its
-// rows cut to the requested window and its `pagination.total` and canned
-// `histogram` kept. The first pair that matches wins.
 const pagination = {
   historyTotal: 103, runsTotal: 3, queryTotal: 53,
   holdHistoryOffset: null, held: null, history: [], runs: [], completed: [],
@@ -538,8 +387,7 @@ function paginationRuns(offset, limit) {
     i => ({ ...source.runs[i % source.runs.length], id: 501 + i })) };
 }
 /** A raw query's canned `histogram` goes back only to a request that
- * asked for it, the way trawld answers. The stub counts nothing: the
- * fixture's histogram is the answer, whatever rows go with it. */
+ * asked for it, the way trawld answers. */
 function histogramAsked(request, body) {
   if (request.histogram !== true) delete body.histogram;
   return body;
@@ -557,8 +405,6 @@ function paginationQuery(offset, limit, query) {
   delete response.histogram;
   response.rows = typedResult(response.columns, paginationSlice(pagination.queryTotal, offset, limit,
     i => [response.rows[0][0], 'web-01', 200, `query-row-${i + 1} ${query}`])).rows;
-  // `total` is what the execution produced, measured before the window
-  // was cut from it — never the length of the slice that went back.
   response.pagination = {
     offset, limit, returned: response.rows.length, total: pagination.queryTotal,
   };
@@ -577,29 +423,16 @@ const sse = {
   responses: new Set(),
 };
 
-// Scripted repin status, for the field case drawer's poll. Unlike the SSE
-// counters below, EVERY field here is rolled by a reset — see the note in
-// `resetState`. The two rules are deliberately different and must stay
-// that way: unifying them would either strand a held response across
-// tests or reset a counter under a stream that is still opening.
+// Unlike the SSE counters, EVERY field here is rolled by a reset. The two
+// rules are deliberately different: unifying them would either strand a
+// held response across tests or reset a counter under a stream that is
+// still opening.
 const repin = {
-  /** The field the scripted job belongs to. `null` = script disarmed, and
-   * the status route answers `{ job: null }` forever, so no other spec's
-   * behaviour changes. */
   field: null,
-  /** Status reads served since the reset that armed the script. */
   hits: 0,
-  /** The parked `ServerResponse` for hit `HELD_HIT` — headers not even
-   * written, so the client is still waiting on it.
-   * @type {import('node:http').ServerResponse|null} */
+  /** @type {import('node:http').ServerResponse|null} */
   held: null,
-  /** The held socket closed before anything was written to it. A release
-   * after that is a lie, and `/__ctl/repin/release` answers 409. */
   heldAborted: false,
-  /** Whether the held response was still pending at the moment
-   * `/__ctl/repin/release` wrote to it. This is the alive-latch evidence:
-   * a read still open across a teardown is a read the client never
-   * abandoned. */
   pendingAtRelease: null,
 };
 
@@ -614,10 +447,6 @@ let unstubbed = [];
 let queries = [];
 /** @type {object[]} */
 let exports_ = [];
-/** DSL of every `corpus` query the shape dispatch did not recognise. Kept
- * beside `unstubbed` and for the same reason: a query nobody keyed a
- * fixture to must be visible as itself, never answered with rows a spec
- * would read as its own. */
 let unhandledQueries = [];
 
 function resetState() {
@@ -663,15 +492,9 @@ function resetState() {
   runListReads = [];
   exports_ = [];
   unhandledQueries = [];
-  // sse.open/opens/closes deliberately survive a reset — a spec resets
-  // the scenario, then drives its own stream lifecycle and reads the
-  // counters itself. Rolling them here would race a stream this same
-  // request is about to open in the previous test's teardown.
-  //
-  // The repin script is the opposite: it is armed BY a reset (which
-  // carries the field to script) and its whole point is a per-test
-  // sequence, so nothing may survive into the next test. A held response
-  // outliving its test would park a socket forever.
+  // sse.open/opens/closes deliberately survive a reset: rolling them here
+  // would race a stream the previous test's teardown is about to open.
+  // A held repin response outliving its test would park a socket forever.
   if (repin.held) {
     repin.held.destroy();
   }
@@ -681,8 +504,6 @@ function resetState() {
   repin.heldAborted = false;
   repin.pendingAtRelease = null;
 }
-
-// ---- helpers --------------------------------------------------------------
 
 function sendJson(res, status, body) {
   const text = JSON.stringify(body);
@@ -706,15 +527,12 @@ function errorEnvelope(message) {
   return { error: { code: 'execution_error', message } };
 }
 
-// ---- static file serving with SPA fallback --------------------------------
-
 function serveStatic(req, res, urlPath) {
   const clean = urlPath.split('?')[0];
   const hasExt = path.extname(clean) !== '';
   const rel = hasExt ? clean : '/index.html';
   const filePath = path.join(DIST, rel);
 
-  // Guard against escaping DIST via a crafted path.
   if (!filePath.startsWith(DIST)) {
     res.writeHead(403);
     res.end('forbidden');
@@ -733,8 +551,6 @@ function serveStatic(req, res, urlPath) {
   });
 }
 
-// ---- SSE ------------------------------------------------------------------
-
 function serveStream(res) {
   res.writeHead(200, {
     'content-type': 'text/event-stream; charset=utf-8',
@@ -752,8 +568,6 @@ function serveStream(res) {
   const chart = scenario === 'stream-chart';
   const timer = (burst || chart) ? undefined : setInterval(() => {
     n += 1;
-    // `wire/live-data-tick.json` is the frame's shape, guarded natively;
-    // only its one row is stamped here.
     const tick = wire('live-data-tick');
     tick.rows = typedResult(tick.columns, [[wireInstant(Date.now()), `tick ${n}`]]).rows;
     res.write(`event: data\ndata: ${JSON.stringify(tick)}\n\n`);
@@ -767,11 +581,9 @@ function serveStream(res) {
     }
   };
 
-  // Deliberately END the response after ~1s server-side: this is what
-  // makes a *leaked* client-side EventSource observable — a browser
-  // EventSource auto-reconnects on a server-closed stream, so if the
-  // SPA failed to `close()` it on unmount we'll see `opens` keep
-  // climbing every ~200ms (the `retry:` interval) after teardown.
+  // Deliberately END the response after ~1s server-side: a browser
+  // EventSource auto-reconnects on a server-closed stream, so a leaked
+  // one keeps `opens` climbing after teardown.
   if (!burst && !chart) setTimeout(() => {
     if (sse.responses.has(res)) {
       res.end();
@@ -789,26 +601,18 @@ function serveStream(res) {
   }
 }
 
-// ---- request handling -------------------------------------------------------
-
 // Node's default header cap is 16 KiB INCLUDING the request line, so a
 // deliberately oversized search link (the SPA's own bound is 32 KiB)
-// would be answered with a 431 by the harness before the app ever saw
-// it. The spec that proves the app refuses such a link needs the link to
-// arrive, so this stub carries more than any real deployment would.
+// would be answered with a 431 before the app ever saw it.
 const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res) => {
   let url;
   let p;
 
   try {
-    // Inside the try: a malformed Host header (only a non-browser local
-    // client can send one) must 500 this request, not crash the process
-    // via an unhandled async rejection.
+    // Inside the try: a malformed Host header must 500 this request, not
+    // crash the process via an unhandled async rejection.
     url = new URL(req.url, `http://${req.headers.host}`);
     p = url.pathname;
-    // -- control plane ---------------------------------------------------
-    // Keep the chart connection open while a test sends valid or malformed
-    // snapshot frames. A closed fixture response is a real disconnect.
     if (p === '/__ctl/stream/frame' && req.method === 'POST') {
       const { data } = JSON.parse(await readBody(req));
       if (scenario !== 'stream-chart' || typeof data !== 'string' || data.includes('\n') || sse.responses.size === 0) {
@@ -849,8 +653,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           if (key in parsed.aggregate) aggregate[key] = parsed.aggregate[key];
         }
       }
-      // The ONE door that arms the repin script. Everything else reads
-      // `repin`; only a reset writes `field`, so a spec cannot end up
+      // The ONE door that arms the repin script, so a spec cannot end up
       // scripting a second job on top of a live one.
       repin.field = parsed.repinField || null;
       dashboard.hold = parsed.dashboardHold ?? false;
@@ -915,26 +718,18 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       });
       return;
     }
-    // Write to the served investigation as an agent would through the
-    // API: `{ entries: [{ payload, seq?, actor?, at? }] }`. See
-    // `writeBoard`.
     if (p === '/__ctl/investigation/write' && req.method === 'POST') {
       const { entries = [] } = JSON.parse((await readBody(req)) || '{}');
       const written = writeBoard(entries);
       sendJson(res, 200, { ok: true, seq: servedBoard().investigation.seq, entries: written });
       return;
     }
-    // Land the next investigation write, then drop its response, or,
-    // given `{ status, code }`, answer it with that status and trawld's
-    // envelope, as a server error after the commit does.
     if (p === '/__ctl/investigation/drop-write' && req.method === 'POST') {
       const { status = null, code = 'internal_error' } = JSON.parse((await readBody(req)) || '{}');
       investigation.dropWrite = status === null ? true : { status, code };
       sendJson(res, 200, { ok: true });
       return;
     }
-    // Land the next investigation write and hold its answer until
-    // `release-write`, so a spec can tear the page down in between.
     if (p === '/__ctl/investigation/hold-write' && req.method === 'POST') {
       investigation.holdWrite = true;
       sendJson(res, 200, { ok: true });
@@ -947,19 +742,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, released: held !== null });
       return;
     }
-    // Answer the next `count` investigation reads with `status`:
-    // `{ count, status, retryAfter? }`, `status` a number or `'network'`.
     if (p === '/__ctl/investigation/fail' && req.method === 'POST') {
       const { count = 1, status = 503, retryAfter = '1' } = JSON.parse((await readBody(req)) || '{}');
       investigation.fail = { count, status, retryAfter: String(retryAfter) };
       sendJson(res, 200, { ok: true, armed: investigation.fail });
       return;
     }
-    // Arm the NEXT schedule PUT to be refused. Two shapes, because the
-    // form reads them differently: `refuse` answers the server's own
-    // error envelope (whose message the inline error shows verbatim) and
-    // `fail` answers a 5xx with no envelope at all (which collapses to
-    // the client's generic status text).
     if ((p === '/__ctl/schedule/refuse' || p === '/__ctl/schedule/fail') && req.method === 'POST') {
       scheduleRefusal = p.endsWith('refuse') ? 'conflict' : 'fail';
       sendJson(res, 200, { ok: true, armed: scheduleRefusal });
@@ -975,9 +763,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, armed: 'run-refuse' });
       return;
     }
-    // Point the run-detail route at a run whose stored result is gone.
-    // One door, set once per spec: the state is a property of the RUN, so
-    // a repeated read answers the same 409 rather than a one-shot.
+    // Not one-shot: a missing stored result belongs to the RUN, so every
+    // read of it answers the same 409.
     const unavailableRun = p.match(/^\/__ctl\/run-unavailable\/(\d+)$/);
     if (unavailableRun && req.method === 'POST') {
       unavailableRunId = Number(unavailableRun[1]);
@@ -1018,8 +805,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true });
       return;
     }
-    // Answers the oldest held query, or the one `number` names. A
-    // `status` other than 200 answers it with the stub's query failure.
     if (p === '/__ctl/pagination/query-release' && req.method === 'POST') {
       const text = await readBody(req);
       let options = {};
@@ -1049,12 +834,9 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, { ok: true, offset: held.offset });
       return;
     }
-    // Finish the parked status read. A spec calls this AFTER the drawer
-    // is gone: a 200 with `pending: true` means the response was still
-    // open at that moment, which is only true if the client never
-    // abandoned it. A premature call (nothing held) or one after the
-    // socket died must fail loudly — a 409 read as proof would be the
-    // whole assertion inverted.
+    // A spec calls this AFTER the drawer is gone. A premature call
+    // (nothing held) or one after the socket died must fail loudly — a 409
+    // read as proof would be the whole assertion inverted.
     if (p === '/__ctl/repin/release' && req.method === 'POST') {
       if (!repin.held || repin.heldAborted) {
         sendJson(res, 409, {
@@ -1066,9 +848,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       const held = repin.held;
-      // Captured before the write, with nothing awaited in between: this
-      // is the fact the spec is buying, and reading it after the write
-      // would read the write's own effect.
+      // Captured before the write, with nothing awaited in between:
+      // reading it after the write would read the write's own effect.
       repin.pendingAtRelease = true;
       repin.held = null;
       const body = repinStatusSucceededResponse();
@@ -1111,7 +892,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- auth --------------------------------------------------------------
     if (p === '/api/auth/me' && req.method === 'GET') {
       if (scenario === 'unauth') {
         sendJson(res, 401, errorEnvelope('unauthorized'));
@@ -1128,10 +908,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- health --------------------------------------------------------------
-    // The capabilities the Send dialog plans around (ADR-0058): the
-    // fixture, with `bounds.max_span_secs` from the `captureMaxSpanSecs`
-    // reset knob when one is set. `capabilitiesFail` answers 503 instead.
     if (p === '/api/v1/capabilities' && req.method === 'GET') {
       capabilityReads += 1;
       if (capabilities.fail) { sendJson(res, 503, errorEnvelope('capabilities unavailable')); return; }
@@ -1150,7 +926,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // Health scenarios answer forbidden admin reads as well as counting them.
     // A missing client gate must fail the request-silence assertion itself.
     // The status bar of a `server_manage` session without investigation
     // reads streams the dashboard here too.
@@ -1203,7 +978,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
     }
 
-    // -- investigations (ADR-0059) --------------------------------------------
     if (p === '/api/v1/investigations' && req.method === 'GET') {
       investigation.listReads += 1;
       if (!investigationReader() || investigation.refuse) { sendJson(res, 403, { error: { code: 'forbidden', message: 'insufficient permissions' } }); return; }
@@ -1297,7 +1071,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         return;
       }
       if (investigation.dropWrite) {
-        // Ran and recorded; the answer starts and never finishes.
         investigation.dropWrite = false;
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end('{"result":');
@@ -1345,7 +1118,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- query ---------------------------------------------------------------
     if (p === '/api/v1/query' && req.method === 'POST') {
       const bodyText = await readBody(req);
       let parsedBody = {};
@@ -1365,9 +1137,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         sendJson(res, 200, body);
         return;
       }
-      // One aggregation at the size the test asked for. Dispatched by
-      // DSL shape like `corpus`, and for the same reason: a body that
-      // says nothing about the query it answers is worse than an error.
       if (scenario === 'aggregate') {
         const dsl = typeof parsedBody.query === 'string' ? parsedBody.query : '';
         const limit = parsedBody.limit ?? 50;
@@ -1410,9 +1179,7 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       if (scenario === 'corpus') {
         // Dispatch by DSL SHAPE, because the service drawer's reads
-        // carry a field or service name the stub cannot predict. The
-        // order matters only in that each shape is checked before the
-        // pipeline catch-all below it.
+        // carry a field or service name the stub cannot predict.
         const dsl = typeof parsedBody.query === 'string' ? parsedBody.query : '';
         if (dsl.includes(QUERY_SHAPES.cardinality)) {
           sendJson(res, 200, corpusCardinalityResponse());
@@ -1430,12 +1197,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           sendJson(res, 200, corpusStatsByResponse());
           return;
         }
-        // A pipeline this scenario has no fixture for, such as the
-        // drawer's `stats count() as hits` collision form, FAILS.
-        // Answering it with the rows fixture would hand a spec a body
-        // that says nothing about the query it asked, which is the
-        // failure mode this dispatch exists to prevent. A bare `|` test
-        // is enough here: no fixture query quotes one.
+        // A pipeline this scenario has no fixture for FAILS. A bare `|`
+        // test is enough here: no fixture query quotes one.
         if (dsl.includes('|')) {
           unhandledQueries.push(dsl);
           sendJson(res, 500, errorEnvelope(`no corpus fixture for this pipeline shape: ${dsl}`));
@@ -1452,11 +1215,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- export -------------------------------------------------------
-    // Captured for the same reason queries are: a spec that asserts a
-    // refused link exported NOTHING needs a counter, and an export that
-    // slipped through must be visible as itself rather than as an
-    // `unstubbed` line item.
     if (p === '/api/v1/export' && req.method === 'POST') {
       const bodyText = await readBody(req);
       let parsedBody = {};
@@ -1474,13 +1232,11 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- SSE stream -----------------------------------------------------
     if (p === '/api/v1/stream' && req.method === 'GET') {
       serveStream(res);
       return;
     }
 
-    // -- other read-only canned surfaces --------------------------------
     if (p === '/api/v1/history' && historyScenario()) {
       if (req.method === 'DELETE') {
         history.deletes += 1;
@@ -1537,18 +1293,10 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       sendJson(res, 200, scenario === 'corpus' ? corpusHistoryResponse() : historyResponse());
       return;
     }
-    // The `populated` scenario answers these two with a corpus that has
-    // something in it: one service and one net. It is an ADDITIONAL
-    // scenario, never a change to `default` — the schema and nets specs
-    // written before it assert on the empty state, and the wire fixture
-    // contract pins both halves.
     if (p === '/api/v1/schema/services' && req.method === 'GET') {
       sendJson(
         res,
         200,
-        // Three bodies, not two: `corpus` gets its own so it can carry a
-        // degraded column, and `populated` keeps the body its specs were
-        // written against.
         scenario === 'corpus'
           ? corpusServiceSchemaResponse()
           : scenario === 'populated'
@@ -1580,10 +1328,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- schedule writes (`schedule`) ----------------------------------
-    // Recorded rather than answered from a fixture keyed to the body: the
-    // spec's whole subject is WHICH keys travelled, so the route keeps
-    // each body as it arrived and answers the same success either way.
     const schedulePut = p.match(/^\/api\/v1\/saved\/(\d+)\/schedule$/);
     if (schedulePut && req.method === 'PUT' && scenario === 'schedule') {
       const bodyText = await readBody(req);
@@ -1594,15 +1338,13 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         // fall through with an empty body record
       }
       scheduleRequests.push({ savedId: Number(schedulePut[1]), body: parsedBody });
-      // One-shot: the arming spec presses Save once against the refusal
-      // and once against a server that accepts, without a second reset.
       const armed = scheduleRefusal;
       scheduleRefusal = null;
       if (armed === 'conflict') {
         sendJson(res, 400, scheduleConflictResponse());
       } else if (armed === 'fail') {
         // Deliberately NOT an error envelope: this is the 5xx a proxy or
-        // a panic writes, which the client cannot quote back.
+        // a panic writes.
         res.writeHead(500, { 'content-type': 'text/plain; charset=utf-8' });
         res.end('upstream failure');
       } else {
@@ -1611,14 +1353,8 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- Run now (`schedule`) ---------------------------------------------
-    // Answers the way trawld's `trigger_run` does per saved net: no
-    // schedule is a 400, and otherwise the claimed run with the window
-    // the server resolved (none in query mode, a trailing span for the
-    // fixed net). Ids are the scenario's own nets.
+    // Answers the way trawld's `trigger_run` does per saved net.
     const runNow = p.match(/^\/api\/v1\/saved\/(\d+)\/run$/);
-    // `schedule-spent`: every POST is recorded. A net under its cap starts a
-    // query-mode run; a spent net is refused the way trawld refuses one.
     if (runNow && req.method === 'POST' && scenario === 'schedule-spent') {
       const savedId = Number(runNow[1]);
       runRequests.push(savedId);
@@ -1645,7 +1381,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       } else {
         const run = { ...runStartedResponse(), id: 504 + startedRuns.length };
         if (!net.schedule.window) {
-          // Query mode: the saved text verbatim, and no window at all.
           run.query = net.query;
           for (const key of ['window_start', 'window_end', 'window_truncated', 'window_kind']) delete run[key];
         } else if (net.schedule.window !== 'since_last') {
@@ -1668,20 +1403,14 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- report runs (`corpus` and `pagination`) ------------------------------------
     // Gated on the scenario rather than answered everywhere: under every
     // other scenario these paths fall through to the `unstubbed`
-    // catch-all, and the auto fixture's empty-`unstubbed` assertion is
-    // what tells a spec author they reached a surface they did not
-    // fixture. The run result is answered for ANY run id — expanding a
-    // row is the behaviour under test, not id routing.
-    // Pagination uses a separate three-row page so the two-row corpus
-    // and its existing assertions remain stable.
+    // catch-all, which tells a spec author they reached a surface they did
+    // not fixture.
     const netRuns = p.match(/^\/api\/v1\/saved\/\d+\/runs$/);
     const netRun = p.match(/^\/api\/v1\/saved\/\d+\/runs\/\d+$/);
     if ((scenario === 'schedule' || scenario === 'schedule-spent') && req.method === 'GET' && (netRuns || netRun)) {
       if (netRuns) {
-        // A run Run now claimed leads its own net's list, as the newest.
         const savedId = Number(p.split('/')[4]);
         const base = scheduleNetRunsResponse();
         const claimed = startedRuns.filter((s) => s.savedId === savedId).map((s) => s.run);
@@ -1691,8 +1420,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
         if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {
           sendJson(res, 409, unavailableRunResponse(unavailableRunId));
         } else {
-          // Run 503 is the long one; the other two keep the `corpus` body,
-          // so an expansion spec can tell a capped preview from a short one.
           sendJson(res, 200, p.endsWith('/503') ? pagedRunResultResponse() : corpusRunResultResponse());
         }
       }
@@ -1706,8 +1433,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
       if (netRun) {
         runDetailReads.push(p);
-        // Arming reaches this scenario too: the global runs page, and so
-        // its execution receipt, is only stubbed under `corpus`.
         if (unavailableRunId !== null && p.endsWith(`/${unavailableRunId}`)) {
           sendJson(res, 409, unavailableRunResponse(unavailableRunId));
           return;
@@ -1749,10 +1474,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       }
     }
 
-    // -- field catalog --------------------------------------------------
-    // The case file's own fetch. The name is whatever the URL asked for,
-    // so a spec that opens `?field=status` gets a case file for `status`
-    // rather than for whatever the fixture happens to be named.
     if (p === '/api/v1/schema/field' && req.method === 'GET') {
       const body = catalogFieldResponse();
       body.name = url.searchParams.get('name') ?? body.name;
@@ -1760,12 +1481,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- repin status ---------------------------------------------------
-    // Scripted, and only once a reset armed it (see `repin` above). The
-    // sequence is: hit 1 running, hit HELD_HIT parked open and never
-    // answered, everything after that succeeded. Holding a read open is
-    // what makes the drawer's alive latch observable — the parked
-    // response is still there to release once the drawer is gone.
     if (p === '/api/v1/schema/repin/status' && req.method === 'GET') {
       if (repin.field === null) {
         sendJson(res, 200, repinStatusNoJobResponse());
@@ -1779,9 +1494,6 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
           // already destroyed must not clobber the fresh state.
           if (repin.held === res) {
             repin.held = null;
-            // Nothing was written, so the socket went away under a read
-            // the client was still owed. `/__ctl/repin/release` reports
-            // this instead of pretending it delivered.
             repin.heldAborted = true;
           }
         });
@@ -1794,14 +1506,12 @@ const server = http.createServer({ maxHeaderSize: 256 * 1024 }, async (req, res)
       return;
     }
 
-    // -- anything else under /api: 200 {} AND recorded as unstubbed -----
     if (p.startsWith('/api/')) {
       unstubbed.push(`${req.method} ${p}`);
       sendJson(res, 200, {});
       return;
     }
 
-    // -- static SPA -------------------------------------------------------
     serveStatic(req, res, p);
   } catch (e) {
     // If headers already went out (e.g. a throw mid-SSE stream), writeHead
@@ -1854,11 +1564,10 @@ function shutdown() {
 }
 process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
-// fixtures.ts starts this server with an IPC channel to its Playwright
-// worker. A worker that dies without running teardown (an OOM kill, say)
-// closes the channel, and the server exits with it instead of keeping the
-// port that the replacement worker needs. A worker that died while this
-// module was still loading has already disconnected: `process.connected`
-// is then false, where a standalone launch leaves it undefined.
+// A worker that dies without running teardown closes the IPC channel, and
+// the server exits with it instead of keeping the port the replacement
+// worker needs. A worker that died while this module was still loading
+// leaves `process.connected` false, where a standalone launch leaves it
+// undefined.
 if (process.connected === false) shutdown();
 else if (process.channel) process.on('disconnect', shutdown);

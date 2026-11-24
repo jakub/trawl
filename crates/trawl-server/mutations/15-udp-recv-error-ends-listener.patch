@@ -1,11 +1,11 @@
 diff --git a/crates/trawl-server/src/syslog/udp.rs b/crates/trawl-server/src/syslog/udp.rs
-index b090b4e1..fae64124 100644
+index 4ba01fd0..1d11a0a6 100644
 --- a/crates/trawl-server/src/syslog/udp.rs
 +++ b/crates/trawl-server/src/syslog/udp.rs
-@@ -94,15 +94,7 @@ async fn serve_udp(
-                 // Any error, such as EMFILE when the process is out of file
-                 // descriptors, ends nothing: log it under the throttle, wait
-                 // out the backoff, and ask the same socket again.
+@@ -76,15 +76,7 @@ async fn serve_udp(
+             () = shutdown_observed(&mut shutdown_rx) => break,
+ 
+             result = incoming.recv_from(&mut buf) => {
 -                let (len, src_addr) = match result {
 -                    Ok(done) => done,
 -                    Err(error) => {

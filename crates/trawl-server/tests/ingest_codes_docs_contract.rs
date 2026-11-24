@@ -2,22 +2,12 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The events reference lists exactly the reject reasons and repair codes
-//! the canonicalizer can produce. Both travel on the wire as these strings
-//! (`IngestEventError::reason`, the ingest preview, `_repairs`, metric
-//! labels), so the documented tables are the contract a sender reads. The
-//! codes are imported, not copied: a new code fails here until the
-//! reference names it, and a documented code the server cannot produce
-//! fails too.
-
 use std::collections::BTreeSet;
 
 use trawl_server::ingest::envelope::{RejectReason, RepairCode};
 
 const EVENTS: &str = include_str!("../../../docs/src/content/docs/reference/events.md");
 
-/// The codes in the first column of the table under `heading`, in
-/// document order: every row whose first cell is one backticked code.
 fn table_codes(heading: &str) -> Vec<&'static str> {
     let start = EVENTS
         .find(&format!("\n{heading}\n"))
@@ -66,8 +56,6 @@ fn repair_table_matches_every_repair_code() {
     assert_same("## Repair codes", &table_codes("## Repair codes"), &code);
 }
 
-/// The class cell of each repair row, keyed by code: the second cell of every
-/// row whose first cell is one backticked code.
 fn repair_classes() -> Vec<(&'static str, &'static str)> {
     let start = EVENTS
         .find("\n## Repair codes\n")

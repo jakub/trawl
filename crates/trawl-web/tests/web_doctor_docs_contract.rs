@@ -2,17 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The configuration reference documents `trawl-web --doctor` from the names
-//! the code uses: every check id, the per-key health rows, the four outcomes,
-//! the reason codes only this doctor reports, and each verdict with its exit
-//! status. The names are imported, not copied, so a renamed check or a new
-//! outcome fails here until the reference names it.
-//!
-//! The deployment guide gives the command for each install channel. Each
-//! command must match what that channel packages: the Debian unit's user,
-//! group, environment file and `--config`, the Helm sidecar's container name
-//! and `--config`, and the trial's web configuration path.
-
 use std::sync::LazyLock;
 use trawl_api::doctor::{Outcome, Verdict, reason};
 use trawl_web::doctor::WebCheck;
@@ -61,9 +50,8 @@ const HELM_COMMAND: &str = "kubectl -n trawl exec trawl-0 -c trawl-web -- \
 const TRIAL_COMMAND: &str =
     "docker compose exec trawl-web trawl-web --doctor --config /var/lib/trawl/trial/web.toml";
 
-/// The part of `page` from the heading line `heading` to the next heading
-/// of the same or a higher level. The page's one `#` title is not a
-/// boundary, so a `#` comment in a code block does not end the section.
+/// The page's one `#` title is not a boundary, so a `#` comment in a code
+/// block does not end the section.
 fn section(page: &'static str, heading: &str) -> &'static str {
     let level = heading.chars().take_while(|c| *c == '#').count();
     let start = page
@@ -78,7 +66,6 @@ fn section(page: &'static str, heading: &str) -> &'static str {
     &rest[..end]
 }
 
-/// The section headed "Check the web proxy with `trawl-web --doctor`".
 fn doctor_section() -> &'static str {
     section(
         &CONFIGURATION,
@@ -93,7 +80,6 @@ fn assert_documented(text: &str, what: &str) {
     );
 }
 
-/// The name serde gives a value, without its JSON quotes.
 fn serde_name(value: impl serde::Serialize) -> String {
     match serde_json::to_value(value).expect("serializes") {
         serde_json::Value::String(name) => name,

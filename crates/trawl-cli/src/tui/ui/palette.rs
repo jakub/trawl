@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Command palette overlay rendering.
-
 use std::collections::HashSet;
 
 use ratatui::Frame;
@@ -24,7 +22,6 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use super::common::centered_rect;
 
-/// Render the command palette overlay.
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     let Some(Popup::CommandPalette {
         ref input,
@@ -57,13 +54,12 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     frame.render_widget(block, area);
 
     let chunks = Layout::vertical([
-        Constraint::Length(1), // input
-        Constraint::Length(1), // separator
-        Constraint::Min(1),    // items
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Min(1),
     ])
     .split(inner);
 
-    // -- input line with ghost text --
     let input_line = Line::from(vec![
         Span::styled("> ", Style::default().fg(theme.text_accent)),
         Span::raw(sanitize_display_text(input)),
@@ -74,15 +70,13 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     ]);
     frame.render_widget(Paragraph::new(input_line), chunks[0]);
 
-    // Position cursor in the input (before ghost text).
     #[allow(clippy::cast_possible_truncation)]
-    let cursor_x = chunks[0].x + 2 + cursor as u16; // ">" + space + cursor offset
+    let cursor_x = chunks[0].x + 2 + cursor as u16;
     frame.set_cursor_position((
         cursor_x.min(chunks[0].right().saturating_sub(1)),
         chunks[0].y,
     ));
 
-    // -- separator line --
     let sep = "─".repeat(chunks[1].width as usize);
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(
@@ -92,11 +86,9 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
         chunks[1],
     );
 
-    // -- item list --
     let list_area = chunks[2];
     let visible_height = list_area.height as usize;
 
-    // Detect column mode: input contains a dot.
     let column_mode_service = input.find('.').map(|pos| &input[..pos]);
 
     let list_width = list_area.width as usize;
@@ -143,14 +135,11 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     }
 }
 
-/// A single display line in the palette (may be a header, item, or detail).
 struct DisplayLine<'a> {
     line: Line<'a>,
-    /// If this line represents a selectable item, its index in the filtered list.
     filtered_index: Option<usize>,
 }
 
-/// Build the display lines from filtered items.
 fn build_display_lines<'a>(
     input: &str,
     items: &'a [PaletteItem],
@@ -162,8 +151,6 @@ fn build_display_lines<'a>(
     let mut lines = Vec::new();
     let is_filtered = !input.is_empty();
 
-    // Column mode reports "No matching service" for both misses: an unknown service
-    // prefix, and a known service whose after-dot column filter matched nothing.
     if filtered.is_empty() {
         let msg = if column_mode_service.is_some() {
             "  No matching service"
@@ -177,7 +164,6 @@ fn build_display_lines<'a>(
         return lines;
     }
 
-    // Column mode: show a service header, then flat column list.
     if let Some(service_name) = column_mode_service {
         lines.push(DisplayLine {
             line: Line::from(Span::styled(
@@ -200,14 +186,12 @@ fn build_display_lines<'a>(
     }
 
     if is_filtered {
-        // Flat list sorted by score (already sorted in `filtered`).
         for (fi, entry) in filtered.iter().enumerate() {
             let item = &items[entry.item_index];
             lines.push(DisplayLine {
                 line: render_item_line(item, &entry.match_positions, theme, width),
                 filtered_index: Some(fi),
             });
-            // Detail line for saved/history items.
             if let Some(ref detail) = item.detail
                 && matches!(
                     item.category,
@@ -221,16 +205,13 @@ fn build_display_lines<'a>(
             }
         }
     } else {
-        // Grouped by category with headers.
         let mut current_category: Option<PaletteCategory> = None;
 
         for (fi, entry) in filtered.iter().enumerate() {
             let item = &items[entry.item_index];
 
-            // Insert category header when category changes.
             if current_category != Some(item.category) {
                 if current_category.is_some() {
-                    // Blank separator between categories.
                     lines.push(DisplayLine {
                         line: Line::from(""),
                         filtered_index: None,
@@ -253,7 +234,6 @@ fn build_display_lines<'a>(
                 filtered_index: Some(fi),
             });
 
-            // Detail line for saved/history.
             if let Some(ref detail) = item.detail
                 && matches!(
                     item.category,
@@ -271,9 +251,6 @@ fn build_display_lines<'a>(
     lines
 }
 
-/// Render a single palette item as a `Line`.
-///
-/// `width` is the available line width — used to right-align shortcuts/hints.
 fn render_item_line<'a>(
     item: &'a PaletteItem,
     match_positions: &[u32],
@@ -281,7 +258,7 @@ fn render_item_line<'a>(
     width: usize,
 ) -> Line<'a> {
     let mut spans = Vec::new();
-    let indent = 2; // "  " prefix
+    let indent = 2;
 
     spans.push(Span::raw("  "));
 
@@ -309,7 +286,6 @@ fn render_item_line<'a>(
         }
     }
 
-    // Right-aligned shortcut or detail hint.
     let hint: Option<&str> = item.shortcut.as_deref().or_else(|| {
         if item.category == PaletteCategory::Service {
             item.detail.as_deref()
@@ -321,7 +297,7 @@ fn render_item_line<'a>(
     if let Some(hint_text) = hint {
         let hint = sanitize_display_text(hint_text);
         let used = indent + label_cells;
-        let trailing_pad = 2; // breathing room before the right edge
+        let trailing_pad = 2;
         let pad = width.saturating_sub(used + cells(&hint) + trailing_pad);
         if pad > 0 {
             spans.push(Span::raw(" ".repeat(pad)));
@@ -332,9 +308,6 @@ fn render_item_line<'a>(
     Line::from(spans)
 }
 
-/// The character indices of the raw `label` that the matcher's
-/// `positions` matched.
-///
 /// nucleo-matcher 0.3.1 does not report character indices. It matches an
 /// ASCII label byte by byte, so a position there is a byte, which is a
 /// character. Any other label it matches one extended grapheme cluster at
@@ -358,11 +331,6 @@ fn matched_chars(label: &str, positions: &[u32]) -> HashSet<usize> {
     matched
 }
 
-/// Render a detail line (indented, dimmed), fitted to `width` display cells.
-///
-/// The detail is cut to at most 60 cells, marker included, and to what is
-/// left of the line after its indent. A line under four cells wide gets
-/// a shorter indent.
 fn render_detail_line(detail: &str, theme: &Theme, width: usize) -> Line<'static> {
     const INDENT: usize = 4;
     const MAX_DETAIL: usize = 60;
@@ -373,7 +341,6 @@ fn render_detail_line(detail: &str, theme: &Theme, width: usize) -> Line<'static
     Line::from(Span::styled(display, Style::default().fg(theme.text_muted)))
 }
 
-/// Find the display line index for the selected filtered item.
 fn find_selected_line(display: &[DisplayLine<'_>], selected: usize) -> usize {
     display
         .iter()
@@ -381,7 +348,6 @@ fn find_selected_line(display: &[DisplayLine<'_>], selected: usize) -> usize {
         .unwrap_or(0)
 }
 
-/// Compute scroll offset to keep the selected line centered in the viewport.
 fn compute_scroll(selected_line: usize, visible_height: usize, total_lines: usize) -> usize {
     if visible_height == 0 || total_lines <= visible_height {
         return 0;
@@ -403,8 +369,6 @@ mod sender_text_tests {
 
     const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
 
-    /// A saved query whose name holds U+202E and a newline, and a service
-    /// whose label and hint hold U+00AD and U+200B.
     fn hostile_items() -> Vec<PaletteItem> {
         vec![
             PaletteItem {
@@ -424,7 +388,6 @@ mod sender_text_tests {
         ]
     }
 
-    /// Draw the palette at 120x40 and return its buffer.
     fn draw(
         input: &str,
         items: Vec<PaletteItem>,
@@ -448,7 +411,6 @@ mod sender_text_tests {
         (app, buffer)
     }
 
-    /// Every cell's symbol, row after row, with a newline between rows.
     fn screen(buffer: &Buffer) -> String {
         (0..buffer.area.height)
             .map(|y| {
@@ -460,7 +422,6 @@ mod sender_text_tests {
             .join("\n")
     }
 
-    /// The cell at which `fragment` starts, one character per cell.
     fn find(buffer: &Buffer, fragment: &str) -> Option<(u16, u16)> {
         let wanted: Vec<char> = fragment.chars().collect();
         (0..buffer.area.height).find_map(|y| {
@@ -490,17 +451,11 @@ mod sender_text_tests {
         }
     }
 
-    /// Labels, hints, the input, its ghost and the column-mode header draw
-    /// through the sanitize rule. The items, their actions and the match
-    /// positions stay as they were, and each match position still marks
-    /// the character it matched.
     #[test]
     fn palette_sender_text_keeps_actions_and_match_positions() {
         let items = hostile_items();
         let before = format!("{items:?}");
 
-        // Matched: the label is drawn one span per grapheme cluster, and
-        // the positions index the raw label.
         let filtered = refilter("pqlab", &items);
         assert_eq!(filtered.len(), 1, "{filtered:?}");
         assert_eq!(filtered[0].item_index, 0);
@@ -538,8 +493,6 @@ mod sender_text_tests {
         assert_eq!(format!("{items:?}"), before, "drawing leaves the items");
         assert_eq!(filtered[0].match_positions, vec![0, 1, 3, 4, 5]);
 
-        // Unmatched and grouped: the label is drawn whole, and the service
-        // hint is drawn at the right. The label is not selected.
         let filtered = refilter("", &items);
         let (app, buffer) = draw("", items, filtered, 1, None);
         assert_drawn(
@@ -556,7 +509,6 @@ mod sender_text_tests {
         };
         assert_eq!(format!("{items:?}"), before, "drawing leaves the items");
 
-        // The input and its ghost.
         let (app, buffer) = draw("in\u{200b}iz", items, Vec::new(), 0, Some("gh\u{00ad}gz"));
         assert_drawn(
             &buffer,
@@ -575,7 +527,6 @@ mod sender_text_tests {
         assert_eq!(input, "in\u{200b}iz");
         assert_eq!(ghost.as_deref(), Some("gh\u{00ad}gz"));
 
-        // Column mode names the service from the input.
         let filtered = vec![FilteredItem {
             item_index: 1,
             score: 0,
@@ -602,9 +553,6 @@ mod unicode_tests {
     use crate::tui::palette::PaletteAction;
     use crate::tui::tests::test_app;
 
-    /// Saved-query bodies a cut must not split: accented, CJK, a combining
-    /// mark, an emoji with its variation selector, and a bidi override with
-    /// a control character, each long enough to pass the 60-cell cap.
     fn details() -> Vec<String> {
         [
             "résumé_ñ",
@@ -657,8 +605,6 @@ mod unicode_tests {
             .collect()
     }
 
-    /// The detail line fits the pane at every width, and at most four cells
-    /// of indent and 60 of detail, marker included.
     #[test]
     fn unicode_panels_survive_resize_palette_detail() {
         let theme = test_app().theme;
@@ -695,9 +641,6 @@ mod unicode_tests {
         insta::assert_snapshot!(frames);
     }
 
-    /// When the list scrolls, the scrollbar takes the list's last column,
-    /// and a detail cut to the full width would have its marker drawn
-    /// over. Every detail row on screen still ends in the marker.
     #[test]
     fn palette_detail_marker_clears_the_scrollbar() {
         let details: Vec<String> = (0..12)
@@ -721,9 +664,6 @@ mod unicode_tests {
         }
     }
 
-    /// Draw `label` matched against `query` as the palette draws a matched
-    /// item, and return each of the first eight cells' symbol and whether
-    /// it carries the match style.
     fn marks(label: &str, query: &str) -> Vec<(String, bool)> {
         let item = PaletteItem {
             label: label.to_owned(),
@@ -750,7 +690,6 @@ mod unicode_tests {
             .collect()
     }
 
-    /// `symbols` with their marks, then unmarked spaces to eight cells.
     fn padded(symbols: &[(&str, bool)]) -> Vec<(String, bool)> {
         let mut row: Vec<(String, bool)> =
             symbols.iter().map(|&(s, m)| (s.to_owned(), m)).collect();
@@ -758,10 +697,6 @@ mod unicode_tests {
         row
     }
 
-    /// nucleo-matcher reports a non-ASCII label's match positions by
-    /// grapheme cluster, so the `x` of `e\u{301}x` is position 1, which
-    /// is the accent's character index. The `x` is marked, the accent's
-    /// cluster is not.
     #[test]
     fn palette_marks_the_cluster_after_a_combining_mark() {
         assert_eq!(
@@ -770,8 +705,6 @@ mod unicode_tests {
         );
     }
 
-    /// A match on `e\u{301}` styles the whole cluster in one cell, and the
-    /// next cell keeps the plain style.
     #[test]
     fn palette_marks_a_matched_cluster_whole() {
         assert_eq!(
@@ -780,7 +713,6 @@ mod unicode_tests {
         );
     }
 
-    /// An ASCII label's positions are its bytes.
     #[test]
     fn palette_marks_ascii_matches() {
         assert_eq!(
@@ -795,10 +727,6 @@ mod unicode_tests {
         );
     }
 
-    /// U+200D extends the cluster of the `a` before it in the raw label,
-    /// so the matcher counts `a\u{200d}` as one position. It draws as
-    /// U+FFFD, a cluster of its own, and the marks after it stay on the
-    /// characters that matched.
     #[test]
     fn palette_marks_stay_put_after_a_replaced_character() {
         assert_eq!(

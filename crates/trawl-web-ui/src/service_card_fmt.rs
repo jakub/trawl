@@ -3,15 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Pure formatting helpers shared by `<ServiceCard/>` and
-//! `<ServiceDrawer/>`. No I/O, no Leptos — just string munging.
-//!
-//! Ungated and top-level for the `tone_vocab` / `facets` reason: inside
-//! the wasm32-gated `components` module its `mod tests` would never run
-//! under `cargo nextest`. `components::service_card_fmt` still resolves
-//! because the module is re-exported there, so every call site keeps its
-//! path.
-//! `today_yesterday_utc` is the one wasm32-only member (it reads the
-//! browser clock) and carries its own gate.
+//! `<ServiceDrawer/>`.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -37,9 +29,7 @@ pub fn format_count(n: u64) -> String {
 ///
 /// The counterpart to [`format_count`] for a number an operator accepts
 /// responsibility for: the values a repin would null, the rows carrying
-/// the field, what a finished job actually rewrote. "1.2k values become
-/// NULL" is not a fact anyone can act on, and grouping is what makes the
-/// exact digits readable at a glance.
+/// the field, what a finished job actually rewrote.
 #[must_use]
 pub fn format_exact(n: u64) -> String {
     let digits = n.to_string();
@@ -98,10 +88,6 @@ pub fn format_uptime(secs: u64) -> String {
     }
 }
 
-/// A service is "healthy" for display purposes when its most recent
-/// `daily_event_counts` entry has a non-zero count AND matches either
-/// `today` or `yesterday` (both formatted as `YYYY-MM-DD`). Pure —
-/// the caller passes in the wall-clock dates.
 #[must_use]
 pub fn is_healthy(svc: &trawl_api::ServiceSchema, today: &str, yesterday: &str) -> bool {
     let Some(last) = svc.daily_event_counts.last() else {
@@ -113,9 +99,6 @@ pub fn is_healthy(svc: &trawl_api::ServiceSchema, today: &str, yesterday: &str) 
     last.date == today || last.date == yesterday
 }
 
-/// Today / yesterday as `YYYY-MM-DD UTC`, read from the browser's
-/// wall-clock. Call once per render (e.g. at the top of `SchemaPage`)
-/// and pass the pair into `is_healthy`. WASM-only.
 #[cfg(target_arch = "wasm32")]
 #[must_use]
 pub fn today_yesterday_utc() -> (String, String) {
@@ -139,9 +122,6 @@ pub fn today_yesterday_utc() -> (String, String) {
     (today, yesterday)
 }
 
-/// How many of this service's fields the catalog currently calls
-/// degraded.
-///
 /// Reads the server-stamped list and nothing else. The count is not
 /// client-derivable: a service is on the list only when
 /// `field_conflict_stats` holds evidence that this service conflicted on
@@ -152,9 +132,6 @@ pub fn degraded_count(svc: &trawl_api::ServiceSchema) -> usize {
     svc.degraded_fields.len()
 }
 
-/// Whether this service's named column carries a degraded pin — the
-/// single membership test behind the fields-tab badge, for the reason in
-/// [`degraded_count`].
 #[must_use]
 pub fn is_degraded_column(svc: &trawl_api::ServiceSchema, field: &str) -> bool {
     svc.degraded_fields.iter().any(|f| f == field)
@@ -176,8 +153,6 @@ pub fn cov_pct(null: u64, total: u64) -> u32 {
     }
 }
 
-/// Map a `DuckDB` type string onto a `.tp-*` pill class + short label
-/// used on field pills across the Schema page.
 #[must_use]
 pub fn type_pill(data_type: &str) -> (&'static str, String) {
     let t = data_type.to_ascii_uppercase();
@@ -206,9 +181,7 @@ pub fn type_pill(data_type: &str) -> (&'static str, String) {
 }
 
 /// Coarser type-bucket mapping used by the donut: returns
-/// `(display_label, css_color, pill_class)`. The three string slices
-/// are `'static` so the donut can reference them in a SVG stroke
-/// without owning a `String`.
+/// `(display_label, css_color, pill_class)`.
 #[must_use]
 pub fn type_bucket(data_type: &str) -> (&'static str, &'static str, &'static str) {
     let t = data_type.to_ascii_uppercase();
@@ -259,11 +232,9 @@ mod tests {
         assert_eq!(format_exact(0), "0");
         assert_eq!(format_exact(7), "7");
         assert_eq!(format_exact(999), "999");
-        // The boundary the grouping is for: nothing is rounded away.
         assert_eq!(format_exact(1_000), "1,000");
         assert_eq!(format_exact(1_204_913), "1,204,913");
         assert_eq!(format_exact(u64::MAX), "18,446,744,073,709,551,615");
-        // Never lossy, unlike `format_count`.
         assert_eq!(format_count(1_204_913), "1.2M");
         assert_ne!(format_exact(1_204_913), format_count(1_204_913));
     }
@@ -325,8 +296,6 @@ mod tests {
         assert_eq!(degraded_count(&svc(&["duration", "status"])), 2);
 
         assert!(is_degraded_column(&svc(&["duration"]), "duration"));
-        // The service carries the column and some other service degraded
-        // it: not badged here.
         assert!(!is_degraded_column(&svc(&[]), "duration"));
         assert!(!is_degraded_column(&svc(&["duration"]), "status"));
         // A degraded field the service no longer carries is filtered

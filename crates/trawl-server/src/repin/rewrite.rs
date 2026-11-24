@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Per-file processing for the shadow build (ADR-0011): source
-//! enumeration/signatures, the affectedness decision, and the two ways a
-//! file lands in the shadow generation — a hardlink (unaffected, foreign,
-//! or non-parquet) or a `ConformPlan` rewrite (affected).
+//! Per-file processing for the shadow build (ADR-0011).
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -35,24 +32,12 @@ pub(crate) struct FileSig {
 /// files, not just parquet — `.corrupt` quarantines and other evidence
 /// must ride the swap too), keyed by data-root-relative path.
 ///
-/// Only valid env directories are covered: the per-env swap moves exactly
-/// these, so `wal/`, `scheduled/`, the markers, and any non-env top-level
-/// entry stay in the live root untouched.
+/// `*.tmp` is the one exclusion: hardlinking a staging file into the shadow
+/// would make a second name for an inode a live writer is about to rewrite.
 ///
-/// `*.tmp` is the one exclusion: a staging file belongs to the writer
-/// holding it open (compaction's `{service}.parquet.tmp`, this module's
-/// own), is never evidence, and hardlinking one into the shadow would
-/// make a second name for an inode a live writer is about to rewrite.
-/// Anything left behind is an orphan compaction's own stale-tmp sweep
-/// reclaims.
-///
-/// A symlink anywhere under an env directory aborts the walk. trawl never
-/// writes one, so it is an operator's own layout (a date partition or a
-/// large service file parked on another volume), and the shadow cannot
-/// carry it: the entry is neither a file nor a directory to `lstat`, and
-/// silently skipping it would leave the only surviving copy in
-/// `data.repin-aside/` for the job's own sweep to delete. Refusing is the
-/// loud half of "no silent loss" (ADR-0008).
+/// A symlink anywhere under an env directory aborts the walk: the shadow
+/// cannot carry it, and silently skipping it would leave the only surviving
+/// copy in `data.repin-aside/` for the job's own sweep to delete.
 pub(crate) fn snapshot_env_files(data_dir: &Path) -> Result<BTreeMap<PathBuf, FileSig>, String> {
     let mut out = BTreeMap::new();
     for (_env, env_dir) in crate::env_dirs::try_list_env_dirs(data_dir)
@@ -115,12 +100,9 @@ fn file_sig(meta: &std::fs::Metadata) -> FileSig {
     }
 }
 
-/// What processing one file into the shadow did.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct ProcessTally {
-    /// Whether the file was rewritten (vs hardlinked verbatim).
     pub(crate) rewritten: bool,
-    /// Rows the rewrite wrote.
     pub(crate) rows: u64,
     /// Stored values the new pin (with resurrection) could not keep.
     pub(crate) nulled: u64,
@@ -134,16 +116,6 @@ pub(crate) struct ProcessTally {
     pub(crate) service: Option<String>,
 }
 
-/// Process one source file into the shadow root: an affected layout
-/// parquet is rewritten through [`ConformPolicy::Repin`]; everything else
-/// — unaffected parquet, foreign parquet, non-parquet evidence — is
-/// hardlinked verbatim (the shadow is a sibling of the data root, and
-/// `marker::check_staging_filesystem` proved before the job started that
-/// the sibling shares its filesystem, so the link cannot be `EXDEV`).
-///
-/// Idempotent per file: a pre-existing shadow entry (an earlier catch-up
-/// pass's output for a since-replaced source) is removed first.
-///
 /// `precounted` is the scan's own tally for this byte-identical file (see
 /// [`crate::repin::plan::ScanTallies`]); supplying it skips the aggregate
 /// recount, and supplying a stale one would misreport the rewrite, so the
@@ -196,12 +168,6 @@ pub(crate) fn process_file(
     )
 }
 
-/// Decide affectedness: a file is rewritten only when it is (a) at a path
-/// trawl itself wrote ([`layout_path`] — the same ownership gate as the
-/// boot pass; a foreign file is never rewritten however it parses) and
-/// (b) a readable parquet whose schema carries the target column under
-/// its folded name.
-///
 /// The scan (`repin::plan`) asks this same function, so the dry run's file
 /// set is the rewrite's file set by construction rather than by two
 /// predicates agreeing.
@@ -218,8 +184,6 @@ pub(crate) fn affected_schema(
         return Ok(None);
     };
     if !is_valid_parquet(src) {
-        // A layout-path file that is not parquet inside: not ours to
-        // rewrite; it rides verbatim like any other evidence.
         return Ok(None);
     }
     let safe = src.to_string_lossy().replace('\'', "''");
@@ -228,9 +192,6 @@ pub(crate) fn affected_schema(
     Ok(carries.then_some((schema, layout)))
 }
 
-/// Rewrite one affected file into the shadow: tally with the same
-/// expressions the write uses, then `COPY` through the
-/// [`ConformPolicy::Repin`] plan, staged `.tmp` → fsync → rename.
 #[allow(clippy::too_many_arguments)]
 fn rewrite_affected(
     conn: &duckdb::Connection,
@@ -245,10 +206,6 @@ fn rewrite_affected(
 ) -> Result<ProcessTally, String> {
     let safe = src.to_string_lossy().replace('\'', "''");
     let source = format!("read_parquet('{safe}')");
-    // The tally is a full aggregate scan of the file, and the mandatory
-    // pre-build scan just ran the identical SQL over it. Reuse that
-    // reading when the source has not changed a byte since — the numbers
-    // are equal by construction, not by approximation.
     let counts = match precounted {
         Some(counts) => counts,
         None => count_repin_effect(conn, &source, schema, field, reading)?,
@@ -292,28 +249,18 @@ fn rewrite_affected(
     })
 }
 
-/// Where a rewrite stages its output before the rename onto `dst`.
-///
 /// Deliberately not `{service}.parquet.tmp` — that is byte-for-byte the
 /// path hourly compaction stages at, and `DuckDB`'s `COPY` opens its target
 /// `O_CREAT|O_TRUNC` without unlinking first, so a shadow entry that is a
 /// hardlink to a live staging file would be truncated and rewritten inside
-/// the live data root. The pid keeps two processes sharing a shadow root
-/// (a would-be operator mistake) off each other's staging file, and the
-/// `.tmp` extension keeps a crash leftover inert and inside compaction's
-/// stale-tmp sweep once the shadow is published.
+/// the live data root.
 fn staging_path(dst: &Path) -> PathBuf {
     dst.with_extension(format!("parquet.repin-{}.tmp", std::process::id()))
 }
 
-/// The per-file numbers the plan reports and the rewrite achieves,
-/// computed with the same expressions the rewrite writes
-/// (`repin_count_exprs` — see `ingest::compaction::repin_target_expr`).
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RepinEffect {
-    /// Total rows in the file.
     pub(crate) rows: u64,
-    /// Stored values carried by the column.
     pub(crate) carrying: u64,
     /// Stored values lost under the new pin (resurrection arm included).
     pub(crate) nulled: u64,
@@ -325,7 +272,6 @@ pub(crate) struct RepinEffect {
     pub(crate) ambiguous: u64,
 }
 
-/// Count what the repin would do to one affected source.
 pub(crate) fn count_repin_effect(
     conn: &duckdb::Connection,
     source: &str,
@@ -337,19 +283,10 @@ pub(crate) fn count_repin_effect(
     Ok(effect)
 }
 
-/// Count what the repin would do to one affected source and sample the
-/// values it cannot read, in one statement.
-///
 /// One statement because the numbers and the evidence must describe the
 /// same read of the same file: compaction can replace a file between two
 /// statements, and a report whose counts came from one generation and whose
 /// samples came from another describes a corpus that never existed.
-///
-/// Sampling is best-effort, exactly as the conform's own evidence capture
-/// is: a sampling failure re-runs the plain count and returns no samples
-/// rather than failing the scan. A repin an operator cannot run because the
-/// optional evidence column errored is a worse outcome than a report
-/// without samples.
 pub(crate) fn count_repin_effect_sampled(
     conn: &duckdb::Connection,
     source: &str,
@@ -383,8 +320,6 @@ pub(crate) fn count_repin_effect_sampled(
     }
 }
 
-/// The one per-file measurement: the four counts, and — when `sampled` —
-/// the bounded misfit samples beside them in the same statement.
 fn measure(
     conn: &duckdb::Connection,
     source: &str,
@@ -450,8 +385,6 @@ fn measure(
 mod tests {
     use super::*;
 
-    /// A repin rewrite that runs out of memory is a resource failure
-    /// (ADR-0056). The source is kept and nothing lands in the shadow.
     #[test]
     fn maintenance_out_of_memory_is_a_resource_failure_in_repin() {
         use crate::ingest::compaction::oom_support;
@@ -500,11 +433,6 @@ mod tests {
         assert!(!shadow.join(rel).exists(), "nothing reaches the shadow");
     }
 
-    /// A live staging file must never enter the shadow: hardlinking one
-    /// gives the shadow a second name for an inode compaction is about to
-    /// rewrite (or has already renamed into place), and the next pass's
-    /// `COPY` would truncate it through the link. Everything else — parquet
-    /// and non-parquet evidence alike — still rides.
     #[test]
     fn snapshot_skips_staging_files_and_keeps_evidence() {
         let tmp = tempfile::tempdir().unwrap();
@@ -523,9 +451,6 @@ mod tests {
         assert_eq!(seen, vec!["nginx.parquet", "nginx.parquet.corrupt"]);
     }
 
-    /// A symlinked entry is neither `is_file` nor `is_dir` to the walk's
-    /// `lstat`, so skipping it would drop it from the shadow and let the
-    /// cutover's aside-sweep delete the only copy. It must abort instead.
     #[cfg(unix)]
     #[test]
     fn snapshot_refuses_symlinked_entries() {
@@ -552,7 +477,6 @@ mod tests {
         assert!(err.contains("symlink"), "{err}");
     }
 
-    /// The rewrite must not stage where compaction stages.
     #[test]
     fn staging_path_cannot_collide_with_compactions() {
         let dst = Path::new("/data/prod/2026-08-12/10/nginx.parquet");
@@ -560,8 +484,6 @@ mod tests {
         assert_ne!(staged, dst.with_extension("parquet.tmp"));
         assert_eq!(staged.parent(), dst.parent());
         assert_eq!(staged.extension().unwrap(), "tmp");
-        // And it is itself excluded from the source enumeration, so a
-        // crash leftover can never be hardlinked forward.
         assert!(staged.extension().is_some_and(|e| e == "tmp"));
     }
 }

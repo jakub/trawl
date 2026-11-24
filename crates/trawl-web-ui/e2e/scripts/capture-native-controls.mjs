@@ -2,21 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-// Evidence tooling, not a test: drives the built SPA against the same
-// stub harness the suite uses and writes the ADR-0028 surfaces to PNG,
-// light and dark, plus the geometry numbers that a picture alone cannot
-// settle.
-//
-// It is here rather than in visual-evidence/ because it is worth
-// re-running: the two tab strips gained a nested `.tablist` box, and
-// "did the underline move" is a question every later change to that
-// chrome has to answer again.
-//
 // The dark pass is not a `colorScheme` emulation. fleet-ui's theme comes
 // from localStorage through `theme::runtime`, never from
 // prefers-color-scheme, so the only honest way to reach dark is the
-// account menu's own theme item — which makes the dark set evidence that
-// the item works as well as evidence of how dark looks.
+// account menu's own theme item.
 //
 // Usage, from the repo root (the SPA must already be built):
 //   node crates/trawl-web-ui/e2e/scripts/capture-native-controls.mjs [outdir]
@@ -36,9 +25,8 @@ const OUT = path.resolve(
   process.argv[2] ?? path.join(ROOT_DIR, 'visual-evidence', 'issue-159'),
 );
 
-/** Screenshot a rectangle that covers every element named, with padding,
- * so an absolutely-positioned panel outside its wrapper's own box (the
- * menu) is still in frame. */
+/** One padded rectangle around every element named, so an absolutely-
+ * positioned panel outside its wrapper's own box (the menu) is in frame. */
 async function shotUnion(page, selectors, file, pad = 12) {
   const rect = await page.evaluate(
     ({ selectors }) => {
@@ -68,10 +56,7 @@ async function shotUnion(page, selectors, file, pad = 12) {
   return file;
 }
 
-/** The two geometry questions the nested `.tablist` raises, answered in
- * device pixels by the browser rather than by reading the stylesheet.
- *
- * `underlineOverlap` is the tab's border-box bottom minus the strip's
+/** `underlineOverlap` is the tab's border-box bottom minus the strip's
  * INNER bottom edge, the top of its 1px bottom border. Each tab carries
  * `margin-bottom: -1px`, which pulls its box down INTO that border row,
  * so the two outer bottoms coincide and the tab's 2px underline paints
@@ -111,12 +96,8 @@ async function stripGeometry(page, stripSel, tabSel) {
   );
 }
 
-/** The pre-#159 layout, measured rather than reasoned about: unwrap the
- * `[role="tablist"]` box in place, which is exactly the flat DOM these
- * strips had before (same buttons, same classes, no wrapper), and
- * re-measure. `.tablist`'s two rules then match nothing, so what comes
- * back is the old geometry under the current stylesheet. Destructive to
- * the DOM, so it runs last, after every screenshot. */
+/** Unwrap the `[role="tablist"]` box in place and re-measure. Destructive
+ * to the DOM, so it runs last, after every screenshot. */
 async function flattenedGeometry(page, stripSel, tabSel) {
   await page.evaluate(
     ({ stripSel }) => {
@@ -129,12 +110,8 @@ async function flattenedGeometry(page, stripSel, tabSel) {
   return stripGeometry(page, stripSel, tabSel);
 }
 
-/** Wait out any CSS entrance animation on the elements named, by their
- * own `finished` promises rather than a sleep: the menu, the modal and
- * the drawer all fade in, and a frame grabbed mid-fade shows the page
- * bleeding through a half-opaque panel. `reducedMotion: 'reduce'` does
- * not help — fleet-ui's stylesheet has no reduced-motion rule (ADR-0028
- * names that as out of scope). */
+/** The menu, the modal and the drawer all fade in, and a frame grabbed
+ * mid-fade shows the page bleeding through a half-opaque panel. */
 async function settle(page, selectors) {
   await page.evaluate(
     async ({ selectors }) => {
@@ -167,7 +144,6 @@ async function capture(browser, theme) {
   await page.locator('.topbar button.user').waitFor({ state: 'visible' });
 
   if (theme === 'dark') {
-    // The theme item is the first item and already holds focus.
     await openAccountMenu(page);
     await page.keyboard.press('Enter');
     await page.waitForFunction(
@@ -179,24 +155,19 @@ async function capture(browser, theme) {
   );
   if (applied !== theme) throw new Error(`capture: data-theme is ${applied}, wanted ${theme}`);
 
-  // 1. The account menu, open, focus ring on the first item.
   await openAccountMenu(page);
   await settle(page, ['.user-menu', '.user-menu *']);
   files.push(await shotUnion(page, ['.topbar .user-wrap', '.user-menu'], `account-menu-${theme}.png`));
   await page.keyboard.press('Escape');
 
-  // 2. The results strip, focus on an UNSELECTED tab (arrow right off
-  //    the selected one) — the roving contract's whole point.
   const wsTabs = page.locator('.tabs [role="tab"]');
   await wsTabs.nth(0).focus();
   await page.keyboard.press('ArrowRight');
   files.push(await shotUnion(page, ['.tabs'], `results-tabs-${theme}.png`, 8));
   const results = await stripGeometry(page, '.tabs', '[role="tab"]');
 
-  // 3. The modal header and its close button, focused. Opened from the
-  //    KEYBOARD: Chromium only paints `:focus-visible` when the last
-  //    interaction was a keypress, so a mouse-opened dialog would show
-  //    a focused close button with no ring on it.
+  // Opened from the KEYBOARD: Chromium only paints `:focus-visible` when
+  // the last interaction was a keypress.
   await page.locator('.tabs .action.export').focus();
   await page.keyboard.press('Enter');
   await page.locator('.modal').waitFor({ state: 'visible' });
@@ -206,8 +177,6 @@ async function capture(browser, theme) {
   await page.keyboard.press('Escape');
   await page.locator('.modal').waitFor({ state: 'detached' });
 
-  // 4. A toast and its dismiss button, focused (keyboard again, same
-  //    reason).
   await page.locator('.editor-tools button.tool').filter({ hasText: /^Share$/ }).focus();
   await page.keyboard.press('Enter');
   await page.locator('.toast').first().waitFor({ state: 'visible' });
@@ -215,8 +184,6 @@ async function capture(browser, theme) {
   await page.locator('.toast button.x').first().focus();
   files.push(await shotUnion(page, ['.toast'], `toast-${theme}.png`, 8));
 
-  // 5. The service drawer strip, focus on an unselected tab. Needs the
-  //    populated corpus, so the scenario flips first.
   await context.request.post(`${BASE}/__ctl/reset`, { data: { scenario: 'populated' } });
   await page.goto(`${BASE}/search/schema?svc=nginx&stab=overview`);
   await page.locator('.sd-drawer').waitFor({ state: 'visible' });
@@ -232,9 +199,6 @@ async function capture(browser, theme) {
   files.push(await shotUnion(page, ['.sd-tabs'], `drawer-tabs-${theme}.png`, 8));
   const drawer = await stripGeometry(page, '.sd-tabs', '[role="tab"]');
 
-  // The before/after, on the same page and the same stylesheet. Each
-  // strip is measured on the route that mounts it, and the flattening is
-  // the last thing that happens to that page.
   const drawerFlat = await flattenedGeometry(page, '.sd-tabs', '[role="tab"]');
   await page.goto(`${BASE}/search`);
   await page.locator('.tabs [role="tablist"]').waitFor({ state: 'visible' });
@@ -250,12 +214,8 @@ async function capture(browser, theme) {
 }
 
 // Readiness is the CHILD's own "listening" line, never a 200 from the
-// port: a harness left by another worktree (or a parallel capture on
-// the default port) answers /__ctl/health just as happily, and the
-// script would then photograph THAT checkout's dist and reset THAT
-// run's scenario while our own child had already died with
-// EADDRINUSE. Same rule as the `stubOrigin` fixture in fixtures.ts,
-// which waits for the same line — a port collision fails loudly.
+// port: a harness left by another worktree answers /__ctl/health just as
+// happily. Same rule as the `stubOrigin` fixture in fixtures.ts.
 function waitForOwnedListener(child) {
   return new Promise((resolve, reject) => {
     let settled = false;

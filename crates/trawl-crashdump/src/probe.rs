@@ -21,8 +21,6 @@ pub(crate) struct StatusFields {
     pub(crate) gid: [u32; 4],
 }
 
-/// Read the monitor's status. `None` when the file is gone (the monitor exited)
-/// or does not parse.
 pub(crate) fn monitor_status(pid: u32) -> Option<MonitorStatus> {
     let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let f = parse_status(&text)?;
@@ -36,7 +34,6 @@ pub(crate) fn monitor_status(pid: u32) -> Option<MonitorStatus> {
     })
 }
 
-/// Read our own status through the same parser.
 pub(crate) fn self_status() -> Option<SelfStatus> {
     let text = std::fs::read_to_string("/proc/self/status").ok()?;
     let f = parse_status(&text)?;
@@ -67,10 +64,6 @@ pub(crate) fn ptrace_scope() -> Option<u8> {
     }
 }
 
-/// Parse a `/proc/<pid>/status` body.
-///
-/// Fields may arrive in any order and unknown ones are ignored, but each of the
-/// six we need must appear exactly once with a well-formed value.
 pub(crate) fn parse_status(text: &str) -> Option<StatusFields> {
     let mut eff = None;
     let mut prm = None;
@@ -156,8 +149,6 @@ fn parse_u32(value: &str) -> Option<u32> {
 mod tests {
     use super::{StatusFields, parse_status, ptrace_scope, self_status};
 
-    /// Shaped like the real thing: tab after the colon, unrelated fields around
-    /// the ones we read, trailing newline.
     const SAMPLE: &str = "Name:\ttrawld\nUmask:\t0022\nState:\tS (sleeping)\nTgid:\t7\nPid:\t7\n\
 PPid:\t1\nUid:\t1000\t1000\t1000\t1000\nGid:\t1000\t1000\t1000\t1000\nFDSize:\t256\n\
 Threads:\t9\nCapInh:\t0000000000000000\nCapPrm:\t0000000000080000\n\
@@ -272,8 +263,6 @@ NoNewPrivs:\t1\nSeccomp:\t2\nSpeculation_Store_Bypass:\tthread vulnerable\n";
     #[test]
     fn reads_our_own_status_from_procfs() {
         let status = self_status().expect("/proc/self/status is readable and well formed");
-        // Whatever this test runner's credentials are, the four uid slots are
-        // real numbers and the parser round-trips them.
         assert_eq!(status.uid.len(), 4);
     }
 

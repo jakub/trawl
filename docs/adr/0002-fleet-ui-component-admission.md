@@ -1,6 +1,6 @@
 # fleet-ui component admission: generic-by-nature, single-consumer OK
 
-**Status:** Accepted
+**Status:** Accepted; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 fleet-ui (coastwatch ADR-0030) was extracted from trawl-web-ui's "Herring"
 design system with a conservative admission rule: components graduate to the
@@ -79,3 +79,9 @@ Slice B (#28) adds Modal, Drawer, Tabs, ErrorBanner, a `Btn` size axis, a
 default-valued props (`ConfirmModal`'s public API is frozen), so #28 introduces
 **no new coastwatch break** — the `badge: None` above is the sole pending
 compile-fix at this rev.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Every fleet-ui icon prop takes the closed `Icon` enum in `icon.rs`, never an SVG view.** `RailItem::icon`, the modal `icon` prop and `IconView` take an `Icon`, so every app draws its chrome from the same glyph set and style. A new shared glyph is a new `Icon` variant and a match arm in `icon_body` (coastwatch ADR-0030). Content slots such as `children` stay open and can carry any view the app passes, SVG included.

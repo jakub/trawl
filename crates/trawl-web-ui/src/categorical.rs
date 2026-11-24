@@ -4,20 +4,6 @@
 
 //! Shape detection for the categorical bar chart beside an aggregate
 //! result, and the group columns the exact table offers a search on.
-//!
-//! Both answers are read off the executed DSL and the response together,
-//! never off the response alone: "which column is the group" is a
-//! question only the `stats … by <field>` stage can answer, and a column
-//! the query did not group by is a generated metric that no filter can
-//! name (functional finding F02).
-//!
-//! At the crate root rather than under `components/`, which is
-//! wasm-gated, so these decisions are tested on native
-//! `cargo nextest run -p trawl-web-ui`.
-//!
-//! On native, only the tests consume these items — `#[allow(dead_code)]`
-//! at module scope silences the bin-crate dead-code warning. Matches the
-//! `facets.rs` pattern.
 
 #![cfg_attr(not(target_arch = "wasm32"), allow(dead_code))]
 
@@ -35,25 +21,17 @@ use trawl_core::schema::{TIME, catalog_key};
 /// the bars against.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CatShape {
-    /// Column index of the grouped field.
     pub group: usize,
-    /// Column index of the generated metric.
     pub metric: usize,
     pub group_name: String,
     pub metric_name: String,
     /// Whether any value is negative, which makes the track two-sided.
     pub signed: bool,
-    /// The largest magnitude in the metric column; `0.0` when every
-    /// value is zero or null.
     pub max_abs: f64,
 }
 
 impl CatShape {
     /// Bar length for one metric value, as a percentage of the track.
-    ///
-    /// A signed track is drawn from its midpoint, so each side gets half
-    /// the width. Zero when there is no scale to draw against, which is
-    /// what an all-zero column has.
     #[must_use]
     pub fn percent(&self, value: &Value) -> f64 {
         let Some(v) = numeric(value) else {
@@ -77,9 +55,6 @@ impl CatShape {
     }
 }
 
-/// The `CatShape` of this result, or `None` when the pair is anything
-/// else.
-///
 /// `None` is the common answer and not a failure: the exact table is the
 /// accessible representation and renders alone. A chart is offered only
 /// for the one shape it can draw honestly — a single grouped field, a
@@ -90,7 +65,6 @@ pub fn detect(query: &str, result: &QueryResult) -> Option<CatShape> {
     if stats.group_by.len() != 1 || stats.aggregations.len() != 1 || result.columns.len() != 2 {
         return None;
     }
-    // An empty page has no scale and nothing to draw.
     if result.rows.is_empty() {
         return None;
     }
@@ -143,24 +117,9 @@ pub fn detect(query: &str, result: &QueryResult) -> Option<CatShape> {
 }
 
 /// Indices of the result columns the query actually grouped by AND can
-/// still be searched for.
-///
-/// These are the only columns the exact table offers a search on: every
-/// other column is a generated metric, and a filter naming one would
-/// advertise a field the corpus has never held (ADR-0025, F02). The
-/// grouping is the final `stats`, read past any trailing stages that only
-/// pass names through (a `sort -errors | head 10` ranking the groups); a
-/// pipeline with any other stage after it, or no `stats` at all, groups by
-/// nothing.
-///
-/// Being grouped by is not enough on its own. A search prepends
-/// `<field>="<value>"` BEFORE the first pipe, so the name has to be one
-/// the corpus holds at that point — and `stats count() as n by service
-/// | stats count() by n` groups by `n`, a number the first aggregation
-/// invented. Provenance is established by walking the stages ahead of
-/// the final `stats`: a name any of them minted is not a field, and a
-/// pipeline that mints names nobody can enumerate ahead of the data
-/// leaves no name searchable at all.
+/// still be searched for. Being grouped by is not enough on its own: a
+/// search prepends `<field>="<value>"` BEFORE the first pipe, so the name
+/// has to be one the corpus holds at that point.
 #[must_use]
 pub fn group_columns(query: &str, columns: &[String]) -> Vec<usize> {
     let Ok(ast) = trawl_core::parser::parse(query) else {
@@ -190,28 +149,14 @@ pub fn group_columns(query: &str, columns: &[String]) -> Vec<usize> {
         .collect()
 }
 
-/// Every column name the stages ahead of the final `stats` mint, or
-/// `None` when a stage mints names that cannot be known without the
-/// data.
-///
 /// Names fold through [`catalog_key`], so a `stats count() as Total`
 /// disqualifies a later group by `total`: the two are one column.
-///
-/// `extract`, `pivot` and `from saved` are the unknowable three. An
-/// extraction's fields come out of a regex or a key/value scan of the
-/// message, a pivot's columns are the VALUES of its `on` field, and a
-/// saved run carries whatever schema it was written with. None of them
-/// can be enumerated from the query text, and a name that might have
-/// been minted is a name whose provenance is not established — so the
-/// whole result withholds the search rather than guessing.
 fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
     fn mint(set: &mut HashSet<String>, name: &str) {
         set.insert(catalog_key(name));
     }
     let mut minted = HashSet::new();
     for stage in stages {
-        // Filtering, ordering, projecting and deduplicating stages pass
-        // names through; none of them invents one.
         if passes_names_through(&stage.node) {
             continue;
         }
@@ -259,19 +204,11 @@ fn minted_before(stages: &[Spanned<PipeStage>]) -> Option<HashSet<String>> {
 
 /// The query's final `stats` stage, if nothing after it changes what the
 /// columns mean.
-///
-/// Trailing pass-through stages are skipped: a later `sort` or `head`
-/// does not change what the columns mean. Any other trailing stage does
-/// (a `let`, a `rename`, a non-`stats` aggregation), so such a query
-/// draws no chart. When a query runs `stats` more than once, only the
-/// last one counts: it names the columns the response carries.
 fn last_stats(query: &str) -> Option<StatsStage> {
     let ast = trawl_core::parser::parse(query).ok()?;
     final_stats(&ast.pipeline).map(|(_, stats)| stats.clone())
 }
 
-/// The index and body of the last stage that is not pass-through, when
-/// that stage is a `stats`; `None` for any other pipeline.
 fn final_stats(pipeline: &[Spanned<PipeStage>]) -> Option<(usize, &StatsStage)> {
     let at = pipeline
         .iter()
@@ -282,7 +219,6 @@ fn final_stats(pipeline: &[Spanned<PipeStage>]) -> Option<(usize, &StatsStage)> 
     }
 }
 
-/// A metric cell as an `f64`, or `None` when it is not a number.
 #[allow(clippy::cast_precision_loss)]
 fn numeric(value: &Value) -> Option<f64> {
     match value {
@@ -295,18 +231,6 @@ fn numeric(value: &Value) -> Option<f64> {
     }
 }
 
-/// The bars are measured against the WHOLE fetched result, not the page
-/// on screen.
-///
-/// `detect` builds `max_abs` from every row it is handed, and under
-/// `FetchPlan::Whole` that is every group the execution produced. So a
-/// row's width is a property of the result, and paging cannot change it.
-/// Detecting over a page instead would rescale the bars on every turn,
-/// which is the defect this pins.
-///
-/// At module scope rather than inside `mod tests`, so
-/// `cargo nextest run -p trawl-web-ui categorical::scale_is_taken_from_the_fetched_result`
-/// selects this one test by its path.
 #[cfg(test)]
 #[test]
 fn scale_is_taken_from_the_fetched_result() {
@@ -339,16 +263,11 @@ fn scale_is_taken_from_the_fetched_result() {
     let shape = detect(query, &whole).expect("a stats-by result with one numeric metric");
     assert!((shape.max_abs - 900.0).abs() < 1e-9);
 
-    // One scale, read once, answering for rows on either page: row 0 is
-    // drawn on page 0 and row 55 on page 1, and neither width depends on
-    // which slice was handed to the chart.
     let row_0 = shape.percent(&rows[0][shape.metric]);
     let row_55 = shape.percent(&rows[55][shape.metric]);
     assert!((row_0 - 1.0).abs() < 1e-9, "row 0 is 9 of 900: {row_0}");
     assert!((row_55 - 100.0).abs() < 1e-9, "row 55 fills the track");
 
-    // The contrast: a scale detected over the first page alone makes the
-    // same row-0 value fill the whole track.
     let page_shape = detect(query, &first_page).expect("the page is a stats-by result too");
     assert!((page_shape.max_abs - 9.0).abs() < 1e-9);
     let page_row_0 = page_shape.percent(&rows[0][page_shape.metric]);
@@ -487,7 +406,6 @@ mod tests {
         )
         .unwrap();
         assert!(shape.signed);
-        // A two-sided track draws each side from the midpoint.
         assert!((shape.percent(&Value::Integer(-940)) - 50.0).abs() < f64::EPSILON);
     }
 
@@ -692,7 +610,6 @@ mod tests {
     fn group_columns_names_only_the_grouped_fields() {
         let columns = vec!["status".to_string(), "count".to_string()];
         assert_eq!(group_columns(BY_STATUS, &columns), vec![0]);
-        // The grouping key folds to the catalog name the column carries.
         assert_eq!(
             group_columns("* | stats count() by STATUS", &columns),
             vec![0]

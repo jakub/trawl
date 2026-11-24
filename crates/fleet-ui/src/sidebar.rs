@@ -2,21 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `<Sidebar/>` — one labelled navigation list (ADR-0032). Replaces the
-//! icon rail and the topbar mode tabs: each app supplies its own groups
-//! and computes its own "active item" signal (typically from the current
-//! pathname); fleet-ui owns the look and the link plumbing only.
-//!
-//! Groups are data, not a fixed taxonomy: a group with no label renders
-//! its items with no heading, a labelled one renders a small-caps
-//! heading and names the run for assistive technology and for the
-//! command palette. The collapsed presentation is icon-only — every
-//! link keeps its `title`, and the visible label becomes screen-reader
-//! text, so nothing loses its accessible name.
-//!
-//! [`RailItem`] and [`SidebarGroup`] are pure `&'static`-shaped data and
-//! build on every target (the consumer's route table is native code);
-//! the component itself is wasm32-only.
+//! `<Sidebar/>` — one labelled navigation list (ADR-0032).
 
 #[cfg(target_arch = "wasm32")]
 use leptos::prelude::*;
@@ -32,14 +18,6 @@ fn item_class(active: bool) -> &'static str {
     if active { "it active" } else { "it" }
 }
 
-/// A single destination. `path` is the route navigated to on click; `id`
-/// is the discriminant the parent compares against the `active` signal
-/// to drive the accent treatment.
-///
-/// `badge` is an optional count chip (unread stories, pending
-/// editions…) — a plain value, so callers rebuild the item Vec
-/// reactively when the count changes. Zero counts are hidden:
-/// `Some(0)` renders no chip, same as `None`.
 #[derive(Debug, Clone)]
 pub struct RailItem {
     pub id: String,
@@ -49,9 +27,6 @@ pub struct RailItem {
     pub badge: Option<u64>,
 }
 
-/// A labelled run of destinations. `label: None` renders the items with
-/// no heading (trawl's first group); `Some` renders a small-caps heading
-/// and names the group for assistive technology and the command palette.
 #[derive(Debug, Clone)]
 pub struct SidebarGroup {
     pub label: Option<String>,
@@ -65,27 +40,11 @@ pub fn Sidebar(
     #[prop(into)] brand_accent: String,
     #[prop(into)] groups: Signal<Vec<SidebarGroup>>,
     #[prop(into)] active: Signal<String>,
-    /// Collapsed (icon-only) presentation. `None` when the consumer
-    /// provides no `UiPrefs`: then no collapse control renders.
-    /// `optional_no_strip` keeps the `Option` so `Shell` forwards its own
-    /// optional pref straight through.
-    #[prop(optional_no_strip)]
-    collapsed: Option<Signal<bool>>,
+    #[prop(optional_no_strip)] collapsed: Option<Signal<bool>>,
     #[prop(optional_no_strip)] on_toggle_collapse: Option<Callback<()>>,
-    /// True inside the <900px overlay: always expanded, no collapse control.
-    #[prop(into, optional)]
-    overlay: Signal<bool>,
-    /// Bottom-pinned slot (trawl's Help link), rendered inside `.bot`.
-    /// A [`ViewFn`] rather than `Children` because the shell mounts the
-    /// sidebar twice — docked and as the compact overlay — and a
-    /// `FnOnce` slot cannot be rendered by both; `optional_no_strip`
-    /// keeps the `Option` so `Shell` forwards its own slot through.
-    #[prop(optional_no_strip)]
-    bottom: Option<ViewFn>,
+    #[prop(into, optional)] overlay: Signal<bool>,
+    #[prop(optional_no_strip)] bottom: Option<ViewFn>,
 ) -> impl IntoView {
-    // The collapse control exists only when the consumer persists the
-    // state; without a toggle callback the button would advertise a
-    // capability the shell cannot deliver (ADR-0025).
     let collapsible = collapsed.is_some() && on_toggle_collapse.is_some();
     let has_bottom = bottom.is_some();
 
@@ -120,12 +79,9 @@ pub fn Sidebar(
                                 view! {
                                     <A
                                         href=item.path
-                                        // `A` marks itself `aria-current="page"` on a
-                                        // PREFIX match unless this is set, which would
-                                        // put Search and History both on "page" at
-                                        // /search/history. The consumer's `active`
-                                        // signal is the one answer to "where am I"; the
-                                        // router must not contradict it.
+                                        // `A` marks itself `aria-current="page"` on a PREFIX match unless this is
+                                        // set, which would put Search and History both on "page" at
+                                        // /search/history.
                                         exact=true
                                         attr:class=move || item_class(active.get() == id)
                                         attr:title=label_attr

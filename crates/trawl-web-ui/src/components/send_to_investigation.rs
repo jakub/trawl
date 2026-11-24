@@ -4,36 +4,6 @@
 
 //! `<SendToInvestigation/>` — send the search Search ran into an open
 //! investigation (ADR-0057, ADR-0059).
-//!
-//! The dialog takes the accepted execution once, when it opens
-//! ([`SendSnapshot`]), so an edit to the draft behind it never changes
-//! what is sent. It lists the open investigations when it opens and sends
-//! nothing until the person picks one: there is no default target. It
-//! shows the exact text and window the capture will carry, as
-//! [`crate::send_investigation::plan`] reads them through the shared
-//! codec, and an optional purpose inside the server's byte bound.
-//!
-//! A fixed range sends at once. A moving range is never sent: the dialog
-//! says so and offers to pin it to the instant the search ran, from the
-//! server's `execution.started_at`. A query whose own time clause moves
-//! offers nothing: the range control cannot pin text, so the dialog says
-//! to remove the clause and pick the range there, and has no Send button. Pinning runs Search again on that
-//! absolute range ([`on_pin`](SendToInvestigation)), and the dialog stays
-//! open with the choice and purpose kept; once Search has accepted the
-//! pinned execution, the dialog sends that search, so the rows behind the
-//! dialog are the rows that are sent.
-//!
-//! The dialog reads the server's capabilities when it opens, and sends
-//! and pins nothing until they answer: a range whose capture would cover
-//! more than `bounds.max_span_secs` is refused, never narrowed, and the
-//! dialog says to pick a shorter one. Capabilities that cannot be read
-//! refuse nothing, and the server decides.
-//!
-//! One press sends one capture. A target closed meanwhile keeps the
-//! input and lists the open investigations again. An answer that never
-//! arrived leaves the outcome unknown: the dialog keeps the input,
-//! offers the board to check, and never sends it again by itself. A
-//! success toasts the step the server appended, with a link to the board.
 
 use std::sync::{
     Arc,
@@ -52,21 +22,14 @@ use crate::send_investigation::{
 };
 use fleet_ui::{Btn, Field, Icon, Modal, ToastBus, ToastKind, ToastLink, Variant};
 
-/// What the dialog is doing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Stage {
-    /// Waiting for the person.
     Idle,
-    /// Search is running again on this pinned range; the dialog sends
-    /// once that execution is accepted.
     Pinning(RangeSpec),
-    /// The capture is on its way.
     Sending,
-    /// The capture's answer was lost on the way to this one target.
     Unknown(InvestigationId),
 }
 
-/// The open investigations, as the dialog last read them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Choices {
     Loading,
@@ -74,15 +37,11 @@ enum Choices {
     Failed,
 }
 
-/// The capture span limit, as the dialog last read the server's
-/// capabilities.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpanLimit {
     Loading,
     /// `bounds.max_span_secs`.
     Known(u64),
-    /// The capabilities could not be read: the dialog refuses nothing for
-    /// span, and the server decides.
     Unknown,
 }
 
@@ -95,13 +54,10 @@ impl SpanLimit {
     }
 }
 
-/// The board of investigation `id`.
 fn board_href(id: &InvestigationId) -> String {
     format!("/investigations/{id}")
 }
 
-/// A window as the dialog shows it: the instants the capture carries,
-/// with the end named as exclusive.
 fn window_text(parts: &CaptureParts) -> String {
     parts.window.as_ref().map_or_else(
         || "From the time terms in the query text.".to_owned(),
@@ -115,17 +71,11 @@ fn window_text(parts: &CaptureParts) -> String {
 }
 
 #[component]
-#[allow(clippy::too_many_lines)] // one dialog: chooser, preview, purpose, pin and send
+#[allow(clippy::too_many_lines)]
 pub fn SendToInvestigation(
-    /// The accepted execution, taken when the dialog opened.
     snapshot: SendSnapshot,
-    /// The execution Search has accepted now, if any, in the same shape.
-    /// The dialog reads it only while a pinned search runs.
-    #[prop(into)]
-    accepted: Signal<Option<SendSnapshot>>,
-    /// Whether Search's current request ended in a failure.
-    #[prop(into)]
-    failed: Signal<bool>,
+    #[prop(into)] accepted: Signal<Option<SendSnapshot>>,
+    #[prop(into)] failed: Signal<bool>,
     /// Run Search again on a pinned range, through the shared codec. The
     /// error is the sentence to show when the link is refused.
     on_pin: Callback<RangeSpec, Result<(), String>>,
@@ -144,8 +94,6 @@ pub fn SendToInvestigation(
     let choices = RwSignal::new(Choices::Loading);
     let choice = RwSignal::new(None::<Choice>);
     let purpose_text = RwSignal::new(String::new());
-    // What the last press came to, in the dialog's own body: the person
-    // is looking at the dialog they pressed.
     let notice = RwSignal::new(None::<String>);
     let span_limit = RwSignal::new(SpanLimit::Loading);
     let current_plan = Memo::new(move |_| {
@@ -156,8 +104,6 @@ pub fn SendToInvestigation(
         let alive = Arc::clone(&alive);
         spawn_local(async move {
             let read = api::capabilities().await;
-            // One read per dialog: a living dialog's answer is current. A
-            // declined 401 leaves the limit unknown.
             if alive.load(Ordering::Acquire) && !crate::auth_return::leaves_for_sign_in(&read) {
                 let _ = span_limit.try_set(match read {
                     Ok(capabilities) => SpanLimit::Known(capabilities.bounds.max_span_secs),
@@ -167,9 +113,6 @@ pub fn SendToInvestigation(
         });
     }
 
-    // Each listing takes the next turn; only the newest may land, and
-    // only it may send the page to sign-in. A declined 401 is a failed
-    // listing.
     let choices_turn = ReadTurn::new();
     let load_choices = {
         let alive = Arc::clone(&alive);
@@ -189,7 +132,6 @@ pub fn SendToInvestigation(
                     Ok(list) => Choices::Ready(open_choices(&list)),
                     Err(_) => Choices::Failed,
                 };
-                // A choice that is no longer open is no choice.
                 if let Choices::Ready(open) = &open
                     && choice
                         .get_untracked()
@@ -281,9 +223,6 @@ pub fn SendToInvestigation(
         }
     };
 
-    // The pinned search, once Search has accepted it: the same query
-    // state on the pinned range. The rows behind the dialog are then the
-    // rows the capture reads, and that execution is what is sent.
     {
         let send_parts = send_parts.clone();
         Effect::new(move |_| {
@@ -361,13 +300,9 @@ pub fn SendToInvestigation(
             footer=Box::new(move || view! {
                 <Btn variant=Variant::Secondary on_click=cancel>"Close"</Btn>
                 {move || match stage.get() {
-                    // The outcome is unknown: the board says whether the
-                    // step landed, and nothing here sends it again.
                     Stage::Unknown(id) => view! {
                         <a class="btn-pri" href=board_href(&id)>"Open the board"</a>
                     }.into_any(),
-                    // Nothing this search can be sent as: the alert says
-                    // why, and no button offers what cannot happen.
                     _ if matches!(current_plan.get(), SendPlan::Refused(_)) => ().into_any(),
                     _ => view! {
                         <Btn variant=Variant::Primary disabled=Signal::derive(move || !ready.get()) on_click=act>

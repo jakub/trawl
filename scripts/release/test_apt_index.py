@@ -87,7 +87,6 @@ class AptIndexTests(unittest.TestCase):
                     self.assertEqual(entry[field], hashlib.new(algorithm, data).hexdigest())
             self.assertIn(b" metadata continuation\n", content)
         self.assert_history_preserved()
-        # Reprocessing identical artifacts is safe and preserves pool content.
         self.assertEqual(self.run_builder().returncode, 0)
         self.assert_history_preserved()
 

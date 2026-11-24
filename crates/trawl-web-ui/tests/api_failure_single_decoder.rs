@@ -3,18 +3,11 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Regression guard for ADR-0066: the SPA reads every failure through
-//! one classifier. No endpoint in `src/api/mod.rs` builds a bare status
-//! or reads a 401 itself; `response_policy` and `api_error` decide both,
-//! and are tested natively. An endpoint that grew its own
-//! `s => Err(ApiError::Status(s))` arm would drop the server's envelope
-//! again, and one that matched 401 would give it a fifth meaning.
+//! one classifier.
 //!
 //! Line comments are dropped first, so the transport's prose may still
-//! name a status. The rule is the one `live_query_single_source.rs`
-//! uses: a line whose first non-space characters are `//` is prose, and
-//! nothing else is, so a `/*` inside a string cannot hide code.
+//! name a status.
 
-/// What no endpoint may spell.
 const FORBIDDEN: &[&str] = &["ApiError::Status", "401"];
 
 const TRANSPORT: &str = include_str!("../src/api/mod.rs");
@@ -69,7 +62,6 @@ fn a_forbidden_token_in_code_trips_the_guard() {
     }
 }
 
-/// `src` without the lines whose first non-space characters are `//`.
 fn comment_stripped(src: &str) -> String {
     src.lines()
         .filter(|line| !line.trim_start().starts_with("//"))

@@ -1,6 +1,6 @@
 # The Visualization tab draws on a time axis, aligns grouped series on it, and offers three chart types
 
-status: accepted (2026-09-21) — prep ruling record for #234
+status: accepted (2026-09-21) — prep ruling record for #234; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The Visualization chart draws x as the row's position in the result, not
 the instant in its `_time` cell (`crates/trawl-web-ui/src/components/chart.rs:16-19`
@@ -134,3 +134,12 @@ cap.
 ## Amendment: display zone, 2026-10-02
 
 ADR-0051 replaces the UTC label rule. The axis, tooltip and legend print in the display zone, with each instant's offset, through uPlot `tzDate` given the zone name. The x coordinates and the bucket ladder stay UTC. When the display zone is not UTC, the caption adds "Buckets align to UTC hours and days". The strict `_time` parser and the request's `timezone: None` are unchanged. This takes effect when #201 lands.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **Line alignment allocates a dense vector for each drawn series, never one for each group.** `align_series` in `crates/trawl-web-ui/src/series.rs` reads every group into a sparse map, ranks the groups, and allocates a vector of grid length only for the `SERIES_CAP` groups that survive. The dense allocation follows the cap, not the number of groups. Twenty thousand groups over twenty thousand instants would otherwise be 400 million cells in the browser.
+- **The reader's chart type is kept when a result arrives that it does not fit.** The chart draws the default for that result, and the stored choice stays in place (`effective_type` in `components/chart.rs`). A reader who picks Column for a `stats … by` and then runs a `timechart` still gets Column when the next `stats … by` lands.
+- **The Events tab draws its categorical bars as an HTML list beside the exact table, not through uPlot.** Each list item in `components/cat_chart.rs` prints its value next to its bar. The uPlot bridge in `vendor/src/uplot.ts` has no draw hook that labels a bar. The list is `aria-hidden`, because the exact table carries the same numbers. Column and Bar draw the same shape on the Visualization tab through uPlot.
+- **Correction.** The sentence "The automatic span is a function of the query's own `last=` filter" cites line numbers that no longer match. The callers of `resolve_span` are `process_timechart` in `crates/trawl-core/src/emitter/pipeline.rs` and `compile_aggregation` in `crates/trawl-core/src/stream.rs`. `compile_aggregation` takes the `last=` filter as an argument. The live stream passes none.

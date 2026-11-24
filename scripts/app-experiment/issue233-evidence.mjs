@@ -68,15 +68,12 @@ for (const file of tracked.filter(f => f.startsWith('crates/') || f.startsWith('
 }
 assert.equal(sourceHash.digest('hex'), build.sourceHash, 'source changed since experiment preparation');
 // Reject wrong build/process/SPA associations before creating evidence or
-// reading a credential. These checks also verify unauthenticated asset bytes.
+// reading a credential.
 await verifyRunIdentity(run, instance, buildRecord);
 const output = path.join(run, 'issue233-evidence');
 await fs.mkdir(output, { mode: 0o700 }); // Refuse accidental overwrite/reseed.
-// Issue 233 (ADR-0039): the query error bodies the real daemon writes, and
-// what the SPA it serves shows for them. Each case types a query into the
-// real editor under the 15-minute range, sends it with Ctrl+Enter, and reads
-// the daemon's answer from the browser's own response. The bodies are the
-// oracle for the e2e suite's route fixtures: each must equal its committed
+// The error bodies the real daemon writes for these cases are the oracle for
+// the e2e suite's route fixtures (ADR-0039): each must equal its committed
 // file under crates/trawl-web-ui/e2e/harness/wire/.
 const wireDir = path.join(root, 'crates/trawl-web-ui/e2e/harness/wire');
 const cases = [
@@ -113,7 +110,6 @@ try {
   const { chromium } = require('@playwright/test');
   browser = await chromium.launch({ headless: true });
   context = await browser.newContext({ viewport: { width: 1440, height: 900 }, timezoneId: 'UTC', locale: 'en-US', reducedMotion: 'reduce', serviceWorkers: 'block' });
-  // Block all traffic outside this owned browser origin, including redirects.
   await context.route('**/*', route => new URL(route.request().url()).origin === origin.origin ? route.continue() : route.abort());
   const page = await context.newPage();
   page.setDefaultTimeout(15000);

@@ -3,35 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The trial's Compose project and the files its containers read, as pure
-//! renderers.
-//!
-//! [`render_compose`] turns the trial state into a Compose file. Compose
-//! reads JSON, so the file is a [`serde_json::Value`] and no YAML writer is
-//! needed. The output is deterministic and holds no secret, so `up`
-//! rewrites it on every run and a snapshot test pins it.
-//!
-//! Services:
-//!
-//! - `postgres`: the recorded PostgreSQL image. Its superuser password is a
-//!   0400 file in its own volume, named by `POSTGRES_PASSWORD_FILE`. No
-//!   published port.
-//! - `trawld`: the trial image with [`trawld_toml`], its data, the pgpass
-//!   file, and the TLS pair in the `trawld` volume. `up` generates the pair
-//!   in process and writes it there. `PGPASSFILE` is the only environment
-//!   entry, and it is a path.
-//! - `trawl-web`: the same image running `trawl-web` with [`web_toml`], the
-//!   cookie key, and a copy of the public certificate in the `web` volume.
-//!   It pins that certificate for its upstream.
-//! - `fleet-admin` (profile `init`): one-shot steps run with `compose run`.
-//!   It connects with a passwordless URL and the pgpass file, and its
-//!   container keeps no log, because `keys create` prints a token.
-//!
-//! Every service, the network, and every volume carry the trial id label.
-//! No service inherits the host's DNS search domains, and Docker's
-//! embedded DNS never forwards a bare service name upstream, so a trial
-//! service name never resolves outside the trial network.
-//! Every published port binds 127.0.0.1. No service has a restart policy,
-//! and no image is pulled by Compose: `up` pulls and records images itself.
+//! renderers. The Compose file is deterministic and holds no secret, so
+//! `up` rewrites it on every run.
 //!
 //! Every `image:` is the recorded image id (`sha256:…`), never the
 //! reference it was resolved from. A tag can move after `up` checked it,
@@ -50,19 +23,14 @@ use super::secrets::DbPasswords;
 use super::state::TrialState;
 use super::{LABEL_ID, PROJECT};
 
-/// The rendered file in the trial directory.
 pub const COMPOSE_FILE_NAME: &str = "compose.json";
 
-/// The profile that keeps the one-shot services out of `compose up`.
 pub const INIT_PROFILE: &str = "init";
 
-/// trawld's HTTPS port inside its container.
 pub const API_CONTAINER_PORT: u16 = 5514;
 
-/// trawl-web's HTTP port inside its container.
 pub const WEB_CONTAINER_PORT: u16 = 8090;
 
-/// The PostgreSQL service's network name and port, as the DSNs spell them.
 const DB_HOST: &str = "postgres";
 const DB_PORT: u16 = 5432;
 
@@ -70,32 +38,23 @@ const DB_PORT: u16 = 5432;
 /// this directory as its volume and keeps `PGDATA` below it, so mounting it
 /// explicitly leaves Docker no anonymous volume to create.
 pub const PG_VOLUME_ROOT: &str = "/var/lib/postgresql";
-/// The superuser password, 0400, owned by `postgres`.
 pub const PG_SUPERUSER_PASSWORD: &str = "/var/lib/postgresql/trial/superuser.password";
 
 /// Mount point of the `trawld` and `web` volumes: the image's `trawl`
 /// home, the one directory that user owns (`/etc/trawl` is root's).
 pub const TRAWL_VOLUME_ROOT: &str = "/var/lib/trawl";
-/// trawld's config, 0400, owned by `trawl`. Holds no secret.
 pub const TRAWLD_TOML: &str = "/var/lib/trawl/trial/trawld.toml";
-/// Both database roles' passwords, 0400, owned by `trawl`.
 pub const PGPASS: &str = "/var/lib/trawl/trial/secrets/pgpass";
-/// The trial's certificate and its key, 0400, owned by `trawl`. `up`
-/// writes the key first, so a certificate always has its key beside it.
 pub const TLS_CERT: &str = "/var/lib/trawl/trial/tls/cert.pem";
 pub const TLS_KEY: &str = "/var/lib/trawl/trial/tls/key.pem";
-/// trawld's parquet data.
 pub const DATA_DIR: &str = "/var/lib/trawl/data";
 
-/// trawl-web's config, 0400, owned by `trawl`, in the `web` volume.
 pub const WEB_TOML: &str = "/var/lib/trawl/trial/web.toml";
 /// The cookie AEAD key: exactly 32 raw bytes, the format
 /// `[web] cookie_secret_path` reads.
 pub const WEB_COOKIE: &str = "/var/lib/trawl/trial/web.cookie";
-/// The public certificate trawl-web pins for its upstream.
 pub const WEB_CA: &str = "/var/lib/trawl/trial/ca.pem";
 
-/// The trial's services.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Service {
     Postgres,
@@ -118,21 +77,17 @@ impl Service {
     }
 }
 
-/// The named volumes, keyed as the Compose file keys them. Docker names
-/// them `trawl-trial_<key>`.
+/// Compose volume keys; Docker names the volumes `trawl-trial_<key>`.
 pub const VOLUMES: [&str; 3] = ["postgres", "trawld", "web"];
 
-/// The `fleet` role's passwordless DSN; the password comes from pgpass.
 pub fn fleet_database_url() -> String {
     format!("postgres://fleet@{DB_HOST}:{DB_PORT}/fleet")
 }
 
-/// The `trawl` role's passwordless DSN; the password comes from pgpass.
 pub fn trawl_database_url() -> String {
     format!("postgres://trawl@{DB_HOST}:{DB_PORT}/trawl")
 }
 
-/// Render the Compose project for `state`.
 pub fn render_compose(state: &TrialState) -> Value {
     let labels = json!({ LABEL_ID: state.trial_id });
     let trawl = state.images.trawl.id.as_str();
@@ -145,21 +100,12 @@ pub fn render_compose(state: &TrialState) -> Value {
             // While a service is stopped, Docker's embedded DNS does not
             // know its name, and without these two settings the name
             // `postgres` can resolve to a machine on the LAN, which pgpass
-            // then offers the role's password:
-            //
-            // - `dns_search: ["."]` drops the host's search domains, so
-            //   the name is not tried as `postgres.<lan domain>`.
-            // - `ndots:1` stops the embedded DNS from forwarding the bare
-            //   name upstream, where a LAN resolver that answers bare
-            //   host names (dnsmasq `expand-hosts`, DHCP-registered
-            //   names) would resolve it. The embedded DNS answers a
-            //   single-label A or AAAA query it cannot resolve itself
-            //   with no records, instead of forwarding it, only when the
-            //   container's resolv.conf sets `ndots` explicitly (moby
-            //   `daemon/libnetwork/resolver.go` at docker-v29.7.2, lines
-            //   462-471; `sandbox_dns_unix.go` lines 320-321). With no
-            //   search domains, `ndots:1` changes nothing else: every
-            //   name is still looked up as it is.
+            // then offers the role's password.
+            // `dns_search: ["."]` drops the host's search domains. `ndots:1`
+            // stops the embedded DNS from forwarding the bare name upstream:
+            // it answers a single-label A or AAAA query it cannot resolve with
+            // no records only when resolv.conf sets `ndots` explicitly (moby
+            // `daemon/libnetwork/resolver.go`, docker-v29.7.2).
             "dns_search": ["."],
             "dns_opt": ["ndots:1"],
         });
@@ -248,7 +194,6 @@ fn volume(source: &str, target: &str, read_only: bool) -> Value {
     mount
 }
 
-/// One loopback-only published port.
 fn published(host_port: u16, container_port: u16) -> Value {
     json!([{
         "target": container_port,
@@ -258,8 +203,6 @@ fn published(host_port: u16, container_port: u16) -> Value {
     }])
 }
 
-/// Double every `$` in every string, key or value, so Compose reads it
-/// literally.
 fn escape_interpolation(value: &mut Value) {
     match value {
         Value::String(s) if s.contains('$') => *s = s.replace('$', "$$"),
@@ -275,8 +218,6 @@ fn escape_interpolation(value: &mut Value) {
     }
 }
 
-/// trawld's config. It holds no secret: the DSNs carry no password, and
-/// trawld reads the passwords from the pgpass file `PGPASSFILE` names.
 pub fn trawld_toml() -> String {
     format!(
         r#"# Rendered by `trawl trial up`. Holds no secret: the database passwords
@@ -330,13 +271,9 @@ allow_insecure_cookies = true
     )
 }
 
-/// SQL that creates the two owner roles and their databases, and sets the
-/// roles' passwords. Idempotent: until the database phase is recorded,
-/// every `up` generates new passwords and runs it again, so the roles and
-/// the pgpass file converge.
-///
-/// It runs as the superuser through `psql` on stdin ([`database_sql_args`],
-/// sealed). Statement logging is off for the session and an error never
+/// Idempotent: until the database phase is recorded, every `up` generates
+/// new passwords and runs this SQL again, so the roles and the pgpass file
+/// converge. Statement logging is off for the session and an error never
 /// logs its statement, so the passwords stay out of the server log.
 pub fn database_sql(passwords: &DbPasswords) -> Zeroizing<String> {
     Zeroizing::new(format!(
@@ -377,9 +314,7 @@ $trial$;
     ))
 }
 
-/// `compose exec` of `psql` as the superuser over the local socket,
-/// reading [`database_sql`] on stdin. Run it sealed: `psql` quotes a
-/// failing statement.
+/// Run `psql` with these arguments sealed: it quotes a failing statement.
 pub fn database_sql_args() -> super::docker::Args {
     super::docker::Args::new().args([
         "exec",
@@ -397,8 +332,6 @@ pub fn database_sql_args() -> super::docker::Args {
     ])
 }
 
-/// The pgpass file both trawld and `fleet-admin` read: one line per role,
-/// matching the DSNs exactly.
 pub fn pgpass(passwords: &DbPasswords) -> Zeroizing<String> {
     Zeroizing::new(format!(
         "{DB_HOST}:{DB_PORT}:fleet:fleet:{fleet}\n{DB_HOST}:{DB_PORT}:trawl:trawl:{trawl}\n",
@@ -430,8 +363,6 @@ mod tests {
         insta::assert_snapshot!(text);
     }
 
-    /// The CLI generates the certificate itself, so no one-shot service
-    /// does, and nothing runs `trawl-admin`, which no release ships.
     #[test]
     fn the_project_runs_four_services_and_no_certificate_step() {
         let project = render_compose(&state());
@@ -456,7 +387,6 @@ mod tests {
         insta::assert_snapshot!("web_toml", web_toml(&state()));
     }
 
-    /// Walk every value and key of the rendered project.
     fn walk<'a>(value: &'a Value, path: &str, visit: &mut impl FnMut(&str, &'a Value)) {
         visit(path, value);
         match value {
@@ -510,8 +440,6 @@ mod tests {
                 "volume {name}"
             );
         }
-        // Every mount is one of the labelled named volumes: no bind mount
-        // and no anonymous volume.
         walk(&project, "", &mut |path, value| {
             if path.ends_with(".volumes") && path.starts_with(".services") {
                 for mount in value.as_array().unwrap() {
@@ -578,12 +506,6 @@ mod tests {
         }
     }
 
-    /// A stopped trial's service names must not resolve outside the
-    /// trial network: on a real host, `postgres` resolved through the
-    /// host's search domains to a LAN PostgreSQL that `fleet-admin` then
-    /// tried the fleet role against. Every service, the ones on no
-    /// network included, carries both settings, so a service added later
-    /// cannot skip them.
     #[test]
     fn no_service_name_leaves_the_trial_network() {
         let project = render_compose(&state());
@@ -601,8 +523,6 @@ mod tests {
         }
     }
 
-    /// Every service, the `init` profile's included, runs the recorded
-    /// image id, so a tag that moves after `up` checked it changes nothing.
     #[test]
     fn every_service_runs_its_recorded_image_id() {
         let state = state();
@@ -620,7 +540,6 @@ mod tests {
         }
     }
 
-    /// The only environment entries are paths and passwordless URLs.
     #[test]
     fn no_environment_entry_holds_a_secret() {
         let project = render_compose(&state());
@@ -657,7 +576,6 @@ mod tests {
                 assert!(!text.contains(secret));
             }
         }
-        // Every DSN names its user and no password.
         for url in [fleet_database_url(), trawl_database_url()] {
             let userinfo = url
                 .strip_prefix("postgres://")
@@ -669,9 +587,6 @@ mod tests {
         }
     }
 
-    /// `allow_insecure_cookies` is the one setting that may say insecure:
-    /// the browser leg is plain HTTP on loopback. Nothing may turn off
-    /// certificate verification.
     #[test]
     fn the_configs_skip_no_verification() {
         for toml in [trawld_toml(), web_toml(&state())] {
@@ -768,8 +683,6 @@ mod tests {
 
     #[test]
     fn results_root_sits_on_the_trawld_volume() {
-        // The trial's trawld.toml leaves `results_dir` at its default, the
-        // data root's sibling, so the volume must cover that sibling.
         let config = trawl_config::Config::from_toml(&trawld_toml()).unwrap();
         let results = config.results_dir();
         assert_eq!(results, std::path::Path::new("/var/lib/trawl/data.results"));

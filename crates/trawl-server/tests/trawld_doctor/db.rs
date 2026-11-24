@@ -3,12 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawld --doctor` tests of the Fleet and app-state database checks.
-//!
-//! Every database is real: minted empty by `common`, then migrated,
-//! tampered with, or locked through `SQLx` itself as each test needs. The
-//! doctor logs in as [`ROLE`], whose password is the planted
-//! [`SECRET`](crate::support::SECRET), so every URL it is handed carries
-//! the secret and none of its output may.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -31,7 +25,6 @@ const LEGACY_DIR: &str = concat!(
     "/../../scripts/schema-baseline/fixtures/trawl"
 );
 
-/// `url` with `query` added to its query string.
 fn with_query(url: &str, query: &str) -> String {
     let separator = if url.contains('?') { '&' } else { '?' };
     format!("{url}{separator}{query}")
@@ -42,7 +35,6 @@ fn with_query(url: &str, query: &str) -> String {
 /// `current_database()` reach the probe's function of that name.
 const PROBE_OPTIONS: &str = "options=-c%20search_path%3Ddoctor_probe%2Cpg_catalog%2Cpublic";
 
-/// The schema holding the probe function [`install_probe`] writes.
 const PROBE_SCHEMA: &str = "doctor_probe";
 
 /// In the database `url` names, (re)define `doctor_probe.current_database()`
@@ -63,9 +55,6 @@ async fn install_probe(url: &str, body: &str) {
     conn.close().await.unwrap();
 }
 
-/// One doctor run over an ingest node in its own directory, with `env`
-/// added to `HOME`. Returns the exit status, the parsed report, and both
-/// streams, after asserting neither stream shows a planted value.
 fn doctor(
     dir: &Path,
     config: &DoctorConfig,
@@ -86,7 +75,6 @@ fn doctor(
     let values: Vec<&str> = planted_values.iter().map(String::as_str).collect();
     assert_no_values(&stdout, &stderr, &values);
 
-    // The table form is held to the same rule.
     let args = [
         OsString::from("--doctor"),
         OsString::from("--config"),
@@ -101,7 +89,6 @@ fn doctor(
     (code, report(&stdout), stderr)
 }
 
-/// A doctor run with both URLs in the environment.
 fn doctor_env(dir: &Path, fleet: &str, app: &str) -> (i32, Report, String) {
     let mut planted_values = url_values(fleet);
     planted_values.extend(url_values(app));
@@ -116,10 +103,6 @@ fn doctor_env(dir: &Path, fleet: &str, app: &str) -> (i32, Report, String) {
     )
 }
 
-/// The fresh installation of `doctor_fresh_install_is_incomplete` with an
-/// empty Fleet database: the run fails on `server.fleet.schema`, whose next
-/// action is `fleet-admin migrate`, and every row that says what boot
-/// initializes says so as it does there (#269 AC3).
 #[tokio::test]
 async fn doctor_unmigrated_fleet_fails() {
     ensure_role().await;
@@ -149,7 +132,6 @@ async fn doctor_unmigrated_fleet_fails() {
             .is_some_and(|next| next.contains("fleet-admin migrate")),
         "{schema:?}"
     );
-    // The empty app-state database is one boot initializes.
     assert_eq!(
         verdict(&report, "server.app.schema"),
         (Outcome::Complete, Some("will_initialize"))
@@ -167,7 +149,6 @@ async fn doctor_unmigrated_fleet_fails() {
         .collect();
     assert_eq!(failed, ["server.fleet.schema"], "{report:#?}");
 
-    // Once migrated, the same Fleet database is current.
     let mut conn = admin(&fleet).await;
     fleet_auth::MIGRATOR.run(&mut conn).await.unwrap();
     conn.close().await.unwrap();
@@ -178,11 +159,6 @@ async fn doctor_unmigrated_fleet_fails() {
     );
 }
 
-/// The migrator's lock, taken by `SQLx`'s own `Migrate::lock` on a
-/// dedicated connection, is seen: a fresh or behind ledger under it is
-/// `migration_in_progress`, a current one is `complete`, and the same
-/// ledgers with the lock free are `will_initialize`. The lock holder keeps
-/// its lock throughout.
 #[tokio::test]
 async fn doctor_detects_real_migrator_lock() {
     use trawl_server::store::migrations::{BASELINE_VERSION, MIGRATOR};
@@ -212,7 +188,6 @@ async fn doctor_detects_real_migrator_lock() {
         .unwrap();
     holder.lock().await.expect("take the migrator's lock");
 
-    // Fresh, lock held.
     let (_, report, _) = run();
     let (outcome, reason, _) = app_schema(&report);
     assert_eq!(
@@ -233,7 +208,6 @@ async fn doctor_detects_real_migrator_lock() {
         (Outcome::NotSampled, Some("migration_in_progress"))
     );
 
-    // Behind, lock free.
     holder.unlock().await.expect("release the migrator's lock");
     let (_, report, _) = run();
     let (outcome, reason, detail) = app_schema(&report);
@@ -249,14 +223,12 @@ async fn doctor_detects_real_migrator_lock() {
         "{detail:?}"
     );
 
-    // Current, lock held.
     holder.lock().await.expect("take the migrator's lock again");
     MIGRATOR.run(&mut holder).await.expect("apply the rest");
     let (_, report, _) = run();
     assert_eq!(app_schema(&report).0, Outcome::Complete, "{report:?}");
     assert_eq!(app_schema(&report).1, None, "{report:?}");
 
-    // The holder kept its lock through every run.
     let mut watcher = admin(&app).await;
     let still: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM pg_locks
@@ -272,12 +244,9 @@ async fn doctor_detects_real_migrator_lock() {
     watcher.close().await.unwrap();
 }
 
-/// What the `pg_locks` watcher saw of the doctor's backends.
 #[derive(Debug, Default)]
 struct Watched {
-    /// Samples taken.
     samples: u64,
-    /// Samples in which a doctor backend was connected to each database.
     fleet_seen: u64,
     app_seen: u64,
     /// Advisory locks, held or awaited, by a doctor backend:
@@ -289,9 +258,6 @@ struct Watched {
 /// `classid`, `objid`, `objsubid` and `granted`, when it has one.
 type LockRow = (String, Option<i64>, Option<i64>, Option<i32>, Option<bool>);
 
-/// Poll, back to back on one admin connection, every advisory lock row of
-/// every backend whose `application_name` is the doctor's and whose
-/// database is one of the two, until `stop` is set.
 async fn watch_doctor_locks(
     fleet_db: String,
     app_db: String,
@@ -336,7 +302,6 @@ async fn watch_doctor_locks(
     watched
 }
 
-/// The database name a test URL names.
 fn database_of(url: &str) -> String {
     url.rsplit('/')
         .next()
@@ -393,16 +358,6 @@ async fn lockless_over_ledgers_that_are_not_current(fleet_url: &str, dir: &Path)
     }
 }
 
-/// While a real trawld holds its writer lock, the doctor runs as
-/// [`LOCKLESS`] on databases where that role may execute no advisory-lock
-/// function, and every database row completes: had the doctor called one,
-/// the call would have been refused and its row would not be `complete`
-/// (`an_advisory_lock_call_fails_the_lockless_proof` is the negative
-/// control). As supporting evidence, a watcher polling `pg_locks` back to
-/// back sees the doctor's backends on both databases and no advisory lock
-/// held or awaited by either. Afterwards the same trawld session still
-/// holds the writer lock and trawld still serves.
-///
 /// A current ledger is `complete` whatever the migrator's lock samples
 /// show, so a refused call among those samples would change no row there.
 /// The same run over a fresh and a behind app-state ledger closes that gap:
@@ -500,8 +455,6 @@ async fn doctor_takes_no_advisory_lock() {
     lockless_over_ledgers_that_are_not_current(&server.fleet_db_url, dir.path()).await;
 }
 
-/// Every app-state ledger boot refuses is `failed` with its own stable
-/// reason, whatever else the run finds, and the run exits 1.
 #[tokio::test]
 async fn doctor_boot_refusals_fail() {
     use trawl_server::store::migrations::BASELINE_VERSION;
@@ -581,7 +534,6 @@ async fn doctor_boot_refusals_fail() {
             (Outcome::Complete, None),
             "{state}"
         );
-        // The writer lock is observed whatever the ledger holds.
         assert_eq!(
             verdict(&report, "server.app.writer"),
             (Outcome::Complete, Some("not_observed")),
@@ -590,8 +542,6 @@ async fn doctor_boot_refusals_fail() {
     }
 }
 
-/// Each connect check names the setting its URL came from and where
-/// `SQLx` found the password, never a value.
 #[tokio::test]
 async fn doctor_names_database_sources_not_values() {
     ensure_role().await;
@@ -604,7 +554,6 @@ async fn doctor_names_database_sources_not_values() {
     let bare = |url: &str| with_login(url, ROLE, None);
     let source = |report: &Report, id: &str| row(report, id).source.clone().unwrap_or_default();
 
-    // In the file, the password from PGPASSWORD.
     let config = DoctorConfig {
         fleet_url: Some(bare(&fleet)),
         app_url: Some(bare(&app)),
@@ -635,7 +584,6 @@ async fn doctor_names_database_sources_not_values() {
         )
     );
 
-    // In the environment, the password from PGPASSFILE.
     let passfile = dir.path().join("pgpass");
     std::fs::write(&passfile, format!("*:*:*:{ROLE}:{SECRET}\n")).unwrap();
     {
@@ -665,8 +613,6 @@ async fn doctor_names_database_sources_not_values() {
     );
 }
 
-/// Each refusal to connect has its own reason, and blocks the schema check
-/// behind it; the other database is checked all the same.
 #[tokio::test]
 async fn doctor_connect_refusals_fail() {
     ensure_role().await;
@@ -676,7 +622,6 @@ async fn doctor_connect_refusals_fail() {
     let mut values = url_values(&planted(&fleet));
     values.extend(url_values(&planted(&app)));
 
-    // A wrong password, no such database, nothing listening.
     let wrong = with_login(&fleet, ROLE, Some("private-secret-wrong"));
     let missing = {
         let url = planted(&app);
@@ -713,7 +658,6 @@ async fn doctor_connect_refusals_fail() {
             (schema.outcome, schema.blocked_by.as_deref()),
             (Outcome::NotSampled, Some("server.fleet.connect"))
         );
-        // The other database is unaffected.
         assert_eq!(
             verdict(&report, "server.app.schema"),
             (Outcome::Complete, None)
@@ -721,13 +665,7 @@ async fn doctor_connect_refusals_fail() {
     }
 }
 
-/// The negative control of `doctor_takes_no_advisory_lock`. On databases
-/// where [`forbid_advisory_locks`] ran, [`LOCKLESS`] calling any one of the
-/// advisory-lock functions is refused with `insufficient_privilege`
-/// (SQLSTATE 42501), so a doctor run as that role cannot take, await or
-/// release an advisory lock without the call erring. The doctor run as
-/// that role completes every database row: had it made such a call, the
-/// error would have turned the row that made it `not_sampled`.
+/// The negative control of `doctor_takes_no_advisory_lock`.
 #[tokio::test]
 async fn an_advisory_lock_call_fails_the_lockless_proof() {
     ensure_role().await;
@@ -777,9 +715,6 @@ async fn an_advisory_lock_call_fails_the_lockless_proof() {
     database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}\n{stderr}"));
 }
 
-/// A query that errs or a connection that breaks after the login proves
-/// nothing about boot: each row is `not_sampled` with a closed reason, and
-/// the error's text, which here carries the planted secret, is not shown.
 #[tokio::test]
 async fn doctor_query_failures_after_login_are_not_sampled() {
     ensure_role().await;
@@ -788,9 +723,7 @@ async fn doctor_query_failures_after_login_are_not_sampled() {
     let dir = tempfile::tempdir().unwrap();
     let probed = with_query(&planted(&app), PROBE_OPTIONS);
 
-    // Every lock query errs. The current ledger is complete whatever its
-    // lock samples show; the writer row has only the failed read. The
-    // writer query calls current_database() only for a pg_locks row that
+    // The writer query calls current_database() only for a pg_locks row that
     // matches its other conditions, so a session of the test holds
     // trawld's writer lock, as `writer_pid` spells its key, meanwhile.
     install_probe(
@@ -815,9 +748,6 @@ async fn doctor_query_failures_after_login_are_not_sampled() {
         (Outcome::Complete, None)
     );
 
-    // The first lock query ends the doctor's own backend: the server
-    // reports the termination, and every read after it finds the
-    // connection gone.
     install_probe(
         &app,
         "PERFORM pg_catalog.pg_terminate_backend(pg_catalog.pg_backend_pid());",
@@ -833,10 +763,8 @@ async fn doctor_query_failures_after_login_are_not_sampled() {
     }
 }
 
-/// One case of `doctor_refuses_unbounded_credential_files`.
 struct FileCase {
     label: &'static str,
-    /// Added to the doctor's environment.
     env: Vec<(&'static str, OsString)>,
     /// The app-state URL, which carries no password when a password file
     /// is to be read.
@@ -919,11 +847,6 @@ fn credential_file_cases(dir: &Path, app: &str, bare_app: &str) -> Vec<FileCase>
     ]
 }
 
-/// A password file `SQLx` would read, or a TLS file the doctor reads for
-/// it, that is not a regular file or is larger than the cap is refused
-/// before the doctor connects: `not_sampled`, promptly, with the file
-/// named by its setting. Only `PGPASSFILE`'s path is shown. A file named
-/// in the environment for every connection refuses both databases.
 #[tokio::test]
 async fn doctor_refuses_unbounded_credential_files() {
     ensure_role().await;
@@ -1023,13 +946,10 @@ async fn doctor_takes_an_ipv6_hostaddr() {
     assert!(stderr.is_empty(), "{stderr}");
 }
 
-/// A session that does not start read-only with the doctor's timeouts is
-/// `not_sampled`, `session_not_read_only`, and the checks behind it are
-/// blocked: no query of theirs ran. A NUL in `options` would cut the
-/// doctor's own settings out of the startup message, so the doctor does
-/// not connect with one; a session the server changed after the login,
-/// here by a login event trigger, is caught when the doctor reads its
-/// settings back.
+/// A NUL in `options` would cut the doctor's own settings out of the
+/// startup message, so the doctor does not connect with one; a session the
+/// server changed after the login, here by a login event trigger, is caught
+/// when the doctor reads its settings back.
 #[tokio::test]
 async fn doctor_refuses_a_session_that_is_not_read_only() {
     ensure_role().await;
@@ -1062,8 +982,6 @@ async fn doctor_refuses_a_session_that_is_not_read_only() {
         refused(&report, options);
     }
 
-    // A login trigger that undoes one of the doctor's settings for the
-    // doctor's sessions only.
     let mut conn = admin(&app).await;
     conn.execute(sqlx::AssertSqlSafe(format!(
         "CREATE SCHEMA {PROBE_SCHEMA};
@@ -1092,7 +1010,6 @@ async fn doctor_refuses_a_session_that_is_not_read_only() {
         refused(&report, setting);
     }
 
-    // With the trigger doing nothing again, the same URL is read-only.
     conn.execute(sqlx::AssertSqlSafe(format!(
         "CREATE OR REPLACE FUNCTION {PROBE_SCHEMA}.undo() RETURNS event_trigger
          LANGUAGE plpgsql AS $$ BEGIN END $$"
@@ -1104,13 +1021,8 @@ async fn doctor_refuses_a_session_that_is_not_read_only() {
     database_rows_complete(&report).unwrap_or_else(|why| panic!("{why}: {report:?}"));
 }
 
-/// A database server that speaks TLS for [`doctor_hands_sqlx_the_tls_file_bytes`].
-///
-/// For each connection it reads the `SSLRequest`, moves `ca` aside, and
-/// only then answers `S`. It completes the TLS handshake with `config`,
-/// puts `ca` back, reads the startup message, and refuses it with SQLSTATE
-/// 28P01. A driver that opened `ca` during the handshake finds nothing at
-/// the path; one that holds its bytes already connects.
+/// Moves `ca` aside for the handshake: a driver that opens `ca` then finds
+/// nothing at the path; one that holds its bytes already connects.
 fn tls_database_server(config: rustls::ServerConfig, ca: PathBuf) -> std::net::SocketAddr {
     use std::io::{Read as _, Write as _};
 
@@ -1160,14 +1072,6 @@ fn tls_database_server(config: rustls::ServerConfig, ca: PathBuf) -> std::net::S
     addr
 }
 
-/// The doctor reads each database TLS file once and hands `SQLx` the
-/// bytes, so `SQLx` never opens the file (S2). The app-state URL names a
-/// valid CA in `sslrootcert` with `sslmode=verify-ca`, and the server moves
-/// the CA aside before it starts the handshake: the handshake still
-/// verifies, and the server's refusal of the login is the row,
-/// `failed`/`authentication failed`, where a driver reading the path would
-/// have failed TLS. A FIFO at the same setting is refused without
-/// hanging (`doctor_refuses_unbounded_credential_files`).
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_hands_sqlx_the_tls_file_bytes() {
     ensure_role().await;
@@ -1221,15 +1125,8 @@ async fn doctor_hands_sqlx_the_tls_file_bytes() {
 /// message does not hold, and panics.
 const MD5_WITHOUT_SALT: [u8; 9] = [0x52, 0, 0, 0, 8, 0, 0, 0, 5];
 
-/// The line the doctor's panic hook prints, and nothing else of a panic.
 const PANIC_LINE: &str = "[trawld] doctor stopped a check: an internal error occurred";
 
-/// A database server for [`doctor_contains_a_driver_panic`]. On each
-/// connection it reads one length-prefixed packet; an `SSLRequest` gets
-/// `N`, as a server without TLS answers, and the startup message after it
-/// is read the same way. The startup message gets [`MD5_WITHOUT_SALT`], and
-/// the connection is then held until the client drops it. Each startup
-/// message, without its length, is recorded as it arrives.
 fn malformed_auth_server() -> (std::net::SocketAddr, Received) {
     use std::io::{Read as _, Write as _};
 
@@ -1275,16 +1172,9 @@ fn malformed_auth_server() -> (std::net::SocketAddr, Received) {
     (addr, startups)
 }
 
-/// A database server that sends a message `SQLx` panics decoding
-/// ([`MD5_WITHOUT_SALT`]) costs only that database's rows: each connect
-/// check is `not_sampled`, `protocol_error`, the checks behind it are
-/// blocked, and the storage and listener checks still run, so the report
-/// renders. The Fleet URL disables TLS; the app-state URL keeps the default
+/// The Fleet URL disables TLS; the app-state URL keeps the default
 /// `sslmode`, `prefer`, whose `SSLRequest` the server declines, so both
-/// reach the decoder. The panic hook's fixed line, once per database, is
-/// all stderr holds. Under `disable` the doctor's own probe reads the same
-/// server first, and its startup message is byte for byte the one `SQLx`
-/// sends after it.
+/// reach the decoder.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_contains_a_driver_panic() {
     let dir = tempfile::tempdir().unwrap();
@@ -1324,7 +1214,6 @@ async fn doctor_contains_a_driver_panic() {
             );
         }
     }
-    // The groups after the databases ran.
     for id in [
         "server.data.root",
         "server.data.epoch",
@@ -1365,7 +1254,6 @@ async fn doctor_contains_a_driver_panic() {
     );
 }
 
-/// The `SSLRequest` message, as `SQLx` sends it.
 const SSL_REQUEST: [u8; 8] = [0, 0, 0, 8, 0x04, 0xd2, 0x16, 0x2f];
 
 /// What an HTTP server answers bytes it cannot parse as a request. `SQLx`
@@ -1391,19 +1279,16 @@ struct Speech {
     answer: &'static [u8],
 }
 
-/// An HTTP server a database URL might name by accident.
 const HTTP: Speech = Speech {
     greeting: b"",
     answer: HTTP_400,
 };
 
-/// An SSH server, which speaks first.
 const SSH: Speech = Speech {
     greeting: SSH_BANNER,
     answer: b"",
 };
 
-/// A server whose first answer has a PostgreSQL type and a huge length.
 const HUGE_R: Speech = Speech {
     greeting: b"",
     answer: HUGE_AUTHENTICATION,
@@ -1413,8 +1298,6 @@ const HUGE_R: Speech = Speech {
 /// client closes it.
 type Received = std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>;
 
-/// Serve one connection as `speech` says, hold it open, and record what
-/// the client sent until it closes.
 fn fake_connection<S>(mut stream: S, speech: Speech, received: &Received)
 where
     S: std::io::Read + std::io::Write + Send + 'static,
@@ -1441,15 +1324,12 @@ where
     });
 }
 
-/// Where a [`fake_server`] listens.
 enum FakeAt {
     Tcp(std::net::SocketAddr),
     /// The socket directory; the socket is `.s.PGSQL.5432` in it.
     Unix(PathBuf),
 }
 
-/// A server that is not PostgreSQL, speaking as `speech` says, on loopback
-/// TCP, or on a Unix socket in `dir` when `unix`, and what it received.
 fn fake_server(dir: &Path, unix: bool, speech: Speech) -> (FakeAt, Received) {
     let received = Received::default();
     let at = if unix {
@@ -1486,9 +1366,6 @@ fn fake_server(dir: &Path, unix: bool, speech: Speech) -> (FakeAt, Received) {
     (at, received)
 }
 
-/// What `received` holds once `count` connections have closed, waiting up
-/// to 10 s for the last of them, then 200 ms more for any connection past
-/// `count` to show.
 fn closed_connections(received: &Received, count: usize) -> Vec<Vec<u8>> {
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while received.lock().unwrap().len() < count && std::time::Instant::now() < until {
@@ -1498,9 +1375,6 @@ fn closed_connections(received: &Received, count: usize) -> Vec<Vec<u8>> {
     received.lock().unwrap().clone()
 }
 
-/// The name and value pairs of a v3.0 startup message that makes up all of
-/// `sent`, after asserting its framing: a length that counts every byte,
-/// protocol 3.0, NUL-terminated fields, and a closing NUL.
 fn startup_fields(sent: &[u8]) -> Vec<(String, String)> {
     let length = u32::from_be_bytes(sent[..4].try_into().unwrap()) as usize;
     assert_eq!(length, sent.len(), "one message and nothing else: {sent:?}");
@@ -1523,10 +1397,6 @@ fn startup_fields(sent: &[u8]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Assert `seen` is one connection per database the doctor probed, each
-/// carrying the doctor's startup message and nothing else: the planted
-/// role, the database, `application_name` `trawld-doctor`, and no byte of
-/// the planted secret.
 fn assert_one_startup_per_database(seen: &[Vec<u8>], databases: &[&str], label: &str) {
     assert_eq!(
         seen.len(),
@@ -1565,8 +1435,6 @@ fn assert_one_startup_per_database(seen: &[Vec<u8>], databases: &[&str], label: 
     assert_eq!(probed, expected, "{label}");
 }
 
-/// Time one JSON doctor run with `fleet` and `app` in the environment,
-/// asserting neither stream shows a value of either URL.
 fn timed_doctor(dir: &Path, fleet: &str, app: &str) -> (std::time::Duration, i32, Report) {
     let mut values = url_values(fleet);
     values.extend(url_values(app));
@@ -1623,14 +1491,6 @@ fn assert_refused_as_not_postgres(
     );
 }
 
-/// A URL with `sslmode` `disable` or `allow` that names an HTTP server by
-/// accident is `failed`, `not_postgres`, and the run does not wait on it:
-/// the doctor sends its own startup message, reads the header `HTTP/`,
-/// whose type `H` no PostgreSQL server answers with, and never hands the
-/// URL to `SQLx`, which would read `HTTP/` as a frame of about 1.4 GB. Each
-/// database gets one connection that carries the doctor's startup message
-/// and no password, over a TCP host and port, a `hostaddr` that overrides
-/// an unresolvable host name, and a Unix socket.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_refuses_a_server_that_is_not_postgres() {
     for shape in ["host", "hostaddr", "unix"] {
@@ -1669,11 +1529,6 @@ async fn doctor_refuses_a_server_that_is_not_postgres() {
     }
 }
 
-/// A server that speaks first, as SSH does, is `failed`, `not_postgres`
-/// under `sslmode` `disable` and `allow`, and promptly: its banner's `S`
-/// is what a PostgreSQL server answers an `SSLRequest` with, but no
-/// PostgreSQL server answers a startup message with it. Each database gets
-/// one connection, and `SQLx` none.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_refuses_a_server_that_speaks_first() {
     let dir = tempfile::tempdir().unwrap();
@@ -1697,10 +1552,6 @@ async fn doctor_refuses_a_server_that_speaks_first() {
     );
 }
 
-/// A first answer with a PostgreSQL type byte, `R`, and a length of 1 GiB
-/// is `failed`, `not_postgres`: the doctor reads the 5-byte header and
-/// refuses a length past 8 KiB instead of waiting for, or buffering, the
-/// body it declares.
 #[tokio::test(flavor = "multi_thread")]
 async fn doctor_refuses_a_first_answer_past_its_length_bound() {
     let dir = tempfile::tempdir().unwrap();
@@ -1725,9 +1576,7 @@ async fn doctor_refuses_a_first_answer_past_its_length_bound() {
 }
 
 /// Under the default `sslmode`, `prefer`, and under `require`, `SQLx` opens
-/// with its own `SSLRequest` and refuses the byte `H`, so the same server
-/// fails the connect check promptly, having received only the `SSLRequest`:
-/// nothing was buffered toward a frame length.
+/// with its own `SSLRequest` and refuses the byte `H`.
 #[tokio::test(flavor = "multi_thread")]
 async fn sqlx_refuses_a_server_that_is_not_postgres_when_it_asks_for_tls() {
     let dir = tempfile::tempdir().unwrap();
@@ -1759,9 +1608,6 @@ async fn sqlx_refuses_a_server_that_is_not_postgres_when_it_asks_for_tls() {
     assert_eq!(seen, [SSL_REQUEST.to_vec(), SSL_REQUEST.to_vec()]);
 }
 
-/// A real PostgreSQL server under `sslmode` `disable` and `allow` answers
-/// the doctor's startup message with an authentication message, the probe
-/// ends without a password, and every database row completes.
 #[tokio::test]
 async fn doctor_takes_postgres_without_tls() {
     ensure_role().await;

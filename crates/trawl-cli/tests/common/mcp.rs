@@ -5,14 +5,6 @@
 //! A `trawl mcp` child driven over its pipes with hand-written JSON-RPC
 //! lines, for the suites that hold it to the MCP contract against a real
 //! trawld (ADR-0058, ADR-0059).
-//!
-//! The child is the real `trawl mcp --profile agent`, started from an
-//! empty environment (only the dynamic loader's search path survives, see
-//! `loader_path`) with a temp `HOME` whose config names the profile: the
-//! server's URL, its pinned certificate and a key in the profile's own
-//! table. Every call is held to the text contract: one text block, and on
-//! success a `structuredContent` that validates against the tool's listed
-//! `outputSchema`.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -26,13 +18,10 @@ use tokio::sync::mpsc;
 
 use super::Server;
 
-/// The profile the config names.
 pub const PROFILE: &str = "agent";
 
-/// How long one response, or the end of a session, may take.
 pub const DEADLINE: Duration = Duration::from_secs(60);
 
-/// The tools, in the order `tools/list` must send them.
 pub const TOOLS: [&str; 8] = [
     "orient",
     "search",
@@ -44,12 +33,9 @@ pub const TOOLS: [&str; 8] = [
     "investigation",
 ];
 
-/// The two protocol eras a client may speak.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Era {
-    /// 2025-11-25: `initialize`, then a session.
     Initialize,
-    /// 2026-07-28: `server/discover`, then self-contained requests.
     Discover,
 }
 
@@ -63,7 +49,6 @@ impl Era {
         }
     }
 
-    /// The `_meta` every 2026-07-28 request carries.
     pub fn meta(self) -> Option<Value> {
         (self == Self::Discover).then(|| {
             json!({
@@ -78,23 +63,18 @@ impl Era {
 /// One stdout line of the child, or the bytes after its last newline.
 pub type Line = Result<String, Vec<u8>>;
 
-/// A running `trawl mcp` child and everything it wrote.
 pub struct Mcp {
     pub era: Era,
     pub child: Child,
     pub stdin: Option<ChildStdin>,
     pub lines: mpsc::UnboundedReceiver<Line>,
-    /// Every whole stdout line so far, in order.
     pub seen: Vec<String>,
-    /// Bytes after the last newline: a partial message.
     pub trailing: Vec<u8>,
     pub stderr: tokio::task::JoinHandle<String>,
     pub next_id: u64,
-    /// The validator of each tool's `outputSchema`, once listed.
     pub outputs: BTreeMap<String, jsonschema::Validator>,
 }
 
-/// One tool call's result.
 pub struct Call {
     pub raw: Value,
     pub text: String,
@@ -102,7 +82,6 @@ pub struct Call {
     pub is_error: bool,
 }
 
-/// What a session left behind once its stdin closed.
 pub struct Finished {
     pub status: Option<i32>,
     pub lines: Vec<String>,
@@ -110,11 +89,9 @@ pub struct Finished {
     pub stderr: String,
 }
 
-/// The dynamic loader's search path, kept when the rest of the environment
-/// is cleared. It is not configuration trawl reads: the test runner sets it
-/// so a binary built in this target directory finds the libraries it links
-/// (libduckdb in CI's archive), and a child that lost it would die before
-/// reading its first frame. Every other variable stays cleared.
+/// The test runner sets the loader path so a binary built in this target
+/// directory finds the libraries it links (libduckdb in CI's archive), and a
+/// child that lost it would die before reading its first frame.
 pub fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)> {
     [
         "LD_LIBRARY_PATH",
@@ -126,7 +103,6 @@ pub fn loader_path() -> impl Iterator<Item = (&'static str, std::ffi::OsString)>
 }
 
 impl Mcp {
-    /// Spawn `trawl mcp --profile agent` under `home`, speaking `era`.
     pub fn spawn(home: &Path, era: Era) -> Self {
         let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_trawl"))
             .env_clear()
@@ -179,7 +155,6 @@ impl Mcp {
         }
     }
 
-    /// Write one message as a line.
     pub async fn send(&mut self, message: &Value) {
         let mut line = serde_json::to_vec(message).expect("serialize a frame");
         line.push(b'\n');
@@ -188,8 +163,6 @@ impl Mcp {
         stdin.flush().await.expect("flush trawl mcp's stdin");
     }
 
-    /// Send a request without waiting for its answer; returns its id. A
-    /// 2026-07-28 request carries the era's `_meta`.
     pub async fn start(&mut self, method: &str, params: Value) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -205,20 +178,16 @@ impl Mcp {
         id
     }
 
-    /// Send a request and wait for its response.
     pub async fn request(&mut self, method: &str, params: Value) -> Value {
         let id = self.start(method, params).await;
         self.response(id).await
     }
 
-    /// Send a notification.
     pub async fn notify(&mut self, method: &str, params: Value) {
         self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}))
             .await;
     }
 
-    /// The response to `id`: one already read, or the next one with that
-    /// id, read under [`DEADLINE`].
     pub async fn response(&mut self, id: u64) -> Value {
         let answers = |line: &str| {
             serde_json::from_str::<Value>(line)
@@ -246,7 +215,6 @@ impl Mcp {
         }
     }
 
-    /// Open the session the era's way.
     pub async fn open(&mut self) {
         match self.era {
             Era::Initialize => {
@@ -285,8 +253,6 @@ impl Mcp {
         }
     }
 
-    /// `tools/list`: the tool table, whose output schemas every later
-    /// call is checked against.
     pub async fn list_tools(&mut self) -> Vec<Value> {
         let listed = self.request("tools/list", json!({})).await;
         let tools = listed["result"]["tools"]
@@ -307,9 +273,6 @@ impl Mcp {
         tools
     }
 
-    /// Call `tool` with `arguments` and hold its result to the text
-    /// contract: one text block, and on success a `structuredContent`
-    /// object valid under the tool's `outputSchema`.
     pub async fn call(&mut self, tool: &str, arguments: Value) -> Call {
         let response = self
             .request("tools/call", json!({"name": tool, "arguments": arguments}))
@@ -368,8 +331,6 @@ impl Mcp {
         }
     }
 
-    /// Close stdin, read stdout to EOF and wait for the exit, under
-    /// [`DEADLINE`].
     pub async fn finish(mut self) -> Finished {
         drop(self.stdin.take());
         let deadline = Instant::now() + DEADLINE;
@@ -400,8 +361,6 @@ impl Mcp {
 }
 
 impl Finished {
-    /// Every stdout line is one JSON-RPC 2.0 message, nothing follows the
-    /// last newline, and the exit was 0. stderr is the caller's to judge.
     pub fn assert_clean(&self, case: &str) {
         let context = format!(
             "{case}\nstatus {:?}\ntrailing: {:?}\nstderr: {}",
@@ -422,7 +381,6 @@ impl Finished {
         assert_eq!(self.status, Some(0), "clean exit after EOF: {context}");
     }
 
-    /// Whether any stdout message answers `id`.
     pub fn answered(&self, id: u64) -> bool {
         self.lines.iter().any(|line| {
             serde_json::from_str::<Value>(line)
@@ -431,14 +389,10 @@ impl Finished {
     }
 }
 
-/// A temp `HOME` whose default config names the [`PROFILE`] profile:
-/// `server`'s URL, its pinned certificate, and the agent key in the
-/// profile's own table. Times display in UTC.
 pub fn home(server: &Server) -> tempfile::TempDir {
     home_as(server, &server.agent_token)
 }
 
-/// A temp `HOME` like [`home`]'s whose profile holds `token`.
 pub fn home_as(server: &Server, token: &str) -> tempfile::TempDir {
     let home = tempfile::tempdir().expect("tempdir");
     let dir = home.path().join(".config/trawl");

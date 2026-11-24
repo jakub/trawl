@@ -4,112 +4,21 @@
 
 //! Translation and repeat pricing over a regex syntax tree (ADR-0063).
 //!
-//! [`shape`] walks a parsed [`Ast`] once and returns what translating it
-//! to HIR costs, how many positions its counted repeats expand to, and its
-//! named capture groups. It translates nothing and builds nothing, so
-//! admission can price every pattern in a query before any of them
-//! compiles. `regex_syntax::ast::visit` keeps its own heap stack, so a
+//! `regex_syntax::ast::visit` keeps its own heap stack, so a
 //! deeply nested pattern cannot overflow the thread's stack here.
-//!
-//! # Units
-//!
-//! One unit is about 3 ns of `regex-syntax` translation on the reference
-//! host, so [`MAX_TRANSLATION_UNITS`] is about 50 ms. The charges follow the
-//! pinned translator, `regex-syntax`'s `hir/translate.rs`:
-//!
-//! | node | units |
-//! |---|---|
-//! | `(?i)` literal inside `FOLD_WINDOW` | `FOLDED_LITERAL` |
-//! | `.` | `DOT_RANGES` |
-//! | `\w`, `\d`, `\s` | their table's ranges, twice when negated, and no fold |
-//! | `\p{…}`, known or not | `UNICODE_PROPERTY` ranges, a fold of every code point under `(?i)`, and its ranges again when negated |
-//! | bracket item | the accumulator's ranges plus the item's own, for the union |
-//! | bracket under `(?i)` | a fold of the accumulator |
-//! | negated bracket or item | its ranges again; inside a bracket, it then covers every code point |
-//! | set operation | both operands' ranges, and under `(?i)` a fold of each operand |
-//! | alternation branch that is a class | the ranges of the class branches before it plus its own, for the merge |
-//!
-//! A fold of a class of at most `R` ranges over at most `S` code points
-//! costs `FOLD_RANGE·R + FOLD_CODEPOINT·S + FOLD_MAPPED·min(S,
-//! FOLD_MAPPED_MAX)`. The translator steps through every code point of a
-//! range that meets the fold table, and pushes one range for each code point
-//! that folds. Perl classes are already closed under case folding, so the
-//! translator never folds them, and neither does the walk. A bracket that
-//! holds one still folds its whole accumulator.
-//!
-//! Where the walk cannot know the translated shape, it charges the most the
-//! shape could cost. The Unicode property tables are private to
-//! `regex-syntax`, so every `\p{…}` class is priced at its largest possible
-//! shape, and so is a property name the translator will refuse. A negated
-//! item inside a bracket covers every code point, so an enclosing `(?i)`
-//! bracket refolds the whole complement, as the translator does. A
-//! class's range count is the sum of its items' counts, an upper bound on
-//! what the translator's canonical class holds, and the same holds for
-//! the class an alternation of classes merges into.
 //!
 //! Flags scope as the translator's `set_flags` scopes them: a group's flags
 //! last until the group closes, and a bare `(?i)` lasts until its enclosing
 //! group closes, across the alternation branches after it.
-//!
-//! # Positions
-//!
-//! A position is a step of the compiled program. Once both engines' lazy
-//! DFAs give up, Rust's Pike VM and `RE2`'s NFA pay for every live step on
-//! every byte of the subject, so every node that compiles to an
-//! instruction counts at least one position:
-//!
-//! - an atom (a literal, a dot or a class) and an assertion (`^`, `$`,
-//!   `\A`, `\z`, and every word boundary) count one;
-//! - a capture group, named or not, counts one for its capture
-//!   instructions, plus what it holds;
-//! - an alternation counts what its branches hold, each at least one for
-//!   its path out of a split, and one for each branch after the first: `n`
-//!   branches compile to `n - 1` splits. So `a|b` is 3, `a|b|c` is 5,
-//!   `(?:a|)` is 3 and `(?:a|b){3}` is 9;
-//! - a repeat counts what its operand holds, and at least one for the
-//!   split around it, times its upper bound. An unbounded repeat counts its
-//!   lower bound plus one. The split is a node of its own, so a repeat
-//!   counts at least one more than its operand: `x?`, `x*`, `x{0,1}` and
-//!   `x{1}` are two positions, and each wrapper nested around another
-//!   adds one. A count of two or more already multiplies past that, so
-//!   `x{20}` is 20 and `x+` is 2.
-//!
-//! Concatenations and non-capturing groups add their children's counts
-//! and nothing of their own: each compiles to its children alone, with no
-//! instruction between them. Flags, and empty nodes in a concatenation,
-//! count zero: the translator drops them, and the cost harness
-//! (`crates/trawl-engine/tests/regex_cost.rs`, its zero-charge family)
-//! times a run of them inside a counted repeat at the cost of the repeat
-//! without them. `(?x)` whitespace and comments are not nodes at all.
-//!
-//! Positions bound how many steps each byte pays for once a DFA gives up.
-//! They do not bound a program's size: one position of `\pL` is about
-//! 42 KiB of program. RE2 sizes its DFA from a fixed budget and gives up at
-//! once on a program too large for it, so the ledger caps a regex body's
-//! program as the batch engine reads it as well
-//! (`super::MAX_BATCH_COMPILED_BYTES`, measured on the view in
-//! `super::re2`).
-//!
-//! Nor do positions fix what one step costs. A class that lists many
-//! separate characters compiles to long lists of byte ranges, and Rust's
-//! Pike VM scans a list from its start for every live step on every byte,
-//! so a byte that sorts late in each list costs the most. The cost harness
-//! searches for the worst such shape at the edge of every limit. Over one
-//! value of `MAX_RAW_CHARS` characters, its slowest admitted Rust call
-//! took about 0.40 s, under the 0.5 s ceiling ADR-0063 sets for the live
-//! lane, and its slowest RE2 call about 1.8 s, which ADR-0063 records as
-//! the batch lane's envelope (`docs/evidence/issue-334/transcript.txt`).
-//!
-//! Units and positions saturate at `u64::MAX`, so no pattern overflows them.
 
 use std::convert::Infallible;
 
 use regex_syntax::ast::{self, Ast, Visitor};
 
-/// The translation budget of one query, in units (ADR-0063).
+/// The translation budget of one query, in units.
 pub(crate) const MAX_TRANSLATION_UNITS: u64 = 1 << 24;
 
-/// The repeat budget of one pattern, in positions (ADR-0063).
+/// The repeat budget of one pattern, in positions.
 pub(crate) const MAX_REPEAT_POSITIONS: u64 = 64;
 
 /// One range that the translator materialises, unions, negates or merges.
@@ -141,27 +50,22 @@ const CODEPOINTS: u64 = 0x11_0000;
 /// Every value of a byte class, which `(?-u)` translates to.
 const BYTES: u64 = 256;
 
-/// `\w` in Unicode mode.
 const PERL_WORD: Set = Set {
     ranges: 796,
     span: 144_667,
 };
-/// `\d` in Unicode mode.
 const PERL_DIGIT: Set = Set {
     ranges: 71,
     span: 760,
 };
-/// `\s` in Unicode mode.
 const PERL_SPACE: Set = Set {
     ranges: 10,
     span: 25,
 };
-/// `\w` under `(?-u)`.
 const BYTE_WORD: Set = Set {
     ranges: 4,
     span: 63,
 };
-/// `\d` under `(?-u)`.
 const BYTE_DIGIT: Set = Set {
     ranges: 1,
     span: 10,
@@ -190,26 +94,19 @@ pub(crate) struct Capture {
     pub(crate) index: u32,
 }
 
-/// What one pattern costs before anything builds it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Shape {
-    /// The translation charge, in units.
     pub(crate) units: u64,
-    /// The repetition-expanded position count.
     pub(crate) positions: u64,
     /// The named capture groups, in pattern order.
     pub(crate) captures: Vec<Capture>,
 }
 
-/// Price a parsed pattern: one walk over its syntax tree, which translates
-/// nothing.
 pub(crate) fn shape(ast: &Ast) -> Shape {
     let Ok(shape) = ast::visit(ast, Walk::new());
     shape
 }
 
-/// The named capture groups of `body`, read from its syntax tree. Parses
-/// the syntax only, so it builds nothing and translates nothing.
 #[cfg_attr(
     target_pointer_width = "64",
     expect(
@@ -239,9 +136,6 @@ struct Flags {
 }
 
 impl Flags {
-    /// Apply a flag directive as the translator's `set_flags` does: each
-    /// flag it names takes the new value, and every other flag keeps its
-    /// value. A `-` turns off every flag after it.
     fn apply(&mut self, flags: &ast::Flags) {
         let mut enable = true;
         for item in &flags.items {
@@ -263,36 +157,25 @@ impl Flags {
     }
 }
 
-/// What a finished node translates to, as far as the translator's
-/// alternation merge cares. `Hir::alternation` unions branches that are
-/// classes into one class, one branch at a time, so each class branch
-/// costs a union with the branches merged before it.
-///
+/// What a finished node translates to, as far as the alternation merge
+/// cares: `Hir::alternation` unions class branches into one class, one at a
+/// time, so each class branch costs a union with the branches before it.
 /// When the walk cannot tell, it says `Class`, which only charges more.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Translated {
     /// Matches only the empty string, so a concatenation drops it.
     Empty,
-    /// A class, or a node the walk prices as one, of at most this many
-    /// ranges.
     Class(u64),
-    /// Anything else, such as a capture group or a literal string.
     Other,
 }
 
-/// How an open container combines what its children translate to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Combine {
-    /// A concatenation, or the whole pattern: one class among empty nodes
-    /// stays a class.
     Concat,
-    /// An alternation: each class branch merges into the branches before it.
     Alternation,
-    /// A group or a repeat, around its one child.
     Single,
 }
 
-/// One open container.
 #[derive(Debug)]
 struct Frame {
     combine: Combine,
@@ -316,12 +199,11 @@ impl Frame {
     }
 }
 
-/// The walk's state. The visitor calls each node's pre and post hooks in
-/// matched pairs, so every stack below has a top when a post hook pops it.
+/// The visitor calls each node's pre and post hooks in matched pairs, so
+/// every stack below has a top when a post hook pops it.
 #[derive(Debug)]
 struct Walk {
     flags: Flags,
-    /// The flags to restore when each open group closes.
     saved: Vec<Flags>,
     /// One accumulator per open bracket and per open set-operation operand.
     classes: Vec<Set>,
@@ -350,7 +232,6 @@ impl Walk {
         self.units = self.units.saturating_add(units);
     }
 
-    /// Charge one pass over a class's ranges.
     fn pass(&mut self, set: Set) {
         self.charge(set.ranges.saturating_mul(RANGE));
     }
@@ -365,16 +246,11 @@ impl Walk {
             .unwrap_or_else(|| Frame::new(Combine::Single))
     }
 
-    /// Hand a finished node's positions and translation to the innermost
-    /// open container, charging an alternation's merge of a class branch.
     fn finished(&mut self, positions: u64, translated: Translated) {
         let Some(frame) = self.frames.last_mut() else {
             return;
         };
         let positions = match frame.combine {
-            // Each branch is a path out of the alternation's split, which
-            // the fallback engines follow at every step even when the
-            // branch holds nothing.
             Combine::Alternation => positions.max(1),
             Combine::Concat | Combine::Single => positions,
         };
@@ -397,12 +273,10 @@ impl Walk {
         self.charge(merge.saturating_mul(RANGE));
     }
 
-    /// Finish an atom: one position, translated to a class of `ranges`.
     fn atom(&mut self, ranges: u64) {
         self.finished(1, Translated::Class(ranges));
     }
 
-    /// How many values a class can cover under the current flags.
     fn universe(&self) -> u64 {
         if self.flags.unicode {
             CODEPOINTS
@@ -429,8 +303,6 @@ impl Walk {
         }
     }
 
-    /// Charge a negation of `set` and return its complement's bound, which
-    /// covers every value.
     fn complement(&mut self, set: Set) -> Set {
         self.pass(set);
         Set {
@@ -468,13 +340,11 @@ impl Walk {
         }
     }
 
-    /// A `\p{…}` class at its largest shape, folded and then negated.
     fn property(&mut self, class: &ast::ClassUnicode) -> Set {
         self.pass(UNICODE_PROPERTY);
         self.fold_and_negate(UNICODE_PROPERTY, class.is_negated())
     }
 
-    /// Union an item into the innermost open accumulator.
     fn union(&mut self, item: Set) {
         let universe = self.universe();
         let Some(acc) = self.classes.last_mut() else {
@@ -487,9 +357,6 @@ impl Walk {
     }
 }
 
-/// How many times a repeat can match its operand, with an unbounded repeat
-/// counted as its lower bound plus one. `?` matches at most once, `*` is
-/// `{0,}` and `+` is `{1,}`.
 fn upper_bound(kind: &ast::RepetitionKind) -> u64 {
     match kind {
         ast::RepetitionKind::ZeroOrOne | ast::RepetitionKind::ZeroOrMore => 1,
@@ -564,16 +431,11 @@ impl Visitor for Walk {
 
     fn visit_post(&mut self, ast: &Ast) -> Result<(), Infallible> {
         match ast {
-            // Free in a concatenation, which drops it: the cost harness's
-            // zero-charge family. As an alternation branch or a repeat's
-            // operand it still counts one, which its container charges.
             Ast::Empty(_) => self.finished(0, Translated::Empty),
-            // Compiles to nothing: the cost harness's zero-charge family.
             Ast::Flags(set) => {
                 self.flags.apply(&set.flags);
                 self.finished(0, Translated::Empty);
             }
-            // A look-around instruction, checked on every live step.
             Ast::Assertion(_) => self.finished(1, Translated::Other),
             Ast::Literal(literal) => {
                 if self.flags.case_insensitive && in_fold_window(literal.c) {
@@ -602,11 +464,6 @@ impl Visitor for Walk {
             }
             Ast::Repetition(repetition) => {
                 let inner = self.close();
-                // A repeat compiles to a split around its operand, even an
-                // operand that holds nothing, so the operand counts one.
-                // The split is a node of its own, so the repeat counts at
-                // least one more than its operand: otherwise wrappers that
-                // repeat at most once, `(?:…)?` or `(?:…)*`, nest for free.
                 let operand = inner.positions.max(1);
                 self.finished(
                     operand
@@ -621,26 +478,17 @@ impl Visitor for Walk {
                 }
                 let inner = self.close();
                 let (own, translated) = match &group.kind {
-                    // Two capture instructions, which the fallback engines
-                    // step through like any other.
                     ast::GroupKind::CaptureIndex(_) | ast::GroupKind::CaptureName { .. } => {
                         (1, Translated::Other)
                     }
-                    // Compiles to its child alone: the cost harness's
-                    // zero-charge family.
                     ast::GroupKind::NonCapturing(_) => (0, inner.translated),
                 };
                 self.finished(inner.positions.saturating_add(own), translated);
             }
-            // Compiles its children one after another and adds no
-            // instruction of its own.
             Ast::Concat(_) => {
                 let inner = self.close();
                 self.finished(inner.positions, inner.translated);
             }
-            // `n` branches compile to `n - 1` splits, which the fallback
-            // engines follow at every live step and an enclosing repeat
-            // copies, so each `|` counts one beside what the branches hold.
             Ast::Alternation(alternation) => {
                 let inner = self.close();
                 let splits =
@@ -732,8 +580,6 @@ impl Visitor for Walk {
 pub(crate) mod calibration {
     use super::{MAX_REPEAT_POSITIONS, MAX_TRANSLATION_UNITS, Shape};
 
-    /// Which budget, if either, refuses a query that holds `copies` of one
-    /// pattern.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub(crate) enum Verdict {
         Admitted,
@@ -751,8 +597,6 @@ pub(crate) mod calibration {
         }
     }
 
-    /// One calibration case: a query of `copies` of `body`, and the verdict
-    /// ADR-0063 requires of it.
     pub(crate) struct Case {
         pub(crate) name: &'static str,
         pub(crate) body: String,
@@ -769,11 +613,6 @@ pub(crate) mod calibration {
         }
     }
 
-    /// Review round 3's F7: four branches of `\pL` that count 1, 2, 4 and 5
-    /// positions, under `{0,2}`, inside 38 `(?:…)?` wrappers, between `\B`
-    /// and `\PL`. Before an alternation's splits counted, it priced at 64
-    /// positions, and over 65 536 Deseret letters one `DuckDB` call took
-    /// about 450 ms.
     pub(crate) fn unequal_alternation() -> String {
         let b3 = r"(?:(?:\pL){0,2}){0,2}";
         let alternation = format!(r"(?:\pL|(?:\pL)?|{b3}|(?:{b3})?){{0,2}}");
@@ -816,15 +655,9 @@ pub(crate) mod calibration {
         r"^\s+at ",
     ];
 
-    /// The cases ADR-0063 names, and the ordinary patterns that must stay
-    /// admitted.
     pub(crate) fn calibration_cases() -> Vec<Case> {
         use Verdict::{Admitted, RefusedByRepeat, RefusedByTranslation};
         let mut cases = vec![
-            // A1 and A2 were measured at 145 and 170 classes a body. The
-            // repeat budget now refuses those bodies, so each attack is as
-            // many classes as it admits, and one body alone is over the
-            // translation budget.
             case(
                 "A1 (?i) + 64 \\p{Any}",
                 format!("(?i){}", r"\p{Any}".repeat(64)),
@@ -837,12 +670,6 @@ pub(crate) mod calibration {
                 63,
                 RefusedByTranslation,
             ),
-            // A3, 64 KiB of `\w`, no longer reaches the translation budget.
-            // It was measured as 127 bodies of 256 `\w`, which the repeat
-            // budget now refuses, like A3'. The pattern cap holds 256
-            // bodies of 64, which price at about 13 M units. Each of them
-            // compiles past the size limit, and construction stops at the
-            // first.
             case("A3 64 \\w, 256 bodies", r"\w".repeat(64), 256, Admitted),
             case(
                 "A3' 512 \\w, 63 bodies",
@@ -915,8 +742,6 @@ pub(crate) mod calibration {
                 RefusedByTranslation,
             ),
         ];
-        // The parser holds the whole `log_regexes` corpus under the
-        // compile limit.
         for body in crate::pattern::charge::LOG_REGEXES {
             cases.push(case("log_regexes", *body, 1, Admitted));
         }
@@ -952,8 +777,6 @@ mod tests {
         price(body).positions
     }
 
-    /// A fold of a `\p{…}` class's largest shape: `FOLD_RANGE·1024 +
-    /// FOLD_CODEPOINT·0x110000 + FOLD_MAPPED·2938`.
     const PROPERTY_FOLD: u64 = 16 * 1024 + 0x11_0000 + 6 * 2938;
 
     #[test]
@@ -1034,28 +857,20 @@ mod tests {
 
     #[test]
     fn a_case_insensitive_bracket_folds_its_accumulator() {
-        // fold(1 range, 26 code points) = 16 + 26 + 6·26.
         assert_eq!(units("(?i)[a-z]"), 1 + 16 + 26 + 6 * 26);
-        // The translator steps through every code point of the range.
         assert_eq!(
             units(r"(?i)[\x00-\x{10FFFF}]"),
             1 + 16 + 0x11_0000 + 6 * 2938
         );
-        // A negated bracket folds its positive side, then negates the
-        // folded bound, so a complement of one code point pays in full.
         assert_eq!(
             units(r"(?i)[^\x00-\x{10FFFE}]"),
             1 + 16 + 0x10_FFFF + 6 * 2938 + (1 + 2938)
         );
-        // The bracket folds a Perl class item, though the class alone never
-        // folds.
         assert_eq!(units(r"(?i)[\w]"), 2 * 796 + 16 * 796 + 144_667 + 6 * 2938);
     }
 
     #[test]
     fn a_negated_nested_class_widens_to_every_code_point() {
-        // [^b] folds {b} and negates it. Its complement covers every code
-        // point, so the (?i) bracket around it steps through all of them.
         assert!(units("(?i)[a[^b]]") > 0x11_0000);
         assert!(units(r"(?i)[a\W]") > 0x11_0000);
         assert!(units("(?i)[a[:^alpha:]]") > 0x11_0000);
@@ -1074,8 +889,6 @@ mod tests {
     fn a_set_operation_charges_both_operands() {
         // lhs \w 796 + 796, rhs \d 71 + 71, the operation 867, its union 867.
         assert_eq!(units(r"[\w&&\d]"), 2 * 796 + 2 * 71 + 2 * 867);
-        // Under (?i) the operation folds each operand, so a negated operand
-        // pays a fold of every code point on either side.
         assert!(units("(?i)[[^b]&&a-z]") > 0x11_0000);
         assert!(units("(?i)[a-z&&[^b]]") > 0x11_0000);
         assert!(units("(?i)[a-z--[^b]]") > 0x11_0000);
@@ -1100,7 +913,6 @@ mod tests {
             FOLDED_LITERAL,
             "a bare flag ends with its group"
         );
-        // Two-literal branches are strings, not classes, so nothing merges.
         assert_eq!(
             units("(?i)ab|cd"),
             4 * FOLDED_LITERAL,
@@ -1133,14 +945,10 @@ mod tests {
             "an empty node drops out"
         );
         assert_eq!(units("a|b"), 1 + 2, "single characters merge too");
-        // A capture group, a repeat and a string are not classes, so only
-        // the class branches merge.
         assert_eq!(units(r"\w|(\d)"), 796 + 71 + 796);
         assert_eq!(units(r"\w|\d{2}"), 796 + 71 + 796);
         assert_eq!(units(r"\w|\d\d"), 796 + 2 * 71 + 796);
         assert_eq!(units(r"\w|^"), 796 + 796);
-        // An inner alternation merges into one class, which the outer one
-        // merges again.
         assert_eq!(
             units(r"(?:\w|\d)|\s"),
             796 + 71 + 10 + (796 + 867) + (867 + 877)
@@ -1155,10 +963,6 @@ mod tests {
         assert_eq!(positions("abc"), 3);
     }
 
-    /// Each `Ast` variant and each `GroupKind`, with the positions it adds
-    /// on its own. A node that compiles to an instruction counts at least
-    /// one. Only flags, empty nodes in a concatenation, concatenations and
-    /// non-capturing groups count nothing of their own.
     const NODE_CHARGES: &[(&str, &str, u64)] = &[
         ("Ast::Empty in a concatenation", "(?:)", 0),
         ("Ast::Flags", "(?i)", 0),
@@ -1188,8 +992,6 @@ mod tests {
         for (node, body, charge) in NODE_CHARGES {
             assert_eq!(positions(body), *charge, "{node}: {body}");
         }
-        // One pattern that holds every kind at once adds them up. Each
-        // sits in a non-capturing group of its own, which adds nothing.
         let all = NODE_CHARGES
             .iter()
             .fold(String::new(), |all, (_, body, _)| all + "(?:" + body + ")");
@@ -1218,7 +1020,6 @@ mod tests {
             assert_eq!(positions(body), 1, "{body}");
         }
         assert_eq!(positions(r"^$\b\B\A\z"), 6);
-        // A repeat multiplies an assertion like any atom.
         assert_eq!(positions(r"(?:\B[abc]){62}"), 124);
         assert_eq!(
             positions(&format!("𐐨(?:{}[𐐨𐐩𐐪]){{62}}𐐪", r"\B".repeat(8))),
@@ -1239,12 +1040,10 @@ mod tests {
 
     #[test]
     fn an_empty_branch_or_repeat_operand_counts_one_position() {
-        // Each branch counts at least one, and each `|` one more.
         assert_eq!(positions("a|"), 3);
         assert_eq!(positions("(?:|)"), 3);
         assert_eq!(positions("(?:||||)"), 5 + 4);
         assert_eq!(positions("(?:(?i)|a)"), 3, "a branch of flags is empty");
-        // The repeat around the empty operand counts one more.
         assert_eq!(positions("(?:)*"), 2);
         assert_eq!(positions("(?:)?"), 2);
         assert_eq!(positions("(?:){0,9}"), 9);
@@ -1267,10 +1066,6 @@ mod tests {
         assert_eq!(positions("(?:a|b)[abc](?:a|d)d"), 8);
     }
 
-    /// An alternation of `n` branches compiles to `n - 1` split
-    /// instructions, which the fallback engines follow on every live step
-    /// and an enclosing repeat copies. Each counts one position, on top of
-    /// what the branches hold.
     #[test]
     fn an_alternation_counts_one_position_for_each_branch_after_the_first() {
         for (body, expect) in [
@@ -1286,10 +1081,6 @@ mod tests {
         ] {
             assert_eq!(positions(body), expect, "{body}");
         }
-        // Review round 3, F7: four unequal branches of `\pL` under `{0,2}`,
-        // inside 38 `(?:…)?` wrappers, once priced at 64 positions; over
-        // 65 536 Deseret letters one DuckDB call took about 450 ms. The
-        // three splits count, and `{0,2}` doubles them: (12 + 3)·2 + 38 + 2.
         assert_eq!(positions(&super::calibration::unequal_alternation()), 70);
     }
 
@@ -1315,16 +1106,10 @@ mod tests {
         assert_eq!(positions("a{3,}"), 4);
         assert_eq!(positions("(?:ab)+"), 4);
         assert_eq!(positions("(?:a+)+"), 4);
-        // `*` is `{0,}`: one times its operand, and then one more for
-        // the repeat itself.
         assert_eq!(positions("a*"), 2);
         assert_eq!(positions("a{0,}"), 2);
     }
 
-    /// The split a repeat compiles to is a node of its own, so a repeat
-    /// counts at least one more than its operand, whatever its bounds and
-    /// greed. Wrappers that repeat at most once, or not at all, cannot
-    /// nest for free: each adds one.
     #[test]
     fn a_repeat_counts_at_least_one_more_than_its_operand() {
         for body in [
@@ -1339,7 +1124,6 @@ mod tests {
         assert_eq!(positions("(?:(?:(?:a)*?)??){0,1}"), 4);
         assert_eq!(positions("(?:(?:a)?){31}"), 62);
         assert_eq!(positions(r"\B(?:(?:(?:[abc])*)*){20}c"), 62);
-        // A count of two or more already multiplies past one more.
         assert_eq!(positions("a{2}"), 2);
         assert_eq!(positions(r"\w{20}"), 20);
         assert_eq!(positions("[0-9a-f]{64}"), 64);
@@ -1397,7 +1181,6 @@ mod tests {
         );
     }
 
-    /// The bound of a translated Unicode class.
     fn bound(class: &ClassUnicode) -> Set {
         Set {
             ranges: u64::try_from(class.ranges().len()).unwrap(),
@@ -1409,8 +1192,6 @@ mod tests {
         }
     }
 
-    /// What `body` translates to. The public API reaches the Unicode tables
-    /// only through translation; the walk never translates.
     fn translated(body: &str) -> hir::Class {
         match regex_syntax::Parser::new()
             .parse(body)
@@ -1509,8 +1290,6 @@ mod tests {
         "sb=Close",
     ];
 
-    /// The Unicode facts the charges use, re-derived through the public
-    /// `regex-syntax` API, so a table bump fails here first.
     #[test]
     fn the_unicode_constants_match_the_pinned_tables() {
         assert_eq!(unicode(r"\w"), PERL_WORD);
@@ -1573,7 +1352,6 @@ mod tests {
     /// FNV-1a 64 of that release's `src/hir/translate.rs`.
     const PINNED_TRANSLATE_RS: u64 = 0x3677_5f0f_d12a_f631;
 
-    /// Which charge of the walk covers a case-fold site in the translator.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Charge {
         /// `visit_post` charges [`FOLDED_LITERAL`] for a `(?i)` literal
@@ -1700,13 +1478,6 @@ mod tests {
         ("fn merge", "case_insensitive", 3, Charge::FlagScope),
     ];
 
-    /// Hold the translator's case-fold sites to [`FOLD_SITES`].
-    ///
-    /// Resolves `regex-syntax` through `cargo metadata`, as this crate
-    /// depends on it, and reads that release's `src/hir/translate.rs`. Fails
-    /// when the release, the file or its list of fold sites changes, so a
-    /// `regex-syntax` bump stays red until someone reviews the walk's
-    /// charges against the new translator and updates the pins.
     pub(crate) fn fold_site_inventory_check() {
         let (version, source) = translate_rs();
         assert_eq!(
@@ -1733,9 +1504,6 @@ mod tests {
         );
     }
 
-    /// The resolved `regex-syntax` version this crate depends on, and the
-    /// text of that release's `src/hir/translate.rs`.
-    ///
     /// The resolve reads every locked crate's manifest, so on a bare checkout
     /// cargo fetches them first, as `trawl-mcp`'s dependency test does.
     fn translate_rs() -> (String, String) {
@@ -1789,11 +1557,6 @@ mod tests {
         (version, source)
     }
 
-    /// The case-fold sites in `source`, outside its `mod tests`: every
-    /// identifier that names a fold, and every use of the `i` flag, keyed by
-    /// the function or struct it sits in and counted, in text order of first
-    /// appearance. Comments are skipped, and so is the line that declares a
-    /// function, since a declaration folds nothing.
     fn fold_sites(source: &str) -> Vec<(String, String, usize)> {
         let end = source
             .find("\n#[cfg(test)]\nmod tests {")

@@ -3,11 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The zone a zone-less syslog timestamp is read in (ADR-0050).
-//!
-//! An RFC 3164 frame carries wall-clock time and no zone. The operator
-//! names the zone per peer, and this module turns that wall clock into an
-//! instant. Nothing here reads the host's zone: the IANA rules are
-//! compiled in through chrono-tz, so every host gives the same answer.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -18,29 +13,19 @@ use chrono::{DateTime, FixedOffset, LocalResult, NaiveDateTime, TimeZone, Utc};
 use chrono_tz::Tz;
 
 /// A configured syslog zone: a fixed offset or an IANA zone.
-///
-/// `UTC` and a zero offset are both `Fixed(+00:00)`, so they compare equal
-/// and print as `UTC`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SyslogZone {
-    /// `UTC` or a `±HH:MM` offset that holds all year.
     Fixed(FixedOffset),
-    /// An IANA zone such as `Europe/Warsaw`, with its DST rules.
     Iana(Tz),
 }
 
 /// What reading a wall-clock time in a zone gave.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Resolved {
-    /// The wall time names one instant. In a fall-back overlap, this is the
-    /// candidate nearer arrival.
     Unique(DateTime<Utc>),
-    /// The wall time falls in a spring-forward gap and names no instant.
     Gap,
 }
 
-/// A zone setting that is not `UTC`, an IANA zone name or a `±HH:MM`
-/// offset. It carries nothing, so no error text can echo the value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ZoneRefused;
 
@@ -53,18 +38,15 @@ impl fmt::Display for ZoneRefused {
 impl std::error::Error for ZoneRefused {}
 
 impl ZoneRefused {
-    /// The one reason every refused zone gives.
     pub const REASON: &'static str = "not UTC, an IANA zone name, or a ±HH:MM offset";
 }
 
 impl SyslogZone {
-    /// UTC, the zone an unset `default_timezone` means.
     pub const UTC: Self = match FixedOffset::east_opt(0) {
         Some(offset) => Self::Fixed(offset),
         None => unreachable!(),
     };
 
-    /// `instant` as it reads on a wall clock in this zone.
     #[must_use]
     pub fn wall_at(self, instant: DateTime<Utc>) -> NaiveDateTime {
         match self {
@@ -73,11 +55,6 @@ impl SyslogZone {
         }
     }
 
-    /// The instant `wall` names in this zone.
-    ///
-    /// A wall time in a fall-back overlap names two instants; the one nearer
-    /// `arrival` wins, and an exact tie goes to the earlier one. A wall time
-    /// in a spring-forward gap names none.
     #[must_use]
     pub fn instant(self, wall: NaiveDateTime, arrival: DateTime<Utc>) -> Resolved {
         match self {
@@ -87,13 +64,9 @@ impl SyslogZone {
     }
 }
 
-/// The zone each syslog peer's zone-less timestamps are read in: the
-/// peer's `sender_timezones` entry, else `default_timezone`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SyslogZones {
     default: SyslogZone,
-    /// Keyed by the canonical peer address's spelling, folded like
-    /// `source_service_map`.
     by_peer: HashMap<String, SyslogZone>,
 }
 
@@ -104,9 +77,6 @@ impl SyslogZones {
         Self { default, by_peer }
     }
 
-    /// The zone for a transport peer, canonicalized by the listener. The
-    /// frame's hostname never takes part, and neither does
-    /// `trusted_relays`: a relay's entry covers everything it forwards.
     #[must_use]
     pub fn for_peer(&self, peer: IpAddr) -> SyslogZone {
         self.by_peer
@@ -117,7 +87,6 @@ impl SyslogZones {
 }
 
 impl Default for SyslogZones {
-    /// Every peer in UTC: the unset configuration.
     fn default() -> Self {
         Self::new(SyslogZone::UTC, HashMap::new())
     }
@@ -143,11 +112,9 @@ fn resolve_in<T: TimeZone>(zone: &T, wall: NaiveDateTime, arrival: DateTime<Utc>
 impl FromStr for SyslogZone {
     type Err = ZoneRefused;
 
-    /// Accept exactly `UTC`, a `±HH:MM` offset (hours 00-23, minutes
-    /// 00-59), or an IANA name containing `/`, spelled as the zone database
-    /// spells it. The `/` rule refuses the database's single-word legacy
+    /// Requiring `/` in a zone name refuses the database's single-word legacy
     /// names (`EST`, `CET`, `Zulu`, `GMT`, `EST5EDT`), which read as
-    /// abbreviations. `local` and every other spelling are refused.
+    /// abbreviations.
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         if s == "UTC" {
             return Ok(Self::UTC);
@@ -162,7 +129,6 @@ impl FromStr for SyslogZone {
     }
 }
 
-/// `±HH:MM`, exactly six bytes.
 fn parse_offset(s: &str) -> Option<FixedOffset> {
     let &[sign, h1, h2, b':', m1, m2] = s.as_bytes() else {
         return None;
@@ -182,8 +148,6 @@ fn parse_offset(s: &str) -> Option<FixedOffset> {
 }
 
 impl fmt::Display for SyslogZone {
-    /// The normalized spelling: `UTC` for a zero offset, `±HH:MM` for any
-    /// other offset, and the IANA name as configured.
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Fixed(offset) => {
@@ -280,7 +244,6 @@ mod tests {
 
     #[test]
     fn dst_overlap_picks_nearest_arrival() {
-        // (zone, overlap wall time, earlier instant, later instant).
         let cases = [
             // America/Chicago falls back from CDT (-05:00) to CST (-06:00).
             (
@@ -333,7 +296,6 @@ mod tests {
                 Resolved::Unique(early),
                 "{name}: a distant earlier arrival"
             );
-            // Both instants read back as the same wall time.
             assert_eq!(z.wall_at(early), at, "{name}");
             assert_eq!(z.wall_at(late), at, "{name}");
         }
@@ -351,7 +313,6 @@ mod tests {
             zone("Australia/Lord_Howe").instant(wall(2026, 10, 4, 2, 15), arrival),
             Resolved::Gap
         );
-        // Either side of the gap is an ordinary instant.
         assert_eq!(
             zone("America/Chicago").instant(wall(2026, 3, 8, 1, 59), arrival),
             Resolved::Unique(utc(2026, 3, 8, 7, 59))

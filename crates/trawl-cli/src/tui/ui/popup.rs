@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Popup overlays (confirmations, text input).
-
 use ratatui::Frame;
 use ratatui::layout::Alignment;
 use ratatui::style::{Modifier, Style};
@@ -16,7 +14,6 @@ use crate::tui::App;
 use crate::tui::state::{Popup, ScheduleField, ScheduleForm};
 use crate::tui::theme::Theme;
 
-/// Render the active popup (if any).
 pub fn render(app: &App, frame: &mut Frame<'_>) {
     if let Some(popup) = &app.popup {
         let theme = &app.theme;
@@ -49,7 +46,6 @@ pub fn render(app: &App, frame: &mut Frame<'_>) {
     }
 }
 
-/// Render confirmation dialog for deleting a saved query.
 fn render_confirm_delete(frame: &mut Frame<'_>, theme: &Theme, name: &str) {
     let area = centered_rect(60, 35, frame.area());
 
@@ -97,7 +93,6 @@ fn render_confirm_delete(frame: &mut Frame<'_>, theme: &Theme, name: &str) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render text input dialog for saving a query.
 fn render_save_query(
     frame: &mut Frame<'_>,
     theme: &Theme,
@@ -163,10 +158,6 @@ fn render_save_query(
     frame.set_cursor_position((cursor_x, cursor_y));
 }
 
-/// Render the event detail popup (key-value view of a single row).
-///
-/// Groups well-known fields first, then remaining non-null fields alphabetically.
-/// Null fields are hidden to reduce noise.
 fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scroll: usize) {
     use trawl_api::value::WELL_KNOWN_LOG_FIELDS;
     use trawl_engine::value::Value;
@@ -226,7 +217,6 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_primary));
 
-    // The widest name's cells, which every name is right-aligned to.
     let max_name_cells = fields.iter().map(|(n, _)| cells(n)).max().unwrap_or(0);
 
     let divider = Line::from(Span::styled(
@@ -234,7 +224,6 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
         Style::default().fg(theme.border_unfocused),
     ));
 
-    // Build lines: well-known section → divider → other fields.
     let mut lines: Vec<Line<'_>> = Vec::new();
 
     if !well_known.is_empty() {
@@ -269,8 +258,6 @@ fn render_event_detail(app: &App, frame: &mut Frame<'_>, row_index: usize, scrol
     frame.render_widget(paragraph, area);
 }
 
-/// Build a single key-value line for the event detail popup, the name
-/// right-aligned to `name_cells` cells.
 fn field_line<'a>(name: &str, value: &str, name_cells: usize, theme: &Theme) -> Line<'a> {
     let name = sanitize_display_text(name);
     let indent = " ".repeat(name_cells.saturating_sub(cells(&name)));
@@ -285,7 +272,6 @@ fn field_line<'a>(name: &str, value: &str, name_cells: usize, theme: &Theme) -> 
     ])
 }
 
-/// Render an error message popup.
 fn render_error(frame: &mut Frame<'_>, theme: &Theme, message: &str) {
     let area = centered_rect(60, 30, frame.area());
     frame.render_widget(Clear, area);
@@ -319,8 +305,6 @@ fn render_error(frame: &mut Frame<'_>, theme: &Theme, message: &str) {
     frame.render_widget(paragraph, area);
 }
 
-/// Render the set-schedule dialog: interval, report window and lag, one row
-/// each, with the focused row highlighted.
 fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm) {
     let area = centered_rect(70, 45, frame.area());
 
@@ -331,9 +315,6 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
         .borders(Borders::ALL)
         .style(Style::default().bg(theme.surface).fg(theme.text_accent));
 
-    // An empty row shows its vocabulary instead of nothing, since the window
-    // spellings are not guessable and an empty row is a meaningful value in
-    // both cases (query mode, and a zero lag).
     let row = |label: &str, editor: &crate::tui::state::SimpleEditor, hint: &str, focused: bool| {
         let text = editor.text();
         let label_style = if focused {
@@ -364,9 +345,6 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
         Line::from(spans)
     };
 
-    // The cap and the paused state are sent back as loaded, never edited
-    // here. `(kept)` marks a value taken from the schedule in force; with no
-    // schedule, they are what a new schedule starts with.
     let kept = if form.schedule_loaded { " (kept)" } else { "" };
     let fixed = |label: &str, value: String| {
         Line::from(vec![
@@ -424,7 +402,6 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
 
     frame.render_widget(paragraph, area);
 
-    // Terminal cursor on the focused row, one column past its text.
     let (editor, row_index) = match form.focus {
         ScheduleField::Interval => (&form.interval, 0),
         ScheduleField::Window => (&form.window, 1),
@@ -441,7 +418,6 @@ fn render_set_schedule(frame: &mut Frame<'_>, theme: &Theme, form: &ScheduleForm
     ));
 }
 
-/// Render column picker popup — checklist for toggling visibility and pinning.
 fn render_column_picker(app: &App, frame: &mut Frame<'_>, selected: usize, scroll: usize) {
     let area = centered_rect(50, 60, frame.area());
     frame.render_widget(Clear, area);
@@ -510,9 +486,7 @@ mod tests {
     use crate::tui::tests::test_app;
 
     /// At 100x30 the save popup's input line is row 15, centred in the 58
-    /// cells from x = 21. A line of odd and of even cells starts where the
-    /// paragraph puts it, and the cursor sits after the cells of the input
-    /// before it, with CJK, lam-alef and a combining accent there.
+    /// cells from x = 21.
     #[test]
     fn save_popup_cursor_sits_after_the_input_cells() {
         // Input, cursor, where `>` is drawn, where the cursor sits.

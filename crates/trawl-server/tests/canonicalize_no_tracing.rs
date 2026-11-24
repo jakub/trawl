@@ -4,23 +4,12 @@
 
 //! The telemetry loop guard: `canonicalize` never calls `tracing`
 //! (ADR-0013 slice 2, ruling 4).
-//!
-//! Internal telemetry turns trawld's own tracing events into ordinary
-//! ingest records, which means they pass through the canonicalizer on
-//! their way to the WAL. A `tracing` call from inside that path emits an
-//! event that is canonicalized, which emits an event — an ingestion loop
-//! that no rate limiter fixes, because the amplification is per event.
-//! Producer failure paths are therefore metrics only (plus rate-limited
-//! stderr at the producer, outside these modules).
-//!
 //! This is a source-level assertion rather than a runtime one: the failure
 //! mode is unbounded recursion, so a test that provoked it would be the
 //! outage.
 
-/// The modules the invariant covers: the door, the profile types it
-/// reaches on every event, and the metric label helpers the per-event
-/// counters call into — a `tracing` call in any of them re-enters
-/// telemetry's `on_event` per event, unbounded.
+/// The door, the profile types it reaches on every event, and the metric label
+/// helpers the per-event counters call into.
 const GUARDED: [(&str, &str); 3] = [
     ("metrics.rs", include_str!("../src/metrics.rs")),
     (
@@ -37,11 +26,8 @@ const GUARDED: [(&str, &str); 3] = [
 /// tests may log freely — they run under no telemetry layer.
 const TEST_MODULE_MARKER: &str = "#[cfg(test)]";
 
-/// Strip whole-line comments, so the invariant is about calls and not
-/// about prose (the two ingest modules state the rule in their headers,
-/// which takes naming `tracing`). Deliberately strict about the rest: a
-/// trailing `// tracing` comment fails this test, a cheap false positive
-/// next to the alternative of parsing Rust.
+/// Strip whole-line comments: the two ingest modules state the rule in their
+/// headers, which takes naming `tracing`.
 fn code_only(source: &str) -> String {
     source
         .lines()
@@ -65,8 +51,6 @@ fn canonicalize_never_calls_tracing() {
              ingestion loop (ADR-0013 slice 2, ruling 4). Count it in \
              `crate::metrics` instead."
         );
-        // The same reason rules out the macros' short spellings, which
-        // reach `tracing` without naming it.
         for macro_name in ["info!", "warn!", "error!", "debug!", "trace!", "event!"] {
             assert!(
                 !code.contains(macro_name),
@@ -78,9 +62,6 @@ fn canonicalize_never_calls_tracing() {
 
 #[test]
 fn the_guard_reads_real_sources() {
-    // A guard that silently matched nothing would pass forever. Pin that
-    // each module was actually found and that the test-module split is
-    // real, so a rename cannot turn this into a no-op.
     for (name, source) in GUARDED {
         assert!(
             source.contains("pub fn canonicalize")

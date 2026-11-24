@@ -2,25 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The evidence clock end to end (ADR-0059, amending ADR-0018), the
-//! acceptance criterion's retention clause: kept evidence survives a
-//! restart; after its investigation's `retain_until` it reads as pruned
-//! while the findings, keeps and steps that cite it remain; each change
-//! slides the deadline, which stops at the 30-day ceiling; a boot
-//! interrupts the steps a dead process left without moving the clock.
-//!
-//! The clause's last part, that only `server_manage` extends or deletes,
-//! is proved in `investigations_api.rs` by
-//! `only_server_manage_extends_and_an_extension_never_shortens` and
-//! `a_delete_unlinks_the_evidence_and_waits_for_running_work`; nothing here
-//! repeats them.
-//!
-//! Through the HTTPS listener of a fixture that restarts over its own disk
-//! and databases (`common::captured::Restartable`), with the default
-//! `[investigation]` clocks (7 days idle, 30 days ceiling), an agent key
-//! that writes and a human key that reads. The results clock moves time;
-//! the restart keeps it. The binary is in the ADR-0021 `postgres` nextest
-//! group.
+//! The evidence clock end to end (ADR-0059, amending ADR-0018).
 
 mod common;
 
@@ -44,15 +26,11 @@ use trawl_server::store::{RetentionRule, StoreActor};
 /// capture corpus's hour.
 const START: &str = "2024-01-16T10:30:00Z";
 
-/// The two principals.
 struct Keys {
-    /// Reads and writes.
     agent: MintedKey,
-    /// Reads only.
     human: MintedKey,
 }
 
-/// A restartable fixture over the capture corpus, its clock at [`START`].
 async fn boot() -> (Restartable, TestServer, Keys) {
     let (fixture, server) = Restartable::boot(
         RateLimitConfig {
@@ -79,8 +57,6 @@ async fn boot() -> (Restartable, TestServer, Keys) {
     (fixture, server, keys)
 }
 
-/// An attached capture of the corpus into investigation `n` as `key`; its
-/// result id.
 async fn kept_capture(server: &TestServer, key: &MintedKey, n: u32) -> String {
     captured::captured(
         server,
@@ -92,7 +68,6 @@ async fn kept_capture(server: &TestServer, key: &MintedKey, n: u32) -> String {
     .id
 }
 
-/// An append to investigation `n` as `key`; it must be created.
 async fn append(server: &TestServer, key: &MintedKey, n: u32, body: &Value) -> Value {
     let (status, answer) = call(
         server,
@@ -106,32 +81,25 @@ async fn append(server: &TestServer, key: &MintedKey, n: u32, body: &Value) -> V
     answer
 }
 
-/// A note into investigation `n` as `key`.
 async fn note(server: &TestServer, key: &MintedKey, n: u32, text: &str) {
     append(server, key, n, &json!({ "kind": "note", "text": text })).await;
 }
 
-/// The evidence deadlines of investigation `n`, read as the human.
 async fn deadlines(server: &TestServer, keys: &Keys, n: u32) -> (DateTime<Utc>, DateTime<Utc>) {
     let head = read(server, &keys.human, n, "").await.investigation;
     (at(&head.retain_until), at(&head.retain_ceiling))
 }
 
-/// The entry kinds of investigation `n`'s board, read as the human, in
-/// sequence order.
 async fn board(server: &TestServer, keys: &Keys, n: u32) -> Vec<EntryKind> {
     let mut entries = read(server, &keys.human, n, "").await.entries;
     entries.sort_by_key(|entry| entry.seq);
     entries.iter().map(|entry| entry.payload.kind()).collect()
 }
 
-/// Whether result `id`'s file is in the results root.
 fn file_exists(server: &TestServer, id: &str) -> bool {
     server.state.results.root.path_of(id).unwrap().exists()
 }
 
-/// Assert that the human's read of row 0 of result `id`, the request the
-/// board makes per cited row, answers 410 for the retention reason.
 async fn assert_retention_ended(server: &TestServer, keys: &Keys, id: &str, what: &str) {
     let (status, _, body) =
         captured::page(server, &keys.human.token, id, "?offset=0&limit=1").await;
@@ -144,9 +112,6 @@ async fn assert_retention_ended(server: &TestServer, keys: &Keys, id: &str, what
     );
 }
 
-/// Kept evidence outlives a restart; once its investigation's retention
-/// ends the sweep prunes it, once, and it reads gone while the finding,
-/// the keep and the step that cite it stay on the board.
 #[tokio::test(flavor = "multi_thread")]
 async fn kept_evidence_outlives_a_restart_and_reads_gone_after_its_retention_ends() {
     let (fixture, server, keys) = boot().await;
@@ -182,7 +147,6 @@ async fn kept_evidence_outlives_a_restart_and_reads_gone_after_its_retention_end
     .await;
     let cited = [EntryKind::Step, EntryKind::Keep, EntryKind::Finding];
 
-    // AC: kept evidence survives a restart.
     let server = fixture.restart(server).await;
     let (status, _, page) = captured::page(&server, &keys.human.token, &result, "").await;
     assert_eq!(
@@ -195,10 +159,8 @@ async fn kept_evidence_outlives_a_restart_and_reads_gone_after_its_retention_end
         Some(captured::ROWS),
         "{page}"
     );
-    // AC: the board shows the finding, the keep and the step after it.
     assert_eq!(board(&server, &keys, 1).await, cited);
 
-    // AC: after `retain_until` the evidence reads as pruned.
     let (retain_until, _) = deadlines(&server, &keys, 1).await;
     let past = retain_until + TimeDelta::seconds(1);
     server.results_clock.set(past);
@@ -206,7 +168,6 @@ async fn kept_evidence_outlives_a_restart_and_reads_gone_after_its_retention_end
     assert_eq!((swept.evidence_pruned, swept.unlinked), (1, 1), "{swept:?}");
     assert_retention_ended(&server, &keys, &result, "after the sweep").await;
     assert!(!file_exists(&server, &result), "the sweep left the file");
-    // AC: the findings, keeps and steps remain.
     assert_eq!(board(&server, &keys, 1).await, cited);
     let step = settled(&server, &keys.human, 1, 1).await;
     let EntryPayload::Step { outcome, .. } = &step.payload else {
@@ -217,15 +178,11 @@ async fn kept_evidence_outlives_a_restart_and_reads_gone_after_its_retention_end
         Some(StepOutcomeKind::Success)
     );
 
-    // The prune happens once.
     let again = sweep(&server.state.results, past).await;
     assert_eq!((again.evidence_pruned, again.unlinked), (0, 0), "{again:?}");
     assert_retention_ended(&server, &keys, &result, "after a second sweep").await;
 }
 
-/// The read is a door of its own: with no sweep between, a read of a kept
-/// result past its investigation's retention prunes that investigation's
-/// evidence, unlinks the file and answers gone for the retention reason.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_alone_ends_evidence_past_its_retention() {
     let (_fixture, server, keys) = boot().await;
@@ -238,19 +195,11 @@ async fn a_read_alone_ends_evidence_past_its_retention() {
     server
         .results_clock
         .set(retain_until + TimeDelta::seconds(1));
-    // AC: after `retain_until` the evidence reads as pruned, sweep or not.
     assert_retention_ended(&server, &keys, &result, "the first read").await;
     assert!(!file_exists(&server, &result), "the read left the file");
-    // AC: the step that made it remains.
     assert_eq!(board(&server, &keys, 2).await, [EntryKind::Step]);
 }
 
-/// A read of a kept result past its retention that a write overtakes still
-/// answers gone. The read loads the row and stops before its locked check;
-/// a note then prunes the evidence and slides the deadline, so the check
-/// finds the retention running again; the read judges the row as the note
-/// left it and answers 410 for the retention reason. The file is refused
-/// while the note's unlink waits, never served.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_read_a_write_overtakes_answers_the_retention_ended() {
     let (_fixture, server, keys) = boot().await;
@@ -265,9 +214,6 @@ async fn a_read_a_write_overtakes_answers_the_retention_ended() {
     assert!(!file_exists(&server, &result), "the note left the file");
 }
 
-/// [`a_read_a_write_overtakes_answers_the_retention_ended`] for a capture
-/// with no columns, which has no file, so its page is answered from the
-/// row alone.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_zero_column_read_a_write_overtakes_answers_the_retention_ended() {
     let (server, keys) = boot_empty().await;
@@ -286,8 +232,6 @@ async fn a_zero_column_read_a_write_overtakes_answers_the_retention_ended() {
     overtaken_read(&server, &keys, 6, &captured.id, None).await;
 }
 
-/// A fixture over an empty data root, whose corpus knows no field, so a
-/// capture keeps no columns and no file; its clock at [`START`].
 async fn boot_empty() -> (TestServer, Keys) {
     let tmp = tempfile::tempdir().unwrap();
     let data = tmp.path().join("data");
@@ -317,11 +261,6 @@ async fn boot_empty() -> (TestServer, Keys) {
     (server, keys)
 }
 
-/// The race of [`a_read_a_write_overtakes_answers_the_retention_ended`]
-/// over `result` of investigation `n`: the human's read stops between
-/// its load and its locked check while the agent's note commits, then
-/// answers 410 for the retention reason. `unlink` holds the note's unlink
-/// of a file until the read has answered.
 async fn overtaken_read(
     server: &Arc<TestServer>,
     keys: &Keys,
@@ -399,7 +338,6 @@ async fn overtaken_read(
     );
 }
 
-/// Wait for a spawned note to be answered.
 async fn write_done(write: tokio::task::JoinHandle<()>) {
     tokio::time::timeout(std::time::Duration::from_mins(1), write)
         .await
@@ -407,9 +345,6 @@ async fn write_done(write: tokio::task::JoinHandle<()>) {
         .expect("the note's task did not panic");
 }
 
-/// Each change slides the deadline to `now + 7 d`; it stops at the 30-day
-/// ceiling; past the ceiling a write prunes the evidence first and still
-/// lands.
 #[tokio::test(flavor = "multi_thread")]
 async fn each_change_slides_the_deadline_until_the_ceiling() {
     let (_fixture, server, keys) = boot().await;
@@ -418,21 +353,17 @@ async fn each_change_slides_the_deadline_until_the_ceiling() {
     settled(&server, &keys.human, 3, 1).await;
     let idle = TimeDelta::days(7);
     let (_, ceiling) = deadlines(&server, &keys, 3).await;
-    // AC: the ceiling is 30 days after creation.
     assert_eq!(ceiling, created + TimeDelta::days(30));
 
-    // AC: a change slides the deadline to `now + idle`.
     let day = created + TimeDelta::days(1);
     server.results_clock.set(day);
     note(&server, &keys.agent, 3, "a day in").await;
     assert_eq!(deadlines(&server, &keys, 3).await.0, day + idle);
 
-    // Changes inside each window keep the evidence alive up to the ceiling.
     for days in [7, 13, 19, 25] {
         server.results_clock.set(created + TimeDelta::days(days));
         note(&server, &keys.agent, 3, "still looking").await;
     }
-    // AC: the deadline stops at the ceiling.
     let late = ceiling - TimeDelta::hours(1);
     server.results_clock.set(late);
     note(&server, &keys.agent, 3, "an hour before the ceiling").await;
@@ -440,7 +371,6 @@ async fn each_change_slides_the_deadline_until_the_ceiling() {
     let (status, _, page) = captured::page(&server, &keys.human.token, &result, "").await;
     assert_eq!(status, StatusCode::OK, "evidence at the ceiling: {page}");
 
-    // AC: past the ceiling a write prunes the evidence first, then lands.
     server.results_clock.set(ceiling + TimeDelta::seconds(1));
     note(&server, &keys.agent, 3, "past the ceiling").await;
     assert!(!file_exists(&server, &result), "the write left the file");
@@ -452,9 +382,6 @@ async fn each_change_slides_the_deadline_until_the_ceiling() {
     );
 }
 
-/// A step whose process died before it recorded an outcome reads
-/// `interrupted` after the next boot, and the boot left the evidence clock
-/// where the step's admission put it, however late it ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_boot_interrupts_a_dead_step_and_leaves_the_clock() {
     let (fixture, server, keys) = boot().await;
@@ -497,13 +424,11 @@ async fn a_boot_interrupts_a_dead_step_and_leaves_the_clock() {
     let EntryPayload::Step { outcome, .. } = &step.payload else {
         panic!("not a step: {step:?}");
     };
-    // AC: the boot records `interrupted`.
     assert_eq!(
         outcome.as_ref().map(|o| o.outcome),
         Some(StepOutcomeKind::Interrupted)
     );
     assert_eq!(outcome.as_ref().and_then(|o| o.total_rows), None);
-    // AC: the interruption advances the sequence and leaves the clock.
     let after = read(&server, &keys.human, 4, "").await.investigation;
     assert_eq!(after.seq, before.seq + 1);
     assert_eq!(

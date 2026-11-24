@@ -1,9 +1,9 @@
 diff --git a/crates/trawl-server/src/pool.rs b/crates/trawl-server/src/pool.rs
-index 3cd8b088..56632b85 100644
+index ec306980..f9a387f6 100644
 --- a/crates/trawl-server/src/pool.rs
 +++ b/crates/trawl-server/src/pool.rs
-@@ -2228,7 +2228,10 @@ impl ExecutorPool {
-         // A refusal here drops the permit with this frame: nothing ran.
+@@ -1736,7 +1736,10 @@ impl ExecutorPool {
+ 
          let published = {
              let _wait = clock.guard(QueryPhase::PublicationWait);
 -            wake.run(deadline, self.publication.read()).await

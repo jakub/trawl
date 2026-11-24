@@ -21,8 +21,6 @@ for (const [path, label, columns] of [
     await expect(table).toBeVisible();
     await expect(table.getByRole('columnheader')).toHaveCount(columns);
     const row = table.locator('tbody > tr').first();
-    // A trailing slack column takes the spare width so a row's facts sit
-    // next to its identifier; it stays out of the accessibility tree.
     for (const slack of await table.locator('.col-slack').all()) {
       await expect(slack).toHaveAttribute('aria-hidden', 'true');
       await expect(slack).toBeEmpty();
@@ -174,8 +172,7 @@ test('live-tail wraps the whole message including unbroken suffixes', async ({ p
   expect(geometry.height).toBeGreaterThan(60);
   expect(geometry.suffixFits).toBe(true);
   const stream = page.getByRole('region', { name: 'Live tail messages', exact: true });
-  // This finite response disconnects after its one event. Retry is now a
-  // reachable control between Pause and the retained messages.
+  // This finite response disconnects after its one event.
   const retry = page.getByRole('button', { name: 'Retry live stream', exact: true });
   await expect(retry).toBeVisible();
   await page.getByRole('button', { name: 'Pause', exact: true }).focus();

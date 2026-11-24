@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Pure serialization of the loaded history rows, in their supplied order.
-
 use std::fmt::Write as _;
 
 use trawl_api::HistoryEntryResponse;
@@ -33,7 +31,6 @@ impl HistoryExportFormat {
     }
 }
 
-/// Serialize exactly these rows. Filtering and pagination belong to the caller.
 pub fn serialize_history(
     entries: &[HistoryEntryResponse],
     format: HistoryExportFormat,

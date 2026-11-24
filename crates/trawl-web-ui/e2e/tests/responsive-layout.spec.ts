@@ -39,35 +39,24 @@ for (const width of [320, 720, 900, 1024, 1440]) {
     for (const selector of ['.topbar .jump', '.topbar .user', '.dsl-editor', '.run', '.tabs .export']) {
       await insideViewport(page.locator(selector));
     }
-    // The console's Save as Net is the one save entry on this page.
     await insideViewport(page.locator(SEL.editorTool).filter({ hasText: COPY.saveAsNetTool }));
     if (width >= 900) {
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
       for (const control of await page.locator('nav.rail .bot a, nav.rail .bot button').all()) {
         await insideViewport(control);
       }
-      // The sidebar is docked here, so a toggle would be a control that
-      // opens nothing. At exactly 900 the CSS used to reveal it while
-      // `Shell` still gated the overlay on 899.98 — visible and dead.
       await expect(page.locator(SEL.navToggle)).toBeHidden();
     } else {
-      // Below 900px navigation is an overlay the command bar opens.
       const toggle = page.locator(SEL.navToggle);
       await insideViewport(toggle);
       await toggle.click();
-      // The overlay slides in from 20px off the left edge. Measure it at
-      // rest, by its own animation's `finished` promise: this suite does
-      // not run under emulated reduced motion, so a box read on the
-      // frame after the click is a frame of the entrance, not the
-      // layout. (`animation-fill-mode` is `none`, so an element that
-      // never animates resolves immediately.)
+      // The overlay slides in. This suite does not run under emulated
+      // reduced motion, so a box read on the frame after the click is a
+      // frame of the entrance: wait for the animation's `finished`.
       await page.locator('nav.rail.overlay').evaluate(async (el) => {
         await Promise.all(el.getAnimations().map((a) => a.finished));
       });
       for (const link of await page.locator(SEL.paletteRailLink).all()) await insideViewport(link);
-      // The bottom slot too: Help and the collapse control live outside
-      // the destination list the palette selector names, and a sweep
-      // that skips them is a sweep of half the sidebar.
       for (const control of await page.locator('nav.rail .bot a, nav.rail .bot button').all()) {
         await insideViewport(control);
       }
@@ -110,7 +99,6 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await expect(needle).toHaveValue('0');
   await expect(page.getByRole('button', { name: 'Include host = cache-01', exact: true })).toBeVisible();
   await page.setViewportSize({ width: 1440, height: 900 });
-  // Wide, the summary is the open rail's header row (ADR-0044).
   await expect(summary).toBeVisible();
   await expectRail(page, true);
   await expect(needle).toHaveValue('0');
@@ -133,9 +121,6 @@ test('responsive filters preserve field search, expanded groups and URL filters 
   await noPageOverflow(page);
 });
 
-// Below 900px the rail is what it was before ADR-0044: a disclosure a
-// countable page leaves closed, whose own open state is not the wide
-// rail's hand choice.
 test('responsive filters: a countable page leaves the narrow disclosure closed, and a narrow close leaves the wide rail automatic', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.setViewportSize({ width: 720, height: 900 });
@@ -148,7 +133,6 @@ test('responsive filters: a countable page leaves the narrow disclosure closed, 
   await expect(panel).toHaveAttribute('open', '');
   await summary.click();
   await expect(panel).not.toHaveAttribute('open');
-  // Wide, on the same countable page, the rail opens by itself.
   await page.setViewportSize({ width: 1440, height: 900 });
   await expectRail(page, true);
 });
@@ -163,7 +147,6 @@ test('responsive filters keep the value search and group state across 720, 1440 
   await expect(panel).toHaveAttribute('open', '');
   const needle = page.locator(SEL.facetFilterInput);
   await needle.fill('0');
-  // One group collapsed, and one expanded past its first five values.
   const status = panel.getByRole('button', { name: /^status, \d+ values?$/ });
   await status.click();
   await expect(status).toHaveAttribute('aria-expanded', 'false');
@@ -187,9 +170,6 @@ test('responsive filters keep the value search and group state across 720, 1440 
   await noPageOverflow(page);
 });
 
-// Narrowing reopens the disclosure for focus in its content, above, so
-// the focused control is never hidden. The <summary> is the one part a
-// closed disclosure still shows, so focus there reopens nothing.
 test('responsive filters leave the narrow disclosure closed for focus on its summary', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.setViewportSize({ width: 1440, height: 900 });
@@ -197,7 +177,6 @@ test('responsive filters leave the narrow disclosure closed for focus on its sum
   await expect(page.locator(SEL.resultsRow)).toHaveCount(8);
   await expectRail(page, true);
   const panel = page.locator(SEL.filterRail), summary = page.locator(SEL.filterRailSummary);
-  // A wide press closes the rail and leaves focus where it was.
   await summary.press('Enter');
   await expectRail(page, false);
   await expect(summary).toBeFocused();
@@ -253,8 +232,6 @@ test('scroll instructions follow actual overflow as the viewport and results cha
   }
   await page.setViewportSize({ width: 320, height: 900 });
   await page.goto('/search');
-  // A search that has not run yet is the Quick start guide, which has no
-  // table and so nothing to scroll sideways.
   await expect(page.locator('.search-quick-start').getByRole('heading', { name: 'Quick start', exact: true })).toBeVisible();
   await expect(page.locator('.overflow-hint')).toHaveCount(0);
   await page.locator('.dsl-editor').getByRole('textbox').fill('service=nginx');
@@ -317,9 +294,6 @@ for (const width of [320, 720]) {
   });
 }
 
-// The overlay's open flag survived the viewport leaving compact, so the
-// next narrowing re-opened it by itself over a page nobody had asked it
-// about.
 test('the nav overlay does not re-open by itself after a wide detour', async ({ page, request }) => {
   await resetScenario(request, 'corpus');
   await page.setViewportSize({ width: 720, height: 900 });

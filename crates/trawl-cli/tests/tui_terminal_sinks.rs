@@ -4,15 +4,6 @@
 
 //! What sender-chosen text does on its way through the TUI to an
 //! operator's terminal.
-//!
-//! A real trawld stores one event whose message holds a bidi override
-//! (U+202E), a zero-width space (U+200B) and a soft hyphen (U+00AD), each
-//! between plain markers. The real `trawl` TUI runs on a PTY and runs a
-//! batch query whose own text holds none of them, then opens the event
-//! detail popup on the event's row. The popup draws U+FFFD in place of
-//! each, one for one. Neither the driver's capture nor the bytes the TUI
-//! wrote to its terminal hold any of the three. Every step waits on a
-//! driver reply; nothing sleeps.
 
 mod common;
 
@@ -21,22 +12,15 @@ use serde_json::json;
 use common::Server;
 use common::tui::{Home, READER_PERMISSIONS, Tui, pinned};
 
-/// The service the event arrives under, and a query that finds it. The
-/// query projects no `_time`, so the result opens in the table view.
+/// `QUERY` projects no `_time`, so the result opens in the table view.
 const SERVICE: &str = "tui_sink_probe";
 const QUERY: &str = "service=tui_sink_probe | table message";
 
-/// The message a sender chose, and how the TUI draws it.
 const HOSTILE: &str = "zqx\u{202e}1\u{200b}2\u{00ad}3";
 const SHOWN: &str = "zqx\u{fffd}1\u{fffd}2\u{fffd}3";
 
-/// The characters no terminal may receive from the event.
 const FORBIDDEN: [char; 3] = ['\u{202e}', '\u{200b}', '\u{00ad}'];
 
-/// The rows inside the event detail popup's border, each cut to the
-/// columns between its side edges. The popup's top edge is the row that
-/// holds its title. A capture line is the grid row in quotes, one
-/// character per cell, so a character's index is its column plus one.
 fn popup_rows(screen: &str) -> Vec<String> {
     let grid: Vec<Vec<char>> = screen.lines().map(|l| l.chars().collect()).collect();
     let (top, title) = grid
@@ -72,7 +56,6 @@ fn popup_rows(screen: &str) -> Vec<String> {
         .collect()
 }
 
-/// Each forbidden character `text` holds, with the line it is on.
 fn forbidden_in(text: &str) -> Vec<String> {
     text.lines()
         .enumerate()
@@ -84,9 +67,6 @@ fn forbidden_in(text: &str) -> Vec<String> {
         .collect()
 }
 
-/// The event detail popup draws a sender's bidi override, zero-width space
-/// and soft hyphen as U+FFFD, and the TUI writes none of them to its
-/// terminal, while the result it holds keeps the value as sent.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tui_terminal_sinks_reach_no_terminal_control() {
     let server = Server::start(true).await;
@@ -101,7 +81,6 @@ async fn tui_terminal_sinks_reach_no_terminal_control() {
     let mut tui = Tui::start(&home, "UTC", &config).await;
     tui.batch(QUERY).await;
 
-    // The result keeps the value as sent: only the drawing replaces it.
     let results = tui.send(json!({ "cmd": "get_results" })).await;
     let column = results["columns"]
         .as_array()

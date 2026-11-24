@@ -2,12 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The query database's budgets against the bundled `DuckDB` (ADR-0056):
-//! they read back from a clone, and a spill past the cap fails as
-//! [`EngineError::ResourceExhausted`] without the spill directory ever
-//! holding more than the cap plus one block of each temp-file size class.
-//! That bound holds while each class stays within one temp file, which is
-//! true at the small caps these tests use (see [`CLASS_SLACK`]).
+//! The query database's budgets against the bundled `DuckDB` (ADR-0056).
 
 use std::num::{NonZeroU32, NonZeroU64};
 use std::path::{Path, PathBuf};
@@ -25,18 +20,8 @@ const BLOCK: u64 = 262_144;
 
 /// What the spill directory may hold past the cap on `DuckDB` 1.5.5: one
 /// block of each temp-file size class, 32 KiB to 256 KiB in 32 KiB steps.
-///
-/// `DuckDB` accounts a temp file as its highest block index in use, but
-/// truncates a shrinking file one block past that
-/// (`TemporaryFileManager::RemoveTempBlockIndex`), and keeps one file per
-/// size class until a class passes 4000 blocks, about 1000 MiB at 256 KiB
-/// blocks, then adds files of 4000 × 2^n blocks (`TemporaryFileHandle`,
-/// `TemporaryFileMap`). So each live file can hold one block it does not
-/// count. This figure is one block per class, which is the bound only while
-/// every class stays within one file. These tests run at caps of tens of
-/// MiB, where it does; at the 4 GiB default a class can hold several files
-/// and the bound is one block per live file. The spill probe measured up to
-/// 1.9 blocks past the cap.
+/// This figure is one block per class, which is the bound only while
+/// every class stays within one file.
 const CLASS_SLACK: u64 = 1_179_648;
 
 fn budgets(spill: u64, memory: u64, threads: u32) -> QueryBudgets {
@@ -47,12 +32,10 @@ fn budgets(spill: u64, memory: u64, threads: u32) -> QueryBudgets {
     }
 }
 
-/// The query scratch directory at `path`, locked for this test.
 fn lock(path: &Path) -> ScratchLock {
     ScratchLock::open(path).expect("the scratch directory locks")
 }
 
-/// The one spill directory the query database made in `scratch`.
 fn spill_dir_in(scratch: &Path) -> PathBuf {
     let mut dirs: Vec<_> = std::fs::read_dir(scratch)
         .expect("read scratch")
@@ -133,9 +116,6 @@ fn query_budgets_read_back_from_a_clone() {
     assert_eq!(reopened.reclaimed(), Reclaimed::default());
 }
 
-/// Budgets `DuckDB` takes at a different value are refused at open, not
-/// run under: a memory limit past what `DuckDB` will hold reads back as
-/// something else.
 #[test]
 fn a_budget_that_reads_back_differently_refuses_the_open() {
     let scratch = tempfile::tempdir().expect("scratch");
@@ -189,13 +169,6 @@ fn random_strings_parquet(dir: &Path, rows: usize) -> PathBuf {
 
 /// The largest byte totals the spill directory reached across samples:
 /// the sum of the files' lengths and of their allocated blocks.
-///
-/// The directory bound is on `length`, the bytes `DuckDB` wrote and
-/// counts. `allocated` is printed with each run's result and is not
-/// bounded: a
-/// filesystem that allocates ahead of a growing file's end (XFS does)
-/// holds blocks `DuckDB` never asked for, up to 113 MiB of them at these
-/// caps (ADR-0056, amendment of 2026-11-10).
 #[derive(Debug, Default, Clone, Copy)]
 struct Peak {
     length: u64,
@@ -203,7 +176,6 @@ struct Peak {
     samples: u64,
 }
 
-/// The spill directory's totals right now.
 fn totals(dir: &Path) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt as _;
     let (mut length, mut allocated) = (0, 0);
@@ -218,8 +190,6 @@ fn totals(dir: &Path) -> (u64, u64) {
     (length, allocated)
 }
 
-/// Whether every thread of `pid` has stopped, or the process has exited
-/// (a zombie never reads as stopped).
 fn stopped_or_gone(pid: u32) -> bool {
     let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
         return true;
@@ -233,11 +203,7 @@ fn stopped_or_gone(pid: u32) -> bool {
     })
 }
 
-/// The child half of [`spill_under`]: run `TRAWL_SPILL_PROBE` in this
-/// process and print its outcome: `ok <rows>`, or `err <class> <message>`
-/// with the class [`EngineError`] gives the failure and `DuckDB`'s own
-/// message. Ignored, and a no-op without the variable, so only the parent
-/// runs it.
+/// The child half of [`spill_under`].
 #[test]
 #[ignore = "child process of the spill tests"]
 fn spill_probe_child() {
@@ -275,13 +241,10 @@ fn spill_probe_child() {
 }
 
 /// Run `sql` on a fresh query database under `budgets` in a child process
-/// and sample its spill directory with the whole child stopped.
-///
-/// Each sample sends `SIGSTOP`, waits until every thread is stopped, reads
-/// the directory, then sends `SIGCONT`. No thread moves a block while the
-/// directory is read, so a sample is one consistent state of the files,
-/// not a sum of states taken at different moments. Sampling can still
-/// miss a peak between two samples.
+/// and sample its spill directory with the whole child stopped. No thread
+/// moves a block while the directory is read, so a sample is one
+/// consistent state of the files, not a sum of states taken at different
+/// moments.
 fn spill_under(sql: &str, budgets: &QueryBudgets) -> (String, Peak) {
     use rustix::process::{Pid, Signal, kill_process};
 
@@ -349,7 +312,6 @@ fn window_sort(source: &Path) -> String {
     )
 }
 
-/// A hash aggregate over every distinct payload, answered with one row.
 fn distinct_count(source: &Path) -> String {
     format!(
         "SELECT count(*) FROM (SELECT DISTINCT payload FROM read_parquet('{}'))",
@@ -357,15 +319,9 @@ fn distinct_count(source: &Path) -> String {
     )
 }
 
-/// The spill probe (ADR-0056, AC4): the natural spill peak of each shape
-/// under a cap it never reaches, then caps swept below that peak, where
-/// the merge phase frees and rewrites blocks before the cap is hit.
-///
-/// Ignored: a measurement of the worst overshoot past the cap across both
-/// shapes and two memory limits, kept for re-measuring
-/// [`CLASS_SLACK`] when `DuckDB` is upgraded. Run it by hand with
-/// `--run-ignored only --no-capture`. The bound itself is asserted by
-/// [`spill_stays_within_budget_plus_class_slack`].
+/// Ignored: a measurement of the worst overshoot past the cap, kept for
+/// re-measuring [`CLASS_SLACK`] when `DuckDB` is upgraded. Run it by hand
+/// with `--run-ignored only --no-capture`.
 #[test]
 #[ignore = "measurement, run by hand"]
 fn spill_budget_probe() {
@@ -465,8 +421,6 @@ fn duckdb_format_bytes(bytes: u64) -> String {
     format!("{} bytes", parts[0])
 }
 
-/// The rendering matches what `DuckDB` printed for the cap that once failed
-/// a tolerance check, and its other unit edges.
 #[test]
 fn duckdb_format_bytes_cuts_like_duckdb() {
     for (bytes, text) in [
@@ -480,14 +434,8 @@ fn duckdb_format_bytes_cuts_like_duckdb() {
     }
 }
 
-/// The last cap of the sweep in [`spill_stays_within_budget_plus_class_slack`],
-/// as a percentage of the natural peak.
 const TOP_PERCENT: u64 = 96;
 
-/// The checks on a capped run that the spill cap refused: `DuckDB` names
-/// the spill cap, not memory, reports the configured cap, accounts no more
-/// than it, and the directory held no more than the cap plus
-/// [`CLASS_SLACK`]. `run` names the run in each failure.
 fn assert_refused_by_the_spill_cap(run: &str, cap: u64, outcome: &str, peak: Peak) {
     let message = outcome
         .strip_prefix("err resource_exhausted ")
@@ -516,34 +464,11 @@ fn assert_refused_by_the_spill_cap(run: &str, cap: u64, outcome: &str, peak: Pea
     );
 }
 
-/// AC4's engine half (ADR-0056): whether a capped spill completes or is
-/// refused, the spill directory never holds more than the cap plus
-/// [`CLASS_SLACK`]; and a refused run fails as
-/// [`EngineError::ResourceExhausted`] through the spill cap, with the
-/// usage `DuckDB` accounts never past the cap.
-///
-/// The shape is a full sort over a million poorly compressible strings at
-/// 128 MiB of memory and two threads, so it spills about 240 MiB with no
-/// cap. The caps sweep from 40% to 96% of that natural peak: below about
-/// half the sort usually fails while its runs are still growing, and above
-/// it the merge frees and rewrites blocks, which is where the slack appears
-/// (the probe's worst cases sat at 52%, 68% and 76%).
-///
 /// The sort's real peak varies with thread timing, and the natural peak is
 /// only the largest spill one run's samples saw, so any capped run may sit
-/// above its own real peak and complete. ADR-0056 promises the budget, not
-/// a repeatable peak: a completed run keeps the directory bound, and a
-/// refused run keeps every refusal check. When every step completes, this
+/// above its own real peak and complete. When every step completes, this
 /// test checks no refusal; [`spill_cap_refuses_a_low_fixed_cap`] always
 /// does.
-///
-/// The directory is sampled with the query's process stopped
-/// ([`spill_under`]): one `read_dir` pass over files that other threads
-/// are growing and truncating is not one state of the directory, and its
-/// sum can count a block twice. A stopped process gives a consistent sum,
-/// so the assertion cannot fail on a sampling artefact. Residual exposure:
-/// sampling can miss a peak between two samples, which weakens the check
-/// but never makes it fail falsely.
 #[test]
 fn spill_stays_within_budget_plus_class_slack() {
     let data = tempfile::tempdir().expect("data");
@@ -591,22 +516,12 @@ fn spill_stays_within_budget_plus_class_slack() {
     );
 }
 
-/// The spill cap in [`spill_cap_refuses_a_low_fixed_cap`]: a few blocks,
-/// far below the fixture's natural spill of about 240 MiB.
 const LOW_CAP: u64 = MIB;
 
-/// The fixture of [`spill_stays_within_budget_plus_class_slack`] under a
-/// fixed cap far below its natural spill must be refused by the spill cap
-/// (ADR-0056), not by memory. This is the refusal check the sweep cannot
-/// guarantee, since any sweep step may complete.
-///
 /// The refusal does not depend on a sample. A cap this low is refused
 /// within a few blocks, so under load the samples can all fall before the
 /// first block or after the refusal removed the files, and a parent that
-/// runs late can take none. The peak is printed as evidence of the run.
-///
-/// Residual exposure: the directory bound is checked only at the samples
-/// taken, as in the sweep.
+/// runs late can take none.
 #[test]
 fn spill_cap_refuses_a_low_fixed_cap() {
     let data = tempfile::tempdir().expect("data");

@@ -2,8 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A restart whose surviving WAL the hot buffer cannot hold (ADR-0041
-//! slice 2), through a real `AppState` and the HTTPS server.
+//! A restart whose surviving WAL the hot buffer cannot hold (ADR-0041),
+//! through a real `AppState` and the HTTPS server.
 //!
 //! Each test plants writer-format WAL above the hot-buffer caps before the
 //! fixture boots, so hydration leaves **overhang**. The fixture never
@@ -36,7 +36,7 @@ use trawl_server::store::{FinishOutcome, RunClaim, RunStatus};
 /// Every planted event's service, so counts see no seed row.
 const SERVICE: &str = "restartoverhang";
 
-/// Caps a handful of events can overflow. The compaction interval only
+/// The compaction interval only
 /// matters to the loop a test spawns to release overhang; its first pass
 /// runs at once regardless.
 const KNOBS: HotBufferKnobs = HotBufferKnobs {
@@ -45,18 +45,12 @@ const KNOBS: HotBufferKnobs = HotBufferKnobs {
     compaction_interval_secs: 3600,
 };
 
-/// Events in the planted file that fits the caps and hydrates.
 const FITS: usize = 5;
 
-/// Events in the planted file over the full event cap: never resident.
 const OVERSIZED: usize = 30;
 
-/// The saved query whose recorded run `| from saved` reads.
 const REPORT: &str = "overhang_report";
 
-// -- capture -------------------------------------------------------------------
-
-/// The one global subscriber, under the production default directives.
 fn capture() -> &'static Capture {
     static CAPTURE: OnceLock<Capture> = OnceLock::new();
     CAPTURE.get_or_init(|| {
@@ -71,7 +65,6 @@ fn capture() -> &'static Capture {
     })
 }
 
-/// Every captured event whose `event_type` is exactly `name`.
 fn events_of(name: &str) -> Vec<Captured> {
     let quoted = format!("{name:?}");
     capture()
@@ -81,10 +74,6 @@ fn events_of(name: &str) -> Vec<Captured> {
         .collect()
 }
 
-// -- planting and boot ---------------------------------------------------------
-
-/// A WAL file in the live writer's name and line format, planted under
-/// `dir/wal/prod`, holding `count` events of [`SERVICE`] tagged `tag`.
 fn plant_wal(dir: &Path, tag: &str, count: usize) -> PathBuf {
     let time = (Utc::now() - chrono::Duration::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -106,9 +95,6 @@ fn plant_wal(dir: &Path, tag: &str, count: usize) -> PathBuf {
     writer.write("prod", SERVICE, &ndjson).unwrap()
 }
 
-/// Boot over a WAL the caps cannot hold: a file of `fits` events that
-/// hydrates (none when zero) and one oversized file. Returns the server
-/// and its data root.
 async fn boot_with_overhang(dir: &Path, fits: usize) -> (TestServer, String) {
     let data = seed_data_root(dir);
     if fits > 0 {
@@ -135,14 +121,10 @@ async fn boot_with_overhang(dir: &Path, fits: usize) -> (TestServer, String) {
     (server, data)
 }
 
-/// The gate the server's reads go through.
 fn unsettled(state: &AppState) -> Option<CorpusUnsettled> {
     state.query.pool.publication().unsettled()
 }
 
-/// Release overhang the way production does: run the compaction loop
-/// `main` runs over this server's WAL and data root until its coverage
-/// proof settles the gate, then stop it.
 async fn settle(server: &TestServer, dir: &Path, data: &str) {
     let state = &server.state;
     let ingest = trawl_config::IngestConfig::default();
@@ -175,8 +157,6 @@ async fn settle(server: &TestServer, dir: &Path, data: &str) {
     compaction.await.unwrap();
 }
 
-// -- requests ------------------------------------------------------------------
-
 fn raw_client() -> reqwest::Client {
     common::harness_client_builder().build().unwrap()
 }
@@ -185,7 +165,6 @@ fn client(server: &TestServer) -> trawl_client::HttpClient {
     trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap()
 }
 
-/// `stats count()` over `dsl` through the query API.
 async fn count(server: &TestServer, dsl: &str) -> i64 {
     let dsl = format!("{dsl} | stats count()");
     let result = client(server)
@@ -198,8 +177,6 @@ async fn count(server: &TestServer, dsl: &str) -> i64 {
     }
 }
 
-/// One authenticated request: its status, its `Retry-After`, its request
-/// id and its body as text.
 struct Answer {
     status: u16,
     retry_after: Option<String>,
@@ -252,7 +229,6 @@ async fn post(server: &TestServer, token: &str, path: &str, body: serde_json::Va
     .await
 }
 
-/// `/api/v1/health`: HTTP 200 with `status` and `checks.corpus`.
 async fn health(server: &TestServer) -> (String, String) {
     let answer = answer(raw_client().get(format!("{}/api/v1/health", server.url))).await;
     assert_eq!(answer.status, 200, "{}", answer.body);
@@ -263,8 +239,6 @@ async fn health(server: &TestServer) -> (String, String) {
     )
 }
 
-/// The value `/metrics` renders for `trawl_corpus_unsettled{reason}`, as
-/// the exposition text spells it (`1` or `0`).
 async fn corpus_gauge(server: &TestServer, reason: CorpusUnsettled) -> String {
     let answer = answer(raw_client().get(format!("{}/metrics", server.url))).await;
     assert_eq!(answer.status, 200);
@@ -280,8 +254,6 @@ async fn corpus_gauge(server: &TestServer, reason: CorpusUnsettled) -> String {
         .unwrap_or_else(|| panic!("no {series} in the scrape:\n{}", answer.body))
 }
 
-/// A saved query with a schedule attached, owned by the analyst key.
-/// Returns the saved query's id and the schedule's.
 async fn scheduled_saved_query(server: &TestServer, name: &str) -> (i64, i64) {
     let client = client(server);
     let saved = client
@@ -295,12 +267,10 @@ async fn scheduled_saved_query(server: &TestServer, name: &str) -> (i64, i64) {
     (saved.id, schedule.id)
 }
 
-/// The app-state database, for what no API reports byte for byte.
 async fn app_db(server: &TestServer) -> sqlx::PgPool {
     common::fixture_pool(&server.app_db_url, 1).await
 }
 
-/// The schedule row, as Postgres renders it: every column, byte for byte.
 async fn schedule_row(db: &sqlx::PgPool, schedule_id: i64) -> String {
     sqlx::query_scalar("SELECT row_to_json(s)::text FROM schedules s WHERE id = $1")
         .bind(schedule_id)
@@ -317,9 +287,6 @@ async fn run_count(db: &sqlx::PgPool, saved_id: i64) -> i64 {
         .unwrap()
 }
 
-/// Assert `answer` is the overhang refusal: 503 `corpus_recovering`, no
-/// `Retry-After`, and exactly one `http_failure` for its request, naming
-/// `restart_backlog`.
 fn assert_restart_backlog_refusal(what: &str, answer: &Answer) {
     assert_eq!(answer.status, 503, "{what}: {}", answer.body);
     assert_eq!(answer.retry_after, None, "{what}: no retry hint");
@@ -345,9 +312,6 @@ fn assert_restart_backlog_refusal(what: &str, answer: &Answer) {
     );
 }
 
-/// A dry-run repin of a pinned field while the corpus is unsettled.
-/// Asserts the job it claimed ended `blocked` with the text that names the
-/// reason, and returns the request's answer.
 async fn refused_repin(server: &TestServer) -> Answer {
     // Admission reaches the corpus check only for a pinned field. The
     // fixture compacts nothing, so pin the planted one here.
@@ -396,14 +360,6 @@ async fn refused_repin(server: &TestServer) -> Answer {
     answer
 }
 
-// -- AC6: refusal and release --------------------------------------------------
-
-/// With WAL above the caps and compaction held (the fixture runs none),
-/// every corpus read answers 503 `corpus_recovering` with one failure
-/// record naming `restart_backlog` and no retry hint, health degrades at
-/// HTTP 200, and the gauge reads 1. Compaction's coverage proof then
-/// settles the gate: every planted event counts once, the gauge reads 0,
-/// and `corpus_settled` is logged once.
 #[tokio::test(flavor = "multi_thread")]
 async fn overhang_refuses_corpus_reads_until_compaction_settles_it() {
     capture();
@@ -483,9 +439,6 @@ async fn overhang_refuses_corpus_reads_until_compaction_settles_it() {
     );
 }
 
-// -- AC7: lanes the gate does not hold -----------------------------------------
-
-/// The result of the report both servers record.
 fn report() -> QueryResult {
     QueryResult {
         columns: vec![
@@ -499,10 +452,6 @@ fn report() -> QueryResult {
     }
 }
 
-/// Record a finished run of `name` whose result is [`report`], through the
-/// stores the scheduler records with, and the result file where it writes
-/// one: the report a `| from saved` read finds after a restart. No run can
-/// execute during overhang, so this is how the overhang server gets one.
 async fn record_report(server: &TestServer, data: &str, name: &str) {
     let (saved_id, schedule_id) = scheduled_saved_query(server, name).await;
     let store = &server.state.storage.schedule;
@@ -536,7 +485,6 @@ async fn record_report(server: &TestServer, data: &str, name: &str) {
     );
 }
 
-/// Read an SSE response until `needle` and the end of its frame arrive.
 async fn read_sse_until(response: &mut reqwest::Response, needle: &str) -> String {
     let mut bytes: Vec<u8> = Vec::new();
     let read = tokio::time::timeout(Duration::from_secs(15), async {
@@ -560,8 +508,6 @@ async fn read_sse_until(response: &mut reqwest::Response, needle: &str) -> Strin
     })
 }
 
-/// Tail `service=livetail` over SSE, ingest one event, and return the
-/// payload the tail delivered for it.
 async fn live_tail_delivers(server: &TestServer) -> serde_json::Value {
     let mut stream = raw_client()
         .get(format!("{}/api/v1/stream", server.url))
@@ -587,7 +533,6 @@ async fn live_tail_delivers(server: &TestServer) -> serde_json::Value {
         .unwrap()
 }
 
-/// Wait for the schema refresh to fill `/schema/services`.
 async fn schema_services(server: &TestServer) -> Answer {
     let deadline = Instant::now() + Duration::from_secs(15);
     loop {
@@ -599,8 +544,6 @@ async fn schema_services(server: &TestServer) -> Answer {
     }
 }
 
-/// The columns and rows of `| from saved` [`REPORT`], which the query
-/// response flattens beside its execution facts.
 async fn from_saved(server: &TestServer) -> (serde_json::Value, serde_json::Value) {
     let query = serde_json::json!({ "query": format!("| from saved {REPORT} | stats sum(n)") });
     let answer = post(server, &server.analyst_token, "/api/v1/query", query).await;
@@ -609,8 +552,6 @@ async fn from_saved(server: &TestServer) -> (serde_json::Value, serde_json::Valu
     (body["columns"].clone(), body["rows"].clone())
 }
 
-/// Fill `from`'s field-value cache for `field` with a real read, and copy
-/// the entry that read produced into `to`'s cache.
 async fn copy_field_values_cache(from: &TestServer, to: &TestServer, field: &str) {
     let path = format!("/api/v1/schema/values/{field}");
     let filled = get(from, &from.analyst_token, &path).await;
@@ -633,8 +574,6 @@ async fn copy_field_values_cache(from: &TestServer, to: &TestServer, field: &str
         .insert(field.to_owned(), entry);
 }
 
-/// Assert the overhang server answered `what` as the settled one did:
-/// the same status and the same JSON body, and a 200.
 fn assert_same_answer(what: &str, settled: &Answer, during: &Answer) {
     assert_eq!(settled.status, 200, "{what}: {}", settled.body);
     assert_eq!(
@@ -644,10 +583,6 @@ fn assert_same_answer(what: &str, settled: &Answer, during: &Answer) {
     );
 }
 
-/// During overhang, the lanes that take no publication read guard answer
-/// exactly as a settled server does: the SSE live tail, `| from saved`,
-/// `/schema`, `/schema/services`, `/metrics` and a cached field-values hit.
-///
 /// The settled server is a control booted beside it, over the same seed,
 /// the same caps and the same recorded report, with no WAL to hydrate. The
 /// field-value cache is empty at boot and filling it takes a corpus read,
@@ -722,9 +657,6 @@ async fn unaffected_lanes_answer_during_overhang_as_on_a_settled_server() {
     );
 }
 
-// -- AC11: nets ----------------------------------------------------------------
-
-/// The schedule's first planned fire.
 async fn first_fire(db: &sqlx::PgPool, schedule_id: i64) -> DateTime<Utc> {
     sqlx::query_scalar("SELECT next_fire_at FROM schedules WHERE id = $1")
         .bind(schedule_id)
@@ -733,8 +665,6 @@ async fn first_fire(db: &sqlx::PgPool, schedule_id: i64) -> DateTime<Utc> {
         .unwrap()
 }
 
-/// One scheduler poll at `now` over the server's stores, awaiting the
-/// executions it spawned. Returns how many it spawned.
 async fn poll(server: &TestServer, now: DateTime<Utc>) -> usize {
     let key_store = fleet_auth::KeyStore::from_pool(server.fleet_pool.clone());
     let handles = poll_and_execute(
@@ -756,10 +686,6 @@ async fn poll(server: &TestServer, now: DateTime<Utc>) -> usize {
     spawned
 }
 
-/// While the corpus is unsettled a scheduler poll claims nothing: the
-/// schedule row, fire cursor and watermark included, is byte-identical
-/// before and after, and no run exists. Once compaction settles the
-/// corpus, one claim covers every boundary that passed in between.
 #[tokio::test(flavor = "multi_thread")]
 async fn nets_scheduler_poll_claims_nothing_while_unsettled() {
     capture();
@@ -806,7 +732,6 @@ async fn nets_scheduler_poll_claims_nothing_while_unsettled() {
     );
 }
 
-/// The key that owns `saved_id`, which the run listing is scoped by.
 async fn runs_owner(server: &TestServer, saved_id: i64) -> i64 {
     sqlx::query_scalar("SELECT key_id FROM saved_queries WHERE id = $1")
         .bind(saved_id)
@@ -815,11 +740,6 @@ async fn runs_owner(server: &TestServer, saved_id: i64) -> i64 {
         .unwrap()
 }
 
-/// While the corpus is unsettled a manual run answers 503
-/// `corpus_recovering` before it claims: no run row, and the schedule row
-/// is unchanged. After settling the same request starts a run. A saved
-/// query that does not exist, or that another key owns, is a 404 either
-/// way: the lookup comes before the corpus check.
 #[tokio::test(flavor = "multi_thread")]
 async fn nets_manual_run_is_refused_before_it_claims() {
     capture();
@@ -860,10 +780,6 @@ async fn nets_manual_run_is_refused_before_it_claims() {
     assert_eq!(run_count(&db, saved_id).await, 1);
 }
 
-/// The scheduler loop logs the corpus state once per change, never once
-/// per poll: one pause naming the reason while the corpus is unsettled,
-/// one resume after it settles. The schedule is due from the start, and
-/// the loop claims it only after the resume.
 #[tokio::test(flavor = "multi_thread")]
 async fn nets_scheduler_loop_logs_each_corpus_transition_once() {
     capture();

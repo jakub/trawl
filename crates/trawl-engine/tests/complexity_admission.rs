@@ -4,20 +4,10 @@
 
 //! Over-budget DSL never reaches `DuckDB` (ADR-0024).
 //!
-//! `trawl-core` proves that the bind-time expansion budget refuses the
-//! right queries; the parity tests prove both validation doors say the
-//! same thing. What is left is the claim the whole defence rests on: a
-//! refusal happens in the emitter, so the binder the budget exists to
-//! protect is never asked to bind anything.
-//!
-//! "Never asked" is a negative, so it is counted rather than argued.
-//! `executor::prepare_probe` counts every statement the query and export
-//! lanes hand `DuckDB`, and each case here asserts the count did not move
-//! across the call. The counter is process-global, so every test in this
-//! file takes one lock: the positive controls deliberately bind, and
-//! under the plain `cargo test` harness — where these run as threads of
-//! one process rather than nextest's separate processes — a concurrent
-//! refusal case must not see its increment.
+//! `prepare_probe`'s statement counter is process-global, so every test
+//! in this file takes one lock: the positive controls deliberately bind,
+//! and under the plain `cargo test` harness, where these run as threads
+//! of one process, a concurrent refusal case must not see its increment.
 
 mod common;
 
@@ -28,21 +18,12 @@ use trawl_core::schema::FieldTypes;
 use trawl_engine::error::EngineError;
 use trawl_engine::executor::{Executor, hot_columns_of, prepare_probe};
 
-/// Serializes this file's tests against the shared bind counter.
 static COUNTER: Mutex<()> = Mutex::new(());
 
 fn counter_lock() -> MutexGuard<'static, ()> {
     COUNTER.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The shapes the budget refuses, at least one per limit.
-///
-/// The severity chain is ADR-0024's worked example: each link reads the
-/// previous one through a severity set, which the emitter writes as
-/// twelve copies of its subject, so eight links multiply the seed
-/// expression far past 512 while the text stays a couple of hundred
-/// bytes. The stage case is one over 128. The `sort` and `dedup` cases
-/// name one field over 64.
 fn refused_queries() -> Vec<(&'static str, String)> {
     use std::fmt::Write as _;
     let points = (0..12).map(|i| (i * 2 + 1).to_string()).collect::<Vec<_>>();
@@ -65,7 +46,6 @@ fn refused_queries() -> Vec<(&'static str, String)> {
     ]
 }
 
-/// A refusal must be the emitter's, and it must be free.
 fn assert_refused_without_binding(case: &str, before: u64, outcome: &Result<(), EngineError>) {
     let error = outcome.as_ref().expect_err(case);
     assert!(
@@ -79,7 +59,6 @@ fn assert_refused_without_binding(case: &str, before: u64, outcome: &Result<(), 
     );
 }
 
-/// A source that reaches no parquet at all, for the hot-only lane.
 fn cold_start_source(dir: &tempfile::TempDir) -> String {
     format!("{}/**/*.parquet", dir.path().display())
 }
@@ -163,8 +142,6 @@ fn the_export_lanes_refuse_over_budget_dsl_without_binding() {
 }
 
 /// The counter is only evidence if it moves when a bind happens.
-///
-/// Without this, wiring it to nothing would make every case above pass.
 #[test]
 fn the_bind_counter_counts_an_admitted_query() {
     let _lock = counter_lock();

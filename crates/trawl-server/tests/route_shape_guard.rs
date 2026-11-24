@@ -55,7 +55,6 @@
 use std::fs;
 use std::path::Path;
 
-/// The sources that hold authenticated handlers.
 const SOURCES: &[&str] = &[
     "src/handlers.rs",
     "src/investigations/routes.rs",
@@ -64,8 +63,6 @@ const SOURCES: &[&str] = &[
     "src/ingest/handler.rs",
 ];
 
-/// Handlers mounted outside the `authenticated` router in
-/// `transport/http.rs` (`/api/v1/health`, `/metrics`).
 const UNAUTHENTICATED: &[&str] = &["health", "prometheus_metrics"];
 
 /// Extractors that never refuse a request on what the caller sent, by the
@@ -84,28 +81,16 @@ const NON_REJECTING: &[&str] = &[
     "IngestKey",
 ];
 
-/// The authority extractors, by the last segment of their type's path:
-/// request-parts extractors that refuse a key without the route's
-/// permission on the request head, before any body extractor runs.
 const AUTHORITY: &[&str] = &["Authorized", "IngestKey"];
 
-/// The extractors a handler takes as `Result<_, …Rejection>` that read the
-/// request head alone. Every other `Result` parameter is judged to read
-/// the body, so the body rule fails closed.
 const HEAD_ONLY_RESULTS: &[&str] = &["Path", "Query"];
 
-/// The raw request and body, by the last segment of their type's path.
-/// Either hands the handler a body to read itself, out of the scan's
-/// sight, and no authenticated handler takes one, so the body rule refuses
-/// them wherever they stand.
 const RAW: &[&str] = &["Request", "Body"];
 
-/// The method routers a `.route(…)` registration names its handlers with.
 const METHODS: &[&str] = &[
     "get", "post", "put", "patch", "delete", "head", "options", "trace", "any",
 ];
 
-/// Drop `//` comments, so prose that mentions `async fn` is not a function.
 fn without_line_comments(source: &str) -> String {
     source
         .lines()
@@ -114,13 +99,10 @@ fn without_line_comments(source: &str) -> String {
         .join("\n")
 }
 
-/// Split `text` at commas that are not inside `()`, `<>`, `[]` or `{}`.
 fn split_top_level(text: &str) -> Vec<&str> {
     split_top_level_at(text, ',')
 }
 
-/// Split `text` at each `separator` that is not inside `()`, `<>`, `[]` or
-/// `{}`.
 fn split_top_level_at(text: &str, separator: char) -> Vec<&str> {
     let mut parts = Vec::new();
     let (mut depth, mut start) = (0_i32, 0);
@@ -143,8 +125,6 @@ fn split_top_level_at(text: &str, separator: char) -> Vec<&str> {
     parts
 }
 
-/// A parameter as (pattern, type): split at the first `:` outside
-/// parentheses and not half of a `::`.
 fn split_parameter(param: &str) -> Option<(&str, &str)> {
     let bytes = param.as_bytes();
     let mut depth = 0_i32;
@@ -164,18 +144,14 @@ fn split_parameter(param: &str) -> Option<(&str, &str)> {
     None
 }
 
-/// The text between the `(` at `open` in `text` and its matching `)`.
 fn parenthesized(text: &str, open: usize) -> Option<&str> {
     enclosed(text, open, '(', ')')
 }
 
-/// The text between the `{` at `open` in `text` and its matching `}`.
 fn braced(text: &str, open: usize) -> Option<&str> {
     enclosed(text, open, '{', '}')
 }
 
-/// The text between the `opening` at `open` in `text` and its matching
-/// `closing`.
 fn enclosed(text: &str, open: usize, opening: char, closing: char) -> Option<&str> {
     let mut depth = 0_i32;
     for (at, c) in text[open..].char_indices() {
@@ -191,24 +167,18 @@ fn enclosed(text: &str, open: usize, opening: char, closing: char) -> Option<&st
     None
 }
 
-/// The last path segment before the first `<` of `ty`: `axum::Json<T>`
-/// and the turbofish `Json::<T>` are `Json`. A type with no `<` is
-/// returned whole.
 fn outer_name(ty: &str) -> &str {
     let head = ty.split('<').next().unwrap_or(ty).trim();
     let head = head.strip_suffix("::").unwrap_or(head);
     head.rsplit("::").next().unwrap_or(head).trim()
 }
 
-/// The text between the first `<` of `ty` and its matching `>`.
 fn generic_args(ty: &str) -> &str {
     let Some(open) = ty.find('<') else { return "" };
     let close = ty.rfind('>').unwrap_or(ty.len());
     &ty[open + 1..close]
 }
 
-/// The names `source` imports under another name with `use … as`, as
-/// (alias, the imported item's last path segment).
 fn use_aliases(source: &str) -> Vec<(String, String)> {
     let source = without_line_comments(source);
     let mut aliases = Vec::new();
@@ -234,7 +204,6 @@ fn use_aliases(source: &str) -> Vec<(String, String)> {
     aliases
 }
 
-/// `name` with a `use … as` alias of its file resolved.
 fn resolved<'a>(name: &'a str, aliases: &'a [(String, String)]) -> &'a str {
     aliases
         .iter()
@@ -242,10 +211,6 @@ fn resolved<'a>(name: &'a str, aliases: &'a [(String, String)]) -> &'a str {
         .map_or(name, |(_, original)| original.as_str())
 }
 
-/// Whether a parameter typed `ty` can refuse the request before the
-/// handler runs: a tuple if any of its types can; a `Result` unless its
-/// error is an axum `…Rejection`; anything else unless it is on
-/// [`NON_REJECTING`].
 fn refuses_before_the_handler(ty: &str, aliases: &[(String, String)]) -> bool {
     let ty = ty.trim();
     if let Some(inner) = ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
@@ -267,7 +232,6 @@ fn refuses_before_the_handler(ty: &str, aliases: &[(String, String)]) -> bool {
     }
 }
 
-/// Every `async fn` in `source`, as (name, parameter list).
 fn async_fns(source: &str) -> Vec<(String, String)> {
     let source = without_line_comments(source);
     let mut found = Vec::new();
@@ -288,8 +252,6 @@ fn async_fns(source: &str) -> Vec<(String, String)> {
     found
 }
 
-/// One line per offending parameter of the handlers `handlers` names in
-/// `source`, which `file` names. Every `async fn` of that name is judged.
 fn offences_in(file: &str, source: &str, handlers: &[&str]) -> Vec<String> {
     let aliases = use_aliases(source);
     let mut offences = Vec::new();
@@ -313,16 +275,12 @@ fn offences_in(file: &str, source: &str, handlers: &[&str]) -> Vec<String> {
     offences
 }
 
-/// [`offences_in`] for every `async fn` of `source`, as for a fixture.
 fn offences_of_every_fn(file: &str, source: &str) -> Vec<String> {
     let fns = async_fns(source);
     let names: Vec<&str> = fns.iter().map(|(name, _)| name.as_str()).collect();
     offences_in(file, source, &names)
 }
 
-/// Whether a parameter typed `ty` reads the request body: a `Result`
-/// whose extractor is not on [`HEAD_ONLY_RESULTS`], such as
-/// `Result<Json<_>, _>` or `Result<Bytes, _>`.
 fn reads_the_body(ty: &str, aliases: &[(String, String)]) -> bool {
     let ty = ty.trim();
     if resolved(outer_name(ty), aliases) != "Result" {
@@ -336,8 +294,6 @@ fn reads_the_body(ty: &str, aliases: &[(String, String)]) -> bool {
     }
 }
 
-/// The extractors a parameter typed `ty` runs, in the order axum runs
-/// them: each member of a tuple, nested tuples flattened, or `ty` itself.
 fn extractors(ty: &str) -> Vec<&str> {
     let ty = ty.trim();
     match ty.strip_prefix('(').and_then(|t| t.strip_suffix(')')) {
@@ -350,11 +306,6 @@ fn extractors(ty: &str) -> Vec<&str> {
     }
 }
 
-/// One line per body parameter of the handlers `handlers` names in
-/// `source`, which `file` names, that no authority extractor precedes,
-/// and one per raw request or body ([`RAW`]). axum runs extractors in
-/// parameter order, a tuple's members in theirs, so only an authority
-/// extractor ahead of the body refuses a key before its body is read.
 fn bodies_ahead_of_authority_in(file: &str, source: &str, handlers: &[&str]) -> Vec<String> {
     let aliases = use_aliases(source);
     let mut offences = Vec::new();
@@ -395,7 +346,6 @@ fn read(relative: &str) -> String {
     fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
-/// The body of `router` in `transport/http.rs`, comments dropped.
 fn router_body(http: &str) -> String {
     let start = http
         .find("pub fn router(")
@@ -407,10 +357,6 @@ fn router_body(http: &str) -> String {
     without_line_comments(&http[start..end])
 }
 
-/// The handler paths the `.route(…)` registrations of `router` name, such
-/// as `handlers::query` or `ingest::preview::preview`, each once. Fails,
-/// naming each, on any registration the guard cannot follow to its
-/// handlers.
 fn registered_handlers(router: &str) -> Vec<String> {
     let (handlers, unreadable) = registrations(router);
     assert!(
@@ -425,15 +371,6 @@ fn registered_handlers(router: &str) -> Vec<String> {
     handlers
 }
 
-/// What the registrations of `router` name: the handler paths of its
-/// `.route(…)` calls, each once, and one line per registration the guard
-/// cannot read, the call as written. A `.route(…)` is read when its
-/// expression is a chain of [`METHODS`] calls on handler paths, such as
-/// `put(routes::c).delete(routes::delete)`. A `.nest(…)` or `.merge(…)` is
-/// read when it names a router [`follows_router`] follows, whose own
-/// `.route(…)` calls are in `router` and so are scanned. Every other
-/// registration in [`OTHER_REGISTRATIONS`], and any `.route(…)` expression
-/// the chain does not cover, is unreadable: the scan fails closed.
 fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
     let mut handlers: Vec<String> = Vec::new();
     let mut unreadable = Vec::new();
@@ -469,18 +406,14 @@ fn registrations(router: &str) -> (Vec<String>, Vec<String>) {
     (handlers, unreadable)
 }
 
-/// Whether `text` is one identifier, such as a `let` binding's name.
 fn is_identifier(text: &str) -> bool {
     text.starts_with(|c: char| c.is_alphabetic() || c == '_')
         && text.chars().all(|c| c.is_alphanumeric() || c == '_')
 }
 
-/// Whether the router `name` names in `router` is one whose registrations
-/// are all in `router`, where the scan reads them: `name` is bound at least
-/// once ([`bindings`]), and every binding builds such a router
-/// ([`builds_a_followed_router`]). `seen` holds the names already being
-/// followed: a chain on one of them, as on `name` itself as it was bound
-/// before, is judged by that name's own bindings.
+/// `seen` holds the names already being followed: a chain on one of them, as
+/// on `name` itself as it was bound before, is judged by that name's own
+/// bindings.
 fn follows_router(router: &str, name: &str, seen: &mut Vec<String>) -> bool {
     if seen.iter().any(|s| s == name) {
         return true;
@@ -494,10 +427,6 @@ fn follows_router(router: &str, name: &str, seen: &mut Vec<String>) -> bool {
     })
 }
 
-/// Whether `value`, what a binding assigns, builds a router whose
-/// registrations are all in `router`: a chain of method calls on
-/// `Router::new()`, or on a name [`follows_router`] follows, or an
-/// `if … else` whose every block ends in one.
 fn builds_a_followed_router(value: &str, router: &str, seen: &mut Vec<String>) -> bool {
     let value = value.trim();
     if let Some(branches) = value.strip_prefix("if ") {
@@ -515,9 +444,6 @@ fn builds_a_followed_router(value: &str, router: &str, seen: &mut Vec<String>) -
     }
 }
 
-/// The receiver of a method chain such as `Router::new().route(…)` or
-/// `routes.layer(…)`: a path, called once with no arguments or not at all,
-/// then nothing but `.method(…)` calls. `None` for anything else.
 fn chain_receiver(value: &str) -> Option<&str> {
     let path_end = value
         .find(|c: char| !(c.is_alphanumeric() || c == '_' || c == ':'))
@@ -549,9 +475,6 @@ fn chain_receiver(value: &str) -> Option<&str> {
     }
 }
 
-/// The value each block of `if <condition> { … } else { … }` ends in, the
-/// text after its `if`, `else if` chains included. `None` unless every
-/// block ends in a value and an `else` block closes the chain.
 fn block_values(branches: &str) -> Option<Vec<&str>> {
     let open = branches.find('{')?;
     let block = braced(branches, open)?;
@@ -575,24 +498,11 @@ fn block_values(branches: &str) -> Option<Vec<&str>> {
     Some(values)
 }
 
-/// What a block ends in: the text after its last top-level `;`, or `None`
-/// when that is empty.
 fn block_value(block: &str) -> Option<&str> {
     let value = split_top_level_at(block, ';').pop()?;
     (!value.trim().is_empty()).then_some(value)
 }
 
-/// What every binding of `name` in `router` assigns, or `None` when `name`
-/// appears anywhere the scan cannot follow. A name may appear only
-///
-/// - where `let`, `let mut` or a plain assignment binds it, with or without
-///   a type: the value runs to the binding's `;`;
-/// - as the receiver of a method call;
-/// - as the whole value of a block, as `else { name }`; and
-/// - as the router a `.merge(name)` or `.nest(path, name)` takes.
-///
-/// Any other use, such as a pattern that destructures it, a closure or
-/// `for` that binds it, or a call that is handed it, is `None`.
 fn bindings<'a>(router: &'a str, name: &str) -> Option<Vec<&'a str>> {
     let mut bound = Vec::new();
     let mut from = 0;
@@ -622,9 +532,6 @@ fn bindings<'a>(router: &'a str, name: &str) -> Option<Vec<&'a str>> {
     Some(bound)
 }
 
-/// The value assigned by a binding of a name between `before` and `after`,
-/// or `None` when it is no binding: `let`, `let mut` or the start of a
-/// statement before it, then `=` or a type and `=` after it.
 fn binding_value<'a>(before: &str, after: &'a str) -> Option<&'a str> {
     let binds = ends_with_word(before, "let")
         || before
@@ -650,14 +557,11 @@ fn binding_value<'a>(before: &str, after: &'a str) -> Option<&'a str> {
     split_top_level_at(value, ';').into_iter().next()
 }
 
-/// Whether `text` ends in the keyword `word`, not in a longer name.
 fn ends_with_word(text: &str, word: &str) -> bool {
     text.strip_suffix(word)
         .is_some_and(|rest| !rest.ends_with(|c: char| c.is_alphanumeric() || c == '_'))
 }
 
-/// Whether the text `before` a name ends where `.merge(` or `.nest(path,`
-/// takes it as its router.
 fn takes_a_router(before: &str) -> bool {
     if before.ends_with(".merge(") {
         return true;
@@ -681,7 +585,6 @@ fn takes_a_router(before: &str) -> bool {
     false
 }
 
-/// The registrations a router makes besides `.route(…)`.
 const OTHER_REGISTRATIONS: &[&str] = &[
     "nest",
     "merge",
@@ -691,7 +594,6 @@ const OTHER_REGISTRATIONS: &[&str] = &[
     "fallback_service",
 ];
 
-/// The argument list of every `.{name}(…)` call in `text`, in order.
 fn calls<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
     let call = format!(".{name}(");
     let mut found = Vec::new();
@@ -704,7 +606,6 @@ fn calls<'a>(text: &'a str, name: &str) -> Vec<&'a str> {
     found
 }
 
-/// The non-empty top-level arguments of an argument list.
 fn top_level_args(args: &str) -> Vec<&str> {
     split_top_level(args)
         .into_iter()
@@ -712,15 +613,10 @@ fn top_level_args(args: &str) -> Vec<&str> {
         .collect()
 }
 
-/// `text` with each run of whitespace made one space.
 fn collapsed(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// The handler paths of a method chain such as `get(a)` or
-/// `put(a).delete(b)`, or `None` when `expr` is anything else: another
-/// call, a macro, a method this guard does not know, or a handler that is
-/// not a path.
 fn method_chain(expr: &str) -> Option<Vec<&str>> {
     let mut handlers = Vec::new();
     let mut rest = expr.trim();
@@ -750,8 +646,6 @@ fn method_chain(expr: &str) -> Option<Vec<&str>> {
     }
 }
 
-/// The `use crate::…` imports of `http`, as (the name in scope, the path
-/// under the crate root).
 fn crate_imports(http: &str) -> Vec<(String, String)> {
     let mut imports = Vec::new();
     for line in without_line_comments(http).lines() {
@@ -786,8 +680,6 @@ fn crate_imports(http: &str) -> Vec<(String, String)> {
     imports
 }
 
-/// The source file, relative to the crate, that defines `handler`, a path
-/// the router names, and the handler's function name.
 fn handler_file(handler: &str, imports: &[(String, String)]) -> (String, String) {
     let segments: Vec<&str> = handler.split("::").collect();
     let [first, middle @ .., name] = segments.as_slice() else {
@@ -813,7 +705,6 @@ fn handler_file(handler: &str, imports: &[(String, String)]) -> (String, String)
     (file.clone(), (*name).to_owned())
 }
 
-/// Every authenticated handler the router registers, as (file, name).
 fn authenticated_handlers() -> Vec<(String, String)> {
     let http = read("src/transport/http.rs");
     let imports = crate_imports(&http);
@@ -829,9 +720,6 @@ fn authenticated_handlers() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every handler the router registers lives in a file this guard reads,
-/// and is an `async fn` there, so a route cannot leave the scan by living
-/// somewhere new.
 #[test]
 fn every_registered_handler_is_scanned() {
     let handlers = authenticated_handlers();
@@ -854,8 +742,6 @@ fn every_registered_handler_is_scanned() {
     }
 }
 
-/// No authenticated handler takes a parameter that can refuse the request
-/// before its authority check.
 #[test]
 fn no_authenticated_handler_binds_a_bare_extractor() {
     let handlers = authenticated_handlers();
@@ -879,9 +765,6 @@ fn no_authenticated_handler_binds_a_bare_extractor() {
     );
 }
 
-/// No authenticated handler reads its body before an authority extractor
-/// has judged the key, so the body of a key without the route's permission
-/// is never read.
 #[test]
 fn every_authenticated_body_follows_an_authority_extractor() {
     let handlers = authenticated_handlers();
@@ -905,9 +788,6 @@ fn every_authenticated_body_follows_an_authority_extractor() {
     );
 }
 
-/// The body rule's negative controls: a body ahead of its authority
-/// extractor, a body with none, a body inside a tuple ahead of it, and a
-/// raw request or body anywhere are each one offence.
 #[test]
 fn the_body_rule_flags_a_body_ahead_of_its_authority() {
     let fixtures = [
@@ -984,9 +864,6 @@ fn the_body_rule_flags_a_body_ahead_of_its_authority() {
     }
 }
 
-/// The body rule's positive control: a body after `Authorized` or
-/// `IngestKey`, an aliased extractor and a tuple's earlier member
-/// included, passes, and so does a path or query string ahead of it.
 #[test]
 fn the_body_rule_passes_a_body_after_its_authority() {
     let source = r"
@@ -1030,9 +907,6 @@ fn the_body_rule_passes_a_body_after_its_authority() {
     );
 }
 
-/// Every exempt name is still a function in the sources and still mounted
-/// outside the `authenticated` router, so the list cannot outlive its
-/// handlers or hide a route that gained authentication.
 #[test]
 fn the_unauthenticated_list_matches_the_router() {
     let sources: Vec<(String, Vec<String>)> = SOURCES
@@ -1066,10 +940,6 @@ fn the_unauthenticated_list_matches_the_router() {
     }
 }
 
-/// The router parser: method chains, nested module paths, comments, and a
-/// nest or merge of a router bound in the same function, to a chain on
-/// `Router::new()`, to an `if … else` of such chains, or to a chain on
-/// itself as it was bound before.
 #[test]
 fn the_router_parser_finds_each_registration() {
     let router = without_line_comments(
@@ -1142,9 +1012,6 @@ fn the_router_parser_finds_each_registration() {
     );
 }
 
-/// Negative controls for the router parser: each registration it cannot
-/// follow to a handler fails the guard, named by its call, path and
-/// expression included, instead of leaving the scan.
 #[test]
 fn the_router_parser_refuses_each_registration_it_cannot_read() {
     let fixtures = [
@@ -1236,8 +1103,6 @@ fn the_router_parser_refuses_each_registration_it_cannot_read() {
     }
 }
 
-/// Negative controls: each way past a name-matching scan is one offence.
-/// Every fixture is valid Rust.
 #[test]
 fn the_scanner_flags_each_bypass_once() {
     let fixtures = [
@@ -1314,9 +1179,6 @@ fn the_scanner_flags_each_bypass_once() {
     }
 }
 
-/// The positive control: every extractor shape a handler may take passes,
-/// aliases of them included, and so does a function the scan was not
-/// asked about.
 #[test]
 fn the_scanner_passes_deferred_and_non_rejecting_extractors() {
     let source = r"

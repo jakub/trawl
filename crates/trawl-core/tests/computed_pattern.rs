@@ -3,10 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A `matches`, `like` or `ilike` pattern is literal text in the query
-//! (ADR-0063), and each door a query passes through refuses a computed
-//! one on its own: the parser, the SQL emitter, and the live plan
-//! compile. A hand-built AST skips the parser, so the two doors after it
-//! are checked over ASTs the parser never saw.
+//! (ADR-0063), and the parser, the SQL emitter, and the live plan compile
+//! each refuse a computed one on its own.
 
 use trawl_core::ast::{BinaryOp, Expr, LiteralValue, PipeStage, Query, Spanned};
 use trawl_core::context::EvalContext;
@@ -24,7 +22,6 @@ const OPERATORS: [(BinaryOp, &str); 3] = [
     (BinaryOp::ILike, "ilike"),
 ];
 
-/// Computed operands as the query spells them, and as an AST.
 fn computed_operands() -> Vec<(&'static str, Expr)> {
     let text = |s: &str| Spanned::new(Expr::Literal(LiteralValue::String(s.to_owned())), 0..0);
     vec![
@@ -46,8 +43,6 @@ fn computed_operands() -> Vec<(&'static str, Expr)> {
     ]
 }
 
-/// `query` with the pattern operand of its one `op` test, in a `where` or
-/// `let` stage, replaced by `operand`.
 fn with_operand(mut query: Query, op: BinaryOp, operand: &Expr) -> Query {
     let condition = match &mut query.pipeline[0].node {
         PipeStage::Where(stage) => &mut stage.condition,
@@ -73,7 +68,6 @@ fn computed_pattern_is_refused_by_every_door() {
                 let dsl = format!("* | {stage}");
                 let label = format!("{dsl:?}");
 
-                // The parser, whether or not it goes on to build.
                 for (door, result) in [
                     ("parse", parse(&dsl)),
                     ("parse_unbuilt", parse_unbuilt(&dsl)),
@@ -89,8 +83,6 @@ fn computed_pattern_is_refused_by_every_door() {
                     assert!(error.hint.is_some(), "{door} {label}");
                 }
 
-                // The same stage over a literal operand, which the parser
-                // admits, with the computed operand put in by hand.
                 let literal = dsl.replace(spelled, r#""a""#);
                 let query = with_operand(
                     parse(&literal).unwrap_or_else(|e| panic!("{literal}: {e:?}")),
@@ -98,14 +90,12 @@ fn computed_pattern_is_refused_by_every_door() {
                     &operand,
                 );
 
-                // The emitter.
                 assert_eq!(
                     emit(&query, "/data/*.parquet", EvalContext::capture()).map(|_| ()),
                     Err(EmitError::ComputedPattern),
                     "emit {label}"
                 );
 
-                // The live plan compile.
                 assert_eq!(
                     compile_stream_plan(&query.pipeline, &PinScope::unpinned(), None).err(),
                     Some(StreamPlanError::Pattern(PatternError::Computed)),

@@ -5,18 +5,8 @@
 //! `trawl doctor` target and key selection, observed on the real binary
 //! (ADR-0047).
 //!
-//! Every run strips the inherited `TRAWL_*` environment and gets a temp
-//! `HOME`, so the default config path is one the test wrote or none at all.
 //! Tests cannot set the environment in-process (`unsafe_code = forbid`), so
 //! every case is a subprocess.
-//!
-//! Where a case must not reach a server, a plain TCP listener stands where a
-//! wrong resolution would send the doctor, and records every connection and
-//! every `Authorization` header it sees. Where a case must reach one, a
-//! [`Stub`] answers over real TLS (rustls, certificates from an rcgen CA, as
-//! in `tests/ca_cert.rs`) or plain HTTP, and records every handshake and
-//! request. Every stub asserts that what it saw is within
-//! [`trawl_cli::doctor::REQUESTS`].
 //!
 //! Under `--url` the doctor trusts system roots only. On Linux those come
 //! from `rustls-native-certs`, which reads `SSL_CERT_FILE` when it is set,
@@ -38,7 +28,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 
 const SAVED_TOKEN: &str = "flt_savedservertokenvalue";
 
-/// What a [`Recorder`] saw.
 #[derive(Debug, Default)]
 struct Seen {
     connections: usize,
@@ -47,12 +36,8 @@ struct Seen {
     barriers: usize,
 }
 
-/// The whole request a barrier connection sends to a [`Recorder`].
 const BARRIER: &[u8] = b"TRAWL-RECORDER-BARRIER\r\n\r\n";
 
-/// A plain TCP listener on `127.0.0.1` that records, answers nothing, and
-/// closes.
-///
 /// One thread accepts and handles connections one at a time, in the order
 /// the kernel queued them. Once it has handled a connection, it has counted
 /// every connection queued before that one.
@@ -99,7 +84,6 @@ impl Recorder {
         format!("{scheme}://127.0.0.1:{}", self.port)
     }
 
-    /// Wait up to ten seconds for `done` to hold, then return the counts.
     fn wait_for(&self, done: impl Fn(&Seen) -> bool) -> MutexGuard<'_, Seen> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -112,8 +96,6 @@ impl Recorder {
         }
     }
 
-    /// Nothing but this call's own barrier connection reached the recorder.
-    ///
     /// Call it after every doctor run has exited. A connection a run made is
     /// queued before the barrier, and the accept loop is sequential, so once
     /// the barrier is handled every earlier connection has been counted.
@@ -131,7 +113,6 @@ impl Recorder {
     }
 }
 
-/// A temp `HOME` (and `XDG_STATE_HOME`) for one test.
 struct Sandbox {
     _tmp: tempfile::TempDir,
     home: PathBuf,
@@ -151,7 +132,6 @@ impl Sandbox {
         }
     }
 
-    /// Write the default config file, `~/.config/trawl/config.toml`.
     fn default_config(&self, toml: &str) -> PathBuf {
         let dir = self.home.join(".config/trawl");
         std::fs::create_dir_all(&dir).unwrap();
@@ -195,16 +175,12 @@ impl ClosedPort {
     }
 }
 
-/// A port with nothing listening on it, held for as long as the guard lives.
 fn closed_port() -> ClosedPort {
     let socket = tokio::net::TcpSocket::new_v4().expect("socket");
     socket.bind(([127, 0, 0, 1], 0).into()).expect("bind");
     ClosedPort(socket)
 }
 
-// ── TLS material ─────────────────────────────────────────────────────────
-
-/// A self-signed CA that can issue server certificates.
 fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     let mut params = CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params.distinguished_name.push(DnType::CommonName, name);
@@ -213,7 +189,6 @@ fn ca(name: &str) -> CertifiedIssuer<'static, KeyPair> {
     CertifiedIssuer::self_signed(params, KeyPair::generate().expect("CA key")).expect("CA cert")
 }
 
-/// A server certificate for `127.0.0.1`, issued by `issuer`.
 fn leaf(issuer: &CertifiedIssuer<'static, KeyPair>) -> Identity {
     let key = KeyPair::generate().expect("leaf key");
     let mut params = CertificateParams::new(vec!["127.0.0.1".to_owned()]).expect("leaf params");
@@ -230,18 +205,13 @@ struct Identity {
     key: PrivateKeyDer<'static>,
 }
 
-// ── the recording stub ───────────────────────────────────────────────────
-
-/// One request a [`Stub`] received.
 #[derive(Debug, Clone)]
 struct Request {
     method: String,
     path: String,
-    /// The `Authorization` header's value, if one was sent.
     authorization: Option<String>,
 }
 
-/// What a [`Stub`] saw.
 #[derive(Debug, Default)]
 struct StubSeen {
     /// One entry per TLS connection: whether its handshake completed.
@@ -249,9 +219,6 @@ struct StubSeen {
     requests: Vec<Request>,
 }
 
-/// An answer: status and JSON body. The status [`STALL`] sends `200`
-/// headers and the body's first byte, then holds the connection open. The
-/// status [`BROKEN`] sends `200` headers and part of the body, then closes.
 type Route = (&'static str, u16, String);
 
 /// A route status that stalls after the headers, past the doctor's 10 s
@@ -262,8 +229,6 @@ const STALL: u16 = 0;
 /// them and close the connection.
 const BROKEN: u16 = 1;
 
-/// A listener on `127.0.0.1` that speaks TLS (or plain HTTP), answers each
-/// routed path with a fixed status and body, and records everything.
 struct Stub {
     port: u16,
     seen: Arc<Mutex<StubSeen>>,
@@ -310,7 +275,6 @@ impl Stub {
         self.seen.lock().unwrap().requests.clone()
     }
 
-    /// The handshake outcomes, once at least `count` have been recorded.
     fn handshakes(&self, count: usize) -> Vec<bool> {
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
@@ -335,7 +299,6 @@ impl Stub {
     }
 }
 
-/// Every request a stub saw is one the doctor declares it may send.
 impl Drop for Stub {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -385,7 +348,6 @@ fn serve(
     }
 }
 
-/// Read one request, record it, and answer it from `routes`.
 fn answer<S: std::io::Read + std::io::Write>(
     stream: &mut S,
     routes: &[Route],
@@ -471,7 +433,6 @@ fn whoami(permissions: &str) -> Route {
     )
 }
 
-/// The checks of a report by id: `(outcome, reason, blocked_by)`.
 fn rows(report: &serde_json::Value) -> Vec<(String, String, Option<String>, Option<String>)> {
     report["checks"]
         .as_array()
@@ -505,7 +466,6 @@ fn text(output: &Output) -> String {
     )
 }
 
-/// A usage error: exit 2, nothing on stdout, and none of `secrets` echoed.
 fn assert_usage_error(output: &Output, fragment: &str, secrets: &[&str], case: &str) {
     let all = text(output);
     assert_eq!(output.status.code(), Some(2), "{case}: exit 2, got {all}");
@@ -522,7 +482,6 @@ fn assert_usage_error(output: &Output, fragment: &str, secrets: &[&str], case: &
     }
 }
 
-/// The JSON report of a run that got past selection.
 fn report(output: &Output) -> serde_json::Value {
     serde_json::from_slice(&output.stdout)
         .unwrap_or_else(|e| panic!("stdout is not a JSON report ({e}): {}", text(output)))
@@ -549,10 +508,8 @@ fn recorder_counts_a_keyed_request() {
     assert_eq!(seen.authorization_headers, 1, "{seen:?}");
 }
 
-/// Each ambient variable refuses the run by name, never by value, even when
-/// it is empty, malformed, or a flag would shadow it. clap never reads these
-/// variables for `doctor`, so a value it would reject (a non-bool
-/// `TRAWL_INSECURE`) is refused by name like any other.
+/// clap never reads the ambient `TRAWL_*` variables for `doctor`, so a value
+/// it would reject (a non-bool `TRAWL_INSECURE`) is refused by name too.
 #[test]
 fn doctor_refuses_ambient_env() {
     const PLANTED: &str = "flt_plantedambientvalue";
@@ -596,9 +553,6 @@ fn doctor_refuses_ambient_env() {
     recorder.assert_untouched("ambient environment");
 }
 
-/// No `--help` prints an environment value, for `doctor` or any other
-/// command, even when a variable carries credentials or clap would reject
-/// it.
 #[test]
 fn help_never_prints_environment_values() {
     const SENTINEL: &str = "s3ntinelvalue";
@@ -625,9 +579,6 @@ fn help_never_prints_environment_values() {
     }
 }
 
-/// Other commands still read the environment as before: `TRAWL_URL` and
-/// `TRAWL_TOKEN` select the server a query goes to, and a malformed
-/// `TRAWL_INSECURE` is still clap's own usage error.
 #[test]
 fn other_commands_still_read_the_environment() {
     let home = Sandbox::new();
@@ -658,8 +609,6 @@ fn other_commands_still_read_the_environment() {
     assert!(all.contains("for '--insecure'"), "{all}");
 }
 
-/// Selection errors on the command line: all exit 2, before anything is
-/// read or contacted.
 #[test]
 fn doctor_selection_usage_errors() {
     let home = Sandbox::new();
@@ -729,9 +678,7 @@ fn doctor_selection_usage_errors() {
 }
 
 /// A URL carrying userinfo would reach the server as a Basic
-/// `Authorization` header. `--url` and `--web-url` refuse it as a usage
-/// error; a profile's url fails `connection.config`. The userinfo never
-/// appears in any output.
+/// `Authorization` header.
 #[test]
 fn doctor_refuses_url_credentials() {
     let home = Sandbox::new();
@@ -788,11 +735,7 @@ fn doctor_refuses_url_credentials() {
 
 /// Request paths are appended to the target URL, so a query or fragment
 /// would carry every request, the keyed `whoami` included, to wherever the
-/// URL's path points. `--url` and `--web-url` refuse one as a usage error
-/// naming the flag; a profile's url fails `connection.config` naming the
-/// profile. Empty and percent-encoded forms are refused alike, the URL's
-/// text never appears in any output, and nothing reaches the listener the
-/// URLs name.
+/// URL's path points.
 #[test]
 fn doctor_refuses_url_query_and_fragment() {
     let home = Sandbox::new();
@@ -851,8 +794,6 @@ fn doctor_refuses_url_query_and_fragment() {
     recorder.assert_untouched("a query or fragment in a URL");
 }
 
-/// Under a profile, every flag that would change its URL, key, or trust is
-/// refused by name.
 #[test]
 fn doctor_profile_refuses_overrides() {
     let home = Sandbox::new();
@@ -887,10 +828,6 @@ fn doctor_profile_refuses_overrides() {
     recorder.assert_untouched("profile overrides");
 }
 
-/// `--url` never reads config.toml: neither the `[server].token` nor the
-/// `insecure` saved there is used. The server, trusted through system roots
-/// (`SSL_CERT_FILE` names the test CA), answers health, and sees no
-/// `Authorization` header: identity is `not_configured`, and the run passes.
 #[test]
 fn doctor_url_ignores_saved_token() {
     let home = Sandbox::new();
@@ -933,9 +870,6 @@ fn doctor_url_ignores_saved_token() {
 /// Case name, extra flags, extra environment, expected reason suffix.
 type KeyCase<'a> = (&'a str, Vec<&'a str>, Vec<(&'a str, &'a str)>, &'a str);
 
-/// `--token-env` and `--token-file` select the key; a missing or empty
-/// source fails `connection.config` naming the flag, not the source's name
-/// or path.
 #[test]
 fn doctor_url_key_sources() {
     let home = Sandbox::new();
@@ -1038,16 +972,14 @@ fn doctor_url_key_sources() {
     recorder.assert_untouched("key sources");
 }
 
-/// A missing config file, a missing profile, or a profile with no url fails
-/// `connection.config` naming what is missing. `[server]` points at the
-/// recorder, so a fallback to it would show as a connection.
+/// `[server]` points at the recorder, so a fallback to it would show as a
+/// connection.
 #[test]
 fn doctor_missing_profile_fails_without_contact() {
     let home = Sandbox::new();
     let recorder = Recorder::start();
     let url = recorder.url("https");
 
-    // No config file at all.
     let output = home.trawl(&["doctor", "-p", "prod", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(1), "{}", text(&output));
     let report_json = report(&output);
@@ -1061,7 +993,6 @@ fn doctor_missing_profile_fails_without_contact() {
         "CLI profile `prod` in ~/.config/trawl/config.toml"
     );
 
-    // A named config file that does not exist.
     let absent = home.home.join("absent.toml");
     let output = home.trawl(
         &[
@@ -1110,8 +1041,6 @@ fn doctor_missing_profile_fails_without_contact() {
     let table = text(&output);
     assert!(table.contains("pick one of: lab, nourl"), "{table}");
 
-    // A profile without a token of its own selects no key: [server].token
-    // is never inherited.
     let output = home.trawl(&["doctor", "-p", "lab", "--format", "json"], &[]);
     let check = connection_config(&report(&output)).clone();
     assert_eq!(check["outcome"], "complete", "{}", text(&output));
@@ -1125,10 +1054,6 @@ fn doctor_missing_profile_fails_without_contact() {
     recorder.assert_untouched("missing profile");
 }
 
-/// `-p trial` resolves through the trial's reserved profile rules: the
-/// trial's recorded port, its operator key, and its pinned certificate. The
-/// trial's API is a TLS stub serving that certificate, so the pin verifies,
-/// and only then does the operator key reach `whoami`.
 #[test]
 fn doctor_trial_profile() {
     const TRIAL_TOKEN: &str = "flt_trialoperatortoken";
@@ -1180,7 +1105,6 @@ fn doctor_trial_profile() {
     );
     let contacted = requests.len();
 
-    // A user profile named `trial` is refused through the trial's own rule.
     let own = home.file("own.toml", "[profiles.trial]\nurl = \"https://x:1\"\n");
     let output = home.trawl(
         &[
@@ -1203,7 +1127,6 @@ fn doctor_trial_profile() {
             .contains("[profiles.trial]")
     );
 
-    // No trial: connection.config fails and names the fix.
     std::fs::remove_dir_all(&trial_dir).unwrap();
     let output = home.trawl(&["doctor", "-p", "trial", "--format", "json"], &[]);
     assert_eq!(output.status.code(), Some(1));
@@ -1274,7 +1197,6 @@ fn write_trial(state_home: &Path, api_port: u16, token: &str, ca_pem: &str) -> P
     dir
 }
 
-/// Other commands keep exiting as before: success is 0, any error is 1.
 #[test]
 fn other_commands_keep_their_exit_status() {
     let home = Sandbox::new();
@@ -1288,7 +1210,6 @@ fn other_commands_keep_their_exit_status() {
 
 const PROFILE_TOKEN: &str = "flt_profiletokenvalue";
 
-/// Write `[profiles.NAME]` with `url`, `token`, and one trust line.
 fn profile(home: &Sandbox, name: &str, url: &str, trust: &str) {
     home.default_config(&format!(
         "[profiles.{name}]\nurl = \"{url}\"\ntoken = \"{PROFILE_TOKEN}\"\n{trust}\n"
@@ -1302,11 +1223,6 @@ fn settled_handshakes(stub: &Stub) -> Vec<bool> {
     stub.handshakes(1)
 }
 
-/// A certificate the client does not trust fails `api.tls`, naming the
-/// trust mode and pointing at `ca_cert`; health is blocked by it, and
-/// identity by health. From the server's end, the handshake failed and no
-/// request arrived, so no bearer header was ever sent. Checked under system
-/// roots (`--url`) and under a pin to another CA (a profile).
 #[test]
 fn doctor_untrusted_cert_sends_no_key() {
     let home = Sandbox::new();
@@ -1409,10 +1325,6 @@ fn doctor_untrusted_cert_sends_no_key() {
     }
 }
 
-/// `insecure` and a plain `http` URL each fail `api.tls`, which blocks
-/// health and, through it, identity. The one request the server sees is
-/// the unkeyed health probe that decided `api.transport`; no
-/// `Authorization` header arrives.
 #[test]
 fn doctor_insecure_never_sends_key() {
     let home = Sandbox::new();
@@ -1503,12 +1415,6 @@ fn doctor_insecure_never_sends_key() {
     }
 }
 
-/// The key goes only to a server that answered the unkeyed probe with
-/// trawl's health body. Under verified TLS, a redirect, a 404, a 503 that
-/// is not a health body, a 200 that is not one, and a 200 health body
-/// without trawl's `checks` map or `version` all fail `api.health`, and
-/// `api.identity` is blocked by it. The server sees the one unkeyed probe:
-/// no `whoami`, no `Authorization` header.
 #[test]
 fn doctor_sends_key_only_after_trawl_health() {
     let cases: [(&str, Option<Route>, String); 9] = [
@@ -1565,11 +1471,6 @@ fn doctor_sends_key_only_after_trawl_health() {
     assert_health_withholds_key(cases);
 }
 
-/// trawld answers health with exactly 200 or 503, and pairs 200 with `ok`
-/// or `degraded` and 503 with `unavailable`. A valid, signed health body
-/// under another 2xx, or under the status it is not paired with, fails
-/// `api.health` and blocks `api.identity`: no `whoami`, no `Authorization`
-/// header.
 #[test]
 fn doctor_health_status_must_match_its_body() {
     let signed = |status: &str| {
@@ -1596,9 +1497,6 @@ fn doctor_health_status_must_match_its_body() {
     ]);
 }
 
-/// For each `(case, health route, reason)`: under verified TLS, the doctor
-/// fails `api.health` with `reason`, blocks `api.identity`, exits 1, and
-/// the stub sees only the unkeyed probe.
 fn assert_health_withholds_key<const N: usize>(cases: [(&str, Option<Route>, String); N]) {
     let home = Sandbox::new();
     let server_ca = ca("trawl doctor server CA");
@@ -1649,9 +1547,6 @@ fn assert_health_withholds_key<const N: usize>(cases: [(&str, Option<Route>, Str
     }
 }
 
-/// The three answers trawld sends, 200 with `ok` or `degraded` and 503
-/// with `unavailable`, each complete `api.health` and send the key to
-/// `whoami`.
 #[test]
 fn doctor_accepts_the_health_answers_trawld_sends() {
     for (http, status) in [(200, "ok"), (200, "degraded"), (503, "unavailable")] {
@@ -1685,11 +1580,6 @@ fn doctor_accepts_the_health_answers_trawld_sends() {
     }
 }
 
-/// A corpus that trawld is still recovering after a restart makes the
-/// answer 200 `degraded`. The corpus row is `not_sampled` with the reason
-/// `recovering`, not failed, and names the next step. `api.health` is
-/// complete, identity still runs, and with nothing else failing the run is
-/// incomplete and exits 3.
 #[test]
 fn doctor_recovering_corpus_is_not_sampled() {
     for value in ["rollup_pending", "restart_backlog"] {
@@ -1730,10 +1620,6 @@ fn doctor_recovering_corpus_is_not_sampled() {
     }
 }
 
-/// A starved engine answers 200 `degraded` with `duckdb: slow`. The
-/// engine row is `complete` with the reported value as its detail, not
-/// failed and not a value this CLI does not know, so the run passes and
-/// exits 0 (ADR-0056).
 #[test]
 fn doctor_slow_engine_is_degraded_not_failed() {
     let body = format!(
@@ -1760,12 +1646,6 @@ fn doctor_slow_engine_is_degraded_not_failed() {
     assert_eq!(paths, [HEALTH_PATH, WHOAMI_PATH]);
 }
 
-/// A 503 keeps its per-check body. Rows are sorted by name: `ok` is
-/// complete (the unknown `wal` included), `error` and `refusing` fail, an
-/// unrecognized value fails and is shown when it is a plain identifier, and
-/// a name that is not one becomes `api.health._invalid` without being
-/// echoed. A server check named `_invalid` is not one either, so it cannot
-/// collide with that row. The run exits 1.
 #[test]
 fn doctor_health_rows_map_values() {
     let home = Sandbox::new();
@@ -1839,12 +1719,6 @@ fn doctor_health_rows_map_values() {
     );
 }
 
-/// A server that echoes the key back never gets it into the report. The
-/// stub's whoami puts the bearer token in the key's name and in a
-/// permission (with a control character spliced in), and the key's prefix
-/// (the 8 characters after `flt_`) in the name; its health answer uses the
-/// prefix as a check name and a piece of the key as a value and a version.
-/// Neither the key nor its prefix appears in the text or the JSON report.
 #[test]
 fn doctor_redacts_the_key_from_remote_fields() {
     let home = Sandbox::new();
@@ -1944,9 +1818,6 @@ fn doctor_identity_shows_only_trawl_vocabulary() {
     );
 }
 
-/// `kind` is one of trawl's principal kinds or the answer is not trawl's:
-/// a whoami whose `kind` is the key fails `api.identity` as a foreign
-/// answer, and neither the report nor its text quotes the value.
 #[test]
 fn doctor_unknown_kind_is_a_foreign_answer() {
     let who = format!(
@@ -1966,8 +1837,6 @@ fn doctor_unknown_kind_is_a_foreign_answer() {
     assert!(identity["detail"].is_null(), "{identity}");
 }
 
-/// Run the doctor against a verified-TLS stub serving `routes`, through a
-/// profile that pins the stub's CA and holds [`PROFILE_TOKEN`].
 fn doctor_against(routes: Vec<Route>) -> (Output, Stub) {
     let home = Sandbox::new();
     let server_ca = ca("trawl doctor server CA");
@@ -1983,7 +1852,6 @@ fn doctor_against(routes: Vec<Route>) -> (Output, Stub) {
     (output, stub)
 }
 
-/// The `api.*` rows of a report, without the ones per health check.
 fn api_rows(report: &serde_json::Value) -> Vec<(String, String, Option<String>, Option<String>)> {
     rows(report)
         .into_iter()
@@ -2005,11 +1873,6 @@ fn own_row(
     )
 }
 
-/// A health answer whose headers arrived under verified TLS and whose body
-/// then stalled proves the transport and the certificate; only the health
-/// answer went unread. So `api.transport` and `api.tls` are complete,
-/// `api.health` is `not_sampled` with `timed_out`, identity is blocked,
-/// and no key is sent. The run is incomplete, exit 3.
 #[test]
 fn doctor_body_stall_is_not_a_transport_timeout() {
     let (output, stub) = doctor_against(vec![
@@ -2037,12 +1900,6 @@ fn doctor_body_stall_is_not_a_transport_timeout() {
     stub.assert_no_authorization("body stall");
 }
 
-/// A health answer whose headers arrived under verified TLS and whose body
-/// the server then cut short proves the transport and the certificate, and
-/// the broken body is an observed failure: `api.health` fails with
-/// `response body broken`, not a timeout and not a failed connection.
-/// Identity is blocked, no key is sent, and the run fails, exit 1. A
-/// whoami body cut short fails `api.identity` the same way.
 #[test]
 fn doctor_body_cut_short_is_not_a_broken_connection() {
     let (output, stub) = doctor_against(vec![
@@ -2083,9 +1940,6 @@ fn doctor_body_cut_short_is_not_a_broken_connection() {
     );
 }
 
-/// trawld's whoami answers exactly 200. Another 2xx with a valid body is
-/// not an identity: `api.identity` fails with `unexpected status` and
-/// names the status.
 #[test]
 fn doctor_identity_requires_exactly_200() {
     let body = r#"{"prefix":"pfx12345","name":"ops-key","kind":"human","roles":[],"permissions":["query"]}"#;
@@ -2104,15 +1958,6 @@ fn doctor_identity_requires_exactly_200() {
     }
 }
 
-/// trawld's request-limit refusal (ADR-0054), under the regular or the
-/// probe message, is a capacity refusal: `api.health` is `not_sampled` with
-/// the reason `request_limit_reached`, the shared text, and a retry with
-/// backoff, never wrong-service advice. The health proof stays incomplete:
-/// no witness, no per-check rows, `api.identity` blocked, and the stub sees
-/// only the unkeyed probe. The run is incomplete, exit 3. On `whoami` the
-/// same refusal leaves `api.identity` not sampled. The typed code alone
-/// decides nothing: an unrelated 503 envelope still fails as not a health
-/// answer.
 #[test]
 fn doctor_request_limit_refusal_is_not_sampled() {
     let regular = r#"{"error":{"code":"request_limit_reached","message":"trawld is at its HTTP request limit ([server] max_concurrent_requests); the request was not processed; retry later with backoff"}}"#;
@@ -2176,7 +2021,6 @@ fn doctor_request_limit_refusal_is_not_sampled() {
         stub.assert_no_authorization(case);
     }
 
-    // On whoami, after trawl's health answer: identity could not look.
     let (output, _stub) = doctor_against(vec![healthy(), (WHOAMI_PATH, 503, regular.to_owned())]);
     assert_eq!(output.status.code(), Some(3), "whoami: {}", text(&output));
     assert_refused(
@@ -2212,11 +2056,6 @@ fn doctor_request_limit_refusal_is_not_sampled() {
     }
 }
 
-/// A 200 health or whoami body past the client's cap is not read: the
-/// check fails with `response too large`, and the run finishes with a
-/// report rather than a crash. An oversized health body blocks identity,
-/// so no key goes out. A 503 health body past the cap is too large as
-/// well, not an HTTP 503 answer: none of it was judged.
 #[test]
 fn doctor_oversized_bodies_are_too_large() {
     let pad = "x".repeat(70 * 1024);
@@ -2278,9 +2117,6 @@ fn envelope_past_the_cap(code: &str) -> String {
     body
 }
 
-/// A non-success health or whoami body past the cap is too large, whatever
-/// its status and whatever error envelope its first bytes hold: an
-/// oversized 429 is not `rate_limited`, and the run fails, exit 1.
 #[test]
 fn doctor_oversized_error_bodies_are_too_large() {
     for (status, code) in [
@@ -2316,9 +2152,6 @@ fn doctor_oversized_error_bodies_are_too_large() {
     }
 }
 
-/// The versioned JSON document for a pass, a fail, and an incomplete run,
-/// and the text form of the fail. Ports and the CLI's own version are
-/// replaced by placeholders, so the snapshots hold only the contract.
 #[test]
 fn doctor_json_contract() {
     let home = Sandbox::new();

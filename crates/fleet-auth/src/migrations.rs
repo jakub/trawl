@@ -9,7 +9,6 @@ use sqlx::{
     migrate::{Migrate as _, MigrateError, Migrator},
 };
 
-/// First supported schema. Earlier deployment histories are not adopted.
 pub const BASELINE_VERSION: i64 = 20_260_913_000_001;
 const LEGACY_VERSIONS: &[i64] = &[20_260_515_000_001, 20_260_726_000_001, 20_260_812_000_001];
 
@@ -17,30 +16,24 @@ const LEGACY_VERSIONS: &[i64] = &[20_260_515_000_001, 20_260_726_000_001, 20_260
 /// Operational callers use `migrate`, which enforces fresh-schema admission.
 pub static MIGRATOR: Migrator = sqlx::migrate!();
 
-/// Schema admission, validation, and execution failures remain distinguishable.
 #[derive(Debug, thiserror::Error)]
 pub enum SchemaError {
-    /// A known pre-baseline installation must be retained, not converted.
     #[error(
         "Fleet database has unsupported pre-1.0 migration {version}; provision a new dedicated database and retain the old database; do not delete or rewrite its migration history"
     )]
     LegacyHistory { version: i64 },
-    /// Tables without a supported history must never be adopted implicitly.
     #[error(
         "Fleet database is nonempty without a supported baseline; provision a new dedicated database and retain this database"
     )]
     UntrackedSchema,
-    /// Runtime validation never initializes an empty database.
     #[error(
         "Fleet database has no initial schema; apply its migrations to a fresh dedicated database before starting the application"
     )]
     Uninitialized,
-    /// Known forward migration has not yet been applied.
     #[error(
         "Fleet database needs migration {version}; apply its migrations before starting the application"
     )]
     PendingMigration { version: i64 },
-    /// Preserve unknown versions, checksum mismatch, and dirty-current errors.
     #[error("Fleet database migration error: {0}")]
     Migration(#[from] MigrateError),
     /// Database errors are logged locally and redacted at HTTP boundaries.
@@ -85,16 +78,12 @@ pub async fn validate_schema(pool: &PgPool) -> Result<(), SchemaError> {
     Ok(())
 }
 
-/// [`validate_schema`] on a connection the caller owns, for a caller that
-/// has no pool, such as `trawld --doctor` (ADR-0021 ruling 3). The
-/// read-only snapshot is rolled back before this returns, so the caller
-/// gets its connection back outside any transaction; if the future is
-/// dropped part-way, the connection may still be inside the snapshot, and
-/// the caller should close it.
+/// [`validate_schema`] on a connection the caller owns. If the future is
+/// dropped part-way, the connection may still be inside the read-only
+/// snapshot, and the caller should close it.
 ///
 /// # Errors
-/// As [`validate_schema`]. A validation error wins over an error rolling
-/// the snapshot back.
+/// A validation error wins over an error rolling the snapshot back.
 pub async fn validate_schema_on(conn: &mut PgConnection) -> Result<(), SchemaError> {
     let mut snapshot = conn
         .begin_with("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")

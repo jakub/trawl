@@ -3,20 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A capture attached to an investigation (ADR-0059) appends its step at
-//! admission and writes the step's terminal outcome when its work ends,
-//! through the fixture's HTTPS listener with real fleet keys: an agent key
-//! that writes (`query`, `investigation_read`, `investigation_write`) and a
-//! human key that reads (`query`, `investigation_read`). One test per
-//! outcome: success, refused, timeout and a client abort; a plan refusal
-//! that records nothing; the authority, the investigation's state and the
-//! purpose's bound. The correlation reads (`context`, `sightings`,
-//! `compare`) attach the same way, with their authority checked before
-//! their own validation.
+//! admission and writes the step's terminal outcome when its work ends.
 //!
-//! Captures resolve their window at the fixture's results clock, set onto
-//! the capture corpus of `common::captured`, 2024-01-16. The process's
-//! tracing events are recorded, so each test runs in its own process:
-//! nextest's. The binary is in the ADR-0021 `postgres` nextest group.
+//! The process's tracing events are recorded, so each test runs in its own
+//! process: nextest's.
 
 mod common;
 
@@ -46,11 +36,8 @@ use trawl_server::test_timing::frozen;
 /// capture corpus's hour.
 const START: &str = "2024-01-16T10:30:00Z";
 
-/// The two principals.
 struct Keys {
-    /// Reads and writes.
     agent: MintedKey,
-    /// Reads only.
     human: MintedKey,
 }
 
@@ -82,8 +69,6 @@ async fn keys(server: &TestServer) -> Keys {
     }
 }
 
-/// A fixture over the capture corpus with `capture`, its clock at
-/// [`START`].
 async fn boot(capture: CaptureConfig) -> (Arc<TestServer>, Keys) {
     let _ = telemetry();
     let server = captured::boot(RateLimitConfig::default(), capture).await;
@@ -92,8 +77,6 @@ async fn boot(capture: CaptureConfig) -> (Arc<TestServer>, Keys) {
     (Arc::new(server), keys)
 }
 
-/// [`boot`] with the slow corpus beside the capture corpus, captures
-/// under `deadline_secs` and queries under a minute.
 async fn boot_slow(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
     let _ = telemetry();
     let tmp = tempfile::tempdir().expect("create a temp dir");
@@ -117,7 +100,6 @@ async fn boot_slow(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
     (Arc::new(server), keys)
 }
 
-/// The capture corpus's 20 events.
 fn corpus_query() -> String {
     format!("service={}", captured::SERVICE)
 }
@@ -127,7 +109,6 @@ fn slow_query() -> String {
     format!("service={SLOW_SERVICE} message=/{SLOW_PATTERN}/")
 }
 
-/// Wait up to a minute for `done`, failing by `what`.
 async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     let give_up = std::time::Instant::now() + Duration::from_mins(1);
     while !done() {
@@ -139,13 +120,11 @@ async fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
     }
 }
 
-/// The investigation's sequence and entry count, read as the human.
 async fn seq_and_entries(server: &TestServer, keys: &Keys, n: u32) -> (u64, usize) {
     let page = read(server, &keys.human, n, "").await;
     (page.investigation.seq, page.entries.len())
 }
 
-/// Start a capture of `body` as `token` on a task of its own.
 fn spawn_capture(
     server: &Arc<TestServer>,
     token: &str,
@@ -156,7 +135,6 @@ fn spawn_capture(
     tokio::spawn(async move { captured::capture(&server, &token, &body).await })
 }
 
-/// The `query_start` events of query `query_id`.
 fn query_starts(query_id: u64) -> usize {
     telemetry()
         .events()
@@ -168,11 +146,6 @@ fn query_starts(query_id: u64) -> usize {
         .count()
 }
 
-/// A capture is admitted with its step already recorded: while the work
-/// is held, the human reads the step with the executed text, its bounds,
-/// the request and query ids and the purpose, and no outcome. Released,
-/// the step reads `success` with the result, its rows and the duration,
-/// at a later `updated_seq`.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_appends_its_step_at_admission_and_records_success() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -257,11 +230,6 @@ async fn an_attached_capture_appends_its_step_at_admission_and_records_success()
     assert_eq!(query_starts(query_id), 1);
 }
 
-/// The step of an attached capture keeps two counts: the rows the result
-/// holds and the rows the execution produced before the capture cut, the
-/// same total the committed result reads with. A capture cut by the row
-/// cap keeps fewer than its total, a whole one keeps all of them, and one
-/// that matches nothing keeps 0 of 0.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_cut_attached_capture_records_kept_and_total_rows() {
     let (server, keys) = boot_unmetered_with(CaptureConfig {
@@ -307,9 +275,6 @@ async fn a_cut_attached_capture_records_kept_and_total_rows() {
     }
 }
 
-/// A step's counts live in its log entry, not in the evidence: once the
-/// investigation's retention ends and the sweep prunes the kept result,
-/// the result reads gone and the step still reads its kept and total rows.
 #[tokio::test(flavor = "multi_thread")]
 async fn step_counts_survive_evidence_pruning() {
     let (server, keys) = boot(CaptureConfig {
@@ -361,11 +326,8 @@ async fn step_counts_survive_evidence_pruning() {
     );
 }
 
-/// A capture refused at admission still has its step, and the step reads
-/// `refused` with the refusal's code: the installation's one running slot
-/// is the human's, so the agent's attached capture is 429 `capture_busy`.
-/// The refusal took no permit and never started a query. (The held capture
-/// reads a window, so it holds the publication guard itself.)
+/// The human's held capture reads a window, so it holds the publication
+/// guard itself.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_refused_busy_records_refused_with_its_code() {
     let (server, keys) = boot(CaptureConfig {
@@ -419,8 +381,6 @@ async fn an_attached_capture_refused_busy_records_refused_with_its_code() {
     assert_eq!(status, StatusCode::OK, "{body}");
 }
 
-/// A capture that runs past its deadline answers 504, and its step reads
-/// `timeout` once the work stops.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_past_its_deadline_records_timeout() {
     let (server, keys) = boot_slow(1).await;
@@ -449,12 +409,9 @@ async fn an_attached_capture_past_its_deadline_records_timeout() {
     );
 }
 
-/// A capture whose client goes away while its work runs records `aborted`
-/// once its work stops, and leaves no row and no file. The work is held
-/// at its start, so the drop lands while it runs by construction; the
-/// release lets the latched cancellation stop it before the engine
-/// executes. `results_abort.rs` drops a capture inside `DuckDB`'s
-/// execution itself.
+/// The work is held at its start, so the client's drop lands while it runs
+/// by construction; the release lets the latched cancellation stop it
+/// before the engine executes.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_whose_client_goes_away_records_aborted() {
     let (server, keys) = boot_slow(60).await;
@@ -503,8 +460,6 @@ async fn verified(server: &TestServer, key: &MintedKey) -> fleet_auth::VerifiedK
         .expect("a fixture token verifies")
 }
 
-/// Start the capture service on `body` as `verified`, on a task of its
-/// own, past the transport.
 fn spawn_service_capture(
     server: &Arc<TestServer>,
     verified: fleet_auth::VerifiedKey,
@@ -524,10 +479,6 @@ fn spawn_service_capture(
     })
 }
 
-/// A capture whose request goes away while its step's admission waits on
-/// the investigation's lock still appends the step, and the admission,
-/// which outlived the request, records it `aborted` at once: the request
-/// that would have run the work is gone, and nothing ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_dropped_during_its_steps_admission_records_aborted() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -558,10 +509,6 @@ async fn a_capture_dropped_during_its_steps_admission_records_aborted() {
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (2, 1));
 }
 
-/// The step admission that outlives its request keeps the request's count
-/// (ADR-0054) until the admission and its `aborted` write end: with a
-/// count of one, a request is refused while the admission waits on the
-/// investigation's lock, and admitted once the step has settled.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dropped_captures_step_admission_keeps_its_request_count() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -601,14 +548,6 @@ async fn a_dropped_captures_step_admission_keeps_its_request_count() {
     until_admitted(&app, &keys.agent.token).await;
 }
 
-/// A step admission waits for its investigation no later than the
-/// capture's deadline. A capture whose admission reaches it answers 429
-/// `capture_busy` with a retry of one second and appends no step, and by
-/// then no session waits on the lock: Postgres ends its wait at the
-/// deadline too, under its own statement timeout. One whose request went
-/// away frees the request's count at the deadline, on its lease, while
-/// the lock is still held, and Postgres has stopped waiting within a
-/// floor of it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_deadline() {
     // Long enough for the test to see the second admission wait and drop
@@ -675,10 +614,6 @@ async fn a_step_admission_waits_for_its_investigation_no_later_than_the_capture_
     );
 }
 
-/// A capture whose request goes away while its step's admission unlinks
-/// the evidence the due-write rule pruned records the step `aborted` once
-/// the unlink ends, and the file is gone: the admission builds the step's
-/// completion itself and finishes without the request.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_dropped_during_its_steps_unlink_records_aborted() {
     // Unmetered: the step is polled until it settles.
@@ -733,15 +668,6 @@ async fn a_capture_dropped_during_its_steps_unlink_records_aborted() {
     assert_eq!(captured::root_names(&server), Vec::<String>::new());
 }
 
-/// The `aborted` write of a step whose request went away keeps the
-/// request's count (ADR-0054) no later than the capture's deadline
-/// (ADR-0059), and is still written. With a count of one, the request
-/// goes away after its step committed, while the admission unlinks pruned
-/// evidence, and the investigation's lock is taken before the write: a
-/// request is refused while the write waits for the lock, admitted once
-/// the deadline passes with the lock still held, and the step reads
-/// `aborted` once the lock is released. One line says the write ran past
-/// the deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_steps_aborted_write_frees_its_request_count_at_the_capture_deadline() {
     // Unmetered: the step is polled until it settles. Long enough for the
@@ -829,22 +755,16 @@ async fn an_abandoned_steps_aborted_write_frees_its_request_count_at_the_capture
     assert_eq!(past_deadline(), 1);
 }
 
-/// The statement the due-write rule prunes an investigation's kept
-/// results with.
 const EVIDENCE_PRUNE: &str = "UPDATE captured_results AS c%";
 
-/// The statement a write appends its log entry with.
 const LOG_INSERT: &str = "INSERT INTO investigation_log%";
 
-/// The statement a step's outcome is written with.
 const STEP_FILL: &str = "UPDATE investigation_log%";
 
 /// What a refused capture may take past its deadline: the rollback, the
 /// handover and the response.
 const FLOOR: Duration = Duration::from_secs(1);
 
-/// [`boot`], unmetered so a step can be polled until it settles, with
-/// captures under `deadline_secs`.
 async fn boot_unmetered(deadline_secs: u64) -> (Arc<TestServer>, Keys) {
     boot_unmetered_with(CaptureConfig {
         deadline_secs,
@@ -909,9 +829,6 @@ fn router_under(
     server.router_over(state, http)
 }
 
-/// Keep `n` results in investigation 1 through attached captures, each
-/// step settled, and answer their ids. The investigation's sequence ends
-/// at `2 * n`.
 async fn keep_results(server: &Arc<TestServer>, keys: &Keys, n: u64) -> Vec<String> {
     let mut kept = Vec::new();
     for step in 0..n {
@@ -927,7 +844,6 @@ async fn keep_results(server: &Arc<TestServer>, keys: &Keys, n: u64) -> Vec<Stri
     kept
 }
 
-/// How many of investigation 1's results are still kept.
 async fn still_kept(server: &TestServer) -> i64 {
     let probe = common::fixture_pool(&server.app_db_url, 1).await;
     let kept = sqlx::query_scalar(
@@ -941,7 +857,6 @@ async fn still_kept(server: &TestServer) -> i64 {
     kept
 }
 
-/// The backend of `session`.
 async fn backend(session: &mut sqlx::PgConnection) -> i32 {
     sqlx::query_scalar("SELECT pg_backend_pid()")
         .fetch_one(session)
@@ -949,8 +864,6 @@ async fn backend(session: &mut sqlx::PgConnection) -> i32 {
         .unwrap()
 }
 
-/// The backend the one session waiting on a lock in a statement like
-/// `pattern` waits for.
 async fn blocker(server: &TestServer, pattern: &str) -> i32 {
     let probe = common::fixture_pool(&server.app_db_url, 1).await;
     let blocker = sqlx::query_scalar(
@@ -965,15 +878,6 @@ async fn blocker(server: &TestServer, pattern: &str) -> i32 {
     blocker
 }
 
-/// A step admission waits no later than the capture's deadline however
-/// many locks it waits on in turn (ADR-0059): Postgres bounds every
-/// statement of the write by what remains. The due-write rule's prune
-/// waits on two kept results, each held by a session of its own: the one
-/// it waits on first lets go at three seconds, the other holds past the
-/// five-second deadline. The capture answers 429 `capture_busy` by the
-/// deadline, and by then no session waits on the prune; its request count
-/// is free, and nothing was written: both results are still kept and no
-/// step was appended.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_capture_deadline() {
     let deadline = Duration::from_secs(5);
@@ -1036,8 +940,7 @@ async fn a_step_admission_waiting_on_one_result_after_another_answers_by_the_cap
 
 /// The `statement_timeout` of each statement of the one step admission
 /// the server's statement record holds, in milliseconds, in the order
-/// the statements ran. Fails unless exactly one admission was recorded
-/// since the record was armed.
+/// the statements ran.
 fn admission_budgets(server: &TestServer) -> Vec<u128> {
     let mut admissions: Vec<_> = server
         .state
@@ -1056,24 +959,6 @@ fn admission_budgets(server: &TestServer) -> Vec<u128> {
     admissions.remove(0).1
 }
 
-/// The statement after a wait gets only what remains of the capture's
-/// deadline (ADR-0059). The due-write rule's prune waits three seconds on
-/// a kept result another session holds, with the investigation's lock
-/// free; then the step's log insert waits on a session holding the log
-/// table in `EXCLUSIVE` mode. The capture answers 429 `capture_busy`, and
-/// by then no session waits on the insert; its request count is free, and
-/// nothing was written. The server's statement record shows the insert
-/// was sent under a timeout of its own, after the lock and the prune;
-/// [`a_step_admission_spends_one_deadline_across_statements`] proves the
-/// timeout is what remained of the deadline.
-///
-/// Only the capture under test runs under the five-second deadline
-/// ([`router_under`]); the setup's capture keeps the default one.
-///
-/// The test runs on the live clock, and its waits are real Postgres lock
-/// waits, each under a hang guard. The prune's waiter is still polled
-/// for while it waits, and it waits no longer than its five-second
-/// `statement_timeout`, so heavy enough load can still miss it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_step_admissions_log_insert_waits_only_what_remains_of_the_capture_deadline() {
     use sqlx::Connection as _;
@@ -1225,13 +1110,6 @@ async fn a_step_admission_spends_one_deadline_across_statements() {
     probe.close().await;
 }
 
-/// The `aborted` write of a step whose request went away waits no later
-/// than the capture's deadline on the step's own log row too, and past it
-/// the outcome is still written, once the row is free (ADR-0059). The
-/// request goes away after its step committed, while the admission unlinks
-/// pruned evidence, and another session holds the step's row: the write
-/// waits on it, one line says it ran past the deadline, the step is still
-/// running, and it reads `aborted` once the row is released.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_steps_write_held_on_its_log_row_is_written_once_the_row_is_free() {
     use sqlx::Connection as _;
@@ -1298,14 +1176,6 @@ async fn an_abandoned_steps_write_held_on_its_log_row_is_written_once_the_row_is
     assert_eq!(past_deadline(), 1);
 }
 
-/// The request's count an abandoned step's admission keeps goes back at
-/// the capture's deadline whatever the admission awaits then (ADR-0059).
-/// With a count of one, the request goes away after its step committed,
-/// while the admission unlinks pruned evidence, and the unlink stays
-/// parked past the deadline: a request is refused before the deadline,
-/// one is admitted once it passes with the unlink still parked and the
-/// step still running, and the step reads `aborted` once the unlink is
-/// released.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_abandoned_admissions_request_count_goes_back_at_the_capture_deadline_whatever_it_awaits()
  {
@@ -1366,13 +1236,6 @@ async fn an_abandoned_admissions_request_count_goes_back_at_the_capture_deadline
     assert_eq!(recorded.outcome, StepOutcomeKind::Aborted, "{recorded:?}");
 }
 
-/// Detached step outcomes are written by one writer, in turn (ADR-0059).
-/// Six attached captures are admitted, their steps committed, and wait
-/// behind the agent's one running slot, which an unattached capture holds;
-/// another session holds the investigation's lock, and the six requests go
-/// away in order. Their `aborted` writes wait on the lock one at a time:
-/// one session waits, the pool still serves a read, and once the lock is
-/// released the six read `aborted` in the order their requests went away.
 #[tokio::test(flavor = "multi_thread")]
 async fn abandoned_steps_are_written_in_turn_by_one_writer() {
     const ABANDONED: u64 = 6;
@@ -1464,17 +1327,6 @@ async fn abandoned_steps_are_written_in_turn_by_one_writer() {
     assert_eq!(support::finish(holder).await.status(), StatusCode::OK);
 }
 
-/// A key's share of the step writer's places is `per_key_running +
-/// queue_depth`, two here, and a step holds one from before its append
-/// until its outcome is written (ADR-0059). An attached capture on
-/// investigation 3 runs, held at its start; one on investigation 1 waits
-/// behind it and goes away while another session holds investigation 1's
-/// lock, so its `aborted` write waits for the writer. An attached capture
-/// of the same key on investigation 2, which nothing locks, finds its
-/// key's share full: it answers 429 `capture_busy` with a retry of one
-/// second at once, well before its deadline, and investigation
-/// 2 holds no step. Once the lock and the held capture are released, the
-/// outcomes land and the same capture succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_capture_is_refused_at_once_while_its_key_holds_its_whole_share() {
     // Long enough that a capture waiting for a place would show: the
@@ -1568,21 +1420,6 @@ async fn an_attached_capture_is_refused_at_once_while_its_key_holds_its_whole_sh
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
 }
 
-/// One key holds no more steps whose outcome is not yet written than its
-/// share of places, `per_key_running + queue_depth`: two here (ADR-0059).
-/// The share is the step writer's only bound, so a key whose outcomes wait
-/// for the writer leaves every other key its own share, however few
-/// captures the installation runs: `installation_running` is one here.
-/// The agent's unattached capture runs, held at its start, and an attached
-/// capture on investigation 1, then one on investigation 2, waits behind
-/// it and goes away while another session holds its investigation's lock,
-/// so both `aborted` writes wait for the writer, which waits on a lock.
-/// Released, the held capture ends. While the writer still waits, a
-/// second writer key's attached capture on investigation 4 is admitted and
-/// succeeds, its step appended, and the agent's own on investigation 3
-/// answers 429 `capture_busy` with a retry of one second at once, and
-/// investigation 3 holds no step. Once the locks are released, both
-/// outcomes land and the agent's capture on investigation 3 succeeds.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_places() {
@@ -1706,18 +1543,6 @@ async fn a_key_whose_outcomes_wait_for_the_writer_leaves_the_other_keys_their_pl
     assert_eq!(outcome(&step).unwrap().outcome, StepOutcomeKind::Success);
 }
 
-/// A capture refused for its key's full share holds no request slot
-/// (ADR-0054, ADR-0059): it is refused at once, so however many of one
-/// key's captures arrive behind a stalled writer, every other key's
-/// requests still reach their own share. As in the test above, the
-/// agent's two abandoned outcomes wait for the writer behind their
-/// investigations' locks and fill its share of two. Through a router
-/// counting two requests, the agent then sends three attached captures on
-/// investigation 3, one after another, each on a task of its own, with
-/// the fixture's deadline. A second writer key's investigation list, sent
-/// while they are in flight or answered, is admitted. Each of the agent's captures
-/// answers 429 `capture_busy` with a retry of one second at once, and
-/// investigation 3 holds no step.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one scenario, stated in order
 async fn a_keys_refused_captures_hold_no_request_slots_from_the_other_keys() {
@@ -1850,9 +1675,6 @@ async fn a_keys_refused_captures_hold_no_request_slots_from_the_other_keys() {
     }
 }
 
-/// A capture refused while its text and bounds are planned runs nothing,
-/// so it records nothing: a window wider than the capture's span, and a
-/// query holding a NUL.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_refused_by_its_plan_records_no_step() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -1870,11 +1692,6 @@ async fn a_capture_refused_by_its_plan_records_no_step() {
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
 }
 
-/// Attaching needs `investigation_write`: the human's attached capture is
-/// 403 and records nothing, before its text is judged, so a query holding
-/// a NUL is 403 too. Revoking the agent's write permission between two
-/// attached captures refuses the second, and the investigation still
-/// reads with its creator's snapshot.
 #[tokio::test(flavor = "multi_thread")]
 async fn attaching_needs_write_authority_read_live_from_the_role() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -1925,14 +1742,6 @@ async fn attaching_needs_write_authority_read_live_from_the_role() {
     );
 }
 
-/// The attached capture is the one place a grant follows the body
-/// (ADR-0059, amended in the #310 final sweep): the intent to attach is a
-/// field of the body, so a key with `query` alone has its body read and
-/// shaped, and nothing else runs before its 403. Its attached capture is
-/// refused with no step, no result and no admission, an over-long purpose
-/// included, since the purpose is judged after the grant. A body that does
-/// not read as a capture request answers 400 `bad_request`, and the same
-/// key's unattached capture succeeds.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_only_keys_attached_capture_is_refused_once_its_body_is_shaped() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -1993,9 +1802,6 @@ async fn a_query_only_keys_attached_capture_is_refused_once_its_body_is_shaped()
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
 }
 
-/// An unknown investigation is 404, a closed one 409
-/// `investigation_closed` naming the reopen, and a purpose over its bound
-/// 400 naming the rule; none records a step.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attachment_names_an_open_investigation_and_a_bounded_purpose() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2046,10 +1852,6 @@ async fn an_attachment_names_an_open_investigation_and_a_bounded_purpose() {
     assert_eq!(seq_and_entries(&server, &keys, 2).await, (0, 0));
 }
 
-// -- correlation reads ---------------------------------------------------------
-
-/// The agent's temporary capture of the corpus: the focus result a
-/// `context` read centres on.
 async fn focus_result(server: &TestServer, key: &MintedKey) -> String {
     captured::captured(
         server,
@@ -2061,10 +1863,6 @@ async fn focus_result(server: &TestServer, key: &MintedKey) -> String {
     .id
 }
 
-/// One valid request body per correlation read, unattached: a context
-/// read around row 0 of `focus`, the sightings of the corpus's message
-/// word, and the corpus's per-host rates in its half hour against the
-/// half hour before.
 fn correlation_bodies(focus: &str) -> [(&'static str, Value); 3] {
     [
         (
@@ -2086,9 +1884,6 @@ fn correlation_bodies(focus: &str) -> [(&'static str, Value); 3] {
     ]
 }
 
-/// One body per correlation read that the read itself refuses as 400,
-/// whoever sends it: a context side over its cap, an empty literal, and
-/// three group fields.
 fn invalid_bodies(focus: &str) -> [(&'static str, Value); 3] {
     [
         (
@@ -2107,8 +1902,6 @@ fn invalid_bodies(focus: &str) -> [(&'static str, Value); 3] {
     ]
 }
 
-/// `body` attached to investigation `n` with `attach`'s other members
-/// (`seen_seq`, `purpose`).
 fn attaching(body: &Value, n: u32, attach: &Value) -> Value {
     let mut investigation = json!({ "id": id(n) });
     if let Value::Object(members) = attach {
@@ -2121,7 +1914,6 @@ fn attaching(body: &Value, n: u32, attach: &Value) -> Value {
     body
 }
 
-/// The server's count of queries begun.
 fn queries_counted(server: &TestServer) -> u64 {
     server
         .state
@@ -2129,12 +1921,6 @@ fn queries_counted(server: &TestServer) -> u64 {
         .load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// An attached correlation read `read` of `body` appends its step and is
-/// kept as investigation 1's evidence: the response carries the step's
-/// seq and, since it sends `seen_seq`, the activity; the result is
-/// `kept`, names the investigation, its kind and its facts; the step
-/// reads `success` with the result, its rows and the executed text the
-/// result records; and the human, who reads the investigation, pages it.
 async fn assert_attached_read_is_kept(read: &str) {
     let (server, keys) = boot(CaptureConfig::default()).await;
     let focus = focus_result(&server, &keys.agent).await;
@@ -2215,31 +2001,21 @@ async fn assert_attached_read_is_kept(read: &str) {
     );
 }
 
-/// A context read attached to an investigation (ADR-0059): its step and
-/// its result kept with its facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_context_read_appends_its_step_and_keeps_its_result_with_its_facts() {
     Box::pin(assert_attached_read_is_kept("context")).await;
 }
 
-/// A sightings read attached to an investigation: its step and its result
-/// kept with its facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_sightings_read_appends_its_step_and_keeps_its_result_with_its_facts() {
     Box::pin(assert_attached_read_is_kept("sightings")).await;
 }
 
-/// A compare read attached to an investigation: its step and its result
-/// kept with its facts.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_compare_read_appends_its_step_and_keeps_its_result_with_its_facts() {
     Box::pin(assert_attached_read_is_kept("compare")).await;
 }
 
-/// A key with `query` alone that names an investigation is refused 403
-/// before the read judges its own input: each body below is one the read
-/// refuses as 400 unattached, and attached it is 403 `forbidden` with no
-/// step, no result and no query begun, an over-long purpose included.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_query_only_keys_attached_correlation_read_is_refused_before_its_own_validation() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2264,8 +2040,6 @@ async fn a_query_only_keys_attached_correlation_read_is_refused_before_its_own_v
             assert_eq!(code(&answer), "forbidden", "{answer}");
         }
     }
-    // A context read on a result that does not exist is 403 too: the
-    // focus is not looked up.
     let missing = json!({ "result_id": "f".repeat(32), "row": 0 });
     let (status, _, answer) = captured::correlate(
         &server,
@@ -2292,9 +2066,6 @@ async fn a_query_only_keys_attached_correlation_read_is_refused_before_its_own_v
     );
 }
 
-/// A writer's attached read that the read refuses for its own input (a
-/// cap, a field rule, a focus that does not exist) is that read's 400 or
-/// 404, and appends no step: nothing ran.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_correlation_read_refused_by_its_own_validation_records_no_step() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2332,9 +2103,6 @@ async fn an_attached_correlation_read_refused_by_its_own_validation_records_no_s
     );
 }
 
-/// Each correlation read naming an unknown investigation is 404 and one
-/// naming a closed investigation 409 `investigation_closed`: no step, no
-/// permit or guard held, no result kept, nothing written.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_correlation_read_naming_an_unknown_or_closed_investigation_runs_nothing() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2387,10 +2155,6 @@ async fn a_correlation_read_naming_an_unknown_or_closed_investigation_runs_nothi
     assert_eq!(captured::root_names(&server), [format!("{focus}.parquet")]);
 }
 
-/// A correlation read's purpose is bounded before anything is looked up:
-/// over its bound or holding a NUL, each read answers 400 naming the rule,
-/// whatever the investigation (here one that does not exist) and whatever
-/// the focus (a context read on a result that does not exist).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_correlation_reads_purpose_is_bounded_before_anything_is_looked_up() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2427,11 +2191,6 @@ async fn a_correlation_reads_purpose_is_bounded_before_anything_is_looked_up() {
     assert_eq!(seq_and_entries(&server, &keys, 1).await, (0, 0));
 }
 
-/// A context read may centre on another key's kept evidence for a key that
-/// reads investigations, as a page read may: the agent's attached search
-/// is kept; the human (`query`, `investigation_read`) reads the rows
-/// around one of its rows, and a second writer attaches such a read to the
-/// investigation. A key with `query` alone does not find it.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_context_read_centres_on_another_keys_kept_evidence_for_an_investigation_reader() {
     let (server, keys) = boot(CaptureConfig::default()).await;
@@ -2488,16 +2247,11 @@ async fn a_context_read_centres_on_another_keys_kept_evidence_for_an_investigati
     assert_eq!(status, StatusCode::NOT_FOUND, "{answer}");
 }
 
-/// A compare attached to an investigation whose data root turns into a
-/// symlink to nothing after boot is refused 503 `service_unavailable`
-/// ("environment listing failed") by retention reach, which runs after the
-/// compare statement, for a pinned filter and the wildcard alike. The fixture
-/// is unmetered so the step can be polled until it settles. The step
-/// was admitted, so it settles as `failed` with that code; no result is
-/// kept or written, the investigation's kept count stays zero, and nothing
-/// is held. The swap happens after boot, since boot refuses a dangling
-/// root, and nothing writes to the data root meanwhile: the fixture's
-/// compaction and retention are idle and the corpus is already seeded.
+/// The fixture is unmetered so the step can be polled until it settles.
+/// The data root turns into a symlink to nothing after boot, since boot
+/// refuses a dangling root, and nothing writes to it meanwhile: the
+/// fixture's compaction and retention are idle and the corpus is already
+/// seeded.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_attached_compare_over_a_dangling_data_root_settles_its_step_as_failed() {
     let _ = telemetry();

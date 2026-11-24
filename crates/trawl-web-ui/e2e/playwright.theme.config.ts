@@ -5,8 +5,6 @@
 import { defineConfig, devices } from '@playwright/test';
 import path from 'node:path';
 
-// The root runner builds this binary and both distributions before invoking
-// Playwright. There is no build or Node SPA substitute inside this config.
 const binary = process.env.THEME_ASSET_SERVER;
 const trawl = process.env.THEME_TRAWL_DIST;
 const workbench = process.env.THEME_WORKBENCH_DIST;

@@ -4,27 +4,6 @@
 
 //! The degraded-field analyzer: a read-time verdict over the durable conflict
 //! evidence, with no daemon, no verdict table and no state of its own.
-//!
-//! A pin that keeps nulling values is not itself news: a burst of bad data
-//! from one deploy is what the conform is for, and the values stay in `_raw`.
-//! What deserves an operator's attention is a pin that has been losing data
-//! long enough to be the system's model of the field rather than an incident.
-//! Hence a gate with two independent halves: the evidence must span
-//! [`DEGRADED_MIN_SPAN`], and it must carry volume, either
-//! [`DEGRADED_MIN_ROWS_SHELVED`] rows shelved or [`DEGRADED_MIN_EPISODES`]
-//! distinct episodes. The span alone would badge a field that lost two rows
-//! a month apart; the volume alone would badge one bad deploy.
-//!
-//! There is no multi-sender gate (ADR-0011): a homelab or SMB install commonly
-//! has exactly one legitimate producer per field, and requiring two would make
-//! the badge unreachable precisely where it is most useful. Sender count is
-//! displayed evidence. The verdict is advisory and sender-influenceable; the
-//! control against a hostile sender steering an operator into rewriting an
-//! archive is the human approval plus `schema_write`, never this function.
-//!
-//! Pure by construction: no async, no pool, no clock beyond the instants it
-//! is handed. The store reads the rows ([`crate::store::CatalogStore::conflict_aggregates`]
-//! and `conflict_evidence_for`); the route handlers compose the two.
 
 use chrono::{DateTime, TimeDelta, Utc};
 use trawl_api::DegradedVerdict;
@@ -34,20 +13,12 @@ use crate::store::MAX_CONFLICT_SAMPLES;
 
 /// Minimum evidence span (`last_at - first_at`) before a pin can be called
 /// degraded.
-///
-/// A day is the shortest window that cannot be one incident: a bad deploy,
-/// a misconfigured shipper caught the same afternoon, a backfill of malformed
-/// history. Anything still conflicting a day later is the steady state.
 pub const DEGRADED_MIN_SPAN: TimeDelta = TimeDelta::hours(24);
 
 /// Volume floor, rows: lifetime rows the pin has shelved.
 pub const DEGRADED_MIN_ROWS_SHELVED: i64 = 100;
 
 /// Volume floor, episodes: distinct conforming casts that nulled something.
-///
-/// The OR sibling of [`DEGRADED_MIN_ROWS_SHELVED`], and not redundant with
-/// it: a low-volume sender losing one row per hour for a week never reaches
-/// a hundred rows, and is exactly as wrong about its pin as a noisy one.
 pub const DEGRADED_MIN_EPISODES: i64 = 3;
 
 /// One field's conflict evidence, aggregated across every service that
@@ -58,7 +29,6 @@ pub const DEGRADED_MIN_EPISODES: i64 = 3;
 /// and unbounded (the aggregation happens in SQL for that reason).
 #[derive(Debug, Clone)]
 pub struct ConflictAggregate {
-    /// Field name (a catalog key).
     pub field: String,
     /// Earliest evidence across the field's services.
     pub first_at: DateTime<Utc>,
@@ -91,24 +61,11 @@ pub fn meets_degraded_threshold(agg: &ConflictAggregate) -> bool {
 
 /// Whether the field is degraded as every read surface reports it: the
 /// evidence meets the threshold and no acknowledgement covers it.
-///
-/// Suppression is a comparison of COUNTS, not of clocks: an ack records the
-/// episode total it was written against, and evidence up to and including
-/// that total is what the operator saw. Episode 4 after an ack through 3
-/// re-raises the verdict. A timestamp high-water would lose to a clock tie —
-/// evidence recorded in the same transaction second as the ack would be
-/// suppressed unseen, and postgres' `now()` is the transaction's clock, so
-/// ties are ordinary rather than exotic.
-///
-/// The counter only grows (`field_conflict_stats.episodes` is a running sum,
-/// and a repin's clear deletes the ack with the evidence), so an ack can
-/// never suppress more than the operator acknowledged.
 #[must_use]
 pub fn is_degraded(agg: &ConflictAggregate) -> bool {
     meets_degraded_threshold(agg) && !acknowledged(agg)
 }
 
-/// Whether an acknowledgement covers all the evidence there is.
 fn acknowledged(agg: &ConflictAggregate) -> bool {
     agg.ack_evidence_through
         .is_some_and(|through| agg.episodes <= through)
@@ -117,18 +74,10 @@ fn acknowledged(agg: &ConflictAggregate) -> bool {
 /// The type the evidence suggests repinning to.
 ///
 /// `observed_types` are the `DuckDB` types the conflicting batches carried,
-/// per-column inferences rather than per-value ones, so they are read through
-/// [`normalize_duckdb_type`], never `CanonicalType::from_catalog` (which
-/// matches canonical spellings exactly and would drop `INTEGER`, `HUGEINT`
-/// and `JSON` on the floor). One rung, unanimously, and different from the
-/// current pin, is a suggestion; anything else resolves to `VARCHAR`: mixed
-/// rungs, `JSON` (which `read_json` infers for mixed scalars), an
-/// out-of-range integer, no evidence at all, or a rung that is the current
-/// pin.
-///
-/// `VARCHAR` is the fallback by choice, not as a shrug: a field whose values
-/// genuinely disagree about their type is an enum-shaped field, and text is
-/// where it stops losing data.
+/// per-column inferences rather than per-value ones, so they are read
+/// through [`normalize_duckdb_type`], never `CanonicalType::from_catalog`
+/// (which matches canonical spellings exactly and would drop `INTEGER`,
+/// `HUGEINT` and `JSON` on the floor).
 #[must_use]
 pub fn suggested_target(current: CanonicalType, observed_types: &[String]) -> CanonicalType {
     let mut uniform: Option<CanonicalType> = None;
@@ -153,8 +102,7 @@ pub fn suggested_target(current: CanonicalType, observed_types: &[String]) -> Ca
 /// `evidence` is the field's retained conflict rows as
 /// `(observed_type, samples)`, newest first — the rows the recency window
 /// kept, which is why the samples are a window while `rows_shelved` is a
-/// lifetime total. The two numbers will disagree, and should: one says what
-/// the pin has cost, the other shows what it is costing right now.
+/// lifetime total.
 #[must_use]
 pub fn verdict(
     agg: &ConflictAggregate,
@@ -164,7 +112,7 @@ pub fn verdict(
     let observed: Vec<String> = evidence.iter().map(|(t, _)| t.clone()).collect();
 
     // Distinct, newest first, capped by the same budget one conflict row
-    // carries — the case file is a sample of a sample, never a dump.
+    // carries.
     let mut samples: Vec<String> = Vec::with_capacity(MAX_CONFLICT_SAMPLES);
     for value in evidence.iter().flat_map(|(_, s)| s) {
         if samples.len() == MAX_CONFLICT_SAMPLES {
@@ -300,7 +248,6 @@ mod tests {
         assert!(is_degraded(&raised));
     }
 
-    /// One sender is enough: there is no multi-sender gate.
     #[test]
     fn single_service_evidence_qualifies() {
         let mut a = agg(TimeDelta::hours(25), 5, 500);
@@ -373,9 +320,6 @@ mod tests {
         }
     }
 
-    /// The verdict carries the facts and nothing else: the lifetime totals,
-    /// the sender count as evidence, and a de-duplicated, capped sample set
-    /// drawn newest-first across the retained rows.
     #[test]
     fn the_verdict_is_capped_distinct_facts() {
         let mut a = agg(TimeDelta::hours(48), 9, 900);

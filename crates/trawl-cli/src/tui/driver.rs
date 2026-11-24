@@ -18,20 +18,13 @@ use tokio::sync::{mpsc, oneshot};
 
 use trawl_client::QueryResponse;
 
-// ---------------------------------------------------------------------------
-// Protocol types
-// ---------------------------------------------------------------------------
-
-/// Inbound request from a driver client (deserialized from NDJSON).
-///
-/// Also serializable so the CLI client can construct and send requests.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum DriverRequest {
-    /// Introspect current TUI state.
     Status,
-    /// Replace the editor content.
-    SetQuery { query: String },
+    SetQuery {
+        query: String,
+    },
     /// Execute the current query and wait for results.
     Execute {
         #[serde(default = "default_timeout_ms")]
@@ -42,21 +35,23 @@ pub enum DriverRequest {
         width: Option<u16>,
         height: Option<u16>,
     },
-    /// Inject a single keystroke.
-    Key { key: String },
-    /// Inject multiple keystrokes sequentially.
-    Keys { keys: Vec<String> },
+    Key {
+        key: String,
+    },
+    Keys {
+        keys: Vec<String>,
+    },
     /// Get structured result data without rendering.
-    GetResults { tab: Option<usize> },
-    /// Clean exit.
+    GetResults {
+        tab: Option<usize>,
+    },
     Quit,
 }
 
 fn default_timeout_ms() -> u64 {
-    300_000 // 5 minutes
+    300_000
 }
 
-/// Outbound response to a driver client (serialized as NDJSON).
 #[derive(Debug, Deserialize, Serialize)]
 pub struct DriverResponse {
     pub ok: bool,
@@ -66,11 +61,8 @@ pub struct DriverResponse {
     pub data: DriverData,
 }
 
-/// Response payload: one flat struct shared by every command, with each
-/// absent field omitted from the wire.
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct DriverData {
-    // status fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub focus: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -86,7 +78,6 @@ pub struct DriverData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result_columns: Option<Vec<String>>,
 
-    // execute / get_results fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -96,7 +87,6 @@ pub struct DriverData {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rows: Option<Vec<Vec<serde_json::Value>>>,
 
-    // capture fields
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -131,18 +121,12 @@ impl DriverResponse {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Internal command type (sent from socket task → event loop)
-// ---------------------------------------------------------------------------
-
-/// A driver command carrying a oneshot reply channel.
 #[derive(Debug)]
 pub struct DriverCommand {
     pub request: DriverRequest,
     pub reply: oneshot::Sender<DriverResponse>,
 }
 
-/// Pending execute waiter: reply channel for the query tab.
 pub struct ExecuteWaiter {
     pub reply: oneshot::Sender<DriverResponse>,
 }
@@ -165,11 +149,6 @@ impl std::fmt::Debug for ExecuteWaiter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Result data extraction
-// ---------------------------------------------------------------------------
-
-/// Convert a `QueryResponse` into driver-friendly JSON rows.
 pub fn query_response_to_data(response: &QueryResponse) -> DriverData {
     let columns: Vec<String> = response
         .result
@@ -195,22 +174,11 @@ pub fn query_response_to_data(response: &QueryResponse) -> DriverData {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Socket listener
-// ---------------------------------------------------------------------------
-
-/// Default socket path: `~/.config/trawl/driver.sock`.
 pub fn default_socket_path() -> PathBuf {
     let config_dir = shellexpand::tilde("~/.config/trawl");
     PathBuf::from(config_dir.as_ref()).join("driver.sock")
 }
 
-// ---------------------------------------------------------------------------
-// Client (used by `trawl driver` subcommands)
-// ---------------------------------------------------------------------------
-
-/// Connect to a running TUI's driver socket, send a request, and return the
-/// response. Short-lived: opens one connection per invocation.
 pub async fn send_command(
     socket_path: &Path,
     request: &DriverRequest,
@@ -233,14 +201,12 @@ pub async fn send_command(
     serde_json::from_str(&line).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
 }
 
-/// Remove stale socket file if it exists.
 fn cleanup_socket(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_file(path);
     }
 }
 
-/// Spawn the unix socket listener task. Returns a receiver for driver commands.
 pub fn spawn_listener(
     path: &Path,
 ) -> Result<mpsc::UnboundedReceiver<DriverCommand>, std::io::Error> {
@@ -252,7 +218,6 @@ pub fn spawn_listener(
 
     let listener = UnixListener::bind(path)?;
 
-    // Set socket permissions to owner-only (0o600).
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -283,7 +248,6 @@ pub fn spawn_listener(
     Ok(rx)
 }
 
-/// Handle a single client connection (runs inline — one client at a time).
 async fn handle_client(stream: tokio::net::UnixStream, tx: &mpsc::UnboundedSender<DriverCommand>) {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
@@ -307,7 +271,7 @@ async fn handle_client(stream: tokio::net::UnixStream, tx: &mpsc::UnboundedSende
 
         let timeout_ms = match &request {
             DriverRequest::Execute { timeout_ms, .. } => *timeout_ms,
-            _ => 30_000, // 30s default for non-execute commands
+            _ => 30_000,
         };
 
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -353,10 +317,6 @@ async fn write_response(
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Key string parser
-// ---------------------------------------------------------------------------
-
 /// Parse a human-readable key string (e.g. `"ctrl+enter"`, `"F5"`, `"a"`)
 /// into a crossterm `KeyEvent`.
 pub fn parse_key_string(s: &str) -> Result<KeyEvent, String> {
@@ -369,7 +329,6 @@ pub fn parse_key_string(s: &str) -> Result<KeyEvent, String> {
     let mut modifiers = KeyModifiers::empty();
     let key_name = parts.last().ok_or_else(|| "empty key string".to_owned())?;
 
-    // Parse modifier prefixes (everything before the last part).
     for &part in &parts[..parts.len() - 1] {
         match part.to_lowercase().as_str() {
             "ctrl" | "control" => modifiers |= KeyModifiers::CONTROL,
@@ -419,11 +378,6 @@ pub fn parse_key_string(s: &str) -> Result<KeyEvent, String> {
     Ok(KeyEvent::new(code, modifiers))
 }
 
-// ---------------------------------------------------------------------------
-// App integration (split impl — methods that handle driver commands from
-// within the TUI event loop)
-// ---------------------------------------------------------------------------
-
 use ratatui::Terminal;
 
 use super::App;
@@ -431,7 +385,6 @@ use super::state::TabStatus;
 use super::ui;
 
 impl App {
-    /// Start the driver socket listener if a path is provided.
     pub(crate) fn start_driver(&mut self, path: &Path) {
         match spawn_listener(path) {
             Ok(rx) => {
@@ -445,7 +398,6 @@ impl App {
         }
     }
 
-    /// Clean up the driver socket file.
     pub(crate) fn cleanup_driver(&mut self) {
         if let Some(ref path) = self.driver_socket_path {
             let _ = std::fs::remove_file(path);
@@ -789,8 +741,6 @@ mod tests {
         assert_eq!(ev.code, KeyCode::BackTab);
     }
 
-    // -- request deserialization tests --
-
     #[test]
     fn deserialize_status() {
         let req: DriverRequest = serde_json::from_str(r#"{"cmd":"status"}"#).unwrap();
@@ -873,8 +823,6 @@ mod tests {
         let result = serde_json::from_str::<DriverRequest>(r#"{"cmd":"foobar"}"#);
         assert!(result.is_err());
     }
-
-    // -- response serialization tests --
 
     #[test]
     fn serialize_ok_response() {

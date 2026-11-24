@@ -3,31 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The query preparation allowance (ADR-0063, amending ADR-0054).
-//!
-//! Preparing query text means parsing it, validating it and building its
-//! patterns, and near-limit patterns can spend about 0.85 s of CPU doing
-//! it. A reactor thread that spends that time stalls every task scheduled
-//! on it, health and metrics included. So every door that takes query text
-//! prepares on the blocking pool, through [`Preparation::run`], behind a
-//! fixed number of slots.
-//!
-//! A request and the job it dispatched are two lifetimes, as a request and
-//! its executor work are (ADR-0024). The slot belongs to the job
-//! ([`PrepJob`]), which the blocking closure owns and drops last. So a job
-//! whose request stopped waiting keeps its slot, and whatever its work
-//! holds, such as a regex reservation, until its closure exits. A charge
-//! the caller attached ([`Preparation::run_with_holding`]), such as a
-//! scheduled run's lease, stays with the job too. When the
-//! request stops waiting, at its deadline, because its caller went away or
-//! because a cancel by id reached it, its guard ([`Waiting`]) requests the
-//! job's [`Stop`], and the work ends at its next cancellation point. A
-//! tracked request's job stops on the request's own cancel flag
-//! ([`Preparation::run_with`]), so a cancel reaches the job even before the
-//! request hears it.
-//!
-//! The allowance shares only its shape with the ADR-0054 allowances: a
-//! size fixed in code, gauges, a fixed refusal sentence and no
-//! `Retry-After`. A job never holds or awaits an executor permit.
 
 use std::any::Any;
 use std::sync::Arc;
@@ -44,14 +19,11 @@ use crate::error::ServerError;
 use crate::pool::seam;
 use crate::pool::{Pending, StartRefusal};
 
-/// The allowance's size: half the cores, at least 2, at most the executor
-/// permits. With one permit the allowance is one slot.
 #[must_use]
 pub fn allowance(cores: usize, permits: usize) -> usize {
     (cores / 2).max(2).min(permits)
 }
 
-/// Which preparation a job runs, for its log events.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Door {
     /// [`crate::admission::admit`]: the parse and validation every door
@@ -67,7 +39,6 @@ pub enum Door {
 }
 
 impl Door {
-    /// The stable log spelling.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -79,7 +50,6 @@ impl Door {
     }
 }
 
-/// The counts behind the retained-job reads.
 #[derive(Debug, Default)]
 struct Counters {
     /// Jobs whose request stopped waiting and whose closure has not exited.
@@ -88,20 +58,16 @@ struct Counters {
     reclaimed: AtomicU64,
 }
 
-/// The preparation allowance: one slot for each preparation job running
-/// on the blocking pool. Clones share the slots.
 #[derive(Debug, Clone)]
 pub struct Preparation {
     slots: Arc<Semaphore>,
     size: usize,
     counters: Arc<Counters>,
-    /// The seams of the pool that owns this allowance.
     #[cfg(any(test, feature = "test-support"))]
     seams: Arc<seam::Table>,
 }
 
 impl Preparation {
-    /// An allowance of `size` slots.
     pub(crate) fn new(size: usize) -> Self {
         Self {
             slots: Arc::new(Semaphore::new(size)),
@@ -112,7 +78,6 @@ impl Preparation {
         }
     }
 
-    /// Reach the seams of the pool that owns this allowance.
     #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(crate) fn with_seams(mut self, seams: Arc<seam::Table>) -> Self {
@@ -120,7 +85,6 @@ impl Preparation {
         self
     }
 
-    /// How many slots the allowance has.
     #[must_use]
     pub fn size(&self) -> usize {
         self.size
@@ -139,22 +103,11 @@ impl Preparation {
         self.counters.retained.load(Ordering::SeqCst)
     }
 
-    /// How many retained jobs have given their slot back since the
-    /// allowance was made.
     #[must_use]
     pub fn reclaimed(&self) -> u64 {
         self.counters.reclaimed.load(Ordering::SeqCst)
     }
 
-    /// Run `work` on the blocking pool once a slot is free, and answer with
-    /// what it returns.
-    ///
-    /// The wait for a slot spends `deadline` like every other wait
-    /// (ADR-0024). Once a slot is taken it belongs to the job, which keeps
-    /// it until its closure exits, past `deadline` and past a caller that
-    /// walked away. Either asks `work` to stop through its [`Stop`]. The
-    /// task is never aborted: `work` ends at its next cancellation point.
-    ///
     /// # Errors
     ///
     /// - [`ServerError::PreparationUnavailable`] when no slot came free
@@ -173,11 +126,6 @@ impl Preparation {
     /// [`Self::run`] for a request that a cancel by id can reach
     /// ([`crate::pool::ExecutorPool::pend`]), or for an untracked one with
     /// `pending` `None`.
-    ///
-    /// A cancel ends the wait for a slot at once. Once the job runs, its
-    /// [`Stop`] is the request's cancel flag, so the job ends at its next
-    /// cancellation point, and the request ends at once while the job keeps
-    /// its slot until then, as at the deadline.
     ///
     /// # Errors
     ///
@@ -202,11 +150,7 @@ impl Preparation {
 
     /// [`Self::run_with`] for a caller whose charge must stay charged
     /// while its preparation runs, as a scheduled run's lease must
-    /// (ADR-0018, amended 2026-11-09).
-    ///
-    /// The job keeps `hold` and drops it after its slot returned, so the
-    /// charge outlives a request that stopped waiting, as the slot does.
-    /// A request that never took a slot drops `hold` when it answers.
+    /// (ADR-0018).
     ///
     /// # Errors
     ///
@@ -293,8 +237,6 @@ impl Preparation {
             biased;
             out = &mut answered => {
                 waiting.armed = false;
-                // The job finished, maybe on the cancel itself: a cancelled
-                // request answers the cancel's refusal either way.
                 if pending.is_some_and(Pending::latched) {
                     return Err(cancelled());
                 }
@@ -320,14 +262,11 @@ impl Preparation {
     }
 }
 
-/// Why a request stopped waiting on its job, for the retained-slot log.
 #[derive(Debug, Clone, Copy)]
 enum Left {
     /// The caller walked away.
     Abandoned,
-    /// The request's deadline passed.
     Deadline,
-    /// A cancel by id reached the request.
     Cancelled,
 }
 
@@ -341,8 +280,6 @@ impl Left {
     }
 }
 
-/// What a job and the request waiting on it decide together, under one
-/// lock: whether the job outlived its request.
 #[derive(Debug, Default)]
 struct JobState {
     /// The job's closure is ending: its slot is on its way back.
@@ -447,7 +384,6 @@ mod tests {
     use crate::error::ServerError;
     use crate::pool::seam::{Seam, Session, Table};
 
-    /// An allowance of `size` slots, and a test's hold on its seams.
     fn allowance_of(size: usize) -> (Preparation, Session) {
         let table = Arc::new(Table::default());
         (
@@ -456,13 +392,10 @@ mod tests {
         )
     }
 
-    /// A deadline no test reaches.
     fn far() -> Deadline {
         Deadline::after(Duration::from_secs(600))
     }
 
-    /// Yield until `reached`, bounded by the real clock so a deadlock fails
-    /// the test instead of hanging it.
     async fn until(label: &str, mut reached: impl FnMut() -> bool) {
         let start = std::time::Instant::now();
         while !reached() {
@@ -474,7 +407,6 @@ mod tests {
         }
     }
 
-    /// Poll `fut` once, waking nothing.
     fn poll_once<F: Future + Unpin>(fut: &mut F) -> Poll<F::Output> {
         Pin::new(fut).poll(&mut Context::from_waker(Waker::noop()))
     }
@@ -515,8 +447,6 @@ mod tests {
         }
     }
 
-    /// The pool builds its allowance from its own permits: one permit is
-    /// one slot, whatever the host's cores.
     #[test]
     fn the_pool_sizes_its_allowance_from_its_permits() {
         let pool =
@@ -528,8 +458,6 @@ mod tests {
         assert_eq!(pool.preparation().size(), allowance(cores, 3));
     }
 
-    /// The test thread is the runtime's only thread. With a job parked on
-    /// its seam, an unrelated task still runs to completion.
     #[tokio::test(flavor = "current_thread")]
     async fn parked_preparation_does_not_block_the_runtime() {
         let (preparation, seams) = allowance_of(2);
@@ -572,9 +500,6 @@ mod tests {
         assert_eq!(job.await.unwrap().unwrap(), 7);
     }
 
-    /// With every slot held by a parked job, a further job waits for a slot
-    /// and, when none frees before its deadline, is refused without
-    /// running. A job that finds a slot freeing in time runs.
     #[tokio::test]
     async fn a_full_allowance_waits_then_refuses_at_the_deadline() {
         let (preparation, seams) = allowance_of(2);
@@ -617,9 +542,6 @@ mod tests {
         assert_eq!(preparation.reclaimed(), 0, "no job outlived its request");
     }
 
-    /// A job whose request timed out keeps its slot until its closure
-    /// exits. Its work is asked to stop, its answer drops inside the
-    /// closure while the slot is still held, and the slot comes back once.
     #[tokio::test]
     async fn a_timed_out_job_keeps_its_slot_until_its_closure_exits() {
         let (preparation, seams) = allowance_of(2);
@@ -665,8 +587,6 @@ mod tests {
         assert_eq!(preparation.reclaimed(), 1, "reclaimed once");
     }
 
-    /// A caller that walks away is a request that stopped waiting: its job
-    /// is asked to stop and keeps its slot until its closure exits.
     #[tokio::test]
     async fn an_abandoned_job_keeps_its_slot_until_its_closure_exits() {
         let (preparation, seams) = allowance_of(2);
@@ -695,8 +615,6 @@ mod tests {
         assert!(saw_stop.load(std::sync::atomic::Ordering::SeqCst));
     }
 
-    /// A panic in the work gives the slot back and answers the internal
-    /// error, with a fixed label and nothing of the payload.
     #[tokio::test]
     async fn a_panic_in_the_work_returns_its_slot() {
         let (preparation, _seams) = allowance_of(1);
@@ -722,9 +640,6 @@ mod tests {
         );
     }
 
-    /// A request whose deadline is already spent when a slot is free
-    /// answers as its deadline, before its job is dispatched: the slot
-    /// goes back and the work never runs.
     #[tokio::test]
     async fn a_spent_deadline_is_refused_before_dispatch() {
         let (preparation, _seams) = allowance_of(1);
@@ -750,8 +665,6 @@ mod tests {
         assert_eq!(preparation.retained(), 0);
     }
 
-    /// A job's answer and its deadline can be ready at the same poll. The
-    /// answer wins, and nothing is left retained.
     #[tokio::test]
     async fn an_answer_ready_with_the_deadline_wins() {
         let (preparation, seams) = allowance_of(1);
@@ -773,9 +686,6 @@ mod tests {
         assert_eq!(preparation.reclaimed(), 0);
     }
 
-    /// When the deadline is ready first, the request times out, and the
-    /// answer the job finishes afterwards drops inside its closure while
-    /// it still holds its slot. The slot comes back once.
     #[tokio::test]
     async fn an_answer_after_the_deadline_drops_in_its_job() {
         let (preparation, seams) = allowance_of(1);
@@ -811,14 +721,6 @@ mod tests {
         assert_ne!(thread, std::thread::current().id(), "inside the closure");
     }
 
-    /// A cancel by id reaches a tracked request in preparation (#343). In
-    /// the slot wait it ends the request at once, and the job never runs.
-    /// During a job it ends the request at once while the job keeps its
-    /// slot, which comes back when the job reaches its next check. The
-    /// job's stop is the request's cancel flag, so the job sees the cancel
-    /// with the request not polled at all, and an answer the job finished
-    /// with the flag latched is the capacity refusal, never the engine's
-    /// cancellation (a 500).
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // three cancels on one allowance, in order
     async fn a_cancel_stops_a_preparation_and_its_slot_wait() {
@@ -833,7 +735,6 @@ mod tests {
         let parked = seams.hold(Seam::Preparing);
         let deadline = far();
 
-        // A holder parks in the only slot, and a waiter queues behind it.
         let holder_id = pool.allocate_query_id();
         let holder_pending = pool.pend(holder_id, WorkKind::Query);
         let holder_saw_stop = Arc::new(AtomicBool::new(false));
@@ -879,7 +780,6 @@ mod tests {
         }
         assert!(!waiter.is_finished(), "the waiter waits for the slot");
 
-        // A cancel during the slot wait.
         assert!(pool.cancel_by_id(waiter_id));
         let answer = waiter.await.unwrap();
         assert!(
@@ -891,7 +791,6 @@ mod tests {
         assert!(!waiter_ran.load(SeqCst));
         assert_eq!(preparation.in_use(), 1, "the holder still has the slot");
 
-        // A cancel during a running job.
         assert!(pool.cancel_by_id(holder_id));
         let answer = holder.await.unwrap();
         assert!(
@@ -949,8 +848,6 @@ mod tests {
         drop(pending);
     }
 
-    /// Preparation takes no executor permit: with every permit held, a job
-    /// still runs.
     #[tokio::test]
     async fn a_preparation_takes_no_executor_permit() {
         let pool =

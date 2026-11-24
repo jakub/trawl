@@ -5,19 +5,12 @@
 //! The shapes of the values no doctor report may show, whatever a test
 //! planted.
 //!
-//! The `trawld --doctor` leak check applies [`forbidden_shape`] to both
-//! output streams. This file depends on nothing but `std`, so another
+//! This file depends on nothing but `std`, so another
 //! crate's doctor tests, such as `trawl-web --doctor`'s, include it with
 //! `#[path]` and refuse the same shapes.
 
 /// The first value in `text` shaped like one no doctor report may show,
-/// named, or `None`:
-///
-/// - a UUID, the form of every catalog id;
-/// - 32 or more hex digits in a row, or 8 or more hex pairs joined by
-///   colons, the forms of a certificate fingerprint;
-/// - a dotted IPv4 address, with or without a port, or a bracketed IPv6
-///   address, the forms of a listener address and a certificate's IP SAN.
+/// named, or `None`.
 pub fn forbidden_shape(text: &str) -> Option<(&'static str, String)> {
     let bytes = text.as_bytes();
     let hex = |b: u8| b.is_ascii_hexdigit();

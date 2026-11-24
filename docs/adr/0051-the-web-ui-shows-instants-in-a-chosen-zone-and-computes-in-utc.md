@@ -1,6 +1,6 @@
 # The web UI shows instants in a chosen zone and computes in UTC
 
-status: accepted (2026-10-02), prep record for #201; implementation blocked by #214; amended (2026-11-08) and (2026-11-09), see the Amendments
+status: accepted (2026-10-02), prep record for #201; implementation blocked by #214; amended (2026-11-08) and (2026-11-09), see the Amendments; amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 Every time in the web UI shows as UTC. An operator comparing logs with an incident report written in local time converts in their head. Trawl stores, compares and buckets in UTC (ADR-0008, ADR-0017), and the browser reads `_time` text back as UTC instants in five places: the context window, the Visualization series, both histogram paths, and facets. The query API's `timezone` field cannot serve the browser. It applies one fixed offset to result text, it reads `local` as the server's zone, and the browser's instant parsers would read the shifted text as UTC. This record adds a display zone that changes only what the browser prints.
 
@@ -117,3 +117,10 @@ Three sentences above change:
 - Under "Considered options", bucketing in the display zone stays rejected. It still needs server-side IANA support in query execution. #197 no longer waits on it: trawld bins in UTC, and a display zone can change only how the bounds print.
 
 "Histogram labels" stays on the list of surfaces that show the display zone. That is #201's work, and this amendment does not change when it lands or what it does. The bins and their bounds do not move when the zone changes, and a zone change sends no request.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **In `--format json` and `--format csv`, an instant that `local` cannot place keeps its UTC wire text and gets no "not converted" marker.** The `Z` already says the text is UTC, and a marker appended to a timestamp would break a script that parses the value. The marker of the 2026-11-08 Amendment applies to human output only: `present_human` appends `NOT_CONVERTED`, and `apply_zone` writes the bare `Presented::NotConverted` text.
+- **Until #201 ships, a browser timestamp cell names no offset, and the `UTC` unit sits on the column header and the detail key.** `cell_text` in `trawl-web-ui/src/results_layout.rs` prints the UTC wall clock without the `T` and the `Z`. It pads the fraction to at least milliseconds so the digits line up down a column, and it keeps any finer precision the wire carries. `zone_unit` gives `UTC` for a `timestamp` column and nothing for any other column. Because the offset lives on the header and not in the cell, #201 must change that unit with the display zone, or drop it for the per-instant offset this record prints. Otherwise the header names UTC over cells printed in another zone.

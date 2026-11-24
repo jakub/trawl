@@ -3,14 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Per-stage tables of prepared patterns for live evaluation (ADR-0063).
-//!
-//! A compiled live stage (a `where`, a `let`, a regex `extract`) owns the
-//! patterns its expressions read. They are built when the plan compiles,
-//! through the plan's one [`Preparer`], so a pattern several stages share
-//! builds once. Evaluation only reads a table: a [`PatternTable`] behind a
-//! shared reference cannot build anything, so no event pays for a build,
-//! and an operand the table does not hold is [`PatternError::Missing`],
-//! never a non-match.
 
 use std::collections::HashMap;
 
@@ -18,21 +10,12 @@ use crate::ast::{Expr, Spanned};
 
 use super::{Pattern, PatternError, PatternKind, Preparer, literal_operand};
 
-/// The prepared patterns of one compiled stage, by kind and text.
 #[derive(Debug, Clone, Default)]
 pub struct PatternTable {
     entries: HashMap<PatternKind, HashMap<String, Pattern>>,
 }
 
 impl PatternTable {
-    /// The table of every pattern operand in `exprs`: the right-hand side
-    /// of each `matches`, `like` and `ilike`, wherever it sits in the tree.
-    ///
-    /// # Errors
-    ///
-    /// [`PatternError::Computed`] for an operand that is not literal text
-    /// ([`literal_operand`]), and whatever `preparer` refuses for a pattern
-    /// it builds.
     pub fn prepare<'e>(
         exprs: impl IntoIterator<Item = &'e Spanned<Expr>>,
         preparer: &mut Preparer,
@@ -66,12 +49,6 @@ impl PatternTable {
         Ok(table)
     }
 
-    /// Build `text` as a `kind` pattern into this table, unless it holds
-    /// it already.
-    ///
-    /// # Errors
-    ///
-    /// Whatever `preparer` refuses for the pattern.
     pub(crate) fn insert(
         &mut self,
         kind: PatternKind,
@@ -89,11 +66,6 @@ impl PatternTable {
         Ok(())
     }
 
-    /// The pattern this table prepared for `text` written as `kind`.
-    ///
-    /// # Errors
-    ///
-    /// [`PatternError::Missing`] when the table holds no such pattern.
     pub fn get(&self, kind: PatternKind, text: &str) -> Result<&Pattern, PatternError> {
         self.entries
             .get(&kind)
@@ -102,8 +74,6 @@ impl PatternTable {
     }
 }
 
-/// A ledger for this crate's unit tests, which prepare tables and compile
-/// stages one at a time.
 #[cfg(test)]
 pub(crate) fn test_ledger() -> Preparer {
     Preparer::new()
@@ -142,8 +112,6 @@ mod tests {
         })
     }
 
-    /// Every pattern operand is found, at any depth and under every
-    /// operator that holds a subexpression, and keyed by its own kind.
     #[test]
     fn a_table_holds_every_pattern_operand_in_the_tree() {
         let nested = call(
@@ -166,15 +134,12 @@ mod tests {
         assert!(table.get(PatternKind::Regex, "err").is_ok());
         assert!(table.get(PatternKind::ILike, "ROOT").is_ok());
         assert!(table.get(PatternKind::Regex, "^x").is_ok());
-        // The same text under another kind is another pattern.
         assert_eq!(
             table.get(PatternKind::Like, "err").err(),
             Some(PatternError::Missing)
         );
     }
 
-    /// A lookup the table cannot answer is a typed error, not a
-    /// non-match and not a build.
     #[test]
     fn a_pattern_the_table_does_not_hold_is_missing() {
         let table = PatternTable::default();
@@ -186,8 +151,6 @@ mod tests {
         assert_eq!(thread_builds(), before, "a lookup builds nothing");
     }
 
-    /// A computed operand is refused while the table is prepared, by the
-    /// one literal-only rule.
     #[test]
     fn a_computed_operand_is_refused_at_preparation() {
         for rhs in [
@@ -204,8 +167,6 @@ mod tests {
         }
     }
 
-    /// One ledger behind several tables builds a shared pattern once, and
-    /// a pattern repeated in one table is held once.
     #[test]
     fn tables_share_their_ledgers_builds() {
         let mut ledger = test_ledger();
@@ -225,8 +186,6 @@ mod tests {
         assert!(second.get(PatternKind::Like, "web-%").is_ok());
     }
 
-    /// A pattern the ledger refuses fails the preparation with the
-    /// ledger's own cause.
     #[test]
     fn a_refused_build_fails_the_preparation() {
         let expr = binary(field("message"), BinaryOp::Matches, text("["));

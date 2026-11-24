@@ -2,17 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Live frames speak the result wire (ADR-0035, issue #214 AC 6).
-//!
-//! A pass-through stream sends each event as a one-row typed result, its
-//! cells conformed under the stream's output pin scope first, so a field
-//! the catalog pins BIGINT arrives as the integer a batch query answers,
-//! not as the text a sender wrote. An aggregate stream's snapshot carries
-//! typed columns beside `capped`. These run the real SSE loop on a live
-//! server with real ingest and a pin the real compaction path wrote, and
-//! read the frames twice: as bytes off the socket, and through
-//! `trawl_client::HttpClient::stream_events`, the decoder the CLI and the
-//! TUI use.
+//! Live frames speak the result wire (ADR-0035).
 
 mod common;
 
@@ -27,7 +17,6 @@ use trawl_client::{HttpClient, StreamEvent};
 use trawl_server::catalog::CatalogContext;
 use trawl_server::config::RateLimitConfig;
 
-/// The live group cap, as the wire states it.
 const MAX_GROUPS: usize = 10_000;
 
 /// 2^53 + 1: the first integer a double cannot hold, so a frame that
@@ -51,7 +40,6 @@ async fn harness() -> Harness {
     let data_path = data_dir.to_str().unwrap().to_owned();
 
     let server = setup_in_dir_with_data(&root, data_path, RateLimitConfig::default()).await;
-    // Leak the tempdir so it survives the server (cleaned up by OS).
     std::mem::forget(tmp);
 
     let ingest = HttpClient::new_insecure(&server.url, &server.ingest_token).unwrap();
@@ -65,8 +53,6 @@ async fn harness() -> Harness {
     }
 }
 
-/// One compaction tick over the server's WAL, with the catalog context
-/// trawld's main wires, so the batch's types become pins.
 async fn compact_tick(h: &Harness) {
     let hot_buffer = h
         .server
@@ -94,8 +80,6 @@ async fn compact_tick(h: &Harness) {
     assert_eq!(errors, 0, "no compaction errors expected");
 }
 
-/// Pin `status` BIGINT the way production does: integer events,
-/// compacted with the catalog wired.
 async fn pin_status_bigint(h: &Harness) {
     let seed: Vec<serde_json::Value> = [200, 404, 500]
         .iter()
@@ -109,7 +93,6 @@ async fn pin_status_bigint(h: &Harness) {
     );
 }
 
-/// One open stream read as raw SSE bytes.
 struct RawFrames {
     resp: reqwest::Response,
     buf: Vec<u8>,
@@ -133,8 +116,6 @@ impl RawFrames {
         }
     }
 
-    /// The `data` payload of the next `event` frame whose payload contains
-    /// `needle`. Panics after 30 s, naming what did arrive.
     async fn frame_with(&mut self, event: &str, needle: &str) -> String {
         let mut seen = Vec::new();
         let read = tokio::time::timeout(Duration::from_secs(30), async {
@@ -155,7 +136,6 @@ impl RawFrames {
                         if name == event && data.contains(needle) {
                             return data;
                         }
-                        // A 10,000-row snapshot is not worth printing whole.
                         seen.push(format!(
                             "{name}: {}",
                             data.chars().take(120).collect::<String>()
@@ -176,8 +156,6 @@ impl RawFrames {
     }
 }
 
-/// The next decoded event from `stream_events` that `wanted` picks out,
-/// skipping the rest. Panics after 30 s.
 async fn next_event<S>(stream: &mut S, wanted: impl Fn(&StreamEvent) -> bool) -> StreamEvent
 where
     S: tokio_stream::Stream<Item = Result<StreamEvent, trawl_client::ClientError>> + Unpin,
@@ -198,7 +176,6 @@ where
     .expect("the wanted event arrived")
 }
 
-/// The cell a one-row frame holds under `name`, with its column's type.
 fn cell<'r>(frame: &'r QueryResult, name: &str) -> (&'r ColumnType, &'r Value) {
     let idx = frame
         .columns
@@ -208,7 +185,6 @@ fn cell<'r>(frame: &'r QueryResult, name: &str) -> (&'r ColumnType, &'r Value) {
     (&frame.columns[idx].ty, &frame.rows[0][idx])
 }
 
-/// The one-row event frame whose `message` is `message`.
 fn is_event(message: &'static str) -> impl Fn(&StreamEvent) -> bool {
     move |event| {
         matches!(event, StreamEvent::Event(frame)
@@ -216,10 +192,6 @@ fn is_event(message: &'static str) -> impl Fn(&StreamEvent) -> bool {
     }
 }
 
-/// AC 6, and the first two pin cases: numeric text under a BIGINT pin
-/// leaves as an `integer` column carrying the digits as a decimal string,
-/// and lands as `Value::Integer`; text the conform cannot read keeps its
-/// own kind, `string`. `_time` is `timestamp`, from the envelope table.
 #[tokio::test(flavor = "multi_thread")]
 async fn raw_frames_carry_pinned_fields_as_typed_cells() {
     let h = harness().await;
@@ -285,10 +257,6 @@ async fn raw_frames_carry_pinned_fields_as_typed_cells() {
     );
 }
 
-/// The other two pin cases, discriminated in one frame over the same text
-/// `"404"`: a renamed pinned field keeps its pin under the new name and
-/// leaves as an integer, while a `let` that overwrites the pinned name is
-/// typed by the value it derived, never by the pin it replaced.
 #[tokio::test(flavor = "multi_thread")]
 async fn renamed_and_overwritten_fields_follow_the_pin_scope() {
     let h = harness().await;
@@ -328,8 +296,6 @@ async fn renamed_and_overwritten_fields_follow_the_pin_scope() {
     );
 }
 
-/// AC 6's aggregate half: a snapshot past the group cap carries typed
-/// columns, in the aggregation's declared order, beside `capped`.
 #[tokio::test(flavor = "multi_thread")]
 async fn snapshots_carry_typed_columns_and_capped() {
     let h = harness().await;

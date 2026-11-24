@@ -1,6 +1,6 @@
 # Advice on a valid query is a local mark that never gates
 
-status: accepted (2026-11-14) — prep ruling record for the DSL footgun hints (0.9.5 RC survey, bug 3)
+status: accepted (2026-11-14) — prep ruling record for the DSL footgun hints (0.9.5 RC survey, bug 3); amended (2026-11-23): rulings moved from code comments, see the Amendment
 
 The 0.9.5 RC survey on the homelab found three query texts that misled
 the person who wrote them. Each one behaves as the DSL reference says:
@@ -137,3 +137,9 @@ change.
   (`crates/trawl-mcp/src/render/budget.rs:570-577`).
 - The installed 0.9.5 binary (04603b8) reports the texts in the table
   above, with the caret on the `s` byte only.
+
+## Amendment (2026-11-23): rulings moved from code comments
+
+A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
+
+- **When the TUI advice region has fewer rows than the advice needs, it shows whole findings in source order and gives its last row to a note that counts every finding it left out.** The count includes the findings past the core's cap. A finding taller than the rows left is left out whole, even when it is the first one, and the note says that a taller terminal shows it. The note is clipped to the terminal width, so a very narrow terminal can cut off its count. A row budget or width of zero shows no region. The region never shows part of a finding, so it never points at text the author cannot reach (`advice_rows` in `crates/trawl-cli/src/tui/ui/editor.rs`).

@@ -3,31 +3,10 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `trawld --doctor`: check, from the server host, whether trawld will start
-//! and serve with this configuration (ADR-0047 and its 2026-09-28
-//! amendment, #269).
-//!
+//! and serve with this configuration (ADR-0047).
 //! `main` reaches [`run`] only after the process is sealed exactly as
-//! `--check-config` seals it, and never enters the normal boot: no crash-dump
-//! monitor, no tracing subscriber, no log file, no pool, no lock, no
-//! migration. The doctor reads the configuration and the process
-//! environment, connects to what the configuration names, and writes
-//! nothing.
-//!
-//! The checks and their prerequisites are data ([`ServerCheck`]). One
-//! [`Runner`] visits them in [`ServerCheck::ALL`] order: a check whose
-//! prerequisite did not complete becomes `not_sampled`, reason `blocked`,
-//! naming that prerequisite, and never looks. `server.config` and
-//! `server.identity` are checked here; the rest belong to three groups, each
-//! in its own file and each writing rows only through the runner:
-//!
-//! - [`db`]: the Fleet and app-state databases.
-//! - [`storage`]: the data root and its recovery markers.
-//! - [`listener`]: the certificate and trawld's own listener.
-//!
-//! Every row is built from [`output`]'s constructors, which accept no
-//! free-form text, so no error text, URL, certificate name, catalog
-//! identifier or listener address reaches the report. Every file is read
-//! through [`fsread`].
+//! `--check-config` seals it, and never enters the normal boot.
+//! Every file is read through [`fsread`].
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -48,31 +27,23 @@ mod storage;
 pub use output::Format;
 use output::{Row, SelectedPath, Selection, Text, UserName};
 
-/// The named checks `trawld --doctor` runs, in order.
-/// `server.listener.health.<key>` rows are part of
-/// [`ServerCheck::ListenerHealth`] and share its prerequisite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerCheck {
     /// The configuration loads and validates as `--check-config` checks it.
     Config,
-    /// The effective user and uid the doctor ran as.
     Identity,
-    /// A connection to the Fleet database authenticates.
     FleetConnect,
     /// The Fleet ledger is current.
     FleetSchema,
-    /// A connection to the app-state database authenticates.
     AppConnect,
     /// trawld's boot will admit the app-state ledger.
     AppSchema,
-    /// Whether trawld's writer lock is held.
     AppWriter,
     /// The data root exists and is a directory, or boot will create it, and
     /// the running user may use it.
     DataRoot,
     /// The data root's epoch is current, or boot will initialize it.
     DataEpoch,
-    /// The data root belongs to the app-state database's catalog.
     DataIdentity,
     /// Conformance is recorded, or will run at boot.
     DataConformance,
@@ -83,14 +54,11 @@ pub enum ServerCheck {
     /// The certificate and key parse, match, and are in date, or boot will
     /// generate them.
     TlsMaterial,
-    /// The listener answers TLS with exactly the certificate on disk.
     ListenerIdentity,
-    /// The listener's health endpoint answers, one row per reported check.
     ListenerHealth,
 }
 
 impl ServerCheck {
-    /// Every check, in the order the runner visits them.
     pub const ALL: [Self; 16] = [
         Self::Config,
         Self::Identity,
@@ -110,7 +78,6 @@ impl ServerCheck {
         Self::ListenerHealth,
     ];
 
-    /// The stable id the report carries.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
@@ -133,9 +100,6 @@ impl ServerCheck {
         }
     }
 
-    /// The checks that must be satisfied before this one looks: `complete`
-    /// with any reason, or `not_sampled` with reason `ran_as_root`.
-    ///
     /// Everything but the identity row reads the configuration. Catalog
     /// identity compares the data root's marker with the ledger's
     /// `catalog_state`, so it waits on both. The listener is compared with
@@ -160,28 +124,21 @@ impl ServerCheck {
     }
 
     /// Whether the check asserts that the running user may read or write
-    /// something. A root run cannot observe that, so the runner reports a
-    /// `complete` access check as `not_sampled`, reason `ran_as_root`
-    /// (ADR-0047 amendment: root sees content, not access). Only the data
-    /// root is an access check; database authentication and certificate
-    /// reads are content.
+    /// something. Only the data root is an access check; database authentication
+    /// and certificate reads are content.
     #[must_use]
     pub const fn is_access(self) -> bool {
         matches!(self, Self::DataRoot)
     }
 }
 
-/// The user the doctor runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunAs {
-    /// The effective uid, where the platform has one.
     pub uid: Option<u32>,
-    /// Whether that uid is 0.
     pub root: bool,
 }
 
 impl RunAs {
-    /// The running process's effective user.
     #[must_use]
     pub fn current() -> Self {
         #[cfg(unix)]
@@ -216,13 +173,10 @@ impl std::fmt::Debug for CatalogId {
 /// What `server.app.schema` read of `catalog_state`, just after its snapshot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CatalogFacts {
-    /// `catalog_state.catalog_id`.
     pub catalog_id: CatalogId,
-    /// Whether `catalog_state.conformed_at` is set.
     pub conformed: bool,
 }
 
-/// What the database group learned that the storage group needs.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AppFacts {
     /// The ledger `server.app.schema` classified, when it read one boot
@@ -245,22 +199,14 @@ impl std::fmt::Debug for Der {
     }
 }
 
-/// What `server.tls.material` read, for the listener checks.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TlsFacts {
-    /// The leaf certificate on disk, when the material parsed.
     pub leaf: Option<Der>,
 }
 
-/// Everything the check groups share. Built once `server.config` loaded
-/// the configuration; each group reads what it needs and fills in its own
-/// facts for the groups after it.
 pub struct Ctx {
-    /// The configuration `server.config` loaded and validated.
     pub config: Config,
-    /// The `--config` path, as the report may name it.
     pub config_path: SelectedPath,
-    /// The user the doctor runs as.
     pub run_as: RunAs,
     /// Filled by [`db`]: what the app-state database holds.
     pub app: AppFacts,
@@ -288,8 +234,6 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
-/// Leave to look at one check, from [`Runner::gate`]. Only the runner makes
-/// one, and [`Runner::record`] consumes it.
 #[derive(Debug)]
 #[must_use = "a gated check must record its row"]
 pub struct Gate {
@@ -297,27 +241,23 @@ pub struct Gate {
 }
 
 impl Gate {
-    /// The check this gate opens.
     #[must_use]
     pub const fn check(&self) -> ServerCheck {
         self.check
     }
 }
 
-/// Visits the checks in [`ServerCheck::ALL`] order and collects their rows.
 #[derive(Debug)]
 pub struct Runner {
     root: bool,
     /// Each check's own row, in order: what prerequisites are judged on.
     outcomes: Vec<(ServerCheck, Outcome, Option<&'static str>)>,
-    /// The check gated and not yet recorded.
     open: Option<ServerCheck>,
     rows: Vec<Row>,
     notes: Vec<String>,
 }
 
 impl Runner {
-    /// A runner for a run as `run_as`.
     #[must_use]
     pub fn new(run_as: RunAs) -> Self {
         Self {
@@ -329,15 +269,6 @@ impl Runner {
         }
     }
 
-    /// Ask to look at `check`, the next check in [`ServerCheck::ALL`].
-    ///
-    /// When a prerequisite is not satisfied, the runner records `check` as
-    /// `not_sampled`, reason `blocked`, naming the first such prerequisite,
-    /// and returns `None`: the check does not look.
-    ///
-    /// # Panics
-    /// When `check` is not the next check, or the last gate was not
-    /// recorded. Both are bugs in a group, never input.
     pub fn gate(&mut self, check: ServerCheck) -> Option<Gate> {
         assert!(self.open.is_none(), "a gated check was not recorded");
         assert_eq!(
@@ -357,21 +288,10 @@ impl Runner {
         Some(Gate { check })
     }
 
-    /// Record the row of a gated check.
-    ///
-    /// # Panics
-    /// When the row is not the gated check's own row.
     pub fn record(&mut self, gate: Gate, row: Row) {
         self.record_with(gate, row, Vec::new());
     }
 
-    /// Record the row of a gated check and its per-key rows, such as
-    /// `server.listener.health` and its `server.listener.health.<key>`
-    /// rows. The check's own row is what its dependents are judged on.
-    ///
-    /// # Panics
-    /// When `row` is not the gated check's own row, or a keyed row belongs
-    /// to another check.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "taking the gate by value spends it: one row per gate"
@@ -398,7 +318,6 @@ impl Runner {
         self.rows.extend(keyed);
     }
 
-    /// The outcome and reason `check` recorded, once it has.
     #[must_use]
     pub fn outcome(&self, check: ServerCheck) -> Option<(Outcome, Option<&'static str>)> {
         self.outcomes
@@ -407,7 +326,6 @@ impl Runner {
             .map(|(_, outcome, reason)| (*outcome, *reason))
     }
 
-    /// Add a report-level note, which never changes an outcome.
     pub fn note(&mut self, note: Text) {
         self.notes.push(note.into_string());
     }
@@ -426,7 +344,6 @@ impl Runner {
         self.rows.push(row);
     }
 
-    /// Every check has a row: build the report.
     fn finish(self, target: Target) -> Report {
         assert_eq!(
             self.outcomes.len(),
@@ -442,26 +359,17 @@ impl Runner {
 /// such as a file read past its deadline.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 
-/// How long each blocking step of `server.config` may take: expanding `~`
-/// in the `--config` path, parsing the file (which expands `~` in its path
-/// settings), and the checks after parsing. Expanding `~` with HOME unset
-/// or empty asks the password database, which can be a network service.
-/// With the file logger in use the checks after parsing inspect
-/// `server.log_file` and the data root's markers, path metadata a hung
-/// filesystem can stall. Each gets a file read's budget.
+/// How long each blocking step of `server.config` may take. Expanding `~`
+/// with HOME unset or empty asks the password database, which can be a
+/// network service.
 const VALIDATE_DEADLINE: Duration = fsread::READ_DEADLINE;
 
 /// How long the running user's name may take to look up. The password
 /// database can be a network service.
 const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Run `trawld --doctor --config <config>` and return its exit status: 0
-/// pass, 1 fail, 3 incomplete (ADR-0047). `config` is the argument as
-/// given; `server.config` expands its `~`.
-///
 /// Call on the main thread of a sealed process, before any other thread
-/// exists. `sealed` proves the seal ran: only
-/// [`trawl_crashdump::seal_for_config_check`] makes one.
+/// exists.
 #[must_use]
 pub fn run(sealed: Sealed, config: &str, format: Option<Format>) -> u8 {
     install_panic_hook(io::stderr);
@@ -490,12 +398,9 @@ pub fn run(sealed: Sealed, config: &str, format: Option<Format>) -> u8 {
     report.verdict().exit_code()
 }
 
-/// The one line the doctor's panic hook prints.
 const PANIC_LINE: &str = "[trawld] doctor stopped a check: an internal error occurred";
 
-/// Replace the default panic hook, which prints the panic's message and
-/// location, with one that writes [`PANIC_LINE`] to `sink` and nothing
-/// else. A dependency's panic message can quote what it was given, such as
+/// A dependency's panic message can quote what it was given, such as
 /// a database URL, so no part of it reaches the output.
 fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
     std::panic::set_hook(Box::new(move |_| {
@@ -503,9 +408,6 @@ fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
     }));
 }
 
-/// Run every check and build the report. Nothing is rendered until the
-/// whole report exists. `sealed` proves the seal ran before the
-/// configuration is read. `config_arg` is the `--config` argument as given.
 pub async fn check(sealed: Sealed, config_arg: &str) -> Report {
     let run_as = RunAs::current();
     let mut runner = Runner::new(run_as);
@@ -540,7 +442,6 @@ pub async fn check(sealed: Sealed, config_arg: &str) -> Report {
             ));
         }
     } else {
-        // Every other check reads the configuration, so each is blocked.
         for check in &ServerCheck::ALL[2..] {
             let gate = runner.gate(*check);
             assert!(
@@ -563,16 +464,8 @@ fn tilde_path(path: &str) -> PathBuf {
     PathBuf::from(shellexpand::tilde(path).as_ref())
 }
 
-/// `server.config`: expand `~` in the `--config` argument with `expand`,
-/// read the file through the bounded reader, parse it with `parse`, then
-/// run the checks `--check-config` runs. Expanding, parsing (which expands
-/// `~` in the file's path settings) and the checks after parsing each run
-/// on the blocking pool under [`VALIDATE_DEADLINE`]. The validation text is
-/// never shown; the next action is `--check-config`, which prints it.
-///
 /// `check` passes [`tilde_path`] and [`Config::from_toml`], what boot
-/// runs. Returns the `--config` path as the report names it, expanded
-/// when the expansion finished, and the configuration when it loaded.
+/// runs.
 async fn check_config(
     _sealed: Sealed,
     runner: &mut Runner,
@@ -655,7 +548,6 @@ async fn check_config(
     }
 }
 
-/// The `server.config` row for a file the bounded reader did not read.
 fn config_read_fault(fault: fsread::ReadFault) -> Row {
     use fsread::ReadFault;
     let check = ServerCheck::Config;
@@ -681,12 +573,9 @@ fn config_read_fault(fault: fsread::ReadFault) -> Row {
     }
 }
 
-/// Why blocking work gave no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unfinished {
-    /// It was still running at the deadline, and was left behind.
     TimedOut,
-    /// It panicked.
     Panicked,
 }
 
@@ -704,8 +593,6 @@ async fn blocking_within<T: Send + 'static>(
     }
 }
 
-/// The `server.config` row for a blocking step that gave no answer;
-/// `what` says which step, when it ran out of time.
 fn unfinished_config(unfinished: Unfinished, what: &'static str) -> Row {
     let check = ServerCheck::Config;
     match unfinished {
@@ -714,9 +601,6 @@ fn unfinished_config(unfinished: Unfinished, what: &'static str) -> Row {
     }
 }
 
-/// The `server.config` row for a configuration that parsed but that the
-/// checks after parsing refuse, in `--check-config`'s order.
-///
 /// A `server.log_file` refusal fails the check only when it proves the
 /// destination invalid. One the running user could not inspect, or that
 /// failed to inspect for another reason, proves nothing about what trawld
@@ -756,9 +640,6 @@ fn loaded_fault(fault: &LoadedFault, explain: &Text) -> Row {
     }
 }
 
-/// A syslog peer fault as the doctor shows it: the setting path, the
-/// `allow_cidrs` index when there is one, and the reason. All three are
-/// static or numeric, so no configured value can reach the report.
 fn syslog_fault_text(fault: crate::syslog::SyslogPeerFault) -> Text {
     let mut text = Text::new(fault.setting());
     if let Some(index) = fault.index() {
@@ -770,8 +651,6 @@ fn syslog_fault_text(fault: crate::syslog::SyslogPeerFault) -> Text {
     text.lit(": ").lit(fault.reason())
 }
 
-/// `server.identity`: the effective uid and, when the password database
-/// answers in time with a plain name, the user name. Always `complete`.
 async fn check_identity(runner: &mut Runner, run_as: RunAs) {
     let gate = runner
         .gate(ServerCheck::Identity)
@@ -795,9 +674,6 @@ async fn check_identity(runner: &mut Runner, run_as: RunAs) {
     runner.record(gate, Row::complete(check).detail(detail));
 }
 
-/// The name of `uid` in the password database, on the blocking pool under
-/// [`USER_LOOKUP_DEADLINE`]. `None` when there is none, it is not a plain
-/// name, or the lookup failed or ran out of time.
 async fn user_name(uid: u32) -> Option<UserName> {
     #[cfg(unix)]
     {
@@ -824,10 +700,6 @@ async fn user_name(uid: u32) -> Option<UserName> {
 mod tests {
     use super::*;
 
-    /// The graph is data: ids are unique and stable, every prerequisite
-    /// comes earlier in `ALL`, the edges are the design's, only the data
-    /// root is an access check, and the three groups cover every check
-    /// after config and identity, in order.
     #[test]
     fn server_checks_form_an_ordered_graph() {
         use ServerCheck as C;
@@ -902,7 +774,6 @@ mod tests {
         }
     }
 
-    /// Record `row` for `check`, or nothing when the runner blocked it.
     fn step(runner: &mut Runner, check: ServerCheck, row: impl FnOnce() -> Row) {
         if let Some(gate) = runner.gate(check) {
             runner.record(gate, row());
@@ -931,8 +802,6 @@ mod tests {
         }
     }
 
-    /// A check that did not complete blocks its dependents, transitively,
-    /// each naming its own first unsatisfied prerequisite.
     #[test]
     fn a_prerequisite_that_did_not_complete_blocks_its_dependents() {
         use ServerCheck as C;
@@ -1007,16 +876,11 @@ mod tests {
                 Some("server.listener.identity")
             )
         );
-        // `complete` with any reason satisfies a prerequisite.
         assert_eq!(rows[8].1, Outcome::Complete);
         assert_eq!(report.verdict(), trawl_api::doctor::Verdict::Fail);
         assert_eq!(report.vantage(), Vantage::Server);
     }
 
-    /// Run as root, a complete access check becomes `not_sampled`,
-    /// `ran_as_root`, and still satisfies the checks that wait on it, so
-    /// content checks report. A content check is left as it is, and the
-    /// run cannot pass.
     #[test]
     fn a_root_run_samples_content_not_access() {
         use ServerCheck as C;
@@ -1039,7 +903,6 @@ mod tests {
         }
         assert_eq!(report.verdict(), trawl_api::doctor::Verdict::Incomplete);
 
-        // A failed access check stays failed as root.
         let mut runner = Runner::new(run_as(true));
         step(&mut runner, C::Config, || Row::complete(C::Config));
         step(&mut runner, C::Identity, || Row::complete(C::Identity));
@@ -1080,9 +943,8 @@ mod tests {
         let _ = runner.finish(target());
     }
 
-    /// A panic under the doctor's hook writes the fixed line and nothing of
-    /// its message or location. The hook is process-global, so another
-    /// test panicking meanwhile may add lines; each must be the fixed one.
+    /// The hook is process-global, so another test panicking meanwhile may add
+    /// lines; each must be the hook's fixed line.
     #[test]
     fn the_panic_hook_prints_only_a_fixed_line() {
         use std::sync::{Arc, Mutex};
@@ -1132,9 +994,6 @@ mod tests {
         assert!(!shown.contains("private"), "{shown}");
     }
 
-    /// The configuration check reads through the bounded reader, so a FIFO
-    /// in place of `trawld.toml` fails promptly instead of hanging the run,
-    /// and every later check is blocked by it.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn a_fifo_config_fails_promptly_and_blocks_the_rest() {
@@ -1165,9 +1024,6 @@ mod tests {
         assert_eq!(report.checks().len(), ServerCheck::ALL.len());
     }
 
-    /// Validation that outlives its deadline costs `server.config` its
-    /// answer, `not_sampled`/`timed_out`, and does not hold the run: the
-    /// wait ends at the deadline while the work is still blocked.
     #[tokio::test]
     async fn validation_past_its_deadline_is_timed_out() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
@@ -1194,12 +1050,8 @@ mod tests {
         );
     }
 
-    /// Which thread ran a step of `server.config`, and what it was given.
     type Ran = std::sync::mpsc::Receiver<(std::thread::ThreadId, String)>;
 
-    /// A step that reports its thread and input on the returned channel,
-    /// then stalls for `stall`, far past [`STEP_DEADLINE`], unless the test
-    /// releases it first by dropping the returned sender.
     fn stalling<T>(
         stall: Duration,
         answer: impl FnOnce(&str) -> T + Send + 'static,
@@ -1220,16 +1072,12 @@ mod tests {
         (step, ran, release)
     }
 
-    /// How long a stalled step of these tests holds its thread: long enough
-    /// that a run which waited it out is plainly not bounded.
     const STALL: Duration = Duration::from_secs(20);
 
     /// The bound these tests hold `server.config` to. [`VALIDATE_DEADLINE`]
     /// plus scheduling slack, well short of [`STALL`].
     const STEP_DEADLINE: Duration = Duration::from_secs(10);
 
-    /// Run `server.config` alone with `expand` and `parse`, under
-    /// [`STEP_DEADLINE`], and return its row and the path it names.
     async fn config_row(
         arg: &str,
         expand: impl FnOnce(&str) -> PathBuf + Send + 'static,
@@ -1254,11 +1102,6 @@ mod tests {
         )
     }
 
-    /// Expanding `~` in the `--config` argument asks the password database
-    /// when HOME is unset or empty, so it runs on the blocking pool, off the
-    /// doctor's own thread, and a stalled expansion costs `server.config`
-    /// its answer, `not_sampled`/`timed_out`, at the deadline instead of
-    /// hanging the run. The report then names the argument as given.
     #[tokio::test]
     async fn config_path_expansion_is_bounded() {
         let here = std::thread::current().id();
@@ -1282,9 +1125,6 @@ mod tests {
         drop(release);
     }
 
-    /// Parsing expands `~` in the file's path settings, so it too runs on
-    /// the blocking pool under the deadline, and a stalled parse is
-    /// `not_sampled`/`timed_out`.
     #[tokio::test]
     async fn config_parse_is_bounded() {
         let dir = tempfile::tempdir().unwrap();
@@ -1309,9 +1149,6 @@ mod tests {
         drop(release);
     }
 
-    /// A syslog peer fault fails `server.config` with the setting path and
-    /// the reason, never the value, even with the listener disabled
-    /// (ADR-0050, ADR-0047).
     #[tokio::test]
     async fn server_config_fails_on_syslog_peer_faults_without_the_value() {
         let dir = tempfile::tempdir().unwrap();
@@ -1352,8 +1189,6 @@ mod tests {
         }
     }
 
-    /// A `server.log_file` refusal is `failed` only when it proves the
-    /// destination invalid; a denied or failed inspection is `not_sampled`.
     #[test]
     fn log_file_refusals_fail_only_when_proven() {
         use std::io::{Error, ErrorKind};

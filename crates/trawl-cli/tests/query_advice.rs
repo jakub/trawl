@@ -6,10 +6,8 @@
 //! binary: `trawl validate` and `trawl query` print advice on stderr and
 //! never change the verdict, the exit code, stdout or an exported file.
 //!
-//! Every run starts from an empty environment with a temp `HOME` and a
-//! config of its own, so no saved key or inherited `TRAWL_*` variable
-//! picks the target. The connected case boots a disposable trawld from
-//! `tests/common`, so this binary is in the `postgres` nextest group.
+//! The connected case boots a disposable trawld from `tests/common`, so
+//! this binary is in the `postgres` nextest group.
 
 mod common;
 
@@ -20,11 +18,9 @@ use common::Server;
 use common::tui::{DEADLINE, Home, describe, pinned};
 use trawl_engine::value::{Column, ColumnType, QueryResult, Value};
 
-/// A valid query with one negated field-shaped term.
 const NEGATED: &str = r#""10.244.0.83" -service=coredns"#;
 /// The same rows as [`NEGATED`], written so no advice applies.
 const NEGATED_SILENCED: &str = r#""10.244.0.83" NOT "service=coredns""#;
-/// A valid query with a search-stage `in (…)`.
 const SEARCH_IN: &str = "service=trawld event_type in (a, b)";
 /// A parse error: an unknown escape in a quoted string.
 const UNKNOWN_ESCAPE: &str = r#"* | where m matches "^\s+at ""#;
@@ -37,7 +33,6 @@ const NEGATED_HINT: &str = "hint: to filter the field, write service!=…";
 const IN_MESSAGE: &str = "advice: in the search stage, in (…) is not a list test";
 const IN_HINT: &str = "hint: to match a list, write event_type=a,b";
 
-/// A trawl home with an empty config: local validation and embedded runs.
 fn local_home() -> (Home, PathBuf) {
     let home = Home::new();
     let config = home.path().join("empty.toml");
@@ -45,7 +40,6 @@ fn local_home() -> (Home, PathBuf) {
     (home, config)
 }
 
-/// `trawl --config config <args>` to completion.
 async fn trawl(home: &Home, config: &Path, args: &[&str]) -> Output {
     let run = home
         .command("UTC")
@@ -60,8 +54,6 @@ async fn trawl(home: &Home, config: &Path, args: &[&str]) -> Output {
         .expect("spawn trawl")
 }
 
-/// `trawl` with stdout and stderr written to one file, in the order the
-/// process wrote them; returns the status and that text.
 async fn trawl_interleaved(home: &Home, config: &Path, args: &[&str]) -> (bool, String) {
     let path = home.path().join("interleaved.txt");
     let file = std::fs::File::create(&path).expect("create the capture");
@@ -88,8 +80,6 @@ fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).into_owned()
 }
 
-/// A valid verdict: exit 0, exactly `valid\n` on stdout, and every
-/// fragment of `expected` on stderr.
 fn assert_valid_with_advice(output: &Output, query: &str, expected: &[&str]) {
     assert!(output.status.success(), "{query}: {}", describe(output));
     assert_eq!(
@@ -107,8 +97,6 @@ fn assert_valid_with_advice(output: &Output, query: &str, expected: &[&str]) {
     }
 }
 
-/// `query`'s advice lines in the caret layout: the source line, carets
-/// under the span, then the advice and the hint.
 fn assert_caret_excerpt(err: &str, source: &str, pad: usize, carets: usize, advice: &str) {
     let expected = format!(
         "\n  {source}\n  {}{}\n  {advice}",
@@ -207,7 +195,6 @@ async fn cli_validate_advice_local() {
     // Bytes 15..30 are `event_type in (`… through the group's last byte.
     assert_caret_excerpt(&stderr(&output), SEARCH_IN, 15, 15, IN_MESSAGE);
 
-    // A query with nothing to advise prints nothing on stderr.
     let output = trawl(&home, &config, &["validate", "service=trawld"]).await;
     assert_valid_with_advice(&output, "service=trawld", &[]);
     assert!(output.stderr.is_empty(), "{}", describe(&output));
@@ -229,7 +216,6 @@ async fn cli_validate_advice_connected() {
     let output = trawl(&home, &config, &["validate", NEGATED]).await;
     assert_caret_excerpt(&stderr(&output), NEGATED, 14, 16, NEGATED_MESSAGE);
 
-    // The server's refusal stands alone: no advice beside an error.
     let output = trawl(&home, &config, &["validate", UNKNOWN_ESCAPE]).await;
     assert!(!output.status.success(), "{}", describe(&output));
     assert!(
@@ -238,8 +224,6 @@ async fn cli_validate_advice_connected() {
         describe(&output)
     );
 
-    // A connected run advises before the server answers, and the reply
-    // is printed as before.
     let output = trawl(&home, &config, &["query", NEGATED, "--format", "json"]).await;
     assert!(output.status.success(), "{}", describe(&output));
     assert!(
@@ -288,7 +272,6 @@ async fn cli_semantic_error_has_no_advice() {
         describe(&output)
     );
 
-    // `trawl query` leaves the error to the run, and advises nothing.
     let data = fixture(home.path());
     let output = trawl(&home, &config, &["query", SEMANTIC_ERROR, "--data", &data]).await;
     assert!(!output.status.success(), "{}", describe(&output));
@@ -303,9 +286,6 @@ async fn cli_semantic_error_has_no_advice() {
 /// build, and that advice would otherwise flag.
 const INVALID_REGEX: &str = r"-service=x f=/\p{Nope}/";
 
-/// Daemon-mode `trawl query` refuses advice for a text local validation
-/// rejects, as `trawl validate` does, on the table and Parquet paths. The
-/// endpoint is unreachable: the advice is printed before any request.
 #[tokio::test]
 async fn cli_query_advice_skips_locally_invalid_regex() {
     let (home, config) = local_home();
@@ -337,7 +317,6 @@ async fn cli_query_advice_skips_locally_invalid_regex() {
     );
 
     for parquet in [false, true] {
-        // The control: the same daemon path advises a valid text.
         let output = trawl(&home, &config, &daemon(NEGATED, parquet)).await;
         assert!(
             stderr(&output).contains(NEGATED_MESSAGE),
@@ -358,7 +337,6 @@ async fn cli_query_advice_precedes_execution() {
     let (home, config) = local_home();
     let data = fixture(home.path());
 
-    // In write order, the advice comes before the first result row.
     let (ok, text) = trawl_interleaved(
         &home,
         &config,
@@ -375,7 +353,6 @@ async fn cli_query_advice_precedes_execution() {
     assert!(advice < row, "advice follows the results:\n{text}");
     assert_eq!(text.matches("advice:").count(), 1, "printed once:\n{text}");
 
-    // A run that fails in the engine was advised before it started.
     let broken = home.path().join("broken.parquet");
     std::fs::write(&broken, "not parquet").expect("write the broken file");
     let (ok, text) = trawl_interleaved(
@@ -391,7 +368,6 @@ async fn cli_query_advice_precedes_execution() {
     let failure = text.find("trawl:").unwrap_or_else(|| panic!("{text}"));
     assert!(advice < failure, "advice follows the failure:\n{text}");
 
-    // The Parquet export path advises too, once.
     let out = home.path().join("advised.parquet");
     let output = trawl(
         &home,
@@ -424,16 +400,12 @@ const NEGATED_KEEPS: [&str; 3] = [
     "refused 10.244.0.83",
     "answered 10.244.0.83 upstream",
 ];
-/// The rows [`NEGATED`] drops from [`fixture`]: the text says
-/// `service=coredns`, whether or not the `service` field does, or the
-/// event lacks the address.
 const NEGATED_DROPS: [&str; 3] = [
     "lookup 10.244.0.83 via service=coredns",
     "probe 10.244.0.83 forwarded to service=coredns",
     "lookup 10.244.0.99 ok",
 ];
 
-/// `text` holds every row [`NEGATED`] keeps and none it drops.
 fn assert_negated_rows(text: &str, what: &str) {
     for kept in NEGATED_KEEPS {
         assert!(text.contains(kept), "{what} lacks {kept:?}:\n{text}");
@@ -513,8 +485,6 @@ async fn cli_query_advice_preserves_stdout_and_exports() {
         let silenced = std::fs::read(&silenced_path).expect("read the silenced export");
         assert!(!advised.is_empty(), "{format} export is empty");
         assert_eq!(advised, silenced, "{format} export differs");
-        // The export holds the rows the text search keeps: a Parquet
-        // file is read back through the CLI as JSON.
         let rows = if format == "parquet" {
             let output = trawl(
                 &home,

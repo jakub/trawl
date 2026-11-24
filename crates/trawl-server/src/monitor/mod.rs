@@ -3,13 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Live terminal monitor for trawld.
-//!
-//! Replaces the default stdout log tail when running interactively (TTY
-//! detected). Renders a ratatui dashboard that refreshes on a configurable
-//! interval, showing executor pool utilization, hot buffer fill, query and
-//! ingest throughput, and recent/active queries.
-//!
-//! Activation is automatic via TTY detection; `--no-monitor` forces log mode.
 
 pub mod state;
 pub mod ui;
@@ -26,7 +19,6 @@ use ratatui::backend::CrosstermBackend;
 
 use crate::state::AppState;
 
-/// RAII guard that restores terminal state on drop (even on panic).
 struct TerminalGuard;
 
 impl TerminalGuard {
@@ -44,10 +36,6 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// Spawn a background task that collects dashboard snapshots on a 1s interval.
-///
-/// Runs regardless of terminal mode — makes `GET /api/v1/dashboard` available
-/// even when the server runs under systemd (no TTY) or with `--no-monitor`.
 /// The [`RateTracker`](state::RateTracker) inside needs regular ticks to
 /// produce meaningful EMA-smoothed rates, so on-demand computation isn't viable.
 pub fn spawn_snapshot_collector(
@@ -71,11 +59,6 @@ pub fn spawn_snapshot_collector(
         loop {
             interval.tick().await;
 
-            // The enabled-schedule count lives in postgres; this async
-            // collector loop owns that store access and pushes the value
-            // into the sync MonitorState. One indexed COUNT(*) per second
-            // on a tiny table is negligible, and per-tick refresh keeps the
-            // dashboard (and its tests) current.
             if monitor.scheduler_enabled() {
                 match app_state.storage.schedule.count_enabled_schedules().await {
                     Ok(count) => {
@@ -104,15 +87,6 @@ pub fn spawn_snapshot_collector(
     })
 }
 
-/// Run the monitor dashboard until shutdown is signalled.
-///
-/// Reads the shared [`DashboardSnapshot`] produced by
-/// [`spawn_snapshot_collector`] and renders it to the terminal. This
-/// ensures the terminal and HTTP API always show identical metrics.
-///
-/// Sets up the terminal in raw/alternate-screen mode, ticks at
-/// `refresh_ms` intervals, and restores the terminal on exit.
-/// Sets the `shutdown` flag on ctrl-c so the HTTP server can drain.
 pub async fn run(
     app_state: AppState,
     refresh_ms: u64,
@@ -130,7 +104,6 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = interval.tick() => {
-                // Drain any pending terminal events (ctrl-c, q).
                 // Raw mode swallows SIGINT, so we must read key events directly.
                 while event::poll(Duration::ZERO)? {
                     if let Event::Key(key) = event::read()? {
@@ -143,7 +116,6 @@ pub async fn run(
                     }
                 }
 
-                // Read the shared snapshot produced by spawn_snapshot_collector.
                 let snapshot = app_state.dashboard_snapshot.lock().clone();
                 if let Some(ref ds) = snapshot {
                     let opts = trawl_dashboard::DashboardOptions::default();

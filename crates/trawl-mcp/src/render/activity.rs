@@ -72,31 +72,19 @@ use crate::reply::{
 use crate::tools::orient::object;
 use crate::tools::schema::{HARD_MAX_BYTES, INVESTIGATION, READ};
 
-/// The most bytes one activity entry's line may take before it prints
-/// abbreviated. About a kilobyte: a note of a few sentences, a keep or a
-/// short finding print whole; a long finding, a long note or a step with a
-/// long query prints its header and the read that prints it whole. With
-/// its mirror an entry then costs at most about 2 KiB, so the default
-/// 16 KiB budget holds several beside a search's rows.
 pub const ENTRY_ALLOWANCE_BYTES: usize = 1024;
 
-/// Why an activity continuation is proposed.
 pub const ACTIVITY_CONTINUATION: &str = "print the entries changed after the last one printed here";
 
-/// Why a board continuation is proposed.
 pub const BOARD_CONTINUATION: &str = "print the entries changed after the last one printed here";
 
-/// Which tool a board's continuation calls: the one that printed it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Continue {
-    /// `investigation` with `action: read`.
     Investigation,
-    /// `read` with `action: investigation`.
     Read,
 }
 
 impl Continue {
-    /// The call that prints the entries of `id` changed after `since`.
     #[must_use]
     pub fn call(self, id: &str, since: u64, reason: &str) -> NextAction {
         match self {
@@ -118,9 +106,6 @@ impl Continue {
     }
 }
 
-// -- views ----------------------------------------------------------------------
-
-/// `actor` as the reply carries it.
 #[must_use]
 pub fn actor_view(actor: &Actor) -> ActorView {
     ActorView {
@@ -129,7 +114,6 @@ pub fn actor_view(actor: &Actor) -> ActorView {
     }
 }
 
-/// `investigation` as the reply carries it.
 #[must_use]
 pub fn investigation_view(investigation: &Investigation) -> InvestigationView {
     InvestigationView {
@@ -149,7 +133,6 @@ pub fn investigation_view(investigation: &Investigation) -> InvestigationView {
     }
 }
 
-/// One list row as the reply carries it.
 #[must_use]
 pub fn summary_view(summary: &InvestigationSummary) -> InvestigationSummaryView {
     InvestigationSummaryView {
@@ -162,7 +145,6 @@ pub fn summary_view(summary: &InvestigationSummary) -> InvestigationSummaryView 
     }
 }
 
-/// `entry` whole, as the reply carries it.
 #[must_use]
 pub fn entry_view(entry: &LogEntry) -> EntryView {
     EntryView {
@@ -177,8 +159,6 @@ pub fn entry_view(entry: &LogEntry) -> EntryView {
     }
 }
 
-/// The activity trawld answered for investigation `id` after the session's
-/// `since`, each entry longer than [`ENTRY_ALLOWANCE_BYTES`] abbreviated.
 #[must_use]
 pub fn activity_view(id: &str, since: u64, activity: &Activity) -> ActivityView {
     let entries = activity
@@ -215,8 +195,6 @@ pub fn activity_view(id: &str, since: u64, activity: &Activity) -> ActivityView 
     view
 }
 
-/// The entries of `read`, a read of investigation `id` after `since`,
-/// whole.
 #[must_use]
 pub fn board_view(id: &str, since: u64, read: &InvestigationRead, tool: Continue) -> ActivityView {
     let mut view = ActivityView {
@@ -235,8 +213,6 @@ pub fn board_view(id: &str, since: u64, read: &InvestigationRead, tool: Continue
     view
 }
 
-/// Keep the first `kept` of the `total` entries trawld sent and make the
-/// view's facts and continuation say so.
 pub(crate) fn keep_entries(view: &mut ActivityView, kept: usize, total: usize, tool: Continue) {
     view.entries.truncate(kept);
     view.entries_dropped_to_fit = as_u64(total.saturating_sub(kept));
@@ -256,7 +232,6 @@ pub(crate) fn keep_entries(view: &mut ActivityView, kept: usize, total: usize, t
         .then(|| tool.call(&view.investigation_id, from, reason));
 }
 
-/// Print `view` as its header and `marker`, saying what was left out.
 fn abbreviate(view: &mut EntryView, read_with: &str) {
     let omitted = entry_body(view).map_or(0, |body| body.len());
     view.payload = None;
@@ -264,10 +239,6 @@ fn abbreviate(view: &mut EntryView, read_with: &str) {
     view.abbreviated = Some(format!("+{omitted} bytes: {read_with}"));
 }
 
-/// The `updated_seq` of the last entry the fitted reply in `result` printed
-/// in its `part` (`activity`, `entries`, or `investigation.activity` for a
-/// search), read from its mirror; `None` for an error or a part with no
-/// entry printed.
 #[must_use]
 pub fn printed_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
     if result.is_error == Some(true) {
@@ -280,11 +251,9 @@ pub fn printed_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
     at.get("printed_through")?.as_u64()
 }
 
-/// After a board read, the sequence through which the fitted reply in
-/// `result` showed the board in its `part`: trawld's `through_seq` when the
-/// reply printed every entry trawld sent and trawld holds none past them,
-/// so a read that printed no entry has still seen the board through there;
-/// otherwise [`printed_through`]. `None` for an error.
+/// trawld's `through_seq` when the reply printed every entry trawld sent and
+/// trawld holds none past them, so a read that printed no entry has still
+/// seen the board through there.
 #[must_use]
 pub fn board_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
     let printed = printed_through(result, part);
@@ -303,9 +272,6 @@ pub fn board_through(result: &CallToolResult, part: &[&str]) -> Option<u64> {
     }
 }
 
-// -- lines ----------------------------------------------------------------------
-
-/// A serde enum's wire word, such as `finding_status`.
 fn word<T: Serialize>(value: &T) -> String {
     serde_json::to_value(value)
         .ok()
@@ -313,7 +279,6 @@ fn word<T: Serialize>(value: &T) -> String {
         .unwrap_or_else(|| "unknown".to_owned())
 }
 
-/// An entry's header: its sequence, kind, actor and time.
 fn entry_header(entry: &EntryView) -> String {
     let mut header = format!("#{}", entry.seq);
     if entry.updated_seq != entry.seq {
@@ -330,14 +295,11 @@ fn entry_header(entry: &EntryView) -> String {
     header
 }
 
-/// An entry's payload as its line prints it, or `None` when the view
-/// holds none (it was abbreviated) or it does not read as an entry.
 fn entry_body(entry: &EntryView) -> Option<String> {
     let payload: EntryPayload = serde_json::from_value(entry.payload.clone()?).ok()?;
     Some(payload_text(&payload))
 }
 
-/// The one-line text of an entry's payload.
 fn payload_text(payload: &EntryPayload) -> String {
     match payload {
         EntryPayload::Step {
@@ -416,8 +378,6 @@ fn payload_text(payload: &EntryPayload) -> String {
     }
 }
 
-/// A step's outcome, appended to its text. A capture cut short of the rows
-/// its query produced says so, as `with 4 of 5000 rows (cut)`.
 fn outcome_text(outcome: &StepOutcome, text: &mut String) {
     let _ = write!(text, "; outcome {}", word(&outcome.outcome));
     if let Some(code) = &outcome.code {
@@ -441,7 +401,6 @@ fn outcome_text(outcome: &StepOutcome, text: &mut String) {
     }
 }
 
-/// One entry on one line, whole or abbreviated.
 #[must_use]
 pub fn entry_line(entry: &EntryView) -> String {
     let header = entry_header(entry);
@@ -452,8 +411,6 @@ pub fn entry_line(entry: &EntryView) -> String {
     }
 }
 
-/// An investigation's own lines: id, title, status, sequence, question,
-/// scope, retention and attribution.
 pub(crate) fn investigation_lines(view: &InvestigationView, lines: &mut Vec<String>) {
     lines.push(format!(
         "investigation {}: {}, {}, seq {}",
@@ -485,8 +442,6 @@ pub(crate) fn investigation_lines(view: &InvestigationView, lines: &mut Vec<Stri
     ));
 }
 
-/// One of an investigation's texts as its line prints it: a JSON string,
-/// followed by its marker when the fitting cut it.
 fn header_text(view: &InvestigationView, field: &str, text: &str) -> String {
     let printed = json_string(text);
     match view.abbreviated.iter().find(|cut| cut.field == field) {
@@ -495,21 +450,15 @@ fn header_text(view: &InvestigationView, field: &str, text: &str) -> String {
     }
 }
 
-/// The bytes `c` prints as inside a JSON string of the text block.
 fn escaped_len(c: char) -> usize {
     let mut buf = [0; 4];
     json_string(c.encode_utf8(&mut buf)).len() - 2
 }
 
-/// The bytes of `text` printed inside a JSON string, without its quotes.
 fn escaped_bytes(text: &str) -> usize {
     text.chars().map(escaped_len).sum()
 }
 
-/// The length of the longest prefix of `text` whose escaped form takes at
-/// most `cap` bytes, and the escaped bytes it leaves out; `None` when the
-/// whole text fits. The prefix ends on a character boundary, so it never
-/// splits a scalar or the escape of one.
 #[must_use]
 pub fn cut_escaped(text: &str, cap: usize) -> Option<(usize, usize)> {
     let total = escaped_bytes(text);
@@ -528,9 +477,6 @@ pub fn cut_escaped(text: &str, cap: usize) -> Option<(usize, usize)> {
     Some((end, total - kept))
 }
 
-/// Cut each of `view`'s title, question and scope whose escaped form is
-/// longer than `cap` bytes to the prefix that fits, its marker saying
-/// what was left out and that `whole_at` shows it whole.
 fn abbreviate_header(view: &mut InvestigationView, cap: usize, whole_at: &str) {
     let InvestigationView {
         title,
@@ -555,7 +501,6 @@ fn abbreviate_header(view: &mut InvestigationView, cap: usize, whole_at: &str) {
     }
 }
 
-/// The facts of an entry block: what it prints, abbreviates and drops.
 fn block_facts(view: &ActivityView, budget: Budget) -> String {
     let printed = view.entries.len();
     let mut facts = format!("{printed} {}", plural(printed, "entry", "entries"));
@@ -585,7 +530,6 @@ fn block_facts(view: &ActivityView, budget: Budget) -> String {
     facts
 }
 
-/// An entry block's lines: the facts line, the entries, the continuation.
 fn block_lines(heading: &str, view: &ActivityView, budget: Budget, lines: &mut Vec<String>) {
     if view.entries.is_empty() && view.entries_dropped_to_fit == 0 && !view.trawld_holds_more {
         lines.push(format!("{heading}: none."));
@@ -598,7 +542,6 @@ fn block_lines(heading: &str, view: &ActivityView, budget: Budget, lines: &mut V
     }
 }
 
-/// One proposed call, as every reply prints it.
 fn next_line(action: &NextAction) -> String {
     format!(
         "next: {} {} — {}",
@@ -608,7 +551,6 @@ fn next_line(action: &NextAction) -> String {
     )
 }
 
-/// The board lines: entries changed after `since`, in change order.
 pub(crate) fn board_lines(view: &ActivityView, budget: Budget, lines: &mut Vec<String>) {
     block_lines(
         &format!("entries changed after #{}, in change order", view.since),
@@ -618,8 +560,6 @@ pub(crate) fn board_lines(view: &ActivityView, budget: Budget, lines: &mut Vec<S
     );
 }
 
-/// The activity lines: entries other keys changed since the session's
-/// `seen_seq`.
 pub(crate) fn activity_lines(view: &ActivityView, budget: Budget, lines: &mut Vec<String>) {
     block_lines(
         &format!(
@@ -632,8 +572,6 @@ pub(crate) fn activity_lines(view: &ActivityView, budget: Budget, lines: &mut Ve
     );
 }
 
-/// An attached search's lines: the investigation, the kept result and the
-/// activity, or the sentence saying why there is none.
 pub(crate) fn attached_lines(view: &AttachedView, budget: Budget, lines: &mut Vec<String>) {
     let mut line = format!("investigation: {}", json_string(&view.id));
     if let Some(result_id) = &view.result_id {
@@ -648,7 +586,6 @@ pub(crate) fn attached_lines(view: &AttachedView, budget: Budget, lines: &mut Ve
     }
 }
 
-/// The text block of an `investigation` reply, unfitted.
 #[must_use]
 pub fn investigation_text(reply: &InvestigationReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -676,7 +613,6 @@ pub fn investigation_text(reply: &InvestigationReply, budget: Budget) -> String 
     lines.join("\n")
 }
 
-/// The list's lines, one investigation each.
 fn list_lines(reply: &InvestigationReply, budget: Budget, lines: &mut Vec<String>) {
     let mut heading = format!(
         "investigations, open first, most recently changed first: {} printed",
@@ -694,7 +630,6 @@ fn list_lines(reply: &InvestigationReply, budget: Budget, lines: &mut Vec<String
     lines.extend(reply.investigations.iter().map(summary_line));
 }
 
-/// One investigation as a list prints it.
 #[must_use]
 pub fn summary_line(summary: &InvestigationSummaryView) -> String {
     format!(
@@ -709,35 +644,22 @@ pub fn summary_line(summary: &InvestigationSummaryView) -> String {
     )
 }
 
-// -- fitting --------------------------------------------------------------------
-
-/// A reply whose entry block or list the fitting may cut from the end.
 pub(crate) trait Entries: Serialize + Clone {
-    /// The text block under `budget`.
     fn text(&self, budget: Budget) -> String;
-    /// The board, the activity or the list the fitting cuts, as
-    /// [`Cut`].
     fn cut(&mut self) -> Option<Cut<'_>>;
-    /// The proposed next calls.
     fn next_actions_mut(&mut self) -> &mut Vec<NextAction>;
-    /// The entry a write wrote, which the fitting may abbreviate.
     fn written_mut(&mut self) -> Option<&mut EntryView> {
         None
     }
-    /// The investigation's own fields, whose texts the fitting may cut.
     fn header_mut(&mut self) -> Option<&mut InvestigationView>;
 }
 
-/// What the fitting cuts from the end.
 pub(crate) enum Cut<'a> {
-    /// An entry block, the board when `board`, else the activity, whose
-    /// continuation calls `tool`.
     Block {
         view: &'a mut ActivityView,
         board: bool,
         tool: Continue,
     },
-    /// The investigation list and its dropped count.
     List {
         rows: &'a mut Vec<InvestigationSummaryView>,
         dropped: &'a mut u64,
@@ -810,10 +732,6 @@ impl Entries for ReadReply {
     }
 }
 
-/// `reply` as a tool result fitted under `budget`; `tool` names the tool
-/// for the error a reply that does not fit gets. A board whose first
-/// entry does not print, even abbreviated, is an error naming that entry
-/// and the read past it.
 pub(crate) fn fit_entries<R: Entries>(reply: R, budget: Budget, tool: &str) -> CallToolResult {
     let first = first_entry(&reply);
     let hard = (budget != Budget::HARD)
@@ -832,8 +750,6 @@ pub(crate) fn fit_entries<R: Entries>(reply: R, budget: Budget, tool: &str) -> C
     }
 }
 
-/// The investigation id, the first entry and the continuation tool of
-/// `reply`'s board; `None` for a reply with no board entry.
 fn first_entry<R: Entries>(reply: &R) -> Option<(String, EntryView, Continue)> {
     match reply.clone().cut() {
         Some(Cut::Block {
@@ -849,10 +765,6 @@ fn first_entry<R: Entries>(reply: &R) -> Option<(String, EntryView, Continue)> {
     }
 }
 
-/// Why a board of investigation `id` answered under `budget` prints no
-/// entry: `entry`, its first, does not fit even abbreviated. Names the
-/// read past it, a larger `max_bytes` when the entry fits at the hard cap
-/// (`fits_hard`), and the investigation's page in trawl's web UI.
 fn entry_does_not_fit(
     id: &str,
     entry: &EntryView,
@@ -879,9 +791,6 @@ fn entry_does_not_fit(
     )
 }
 
-/// The reply to a write trawld accepted for investigation `id`, fitted
-/// under `budget`; `None` only when not even its acknowledgement with
-/// every text cut fits, which takes an attribution larger than the budget.
 pub(crate) fn fit_written(
     reply: InvestigationReply,
     budget: Budget,
@@ -890,7 +799,6 @@ pub(crate) fn fit_written(
     fit_reply(reply, budget, Some(id))
 }
 
-/// Why a reply `tool` answered does not fit `budget`, and what to do.
 #[must_use]
 pub fn does_not_fit(tool: &str, budget: Budget) -> String {
     let bytes = budget.bytes();
@@ -912,12 +820,8 @@ pub fn does_not_fit(tool: &str, budget: Budget) -> String {
 /// A rendered reply and the entries or rows of its cut it kept.
 type Fitted = (String, Json, usize);
 
-/// `reply` fitted under `budget`, giving up, in order: entries from the
-/// end of its block, the proposed next calls, the whole entry written (a
-/// write's, of investigation `written_in`), and the whole header texts. A
-/// board with entries that prints none of them does not advance, so a
-/// later step that prints one wins over it, and when no step prints one
-/// the reply is `None`: [`fit_entries`] says which entry did not print.
+/// A board with entries that prints none of them does not advance, so a
+/// later step that prints one wins over it.
 fn fit_reply<R: Entries>(
     mut reply: R,
     budget: Budget,
@@ -966,11 +870,6 @@ fn fit_reply<R: Entries>(
     Some(result)
 }
 
-/// `reply` with its title, question and scope cut to the longest escaped
-/// prefixes, one cap for all three, with which as many entries print as
-/// with empty prefixes; `None` when not even empty prefixes fit. Each
-/// marker names the read at the hard cap when the whole header fits there,
-/// else the investigation's page in trawl's web UI.
 fn cut_header<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     let mut whole = reply.clone();
     let view = whole.header_mut()?;
@@ -1011,15 +910,12 @@ fn cut_header<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     Some(best)
 }
 
-/// `candidate` rendered under `budget`, or `None` when it does not fit.
 fn fitted<R: Entries>(candidate: &R, budget: Budget) -> Option<(String, Json)> {
     let mirror = mirror(candidate).ok()?;
     let text = candidate.text(budget);
     (measure(&text, &mirror) <= budget.bytes()).then_some((text, mirror))
 }
 
-/// `reply` keeping the first `kept` of the `total` entries or rows of its
-/// cut.
 fn keeping<R: Entries>(reply: &R, kept: usize, total: usize) -> R {
     let mut candidate = reply.clone();
     match candidate.cut() {
@@ -1033,10 +929,6 @@ fn keeping<R: Entries>(reply: &R, kept: usize, total: usize) -> R {
     candidate
 }
 
-/// The reply with the most of its first entries that fit, rendered, or
-/// `None` when not even none fit. A binary search over the kept count, as
-/// the result fitting searches rows; every answer was measured.
-///
 /// A board that fits none of its entries prints its first one
 /// abbreviated instead, so a read advances; when not even that fits, the
 /// read is the error [`fit_entries`] answers.
@@ -1069,9 +961,6 @@ fn most_entries<R: Entries>(reply: &R, budget: Budget) -> Option<Fitted> {
     Some(best)
 }
 
-/// For a board whose first entry does not fit `budget`: the reply printing
-/// that entry abbreviated, its marker naming the read at the hard cap when
-/// the entry fits there, else saying no response holds it.
 fn first_abbreviated<R: Entries>(
     reply: &R,
     total: usize,

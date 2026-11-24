@@ -5,11 +5,6 @@
 //! Every call a query writes is checked once, before either lane runs it,
 //! and every lane refuses a bad call with the same sentence (ADR-0001,
 //! Amendment 2026-11-11).
-//!
-//! The emitter's SQL-position refusals are the reference: their exact
-//! `to_string()` and `hint()` were pinned here as a baseline on the code
-//! before the shared call check existed, so every door has to say what
-//! emit said.
 
 use trawl_core::ast::{PipeStage, Spanned};
 use trawl_core::context::EvalContext;
@@ -25,8 +20,6 @@ mod doc_examples;
 
 const SOURCE: &str = "/data/*.parquet";
 
-/// A FIXED anchor: nothing may self-serve an evaluation context
-/// (`tests/now_anchor_contract.rs`).
 fn anchor() -> EvalContext {
     EvalContext::at(
         chrono::DateTime::parse_from_rfc3339("2026-11-11T12:00:00Z")
@@ -41,24 +34,15 @@ fn pipeline(query: &str) -> Vec<Spanned<PipeStage>> {
         .pipeline
 }
 
-/// The operator hint every spelling of `match(` carries.
 const MATCH_HINT: &str = "matches is an operator, not a function: where message matches /re/";
 
-/// One bad call and the refusal emit gives it today.
 struct Refusal {
     query: &'static str,
     display: &'static str,
     hint: Option<&'static str>,
 }
 
-/// Emit's refusal of each single-defect call, in a SQL position: a `where`
-/// condition, a `let`/`eval` value, and an aggregation head or operand.
-///
-/// `case(x)` once had two sentences: the arity table said "argument(s)"
-/// where emit's SQL-position guard said "arguments". The table now says
-/// what the guard says, in every position.
 const BASELINE: &[Refusal] = &[
-    // unknown name, with a suggestion
     Refusal {
         query: "* | where countt(message) > 0",
         display: "unknown function: countt (did you mean 'count'?)",
@@ -79,7 +63,6 @@ const BASELINE: &[Refusal] = &[
         display: "unknown function: countt (did you mean 'count'?)",
         hint: Some("did you mean 'count'?"),
     },
-    // unknown name, no suggestion
     Refusal {
         query: "* | where nosuchfn(message)",
         display: "unknown function: nosuchfn",
@@ -105,7 +88,6 @@ const BASELINE: &[Refusal] = &[
         display: "unknown function: nosuchfn",
         hint: None,
     },
-    // `match(`, in either case, with the operator hint
     Refusal {
         query: r#"* | where match(message, "x")"#,
         display: "unknown function: match (matches is an operator, not a function: where \
@@ -130,7 +112,6 @@ const BASELINE: &[Refusal] = &[
                   message matches /re/)",
         hint: Some(MATCH_HINT),
     },
-    // argument count
     Refusal {
         query: "* | let x = length()",
         display: "invalid aggregation: length() requires exactly one argument",
@@ -161,7 +142,6 @@ const BASELINE: &[Refusal] = &[
         display: "invalid aggregation: case() requires at least 2 arguments",
         hint: None,
     },
-    // integer-literal position
     Refusal {
         query: "* | let x = round(1, message)",
         display: "invalid aggregation: round() argument 2 must be an integer literal",
@@ -177,7 +157,6 @@ const BASELINE: &[Refusal] = &[
         display: "invalid aggregation: split() argument 3 must be an integer literal",
         hint: None,
     },
-    // unit and dialect
     Refusal {
         query: r#"* | let x = date_part("nanosecond", _time)"#,
         display: "unsupported operation: date_part() unit \"nanosecond\" is not in the allowed \
@@ -208,14 +187,11 @@ const BASELINE: &[Refusal] = &[
                   name, not an expression",
         hint: None,
     },
-    // format
     Refusal {
         query: r#"* | let x = strftime(_time, "%Q")"#,
         display: "strftime(): invalid format string \"%Q\"",
         hint: None,
     },
-    // JSON path (ADR-0017, amendment of 2026-11-13); added with the
-    // check, not part of the pre-check baseline
     Refusal {
         query: r#"* | let x = json(message, "$[")"#,
         display: "json(): invalid JSON path \"$[\" in argument 2: expected an array index \
@@ -233,7 +209,6 @@ const BASELINE: &[Refusal] = &[
     },
 ];
 
-/// The accepted forms every JSON path refusal's hint ends with.
 const JSON_PATH_FORMS: &str = "a JSON path is $ for the root, $ then steps such as .key, \
      .\"quoted key\", [0], [-1] or [#-1], a pointer such as /key/0, or one bare key";
 
@@ -254,14 +229,7 @@ fn emit_refuses_each_bad_call_with_the_baseline_sentence() {
     }
 }
 
-/// At least one valid call per `KNOWN_FUNCTIONS` entry, keyed by name.
-///
-/// The fixtures cover optional arguments, unit and dialect names in any
-/// case, dynamic format expressions, aliases, calls nested in calls and
-/// under `not`, `in` and comparisons, and fields named like functions
-/// (`count`, `lower`), which are leaves and never calls.
 const VALID_CALLS: &[(&str, &[&str])] = &[
-    // aggregates
     (
         "count",
         &[
@@ -299,7 +267,6 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
     ("list", &["* | stats list(host)"]),
     ("median", &["* | stats median(dur)"]),
     ("stddev", &["* | stats stddev(dur)"]),
-    // scalars
     (
         "lower",
         &[
@@ -363,7 +330,6 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             r#"* | let s = sev(level, "OTEL")"#,
         ],
     ),
-    // string
     ("contains", &[r#"* | where contains(message, "timeout")"#]),
     ("startswith", &[r#"* | where startswith(path, "/api")"#]),
     ("endswith", &[r#"* | where endswith(path, ".json")"#]),
@@ -375,7 +341,6 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             r#"* | let x = concat(host, ":", port)"#,
         ],
     ),
-    // date/time
     (
         "date_part",
         &[
@@ -409,7 +374,6 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             "* | let t = strptime(ts, fmt)",
         ],
     ),
-    // conditional
     (
         "case",
         &[
@@ -417,7 +381,6 @@ const VALID_CALLS: &[(&str, &[&str])] = &[
             r#"* | let x = case(status >= 500, "error", status >= 400, "warn")"#,
         ],
     ),
-    // json: every path form the grammar accepts
     (
         "json",
         &[
@@ -504,10 +467,8 @@ fn every_known_function_has_a_valid_call() {
     }
 }
 
-/// The valid fixtures live refuses, and why: never for a call, always for
-/// a stage it cannot stream. A scalar aggregation head and a computed
-/// aggregation operand run only in SQL, and `eventstats` and `pivot` do
-/// not stream at all.
+/// The valid fixtures live refuses: never for a call, always for a stage it
+/// cannot stream.
 const LIVE_REFUSED: &[(&str, &str)] = &[
     (
         "* | stats coalesce(sum(bytes), 0)",
@@ -531,7 +492,6 @@ const LIVE_REFUSED: &[(&str, &str)] = &[
     ),
 ];
 
-/// The baseline pin for one PC-1 query.
 fn pin(query: &str) -> &'static Refusal {
     BASELINE
         .iter()
@@ -539,8 +499,6 @@ fn pin(query: &str) -> &'static Refusal {
         .unwrap_or_else(|| panic!("{query}: no baseline pin"))
 }
 
-/// One refusal as a caller sees it: the whole sentence, and the hint
-/// alone.
 #[derive(Debug, PartialEq)]
 struct Seen {
     display: String,
@@ -556,8 +514,6 @@ impl From<&EmitError> for Seen {
     }
 }
 
-/// The batch lanes' refusal of `query`: `validate_pipeline` and emit must
-/// both refuse, with the same sentence and the same hint.
 fn batch_refusal(query: &str) -> Seen {
     let ast = parser::parse(query).unwrap_or_else(|e| panic!("{query}: parse failed: {e:?}"));
     let validated = Seen::from(
@@ -569,7 +525,6 @@ fn batch_refusal(query: &str) -> Seen {
     validated
 }
 
-/// The stream lane's error for `query` under `scope`.
 fn live_error(query: &str, scope: &PinScope) -> StreamPlanError {
     match compile_stream_plan(&pipeline(query), scope, None) {
         Ok(_) => panic!("{query}: live accepted it"),
@@ -577,8 +532,6 @@ fn live_error(query: &str, scope: &PinScope) -> StreamPlanError {
     }
 }
 
-/// The stream lane's refusal of `query`, compiled pin-blind: the
-/// emitter's sentence, verbatim, as [`StreamPlanError::InvalidFunction`].
 fn live_refusal(query: &str) -> String {
     match compile_stream_plan(&pipeline(query), &PinScope::unpinned(), None) {
         Err(StreamPlanError::InvalidFunction(sentence)) => sentence,
@@ -586,24 +539,18 @@ fn live_refusal(query: &str) -> String {
     }
 }
 
-/// Each rule: a bad call, and the PC-1 query whose pin it must reproduce.
 const RULES: &[(&str, &str)] = &[
-    // unknown name, with and without a suggestion
     ("countt(message)", "* | let x = countt(message)"),
     ("nosuchfn(message)", "* | let x = nosuchfn(message)"),
-    // `match(` in either case, with the operator hint
     (
         r#"match(message, "x")"#,
         r#"* | let x = match(message, "x")"#,
     ),
     (r#"MATCH(message, "x")"#, r#"* | where MATCH(message, "x")"#),
-    // argument count
     ("length()", "* | let x = length()"),
     ("case(x)", "* | let x = case(x)"),
-    // integer-literal position
     ("round(1, message)", "* | let x = round(1, message)"),
     (r#"split(a, ",", i)"#, r#"* | let x = split(a, ",", i)"#),
-    // unit and dialect
     (
         r#"date_part("nanosecond", _time)"#,
         r#"* | let x = date_part("nanosecond", _time)"#,
@@ -613,12 +560,10 @@ const RULES: &[(&str, &str)] = &[
         r#"sev(level, "klingon")"#,
         r#"* | let x = sev(level, "klingon")"#,
     ),
-    // format
     (
         r#"strftime(_time, "%Q")"#,
         r#"* | let x = strftime(_time, "%Q")"#,
     ),
-    // JSON path: refused, and computed
     (
         r#"json(message, "$[")"#,
         r#"* | let x = json(message, "$[")"#,
@@ -629,7 +574,6 @@ const RULES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Every position a call can stand in; `{}` is the bad call.
 const POSITIONS: &[(&str, &str)] = &[
     ("where", "* | where {}"),
     ("let", "* | let r = {}"),
@@ -671,8 +615,7 @@ fn every_call_rule_refuses_in_every_position() {
 }
 
 /// Bad calls in the stages after `extract kv`, which run in Rust behind
-/// the SQL. `validate_pipeline` once answered `valid` for each of these,
-/// and the run refused them only when the kv tail compiled.
+/// the SQL.
 const KV_TAIL: &[(&str, &str)] = &[
     (
         "* | extract kv | let r = nosuchfn(a)",
@@ -696,25 +639,19 @@ fn bad_calls_after_extract_kv_are_refused() {
     }
 }
 
-/// One query with several defects: the first in the shared order wins.
 const ORDER: &[(&str, &str)] = &[
-    // parent before children
     (
         "* | let r = foo(bar(x))",
         "unknown function: foo (did you mean 'floor'?)",
     ),
-    // a known parent passes, so its bad argument is next
     (
         "* | let r = lower(bar(x))",
         "unknown function: bar (did you mean 'max'?)",
     ),
-    // within one call: name, count, then literal positions; the
-    // arguments' own calls come after
     (
         r#"* | let r = split(nosuch(x), ",", i)"#,
         "invalid aggregation: split() argument 3 must be an integer literal",
     ),
-    // stages in written order
     (
         "* | let a = nosuchfn(x) | let b = length()",
         "unknown function: nosuchfn",
@@ -723,21 +660,19 @@ const ORDER: &[(&str, &str)] = &[
         "* | where length() > 0 | let a = nosuchfn(x)",
         "invalid aggregation: length() requires exactly one argument",
     ),
-    // the aggregate-position phase before the call phase
     (
         "* | where count(nosuch(x))",
         "invalid aggregation: count() is an aggregation; use it in stats, timechart, \
          eventstats or pivot",
     ),
-    // the call phase before the projection check
     (
         "* | stats count(), count() | where x > 0 | let r = nosuchfn(x)",
         "unknown function: nosuchfn",
     ),
 ];
 
-/// A same-stage chain over `n` references, over the lateral-expansion
-/// budget at 513 (`tests/complexity_parity.rs`), with a bad call after it.
+/// 513 references, one over the lateral-expansion budget
+/// (`tests/complexity_parity.rs`), then a bad call.
 fn over_budget_with_a_bad_call() -> String {
     let args = vec!["x"; 513].join(", ");
     format!("* | let x = abs(y), z = coalesce({args}) | let r = nosuchfn(x)")
@@ -750,8 +685,7 @@ fn the_phase_and_call_order_is_shared() {
         assert_eq!(live_refusal(query), *display, "live: {query}");
     }
 
-    // The expansion budget runs before every other phase. Each lane keeps
-    // its own form of the budget's sentence.
+    // Each lane keeps its own form of the budget's sentence.
     let query = over_budget_with_a_bad_call();
     let budget = trawl_core::complexity::check_pipeline_complexity(&pipeline(&query))
         .expect_err("the fixture is over budget")
@@ -765,8 +699,6 @@ fn the_phase_and_call_order_is_shared() {
         StreamPlanError::TooComplex(budget),
     );
 
-    // Live, a pinned comparison is refused while its stage compiles,
-    // after the call phase: a later stage's bad call is reported first.
     let mut pins = FieldTypes::new();
     pins.insert("level", CanonicalType::Severity);
     let scope = PinScope::root(&pins);
@@ -785,9 +717,6 @@ fn the_phase_and_call_order_is_shared() {
     );
 }
 
-/// Live and the `extract kv` tail refuse an integer position that is not
-/// an integer literal, as batch does: a field, a string, a float, and a
-/// negation (`-1` is not a literal).
 #[test]
 fn live_refuses_non_literal_integer_positions() {
     const ROUND: &str = "invalid aggregation: round() argument 2 must be an integer literal";
@@ -805,16 +734,12 @@ fn live_refuses_non_literal_integer_positions() {
     }
 }
 
-/// `text` as a DSL string literal: `\` and `"` escaped, every other
-/// character as written.
 fn dsl_string(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The refused paths of #457's acceptance criteria, as the path text
-/// itself (not as DSL).
+/// The refused paths, as the path text itself (not as DSL).
 const REFUSED_JSON_PATHS: &[&str] = &[
-    // malformed
     "$[",
     "$.k.",
     "$.",
@@ -832,7 +757,6 @@ const REFUSED_JSON_PATHS: &[&str] = &[
     "$[#-00000000000000000001]",
     r#"$."a\nb""#,
     "/a~2b",
-    // unsupported
     "$.*",
     "$[*]",
     "$..k",
@@ -846,8 +770,6 @@ const REFUSED_JSON_PATHS: &[&str] = &[
     " k",
 ];
 
-/// The JSON path refusal `query` gets from `validate_pipeline`, after
-/// asserting emit and the stream compiler say the same.
 /// `compile_stream_plan` is `compile_stream_plan_with` over a fresh
 /// ledger; calling it keeps this file out of the pattern construction
 /// inventory.
@@ -869,11 +791,6 @@ fn json_path_refusal(query: &str) -> EmitError {
     err
 }
 
-/// Each malformed or unsupported literal path is refused with the typed
-/// variant and the parser's reason, through `validate_pipeline` and the
-/// stream compiler, before either lane reads a row: a search that matches
-/// nothing is refused the same way (#457, ADR-0017's amendment of
-/// 2026-11-13).
 #[test]
 fn json_path_refusal_reaches_both_lanes() {
     for &path in REFUSED_JSON_PATHS {
@@ -905,9 +822,6 @@ fn json_path_refusal_reaches_both_lanes() {
     }
 }
 
-/// A path that is not a string literal (a field, an expression, a null, a
-/// number) cannot be checked before the query runs, so both lanes refuse
-/// it.
 #[test]
 fn json_path_must_be_a_string_literal() {
     for path in ["path_field", r#"concat("$.", "k")"#, "null", "1"] {
@@ -930,11 +844,9 @@ fn json_path_must_be_a_string_literal() {
     }
 }
 
-/// The candidates `example` covers, by index. A fenced row covers each run
-/// of candidates that holds its excerpt's lines contiguous and in order
-/// inside one fenced block, so a query whose lines were dropped, reordered
-/// or split across blocks covers nothing. A shell row covers each command
-/// that passes its argument, and an inline row each span equal to it.
+/// A fenced row covers each run of candidates that holds its excerpt's
+/// lines contiguous and in order inside one fenced block, so a query whose
+/// lines were dropped, reordered or split across blocks covers nothing.
 fn covered(example: &doc_examples::Example, candidates: &[doc_examples::Candidate]) -> Vec<usize> {
     use doc_examples::Site;
     let matching = |keep: &dyn Fn(&doc_examples::Candidate) -> bool| {
@@ -971,8 +883,6 @@ fn covered(example: &doc_examples::Example, candidates: &[doc_examples::Candidat
     }
 }
 
-/// The candidates no row covers and no exclusion names, described for a
-/// failure message.
 fn strays(
     candidates: &[doc_examples::Candidate],
     accounted: &[bool],
@@ -997,10 +907,6 @@ fn strays(
         .collect()
 }
 
-/// Every query the documentation shows still means what it says: each
-/// positive parses and passes `validate_pipeline`, the call check
-/// included, and each deliberate negative is refused by the layer that
-/// owns it. Every place a source can write a query is accounted for.
 #[test]
 fn documented_examples_validate() {
     use doc_examples::{EXAMPLES, EXCLUSIONS, Expect, Site, Source};
@@ -1018,7 +924,6 @@ fn documented_examples_validate() {
             .map(|example| covered(example, &candidates))
             .collect();
 
-        // Each row is anchored in the source as it stands.
         for (example, rows) in examples.iter().zip(&coverage) {
             let excerpt = example.excerpt;
             let anchored = match example.site {
@@ -1070,8 +975,6 @@ fn documented_examples_validate() {
             );
         }
 
-        // Every candidate is a row or an exclusion. Every stray is listed,
-        // not just the first.
         let strays = strays(&candidates, &accounted, &exclusions);
         assert!(
             strays.is_empty(),
@@ -1079,8 +982,6 @@ fn documented_examples_validate() {
             strays.join("\n")
         );
 
-        // What each row must answer. Every miss is listed, not just the
-        // first.
         let mut misses = Vec::new();
         for example in &examples {
             let query = example.query;

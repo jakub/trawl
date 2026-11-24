@@ -2,29 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Regression guard for ADR-0027 as amended 2026-09-21: a live stream
-//! carries no range. `search_url::mode_query` is the ONE place either
-//! DSL is produced, so nothing under `src` names `effective_query` or
-//! `live_query`: not the pages, components and state that make up the
-//! wasm shell, and not a crate-root helper a component could call
-//! instead. The modules that define and dispatch them live in the
-//! `trawl-search-url` crate, outside this walk; the `query_merge` and
-//! `search_url` shims here re-export them without naming either. A caller that reached for one of them directly could fold
-//! the popover's range into a stream again, and the stream lane would
-//! drop every event older than that window while the page still said
-//! Live.
-//!
-//! Line comments are dropped first, so prose about the merge is still
-//! allowed to name the functions it describes. Nothing else is: a
-//! stripper that tracked `/*` would read one inside a string literal or
-//! a line comment as an opener and hide every call after it, so this
-//! guard fails closed instead. A name inside a block comment trips it,
-//! loudly, and the reader moves the prose to a `//` line.
+//! Regression guard for ADR-0027: nothing under `src` names
+//! `effective_query` or `live_query`; the shell reaches a DSL only through
+//! `search_url::mode_query`.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The DSL producers only `mode_query` may call.
 const FORBIDDEN: &[&str] = &["effective_query", "live_query"];
 
 #[test]
@@ -79,9 +63,6 @@ fn a_forbidden_name_in_a_comment_is_prose() {
 
 #[test]
 fn a_call_is_never_hidden_by_what_precedes_it() {
-    // Each of these once slipped past a stripper that tracked `/*`: an
-    // opener inside a line comment or a string literal swallowed the
-    // rest of the file. The call after it must still trip the guard.
     for src in [
         "let q = live_query(b, f);\n",
         "// treat /* as literal log text.\nlet q = crate::query_merge::live_query(b, f);\n",
@@ -96,8 +77,6 @@ fn a_call_is_never_hidden_by_what_precedes_it() {
     }
 }
 
-/// Every `.rs` file under `src`, sorted so a failure reads the same way
-/// twice.
 fn source_files() -> Vec<PathBuf> {
     let mut out = Vec::new();
     collect(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
@@ -105,7 +84,6 @@ fn source_files() -> Vec<PathBuf> {
     out
 }
 
-/// Recursive half of [`source_files`].
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) {
     for entry in fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display())) {
         let path = entry.expect("a readable directory entry").path();

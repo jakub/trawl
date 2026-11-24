@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `POST /api/v1/results` end to end (ADR-0057): the guards a capture
-//! passes before it takes anything, the bounds it resolves, and what a
-//! finished capture leaves behind.
+//! `POST /api/v1/results` end to end (ADR-0057).
 //!
 //! Captures resolve their window at the fixture's results clock, which a
 //! test moves onto the corpus it seeded: the shared seed sits on
@@ -13,7 +11,7 @@
 //!
 //! One test installs trawld's telemetry as the process's global subscriber
 //! and reads its own request's events back; no other test here installs
-//! one. The binary is in the ADR-0021 `postgres` nextest group.
+//! one.
 
 mod common;
 
@@ -43,10 +41,8 @@ use trawl_server::publication::CorpusUnsettled;
 use trawl_server::store::{FinishOutcome, RunClaim, RunStatus};
 use trawl_server::telemetry::{self, WalHandle, WalLayer};
 
-/// The order an event-shaped capture's recorded text ends with.
 const IMPOSED_ORDER: &str = "| sort -_time, -_ingested";
 
-/// The corpus query every capture here runs, unless it says otherwise.
 fn corpus_query() -> String {
     format!("service={}", captured::SERVICE)
 }
@@ -63,10 +59,6 @@ fn code(body: &serde_json::Value) -> &str {
     body["error"]["code"].as_str().unwrap_or_default()
 }
 
-// -- guards before any work ---------------------------------------------------
-
-/// A key without the `query` permission is refused before the capture takes
-/// a permit or leaves a record.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_key_without_query_is_refused_before_it_takes_anything() {
     let server = boot().await;
@@ -85,14 +77,11 @@ async fn a_key_without_query_is_refused_before_it_takes_anything() {
     );
 }
 
-/// A capture is one more request under the ADR-0054 count: with the count
-/// full, it is refused at the edge before auth.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_full_request_count_refuses_a_capture() {
     let server = boot().await;
     let app = server.router_with(|http| http.max_concurrent_requests = 1);
 
-    // One capture whose body the test holds open holds the only slot.
     let release = Arc::new(Semaphore::new(0));
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let gate = Arc::clone(&release);
@@ -126,8 +115,6 @@ async fn a_full_request_count_refuses_a_capture() {
     );
 }
 
-/// A JSON capture request through the in-process router, with the peer the
-/// accept loop would insert.
 fn capture_request(token: &str, body: Body) -> Request<Body> {
     let mut request = Request::builder()
         .method("POST")
@@ -145,7 +132,6 @@ fn capture_request(token: &str, body: Body) -> Request<Body> {
 /// Events of a service no other test reads, for the WAL a restart left.
 const OVERHANG_SERVICE: &str = "captureoverhang";
 
-/// A WAL file in the live writer's format holding `count` events.
 fn plant_wal(dir: &Path, count: usize) {
     let time = (chrono::Utc::now() - TimeDelta::minutes(5))
         .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
@@ -166,9 +152,6 @@ fn plant_wal(dir: &Path, count: usize) {
     writer.write("prod", OVERHANG_SERVICE, &ndjson).unwrap();
 }
 
-/// While hydration has not finished, a capture is refused as a corpus read:
-/// 503 `corpus_recovering` without a retry hint, and nothing taken.
-///
 /// The WAL a restart left is larger than the hot buffer holds, and the
 /// fixture never runs compaction, so hydration stays unfinished for the
 /// whole test: the in-process form of `TRAWL_TEST_HOLD_BOOT_PASS`, which
@@ -204,7 +187,6 @@ async fn an_unhydrated_corpus_refuses_a_capture_as_recovering() {
     );
 }
 
-/// The per-key rate covers captures: over it, 429 with `Retry-After`.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_per_key_rate_refuses_a_capture_with_retry_after() {
     let server = captured::boot(
@@ -237,11 +219,6 @@ async fn the_per_key_rate_refuses_a_capture_with_retry_after() {
     assert!(retry_after >= 1, "{retry_after}");
 }
 
-// -- bounds -------------------------------------------------------------------
-
-/// `last=1h` resolves once, at the results clock, to microsecond bounds,
-/// and the recorded text is what ran: the window spliced in, ending with the
-/// imposed newest-first order.
 #[tokio::test(flavor = "multi_thread")]
 async fn last_resolves_to_microsecond_bounds_and_records_the_imposed_order() {
     let server = boot().await;
@@ -277,8 +254,6 @@ async fn last_resolves_to_microsecond_bounds_and_records_the_imposed_order() {
     assert!(!captured.truncated);
 }
 
-/// With no window and no clause, a capture covers the 15 minutes ending at
-/// the results clock, lower bound included.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_window_covers_the_default_fifteen_minutes() {
     let server = boot().await;
@@ -305,11 +280,8 @@ async fn no_window_covers_the_default_fifteen_minutes() {
     );
 }
 
-/// Bounds a capture cannot honour are a 400 before anything is taken: no
-/// permit, no publication guard, no record. A window and a time clause in
-/// the query are refused alike, as the capture's own `bad_request`. The
-/// clause cases quote their values: an unquoted `latest=…` is a filter on
-/// a field named `latest`, which reads NULL when absent (ADR-0062).
+/// The clause cases quote their values: an unquoted `latest=…` is a filter
+/// on a field named `latest`, which reads NULL when absent (ADR-0062).
 #[tokio::test(flavor = "multi_thread")]
 async fn refused_bounds_take_nothing() {
     let server = boot().await;
@@ -368,10 +340,9 @@ async fn refused_bounds_take_nothing() {
 }
 
 /// The store's TEXT columns refuse U+0000, and a capture's text is stored
-/// and shown back (ADR-0057), so a request whose `query` carries one is a
-/// 400 at the boundary, not a 503 from the insert. Nothing is held, no row
-/// is kept and no file is left. A NUL in a `window` string already fails
-/// as an unparseable timestamp.
+/// and shown back (ADR-0057), so a NUL in `query` is a 400 at the
+/// boundary, not a 503 from the insert. A NUL in a `window` string
+/// already fails as an unparseable timestamp.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_nul_in_the_query_text_is_refused_at_the_boundary() {
     let server = boot().await;
@@ -422,11 +393,8 @@ async fn a_nul_in_the_query_text_is_refused_at_the_boundary() {
     );
 }
 
-/// The saved query whose recorded run the `from saved` capture reads.
 const REPORT: &str = "capture_report";
 
-/// Record a finished run of [`REPORT`] whose file holds two rows, through
-/// the stores the scheduler records with.
 async fn record_report(server: &TestServer, data: &str) {
     let client =
         trawl_client::HttpClient::new_insecure(&server.url, &server.analyst_token).unwrap();
@@ -480,8 +448,6 @@ async fn record_report(server: &TestServer, data: &str) {
     );
 }
 
-/// A `from saved` capture reads stored report rows: source `stored`, no
-/// bounds, the whole result.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_captures_the_stored_rows_without_bounds() {
     let (server, data) =
@@ -501,10 +467,6 @@ async fn from_saved_captures_the_stored_rows_without_bounds() {
     assert!(!captured.truncated);
 }
 
-/// A `from saved` capture types a field the recorded run does not carry
-/// by the run, as the query lane does, never by a live pin (ADR-0062):
-/// with `f` pinned DOUBLE, `f` lands as a string column of nulls and a
-/// string function over it binds.
 #[tokio::test(flavor = "multi_thread")]
 async fn from_saved_capture_takes_no_live_pin_for_a_field_the_run_lacks() {
     let (server, data) =
@@ -530,12 +492,8 @@ async fn from_saved_capture_takes_no_live_pin_for_a_field_the_run_lacks() {
     assert_eq!(columns, [("host", &string), ("f", &string), ("y", &string)]);
 }
 
-// -- a finished capture -------------------------------------------------------
-
 type Row = BTreeMap<String, Value>;
 
-/// Install trawld's subscriber shape as the global one, as
-/// `query_timing_roundtrip.rs` does: one filter, a WAL sink, no other sink.
 fn install_telemetry() -> (WalHandle, WalLayer) {
     let defaults = IngestConfig::default();
     let handle = WalHandle::new();
@@ -560,7 +518,6 @@ fn install_telemetry() -> (WalHandle, WalLayer) {
     (handle, layer)
 }
 
-/// `/api/v1/query` over `dsl`: its typed result.
 async fn query(server: &TestServer, dsl: &str) -> trawl_api::value::QueryResult {
     let response = common::harness_client_builder()
         .build()
@@ -584,7 +541,6 @@ async fn query(server: &TestServer, dsl: &str) -> trawl_api::value::QueryResult 
         .result
 }
 
-/// A query's rows as maps from column name to value.
 fn rows(result: trawl_api::value::QueryResult) -> Vec<Row> {
     let names: Vec<String> = result.columns.iter().map(|c| c.name.clone()).collect();
     result
@@ -594,12 +550,6 @@ fn rows(result: trawl_api::value::QueryResult) -> Vec<Row> {
         .collect()
 }
 
-/// A capture of the 20-event corpus keeps every row, shows in history and
-/// the query list as the caller's, reads back as `/query` answers its
-/// recorded text, and books exactly one `query_timing` of kind `capture`
-/// with its file write timed. History and the query list are read before
-/// the comparison `/query`, which records the same text, and the list's
-/// entry is the capture's own query id.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     let (handle, telemetry) = install_telemetry();
@@ -667,7 +617,6 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     assert_eq!(recent[0].snapshot.rows, Some(captured::ROWS));
     let capture_query_id = recent[0].snapshot.id;
 
-    // The page is what `/query` answers for the recorded text.
     let (status, _, page) = captured::page(&server, &server.analyst_token, &result.id, "").await;
     assert_eq!(status, StatusCode::OK, "{page}");
     let page: trawl_api::results::ResultPage = serde_json::from_value(page).unwrap();
@@ -677,8 +626,6 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     assert_eq!(page.page.columns, live.columns);
     assert_eq!(page.page.rows, live.rows);
 
-    // One timing account, of kind capture, with the write phase booked,
-    // under the query id the list showed.
     telemetry.flush_cycle().await;
     let found = rows(
         query(
@@ -710,9 +657,6 @@ async fn a_capture_reads_back_as_query_answers_and_is_accounted_once() {
     );
 }
 
-/// A selection whose stored files pass `source_max_bytes` is refused with
-/// 400 `capture_source_too_large` before the work starts; one file of it
-/// alone fits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
     let tmp = tempfile::tempdir().unwrap();
@@ -726,7 +670,6 @@ async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
                 .len()
         })
         .collect();
-    // Each file fits on its own; the two together do not.
     let budget = *sizes.iter().max().unwrap();
     assert!(sizes.iter().sum::<u64>() > budget);
     let server = common::setup_with_capture(
@@ -760,9 +703,6 @@ async fn a_selection_over_the_source_budget_is_refused_before_work_starts() {
     assert_eq!(started.arrivals(), 1);
 }
 
-/// A capture that pins two of three services in one window is measured
-/// over those two files only (#374): it fits a budget the whole window
-/// does not, and the unpinned window is refused with the service hint.
 /// The third service's file is not parquet, so a capture that opened it
 /// would fail: the pinned capture read only its services' files.
 #[tokio::test(flavor = "multi_thread")]
@@ -840,8 +780,6 @@ async fn multi_service_capture_reads_only_its_services() {
     .await;
 }
 
-/// The page of a capture of `window`, and what `/query` answers for its
-/// recorded text right after.
 async fn captured_and_live(
     server: &TestServer,
     dsl: &str,
@@ -860,10 +798,9 @@ async fn captured_and_live(
     (page, query(server, &result.executed_query).await)
 }
 
-/// A capture reads what `/query` reads for the text it recorded, whatever
-/// partition holds the event. Compaction names a partition by when it
+/// Compaction names a partition by when it
 /// wrote it, and ingest keeps a `_time` up to [`MAX_TIME_LEAD`] ahead of
-/// arrival, so an event's partition does not pin its `_time` (ADR-0057):
+/// arrival, so an event's partition does not pin its `_time`:
 ///
 /// - a sender stamping the full allowed lead ahead: its event is compacted
 ///   now, into this hour's partition, and drained from the hot buffer, and
@@ -990,8 +927,6 @@ async fn an_ancient_window_is_selected_from_the_partitions_on_disk() {
     );
 }
 
-/// A window with no events, over a corpus that knows no field yet,
-/// captures no columns: 200, no file, and an empty page.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_empty_corpus_captures_no_columns() {
     let tmp = tempfile::tempdir().unwrap();
@@ -1026,8 +961,6 @@ async fn an_empty_corpus_captures_no_columns() {
     assert!(page.page.rows.is_empty());
 }
 
-/// An empty window over a corpus with fields answers their columns and no
-/// rows, and the capture keeps a file of the columns.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_quiet_window_captures_its_columns_and_no_rows() {
     let server = boot().await;
@@ -1051,10 +984,6 @@ async fn a_quiet_window_captures_its_columns_and_no_rows() {
     assert!(page.page.rows.is_empty());
 }
 
-/// A string holding U+0000 is a value like any other. An event whose
-/// message carries one is ingested and compacted, then captured: its
-/// column facts list the value, the list answers the capture as it was
-/// committed, and a page reads the value back.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_value_holding_nul_is_captured_listed_and_read_back() {
     const MESSAGE: &str = "a\u{0}b";
@@ -1120,17 +1049,14 @@ async fn a_value_holding_nul_is_captured_listed_and_read_back() {
 /// A stage that keeps every corpus event and keeps the result events.
 const KEEP_STAGE: &str = " | where severity >= 0";
 
-/// The corpus query with `stages` copies of [`KEEP_STAGE`], then `tail`.
 fn staged(stages: usize, tail: &str) -> String {
     format!("{}{}{tail}", corpus_query(), KEEP_STAGE.repeat(stages))
 }
 
-/// A capture of `query` over the last hour.
 fn last_hour(query: &str) -> serde_json::Value {
     json!({ "query": query, "window": { "last": "1h" } })
 }
 
-/// `/api/v1/query` over `dsl`, answered with a refusal: its status and body.
 async fn query_refusal(server: &TestServer, dsl: &str) -> (StatusCode, serde_json::Value) {
     let response = common::harness_client_builder()
         .build()
@@ -1145,12 +1071,6 @@ async fn query_refusal(server: &TestServer, dsl: &str) -> (StatusCode, serde_jso
     (status, response.json().await.unwrap())
 }
 
-/// The stage cap (ADR-0024, 128 stages) counts the text that runs, and an
-/// events capture runs its query with the server's order appended, so the
-/// query may carry 127 stages. One with 128 is the capture's own 400,
-/// naming its limit, and one with 129 is the refusal `/query` gives it,
-/// from the check of the text as sent. A whole-shaped capture appends
-/// nothing and takes 128. No refusal takes a permit.
 #[tokio::test(flavor = "multi_thread")]
 async fn an_events_capture_keeps_one_stage_for_its_order() {
     let server = boot().await;
@@ -1200,15 +1120,6 @@ async fn an_events_capture_keeps_one_stage_for_its_order() {
     assert_eq!(whole.captured_rows, 1);
 }
 
-// -- cancel by id --------------------------------------------------------------
-
-/// A window capture that waits for a permit is cancelled by its owner's
-/// first `DELETE /queries/{id}` (ADR-0024, Amendment 2026-11-09). It answers
-/// the not-started 503 while every permit is still held, well before its
-/// deadline, closes its tracker entry once with that text, and gives back
-/// what the gate admitted it with: its lane and installation slots and its
-/// quota charge, so the key's next capture is admitted at once. The worker
-/// never took it.
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)] // one capture, its queued state, its refusal, and what it gives back
 async fn a_queued_capture_is_cancellable_by_its_owner() {
@@ -1268,8 +1179,6 @@ async fn a_queued_capture_is_cancellable_by_its_owner() {
     .expect("the queued capture is listed");
     assert!(!run.is_finished(), "the capture waits for a permit");
 
-    // Admitted and charged while it waits: the key's quota is full, and
-    // the installation's one running slot is taken.
     let (_, _, answer) = captured::capture(&server, &server.analyst_token, &body).await;
     assert_eq!(code(&answer), "capture_quota_exceeded", "{answer}");
     let (_, _, answer) = captured::capture(&server, &server.reader_token, &body).await;
@@ -1334,7 +1243,6 @@ async fn a_queued_capture_is_cancellable_by_its_owner() {
         "no row"
     );
 
-    // Its lane slot, its installation slot and its charge came back.
     let answer = captured::capture(&server, &server.analyst_token, &body).await;
     assert_eq!(answer.0, StatusCode::OK, "admitted at once: {}", answer.2);
     assert_eq!(server.state.results.gate.queued(key), 0);

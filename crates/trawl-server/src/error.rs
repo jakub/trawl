@@ -17,22 +17,13 @@ use crate::results::service::{CaptureOverflow, GoneReason};
 use crate::store::StoreError;
 use crate::transport::request_limit::Allowance;
 
-/// The message of [`ServerError::CapacityNotStarted`], the one reason a
-/// unit of pool work refused before it ever started (ADR-0024): the
+/// The message of [`ServerError::CapacityNotStarted`] (ADR-0024): the
 /// request's budget was gone, or its cancellation was latched, while the
-/// work was still queued behind capacity.
-///
-/// Fixed text, no interpolation: it is a capacity fact about the server,
-/// not a fact about the query, and it travels into the query tracker,
-/// the scheduler's run rows and the client response unchanged. A refusal
-/// here is 503, never the 504 an execution timeout earns — nothing ran.
+/// work was still queued behind capacity. Fixed text, no interpolation.
 pub const CAPACITY_NOT_STARTED: &str = "server at capacity: the query was not started";
 
 /// The whole answer to a query that exhausted the query database's spill
-/// cap or memory limit (ADR-0056), or its regex memory (ADR-0063). Fixed
-/// text: the server is healthy, and narrowing or simplifying the query is
-/// what helps. It names no path, size, pattern or `DuckDB` text, so the
-/// wire, the query tracker and a run row can all carry it unredacted.
+/// cap or memory limit (ADR-0056), or its regex memory (ADR-0063).
 pub const QUERY_RESOURCE_EXHAUSTED: &str = "query could not complete with the available query \
      resources; narrow the time range or simplify the query";
 
@@ -43,8 +34,7 @@ pub const MISSING_PREPARED_PATTERN: &str =
     "internal error: the server did not prepare a pattern this query reads";
 
 /// The whole answer to a read refused while the corpus is not settled
-/// (ADR-0041). Fixed per reason: no counts, paths or marker names, so the
-/// wire, the query tracker and a run row can all carry it unredacted.
+/// (ADR-0041).
 const fn corpus_recovering_message(reason: CorpusUnsettled) -> &'static str {
     match reason {
         CorpusUnsettled::RestartBacklog => {
@@ -81,7 +71,6 @@ pub const CONTROL_ALLOWANCE_REACHED: &str = "trawld is at its HTTP control allow
 pub const PREPARATION_ALLOWANCE_EXHAUSTED: &str = "trawld is at its query preparation allowance; \
      the query was not started; retry later with backoff";
 
-/// The fixed sentence for a refusal charged to `allowance`.
 const fn request_limit_message(allowance: Allowance) -> &'static str {
     match allowance {
         Allowance::Regular => REQUEST_LIMIT_REACHED,
@@ -108,29 +97,23 @@ fn ingest_batch_too_large_message(requested: Option<Charge>, ceiling: Charge) ->
     }
 }
 
-/// Server errors, mapped to HTTP responses via [`IntoResponse`].
-///
 /// Each error has one public message ([`ServerError::safe_message`]),
 /// which the wire and every record of the failure carry. The free-text
 /// variants (`Unauthorized`, `Forbidden`, `BadRequest`, `NotFound`,
 /// `Conflict`, `Ingest` and `ServiceUnavailable`) disclose their text as
 /// written, so their constructors never interpolate an error's `Display`
-/// or an absolute host path (ADR-0040, amended 2026-11-08).
+/// or an absolute host path (ADR-0040).
 #[derive(Debug, thiserror::Error)]
 pub enum ServerError {
-    /// Query engine failure (parse, emit, or `DuckDB` execution).
     #[error("{0}")]
     Engine(#[from] EngineError),
 
-    /// App-state store failure (history, saved queries, schedules, runs).
-    /// Mapped per the ADR-0004 table: unavailability → 503 (redacted),
-    /// conflict → 409, not-found → 404, validation → 400. The store's two
-    /// investigation conflicts become their own variants on conversion
+    /// App-state store failure, mapped per the ADR-0004 table. The store's
+    /// two investigation conflicts become their own variants on conversion
     /// (`From<StoreError>`), so they carry their own codes.
     #[error("{0}")]
     Store(StoreError),
 
-    /// Missing or malformed Authorization header.
     #[error("unauthorized: {0}")]
     Unauthorized(String),
 
@@ -139,7 +122,6 @@ pub enum ServerError {
     #[error("forbidden: {0}")]
     Forbidden(String),
 
-    /// Bad request (invalid input, duplicate name, etc.).
     #[error("bad request: {0}")]
     BadRequest(String),
 
@@ -156,10 +138,6 @@ pub enum ServerError {
     #[error("conflict: {0}")]
     Conflict(String),
 
-    /// A schedule window and a saved query's own text cannot both say
-    /// what a report covers (ADR-0018 rulings 7 and 12). A 400 whose
-    /// message names both sides: the operator picks which one to drop,
-    /// and the server has no basis for choosing.
     #[error("{0}")]
     WindowPolicy(#[from] WindowPolicyError),
 
@@ -176,7 +154,6 @@ pub enum ServerError {
     #[error("{0}")]
     WindowMaterialize(#[from] MaterializeError),
 
-    /// Query execution exceeded the configured timeout.
     #[error("query timed out")]
     Timeout,
 
@@ -559,27 +536,16 @@ pub enum CauseKind {
     None,
     /// A server fault whose source kept no typed kind.
     Unknown,
-    /// [`std::io::ErrorKind::NotFound`].
     IoNotFound,
-    /// [`std::io::ErrorKind::PermissionDenied`].
     IoPermissionDenied,
-    /// [`std::io::ErrorKind::AlreadyExists`].
     IoAlreadyExists,
-    /// [`std::io::ErrorKind::StorageFull`].
     IoStorageFull,
-    /// [`std::io::ErrorKind::ReadOnlyFilesystem`].
     IoReadOnlyFilesystem,
-    /// [`std::io::ErrorKind::TimedOut`].
     IoTimedOut,
-    /// [`std::io::ErrorKind::Interrupted`].
     IoInterrupted,
-    /// [`std::io::ErrorKind::UnexpectedEof`].
     IoUnexpectedEof,
-    /// [`std::io::ErrorKind::InvalidData`].
     IoInvalidData,
-    /// [`std::io::ErrorKind::OutOfMemory`].
     IoOutOfMemory,
-    /// Any other I/O error kind.
     IoOther,
     /// `DuckDB` itself reported the failure (`duckdb::Error::DuckDBFailure`).
     /// Its error code is not typed reliably by the driver, so it stops here.
@@ -644,7 +610,6 @@ pub enum CauseKind {
 }
 
 impl CauseKind {
-    /// Every kind, for closed-set checks and for consumers that enumerate.
     pub const ALL: [Self; 37] = [
         Self::None,
         Self::Unknown,
@@ -685,7 +650,6 @@ impl CauseKind {
         Self::PreparationAllowanceExhausted,
     ];
 
-    /// The fixed `snake_case` literal this kind is recorded as.
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -729,7 +693,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of a regex memory refusal, from the bound that refused.
     fn of_regex(refusal: trawl_core::pattern::RegexRefusal) -> Self {
         use trawl_core::pattern::RegexRefusal;
         match refusal {
@@ -738,7 +701,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of an I/O error, from its [`std::io::ErrorKind`] alone.
     /// Public so the `trawld` binary classifies its own I/O failures.
     pub fn of_io(err: &std::io::Error) -> Self {
         use std::io::ErrorKind as K;
@@ -757,7 +719,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of a `DuckDB` driver error, from its variant alone.
     pub(crate) fn of_duckdb(err: &duckdb::Error) -> Self {
         use duckdb::Error as E;
         match err {
@@ -773,7 +734,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of a database driver error, from its variant alone.
     fn of_sqlx(err: &sqlx::Error) -> Self {
         use sqlx::Error as E;
         match err {
@@ -795,7 +755,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of a fleet-auth schema check failure.
     fn of_auth_schema(err: &fleet_auth::SchemaError) -> Self {
         use fleet_auth::SchemaError as E;
         match err {
@@ -805,7 +764,6 @@ impl CauseKind {
         }
     }
 
-    /// The kind of a trawl app-state schema check failure.
     fn of_store_schema(err: &crate::store::migrations::SchemaError) -> Self {
         use crate::store::migrations::SchemaError as E;
         match err {
@@ -818,42 +776,15 @@ impl CauseKind {
 
 impl ServerError {
     /// The public message: the one string a client reads as the
-    /// envelope's `message` and every record of the failure stores, which
-    /// are the query tracker's recent entries, report run rows, repin job
-    /// rows and the capture tracker's outcome (ADR-0040, amended
-    /// 2026-11-08).
-    ///
-    /// It is the message `rendered()` sends, so the wire and the records
-    /// cannot disagree. `rendered()` decides it per variant, with no
-    /// wildcard arm at the `ServerError`, `EngineError` or `StoreError`
-    /// level, so a new variant does not compile until its disclosure is
-    /// written. Provenance decides what it may hold: text trawl wrote,
-    /// values the request carried, and permitted domain facts such as
-    /// configured limits, counts, sequence numbers and names relative to
-    /// the data root. Never the `Display` text of `DuckDB`, an `io::Error`
-    /// or the store driver, an absolute host path, generated SQL or a
-    /// panic payload: a variant that carries those answers a fixed
-    /// sentence. Structured details from the request, such as parse spans,
-    /// emit hints and the `conflict` member, stay on the wire.
-    ///
+    /// envelope's `message` and every record of the failure stores (ADR-0040).
     /// Not for default-level telemetry: parse and emit text quotes the
-    /// caller's own tokens. Events carry [`Self::error_class`] and
-    /// [`Self::cause_kind`] instead.
+    /// caller's own tokens.
     pub fn safe_message(&self) -> String {
         self.rendered().1.message
     }
 
     /// Return a stable, content-free classification of this error.
-    ///
     /// SECURITY: default-filter telemetry logs this instead of any message.
-    /// The public message ([`safe_message`](Self::safe_message)) goes to
-    /// the client and to the failure's own records, which only key holders
-    /// read, but not into telemetry: it keeps parse/emit text, which
-    /// quotes the user's own tokens and format strings, and an error's raw
-    /// `Display` is worse (`Self::Engine(EngineError::Database)`'s embeds
-    /// the generated SQL and the values it choked on). The class comes from
-    /// a closed set of literals, so it is safe to store in the retained
-    /// `service=trawld` corpus and stable enough to alarm on.
     pub fn error_class(&self) -> &'static str {
         match self {
             Self::Engine(EngineError::Parse(_)) => "parse",
@@ -1035,11 +966,6 @@ pub fn join_failure_text(what: &str, e: tokio::task::JoinError) -> String {
 }
 
 impl From<trawl_core::correlate::BuildError> for ServerError {
-    /// A correlation builder's refusal as the read's answer: overlapping
-    /// windows by name, a stopped build as the cancellation it is (never a
-    /// refusal of the input), every other refusal, the reparse proof
-    /// included, as `correlation_invalid`. The builder's message names the
-    /// input and never quotes the composed text.
     fn from(e: trawl_core::correlate::BuildError) -> Self {
         match e {
             trawl_core::correlate::BuildError::WindowsOverlap => {
@@ -1052,10 +978,6 @@ impl From<trawl_core::correlate::BuildError> for ServerError {
 }
 
 impl From<StoreError> for ServerError {
-    /// A store error, except the two investigation conflicts the wire
-    /// names with codes of their own (ADR-0059): a stale overwrite is
-    /// [`Self::SequenceConflict`] with both numbers, and a write to a
-    /// closed investigation is [`Self::InvestigationClosed`].
     fn from(err: StoreError) -> Self {
         match err {
             StoreError::SequenceConflict { expected, current } => {
@@ -1068,10 +990,6 @@ impl From<StoreError> for ServerError {
 }
 
 impl From<crate::store::WindowWriteError> for ServerError {
-    /// Split a checked window write back into the two answers it already
-    /// carries. Neither half gains or loses anything here: the store fault
-    /// keeps the SQLSTATE mapping every other store error gets, and the
-    /// policy refusal keeps its 400 and its message.
     fn from(err: crate::store::WindowWriteError) -> Self {
         use crate::store::WindowWriteError as E;
         match err {
@@ -1082,11 +1000,6 @@ impl From<crate::store::WindowWriteError> for ServerError {
 }
 
 impl From<crate::store::DueClaimError> for ServerError {
-    /// A manual run's claim fails the same four ways a scheduled one does,
-    /// and each already has a considered wire treatment: the store fault
-    /// keeps its SQLSTATE mapping and redaction, the policy refusal keeps
-    /// its 400 naming both sides, and a plan or materialize failure is a
-    /// redacted 500 because its inputs are stored state, not the request.
     fn from(err: crate::store::DueClaimError) -> Self {
         use crate::store::DueClaimError as E;
         match err {
@@ -1099,13 +1012,6 @@ impl From<crate::store::DueClaimError> for ServerError {
 }
 
 impl From<fleet_auth::AuthError> for ServerError {
-    /// Map fleet-auth keystore failures onto trawl's error contract.
-    ///
-    /// Backend trouble (pg down, migration state, hash-worker panics) is a
-    /// 503 without postgres detail; credential failures stay an opaque 401.
-    /// Anything else in this path is a bug — surface as 500. The backend
-    /// 503 keeps the driver's typed kind, so the failure record can say
-    /// which trouble it was without quoting it.
     fn from(err: fleet_auth::AuthError) -> Self {
         use fleet_auth::AuthError as E;
         if let Some((kind, what, source)) = auth_backend_cause(&err) {
@@ -1163,14 +1069,8 @@ impl ServerError {
         self.rendered().1.code
     }
 
-    /// The status and the envelope this error answers with, and the
-    /// disclosure projection: the envelope's `message` is the public
-    /// message every record stores ([`Self::safe_message`]). Pure: the
-    /// log of a fault is [`Self::log_fault`]'s, written once per response.
-    ///
-    /// No arm is a wildcard, here or in the nested `Store` match, and the
-    /// lint below keeps it so: a new variant is a compile error until its
-    /// disclosure is decided.
+    /// The status and the envelope this error answers with. Pure: the log of
+    /// a fault is [`Self::log_fault`]'s, written once per response.
     #[allow(clippy::too_many_lines)] // exhaustive error table is cohesive
     #[deny(clippy::wildcard_enum_match_arm)]
     fn rendered(&self) -> (StatusCode, trawl_api::ErrorEnvelope) {
@@ -1222,11 +1122,9 @@ impl ServerError {
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ValidationError, message.clone()),
             ),
-            // A result cell no wire integer holds (ADR-0035, amended
-            // 2026-10-22). The query ran; its answer has no exact spelling,
-            // and only the caller can choose a cast, so it is the caller's
-            // to fix: a 400 under the execution code, with the
-            // trawl-authored sentence naming the column and the casts.
+            // A result cell no wire integer holds (ADR-0035). Only the caller can
+            // choose a cast, so it is the caller's to fix: a 400 under the
+            // execution code.
             Self::Engine(err @ EngineError::IntegerOutOfRange { .. }) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, err.to_string()),
@@ -1247,17 +1145,9 @@ impl ServerError {
             ),
             // Database/IO errors answer without their details, which the
             // log names by class and cause, with the text at DEBUG only.
-            //
             // A cancellation caught at the bind-to-execute boundary answers
-            // here too, deliberately: cancelling a running query has always
-            // surfaced as `DuckDB`'s interrupted execution, and the latch
-            // exists to catch the same request when the interrupt was
-            // swallowed during a bind (ADR-0024). One request, one answer —
-            // the latch does not earn the caller a different status than the
-            // interrupt it backs up. `error_class` still tells the two apart
-            // for telemetry. The run writer's refusal never reaches a
-            // request (the scheduler stores a blob instead); were it to,
-            // it is the server's fault, not the query's.
+            // here too, deliberately: the latch backs up `DuckDB`'s interrupt,
+            // and one request gets one answer (ADR-0024).
             Self::Engine(
                 EngineError::Database(_)
                 | EngineError::BudgetNotApplied { .. }
@@ -1268,16 +1158,9 @@ impl ServerError {
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ExecutionError, "query execution failed"),
             ),
-            // The query ran out of the query database's spill cap or memory
-            // limit (ADR-0056). The server is fine and the same query would
-            // fail the same way, so there is no `Retry-After`; the fixed
-            // sentence tells the caller what helps and names no path, size
-            // or `DuckDB` text.
-            //
-            // A query refused for its regex memory answers the same way
-            // (ADR-0063): the same query asks for the same memory, and the
-            // sentence names no pattern. Stream setup and the batch tail
-            // raise it from two places.
+            // The same query would fail the same way, so there is no
+            // `Retry-After` (ADR-0056). A query refused for its regex memory
+            // answers the same way (ADR-0063).
             Self::Engine(EngineError::ResourceExhausted | EngineError::RegexResources(_))
             | Self::RegexResources(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1299,10 +1182,6 @@ impl ServerError {
                     "cold data temporarily unreadable; retry the query",
                 ),
             ),
-            // App-state store errors follow the ADR-0004 table. Backend
-            // trouble is a 503 with pg diagnostics redacted from the wire
-            // (their text is logged at DEBUG only); conflicts are 409 with
-            // their domain message; ownership misses are opaque 404s.
             Self::Store(e) => match e {
                 StoreError::Unavailable(_) | StoreError::Migration(_) | StoreError::LockHeld => (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -1311,18 +1190,8 @@ impl ServerError {
                         "app-state store unavailable",
                     ),
                 ),
-                // The purge is neither committed nor rolled back as far as
-                // this process knows, and 503 is the honest answer: the
-                // request did not complete, and retrying is safe only after
-                // the operator has looked. The message says so; it names no
-                // pg diagnostics.
-                // Same 503 for the pre-commit bound, and the same reason to
-                // say more than "store unavailable": the operator's next
-                // move differs from a plain outage. This one adds that
-                // nothing was reclaimed, which is provable — the dropped
-                // transaction rolled back. A deadline-bounded write that gave
-                // up before its commit says the same; the admissions that
-                // bound one answer `capture_busy` instead.
+                // These 503s say more than "store unavailable": the
+                // operator's next move differs from a plain outage.
                 StoreError::PurgeCommitUnknown
                 | StoreError::PurgePrepareTimeout
                 | StoreError::WaitExpired => (
@@ -1344,8 +1213,6 @@ impl ServerError {
                         format!("{resource} not found or unauthorized"),
                     ),
                 ),
-                // Every key with the read grant sees every investigation,
-                // so a miss means the id names none.
                 StoreError::InvestigationNotFound => (
                     StatusCode::NOT_FOUND,
                     ErrorEnvelope::simple(ErrorCode::NotFound, "investigation not found"),
@@ -1416,14 +1283,10 @@ impl ServerError {
                 StatusCode::CONFLICT,
                 ErrorEnvelope::simple(ErrorCode::BadRequest, msg.clone()),
             ),
-            // Both sides of the conflict are in the message, and both are
-            // the operator's: nothing to redact.
             Self::WindowPolicy(e) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
             ),
-            // Planning and materialization read stored state, so a failure
-            // here is the server's to fix. The detail goes to the log.
             Self::WindowPlan(_) | Self::WindowMaterialize(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(
@@ -1457,7 +1320,6 @@ impl ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "auth backend unavailable"),
             ),
-            // `Retry-After` is added below, from the variant.
             Self::HotBufferFull { .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(
@@ -1467,8 +1329,7 @@ impl ServerError {
                 ),
             ),
             // No `Retry-After`: nothing says when a backlog drains or a
-            // rollup finishes. The reason is the failure record's cause
-            // kind, and the sentence already says it in words.
+            // rollup finishes.
             Self::CorpusRecovering(reason) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(
@@ -1476,8 +1337,6 @@ impl ServerError {
                     corpus_recovering_message(*reason),
                 ),
             ),
-            // Never a cold-only answer in place of the newest events. The
-            // I/O error's text stays off the wire; its kind is recorded.
             Self::HotSnapshot(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(
@@ -1485,8 +1344,6 @@ impl ServerError {
                     "recent events could not be read for this query",
                 ),
             ),
-            // No answer that vouches for envs it could not list. The I/O
-            // error's text stays off the wire; its kind is recorded.
             Self::EnvListing(_) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "environment listing failed"),
@@ -1495,9 +1352,8 @@ impl ServerError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(ErrorCode::ServiceUnavailable, "query engine unavailable"),
             ),
-            // Every preparation slot stayed in use until the deadline
-            // (ADR-0063). No `Retry-After`, as for the request limit
-            // (ADR-0054): nothing predicts when a slot frees.
+            // No `Retry-After`, as for the request limit (ADR-0054): nothing
+            // predicts when a slot frees.
             Self::PreparationUnavailable => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(
@@ -1505,9 +1361,6 @@ impl ServerError {
                     PREPARATION_ALLOWANCE_EXHAUSTED,
                 ),
             ),
-            // No `Retry-After`: nothing predicts when a request in progress
-            // ends, and a fixed hint would make senders retry together
-            // (ADR-0054). `Cache-Control: no-store` is added below.
             Self::RequestLimitReached(allowance) => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 ErrorEnvelope::simple(
@@ -1515,42 +1368,30 @@ impl ServerError {
                     request_limit_message(*allowance),
                 ),
             ),
-            // A client error with no `Retry-After`: the same request can
-            // never fit.
             Self::IngestBatchTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::IngestBatchTooLarge, self.to_string()),
             ),
-            // Fixed text and the limit: nothing from the sample.
             Self::PreviewTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::PreviewTooLarge, self.to_string()),
             ),
-            // The caller's to fix by narrowing the window, so a 400 and no
-            // `Retry-After`: the same window selects the same files. Fixed
-            // text and two counts.
             Self::CaptureSourceTooLarge { .. } => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::CaptureSourceTooLarge, self.to_string()),
             ),
-            // The caller's to fix, and the message says how; nothing was
-            // taken.
             Self::CaptureBounds(e) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::BadRequest, e.to_string()),
             ),
-            // The code a row-capped `/query` answers, with the capture's
-            // own hint.
             Self::CaptureTooLarge(_) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::ResultTooLarge, self.to_string()),
             ),
-            // `Retry-After` is added below, from the variant.
             Self::CaptureBusy { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::CaptureBusy, self.to_string()),
             ),
-            // `Retry-After` is added below, from the variant.
             Self::ManualRunBusy { .. } => (
                 StatusCode::TOO_MANY_REQUESTS,
                 ErrorEnvelope::simple(ErrorCode::ManualRunBusy, self.to_string()),
@@ -1567,14 +1408,10 @@ impl ServerError {
                 StatusCode::CONFLICT,
                 ErrorEnvelope::simple(ErrorCode::ResultUnavailable, self.to_string()),
             ),
-            // The read path logs the result's id where it finds the
-            // mismatch; the wire names neither a path nor a digest.
             Self::ResultCorrupt => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::ResultCorrupt, self.to_string()),
             ),
-            // A correlation read's input, the caller's to fix; nothing was
-            // taken.
             Self::FocusIncomplete(message) => (
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::FocusIncomplete, message),
@@ -1591,8 +1428,6 @@ impl ServerError {
                 StatusCode::BAD_REQUEST,
                 ErrorEnvelope::simple(ErrorCode::CorrelationInvalid, message),
             ),
-            // The one envelope with a `conflict` member: the client reads
-            // the current sequence from it instead of parsing the message.
             Self::SequenceConflict { expected, current } => (
                 StatusCode::CONFLICT,
                 ErrorEnvelope {
@@ -1615,7 +1450,6 @@ impl ServerError {
                 StatusCode::CONFLICT,
                 ErrorEnvelope::simple(ErrorCode::EvidenceBudgetExceeded, self.to_string()),
             ),
-            // Fixed text, the setting and its value: nothing from the request.
             Self::RequestTooLarge { .. } => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 ErrorEnvelope::simple(ErrorCode::RequestTooLarge, self.to_string()),
@@ -1624,8 +1458,6 @@ impl ServerError {
                 StatusCode::UNSUPPORTED_MEDIA_TYPE,
                 ErrorEnvelope::simple(ErrorCode::UnsupportedEncoding, self.to_string()),
             ),
-            // `self` renders as the fixed label only: a panic's payload
-            // never made it into the variant.
             Self::Internal(_) | Self::Panicked(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 ErrorEnvelope::simple(ErrorCode::InternalError, "internal server error"),
@@ -1635,11 +1467,6 @@ impl ServerError {
 
     /// Log a fault its response redacts: a store's diagnostics, a report
     /// window's failure, an internal error.
-    ///
-    /// The ERROR event carries the class and the cause kind, never the
-    /// error's text, which can quote the saved query, paths and driver
-    /// diagnostics. The text goes to a DEBUG event beside it, which the
-    /// default filter drops (ADR-0040, amended 2026-11-08).
     fn log_fault(&self) {
         let error_class = self.error_class();
         let cause_kind = self.cause_kind().as_str();
@@ -1715,8 +1542,7 @@ impl ServerError {
 
     /// The auth backend's 503, logged where a keystore failure converts:
     /// the class and the driver's kind at ERROR, and the driver's text,
-    /// which the wire never carries, at DEBUG only (ADR-0040, amended
-    /// 2026-11-08).
+    /// which the wire never carries, at DEBUG only.
     fn auth_backend_fault(
         kind: CauseKind,
         what: &'static str,
@@ -1736,8 +1562,6 @@ impl ServerError {
 
 impl IntoResponse for ServerError {
     fn into_response(self) -> Response {
-        // The request's failure record takes the class and cause kind,
-        // never this error's text (ADR-0040).
         crate::transport::failure::record_error(&self);
         self.log_fault();
         let (status, envelope) = self.rendered();
@@ -1774,7 +1598,6 @@ impl IntoResponse for ServerError {
 mod tests {
     use super::*;
 
-    /// A stopped correlation build is a cancellation, never `correlation_invalid`.
     #[test]
     fn a_cancelled_correlation_build_is_a_cancellation() {
         assert!(matches!(
@@ -1801,8 +1624,6 @@ mod tests {
         }
     }
 
-    /// A batch aggregation past a cap answers like a row cap: 400
-    /// `result_too_large`, with a message that names the cap and its limit.
     #[tokio::test]
     async fn aggregation_cap_answers_result_too_large() {
         let err = ServerError::Engine(EngineError::AggregationCapped(
@@ -1823,16 +1644,11 @@ mod tests {
         );
     }
 
-    /// A tail stage with no prepared pattern is the server's fault: a 500
-    /// with a fixed sentence and its own class, never the 400 that blames
-    /// the query, and nothing of any pattern on the wire.
     #[tokio::test]
     async fn a_missing_prepared_pattern_answers_as_a_server_fault() {
         let err = ServerError::Engine(EngineError::MissingPreparedPattern);
         assert_eq!(err.error_class(), "missing_prepared_pattern");
         assert_eq!(err.cause_kind(), CauseKind::None);
-        // The tracker stores the sentence the client reads, not the
-        // engine's own wording of the invariant it broke.
         assert_eq!(err.safe_message(), MISSING_PREPARED_PATTERN);
         let response = err.into_response();
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -1845,7 +1661,6 @@ mod tests {
         assert!(body["error"].get("details").is_none(), "{body}");
     }
 
-    /// Parse and emit a query the emitter refuses, and return its refusal.
     fn emit_error(query: &str) -> trawl_core::emitter::EmitError {
         let parsed = trawl_core::parser::parse(query).expect("the query parses");
         trawl_core::emitter::emit(
@@ -1856,8 +1671,6 @@ mod tests {
         .expect_err("the emitter refuses the query")
     }
 
-    /// Parse and emit a query the emitter refuses, and read the envelope
-    /// the server answers with.
     async fn emit_refusal(query: &str) -> (StatusCode, serde_json::Value) {
         let response = ServerError::Engine(EngineError::Emit(emit_error(query))).into_response();
         let status = response.status();
@@ -1867,9 +1680,6 @@ mod tests {
         (status, serde_json::from_slice(&bytes).unwrap())
     }
 
-    /// A validation error carries one spanless detail: the sentence and
-    /// the did-you-mean apart, so a client shows the hint once. The
-    /// summary `message` is the sentence it always was, hint included.
     #[tokio::test]
     async fn an_unknown_function_with_a_near_miss_details_its_message_and_hint() {
         let (status, body) = emit_refusal("* | stats countt(x) by host").await;
@@ -1896,8 +1706,6 @@ mod tests {
         );
     }
 
-    /// With no suggestion within reach the detail still carries the
-    /// sentence, and no hint.
     #[tokio::test]
     async fn an_unknown_function_without_a_near_miss_details_only_its_message() {
         let (status, body) = emit_refusal("* | stats nosuchfunc(x) by host").await;
@@ -1920,8 +1728,6 @@ mod tests {
         );
     }
 
-    /// A refusal from `DuckDB`'s own verdict stays a bare summary: the
-    /// engine's sentence names no function the client could point at.
     #[tokio::test]
     async fn a_refused_query_keeps_an_empty_details_list() {
         let response = ServerError::Engine(EngineError::Refused {
@@ -1949,8 +1755,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
     }
 
-    /// The correlation reads' refusals (ADR-0058): 400 with their own code
-    /// and class, no `Retry-After`, no cause, and the message as built.
     #[tokio::test]
     async fn correlation_refusals_are_400s_with_their_own_codes() {
         let cases = [
@@ -1991,9 +1795,6 @@ mod tests {
         }
     }
 
-    /// A builder's refusal maps by kind: overlapping windows by name, every
-    /// other one, the reparse proof included, as `correlation_invalid`, each
-    /// with the builder's caller-facing message.
     #[test]
     fn a_build_error_maps_overlap_by_name_and_the_rest_as_invalid() {
         use trawl_core::correlate::BuildError;
@@ -2040,8 +1841,6 @@ mod tests {
         );
     }
 
-    /// The class is what default telemetry persists, so it must be a fixed
-    /// literal — never a rendering of the user's own query text.
     #[test]
     fn error_class_never_carries_user_content() {
         let parse = ServerError::Engine(EngineError::Parse(vec![trawl_core::parser::ParseError {
@@ -2082,9 +1881,6 @@ mod tests {
         );
     }
 
-    /// The cause kind is persisted beside the class, so it is held to the
-    /// same standard: a closed set of fixed `snake_case` literals, one per
-    /// variant, and `ALL` names every variant exactly once.
     #[test]
     fn cause_kind_is_a_closed_snake_case_set() {
         // Exhaustive on purpose: a new variant fails to compile here until
@@ -2147,8 +1943,6 @@ mod tests {
         }
     }
 
-    /// Representative typed sources land on their kinds, and a failure
-    /// with nothing typed beneath it says so instead of guessing.
     #[test]
     fn cause_kind_reads_typed_sources() {
         use std::io::{Error as IoError, ErrorKind};
@@ -2231,9 +2025,6 @@ mod tests {
         }
     }
 
-    /// The auth backend's 503 keeps the answer it always gave while the
-    /// driver's kind rides along for the failure record, and the record
-    /// stores the sentence the client reads.
     #[tokio::test]
     async fn an_auth_backend_failure_answers_the_same_redacted_503() {
         let err = ServerError::from(fleet_auth::AuthError::Database(sqlx::Error::PoolTimedOut));
@@ -2246,8 +2037,6 @@ mod tests {
         assert!(!body.to_lowercase().contains("pool"), "got: {body}");
     }
 
-    /// A caught panic is a 500 with the same redacted body an internal
-    /// error gets, and its own class.
     #[tokio::test]
     async fn a_panic_is_a_redacted_500_with_its_own_class() {
         let err = ServerError::Panicked("query worker");
@@ -2260,8 +2049,6 @@ mod tests {
         assert!(body.contains("internal server error"), "got: {body}");
     }
 
-    /// A joined task that panicked answers Panicked and drops the payload;
-    /// one that was cancelled is an ordinary internal error.
     #[tokio::test]
     async fn from_join_splits_a_panic_from_a_cancellation() {
         let panicked = tokio::task::spawn(async { panic!("zz_join_payload_sentinel") })
@@ -2298,13 +2085,6 @@ mod tests {
         assert!(err.safe_message().contains("bad syntax"));
     }
 
-    /// A free-text 503 discloses its text as written, on the wire and in
-    /// the records alike, so a query refused one says why. Provenance
-    /// decides disclosure, not the characters (ADR-0040, amended
-    /// 2026-11-08): the projection passes the text whole, whatever it
-    /// holds, and keeping a backend's own words out is its constructors'
-    /// rule. Backend outages have variants of their own, with fixed
-    /// sentences.
     #[tokio::test]
     async fn a_free_text_503_discloses_what_its_constructor_wrote() {
         let sentence = "dashboard data not yet available";
@@ -2337,12 +2117,6 @@ mod tests {
         }
     }
 
-    /// The pre-start capacity refusal is a typed variant (ADR-0040,
-    /// amended 2026-11-08), and it answers what the string-matched 503 it
-    /// replaced answered: 503 `service_unavailable` with the fixed
-    /// sentence and no `Retry-After`, the class `service_unavailable`, and
-    /// no cause beneath it. Read back from the error, its timing outcome is
-    /// the capacity refusal its producers book.
     #[tokio::test]
     async fn typed_capacity_refusal_preserves_protocol() {
         use crate::query_timing::Outcome;
@@ -2357,10 +2131,6 @@ mod tests {
             err.to_string(),
             "service unavailable: server at capacity: the query was not started"
         );
-        // The pool, the expired `from saved` lookup and capture planning
-        // book `CapacityRefused` where they refuse. A cancel by id that
-        // ends a request in one of the route's own waits books it only
-        // through `of_error` (ADR-0024, Amendment 2026-11-09).
         assert_eq!(Outcome::of_error(&err), Outcome::CapacityRefused);
 
         let response = err.into_response();
@@ -2388,9 +2158,6 @@ mod tests {
         let err = ServerError::Internal("db connection string leaked".into());
         assert_eq!(err.safe_message(), "internal server error");
 
-        // An evidence refusal is a domain fact, not an internal error: its
-        // safe message is its whole text, which names the budget and calls
-        // the count what it is.
         for (scope, budget) in [
             (
                 EvidenceScope::Investigation,
@@ -2421,8 +2188,6 @@ mod tests {
         }
     }
 
-    /// A conflict is the state, not the request: 409 with the message
-    /// intact, because it tells the operator what to do about it.
     #[tokio::test]
     async fn conflict_maps_to_409_with_its_message() {
         let err = ServerError::Conflict("a repin owns the data root".into());
@@ -2432,11 +2197,6 @@ mod tests {
         assert!(body.contains("a repin owns the data root"), "got: {body}");
     }
 
-    /// An unknown purge commit is a store error like any other as far as
-    /// telemetry is concerned (the class is content-free and stays
-    /// `store`), but on the wire it is a 503 that says what happened: the
-    /// operator has to go and look, and a redacted "store unavailable"
-    /// would not tell them to.
     #[tokio::test]
     async fn purge_commit_unknown_is_a_store_class_503_with_its_message() {
         let err = ServerError::Store(StoreError::PurgeCommitUnknown);
@@ -2454,12 +2214,6 @@ mod tests {
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
-    /// A query refused for its regex memory (ADR-0063) answers the 503
-    /// contract a query over the `DuckDB` budgets answers: the code and the
-    /// fixed sentence, no `Retry-After`, and the class `service_unavailable`.
-    /// Its cause kind names the regex bound that refused it, whether stream
-    /// setup or the batch tail raised it. Nothing of the pattern reaches
-    /// the wire, the tracker or the record.
     #[tokio::test]
     async fn a_regex_memory_refusal_is_the_resource_503_with_its_cause() {
         use trawl_core::pattern::RegexRefusal;
@@ -2514,9 +2268,6 @@ mod tests {
         }
     }
 
-    /// A query refused a preparation slot is the resource 503 (ADR-0063):
-    /// `query_resource_exhausted`, the fixed allowance sentence, no
-    /// `Retry-After`, the class `service_unavailable` and its own cause.
     #[tokio::test]
     async fn a_preparation_refusal_is_the_resource_503_with_its_cause() {
         let err = ServerError::PreparationUnavailable;
@@ -2545,8 +2296,6 @@ mod tests {
         );
     }
 
-    /// A full hot buffer is a 503 whose `Retry-After` is the variant's
-    /// interval, classed as a refusal to serve and named by its cause.
     #[tokio::test]
     async fn hot_buffer_full_is_a_503_with_retry_after() {
         let err = ServerError::HotBufferFull {
@@ -2564,11 +2313,6 @@ mod tests {
         assert_eq!(body["error"]["code"], "hot_buffer_full");
     }
 
-    /// A corpus that is not settled refuses reads with one 503 per reason
-    /// (ADR-0041): classed like any refusal to serve, the reason as its
-    /// cause kind, and a fixed sentence that names no count, path or
-    /// marker. No `Retry-After`: nothing tells the server when a backlog
-    /// drains or a rollup finishes.
     #[tokio::test]
     async fn corpus_recovering_is_a_503_naming_its_reason_without_retry_after() {
         for reason in CorpusUnsettled::ALL {
@@ -2589,7 +2333,6 @@ mod tests {
             assert_eq!(err.error_class(), "service_unavailable");
             assert_eq!(err.cause_kind(), kind);
             assert_eq!(kind.as_str(), reason.label());
-            // The tracker and a run row get the same sentence the wire does.
             assert_eq!(err.safe_message(), message);
             let response = err.into_response();
             assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2608,10 +2351,6 @@ mod tests {
         }
     }
 
-    /// A hot snapshot that cannot be built refuses the read instead of
-    /// answering without the newest events (ADR-0041): a 503 classed like
-    /// any refusal to serve, its cause kind read off the I/O error, and a
-    /// fixed body that quotes nothing the error carried.
     #[tokio::test]
     async fn a_hot_snapshot_failure_is_a_redacted_503_with_its_io_kind() {
         use std::io::{Error as IoError, ErrorKind};
@@ -2642,10 +2381,6 @@ mod tests {
         }
     }
 
-    /// A data root whose envs cannot be listed refuses the compare instead
-    /// of reporting retention reach over none: a 503 classed like any
-    /// refusal to serve, its cause kind read off the I/O error, and a fixed
-    /// body that quotes nothing the error carried.
     #[tokio::test]
     async fn an_env_listing_failure_is_a_redacted_503_with_its_io_kind() {
         use std::io::{Error as IoError, ErrorKind};
@@ -2673,9 +2408,6 @@ mod tests {
         }
     }
 
-    /// A query that exhausted the query database's budgets is a 503
-    /// `query_resource_exhausted` with the fixed sentence and no
-    /// `Retry-After`, everywhere it is told (ADR-0056).
     #[tokio::test]
     async fn an_exhausted_query_budget_is_a_fixed_503() {
         let err = ServerError::Engine(EngineError::ResourceExhausted);
@@ -2706,8 +2438,6 @@ mod tests {
         assert_eq!(body["error"]["message"], QUERY_RESOURCE_EXHAUSTED);
     }
 
-    /// An oversized ingest request is a 413 with no `Retry-After`, and its
-    /// message gives the sender the numbers to split by.
     #[tokio::test]
     async fn ingest_batch_too_large_is_a_413_without_retry_after() {
         let ceiling = Charge {
@@ -2745,8 +2475,6 @@ mod tests {
         assert_eq!(unparsed.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    /// The ingest preview's two refusals: fixed text, a class and no cause
-    /// beneath it.
     #[tokio::test]
     async fn preview_refusals_are_413_and_415_with_their_codes() {
         let too_large = ServerError::PreviewTooLarge { limit: 500 };
@@ -2767,11 +2495,6 @@ mod tests {
         assert_eq!(body["error"]["code"], "unsupported_encoding");
     }
 
-    /// A capture refused for its source budget (ADR-0057): 400 with its own
-    /// code and no `Retry-After`, a message giving both counts and the fix,
-    /// and no cause beneath it. A window's fix names the service filter; a
-    /// stored run's does not, since a filter cannot shrink it. Neither
-    /// message holds a path, a service name or query text.
     #[tokio::test]
     async fn a_capture_source_refusal_is_a_400_naming_both_counts() {
         const HINT: &str = "pin the services with service=a or service=a,b";
@@ -2834,10 +2557,6 @@ mod tests {
         }
     }
 
-    /// Every investigation answer (ADR-0059) is a 409 with its own code and
-    /// class, no `Retry-After` and no cause, and a fixed message that names
-    /// no path and no SQL. Only `sequence_conflict` carries `conflict`, and
-    /// the store's own conflicts keep their `bad_request` code.
     #[tokio::test]
     async fn investigation_answers_are_409s_with_their_own_codes() {
         let cases = [
@@ -2908,9 +2627,6 @@ mod tests {
         assert!(body["error"].get("conflict").is_none(), "{body}");
     }
 
-    /// Every capture and captured-result answer (ADR-0057): its status, its
-    /// code, its class, `Retry-After` exactly on the two 429s, and a fixed
-    /// message that names no path.
     #[tokio::test]
     async fn capture_and_result_answers_map_to_their_statuses_and_codes() {
         use crate::results::bounds::BoundsError;
@@ -3013,9 +2729,6 @@ mod tests {
         );
     }
 
-    /// A manual-run refusal (ADR-0018): 429 with `Retry-After`, its own
-    /// code and class, no cause beneath it, no `Cache-Control`, and a fixed
-    /// message that names no setting and no count.
     #[tokio::test]
     async fn a_manual_run_refusal_is_429_with_retry_after_and_no_cause() {
         let busy = ServerError::ManualRunBusy {
@@ -3059,8 +2772,6 @@ mod tests {
         assert_eq!(body["error"]["message"], message);
     }
 
-    /// A body-limit refusal: 413 with its own code, a message naming the
-    /// setting and the number it enforced, and no cause beneath it.
     #[tokio::test]
     async fn a_body_limit_refusal_is_413_naming_the_setting_and_limit() {
         let too_large = ServerError::RequestTooLarge {
@@ -3080,11 +2791,6 @@ mod tests {
         );
     }
 
-    /// A request-limit refusal (ADR-0054): 503 with its own code and the
-    /// fixed sentence for its allowance, classed like every refusal to
-    /// serve, `Cache-Control: no-store` and no `Retry-After`. Every
-    /// allowance is covered: the match below is exhaustive, and `ALL` is
-    /// pinned to the three of them.
     #[tokio::test]
     async fn a_request_limit_refusal_is_a_no_store_503_without_retry_after() {
         assert_eq!(
@@ -3122,9 +2828,6 @@ mod tests {
         }
     }
 
-    /// The three sentences, word for word. None carries a digit, so no
-    /// configured value can be in one. The regular one names the setting;
-    /// the probe and control ones name their allowance and not the setting.
     #[test]
     fn the_request_limit_messages_are_fixed_and_carry_no_value() {
         assert_eq!(
@@ -3169,15 +2872,6 @@ mod tests {
         assert!(!CONTROL_ALLOWANCE_REACHED.contains("max_concurrent_requests"));
     }
 
-    /// An engine refusal is the caller's mistake, not the server's: 400,
-    /// with the sentence intact.
-    ///
-    /// The engine raises it after proving the query wrong against
-    /// `DuckDB` — a `timechart` bucketing a column that is not a
-    /// timestamp — so the text is trawl-authored and quotes only the
-    /// caller's own tokens. Redacting it would leave a 400 that says
-    /// nothing, and classing it 500 would blame the server for a query
-    /// no source could have answered.
     #[tokio::test]
     async fn engine_refusal_is_a_bad_request_with_its_message() {
         let message = "timechart on 'hostname' is not a timestamp: VARCHAR";
@@ -3202,9 +2896,6 @@ mod tests {
         );
     }
 
-    // -- StoreError → HTTP table (ADR-0004: 503 / 409 / 404 / 400) ─────────
-
-    /// Render a response body to a string for envelope assertions.
     async fn body_string(response: Response) -> String {
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
             .await
@@ -3277,9 +2968,6 @@ mod tests {
         }
     }
 
-    /// The store's investigation conflicts convert to the variants whose
-    /// codes the wire names (ADR-0059); every other store error stays a
-    /// store error.
     #[tokio::test]
     async fn store_investigation_conflicts_convert_to_their_own_codes() {
         let stale = ServerError::from(StoreError::SequenceConflict {
@@ -3321,8 +3009,6 @@ mod tests {
         assert!(body.contains("\"not_found\""), "got: {body}");
     }
 
-    /// Postgres diagnostics must never reach the wire: the 503 body is the
-    /// fixed redacted envelope regardless of the underlying sqlx error.
     #[tokio::test]
     async fn store_unavailable_body_is_redacted() {
         let err = ServerError::Store(StoreError::Unavailable(sqlx::Error::PoolTimedOut));
@@ -3341,8 +3027,6 @@ mod tests {
         assert_eq!(err.safe_message(), "app-state store unavailable");
     }
 
-    /// ADR-0018 ruling 7: the conflict is the operator's to resolve, so
-    /// the refusal is a 400 that keeps both sides on the wire.
     #[tokio::test]
     async fn a_window_policy_refusal_is_a_400_naming_both_sides() {
         let err = ServerError::from(WindowPolicyError::TimeClause {
@@ -3361,8 +3045,6 @@ mod tests {
         assert!(body.contains("since_last"), "got: {body}");
     }
 
-    /// A claim failure keeps the wire treatment its leaf already has: no
-    /// second, differently-mapped route to the same answer.
     #[test]
     fn a_claim_failure_maps_to_its_leafs_own_variant() {
         use crate::store::DueClaimError;
@@ -3390,9 +3072,6 @@ mod tests {
         ));
     }
 
-    /// Planning and materialization read a schedule row and the saved DSL,
-    /// never the request, so their failures are 500s and the DSL text they
-    /// can quote stays off the wire.
     #[tokio::test]
     async fn window_plan_and_materialize_failures_are_redacted_500s() {
         let plan = ServerError::from(PlanError::Arithmetic);
@@ -3417,9 +3096,6 @@ mod tests {
         assert!(!body.contains("zz_secret_token"), "got: {body}");
     }
 
-    // -- One public message (ADR-0040, amended 2026-11-08) ────────────────
-
-    /// The status, headers and decoded body an error answers with.
     async fn answer(error: ServerError) -> (StatusCode, axum::http::HeaderMap, serde_json::Value) {
         let response = error.into_response();
         let status = response.status();
@@ -3439,7 +3115,6 @@ mod tests {
             engine { $($engine_pat:pat => $engine_sample:expr,)+ }
             store { $($store_pat:pat => $store_sample:expr,)+ }
         ) => {
-            /// The row `error` belongs to, through `Engine` and `Store`.
             #[deny(clippy::wildcard_enum_match_arm)]
             fn variant_name(error: &ServerError) -> &'static str {
                 match error {
@@ -3453,7 +3128,6 @@ mod tests {
                 }
             }
 
-            /// One sample of every variant, with the row it was written in.
             fn every_variant() -> Vec<(&'static str, ServerError)> {
                 vec![
                     $((stringify!($pat), $sample),)+
@@ -3653,10 +3327,6 @@ mod tests {
         }
     }
 
-    /// Every variant's disclosure is decided at compile time: the witness
-    /// above names each one with no wildcard at any level, and each sample
-    /// is the variant its row names, so no sample stands in for another
-    /// and every row's sample reaches the projection tests below.
     #[test]
     fn every_variant_has_a_decided_disclosure() {
         let mut names = std::collections::HashSet::new();
@@ -3667,8 +3337,6 @@ mod tests {
         }
     }
 
-    /// The decoded wire `message` is the public message every record
-    /// stores, for every variant: one projection, not two policies.
     #[tokio::test]
     async fn wire_and_stored_messages_are_one_projection() {
         for (row, error) in every_variant() {
@@ -3684,8 +3352,6 @@ mod tests {
         }
     }
 
-    /// Errors that carry internals answer their fixed sentence, wherever
-    /// the planted path, SQL, driver text or panic label sat inside them.
     #[tokio::test]
     async fn internal_markers_do_not_cross_the_disclosure_boundary() {
         use crate::store::migrations::SchemaError;
@@ -3778,8 +3444,6 @@ mod tests {
         ];
         for (error, marker) in cases {
             let label = format!("{error:?}");
-            // The marker is in the error, so its absence below is the
-            // projection's doing.
             assert!(
                 error.to_string().contains(&marker) || label.contains(&marker),
                 "the marker was planted in {label}"
@@ -3801,10 +3465,6 @@ mod tests {
         }
     }
 
-    /// What a caller needs to act on survives the projection whole: parse
-    /// spans and emit hints, configured limits, counts, sequence numbers
-    /// and the specialized 409 codes, each with its status, code, details,
-    /// `conflict` member and headers, and with the same text in the record.
     #[tokio::test]
     #[allow(clippy::too_many_lines)] // one flat table of facts, one row per answer
     async fn approved_domain_facts_remain_actionable() {
@@ -4006,7 +3666,6 @@ mod tests {
                 "result_unavailable",
                 "the captured result's file is missing; its rows cannot be read",
             ),
-            // A generic 409 keeps `bad_request`, with its remedy as written.
             fact(
                 ServerError::Conflict("a repin owns the data root; retry after it finishes".into()),
                 StatusCode::CONFLICT,
@@ -4113,8 +3772,6 @@ mod tests {
         }
     }
 
-    /// One event a fault logged: its level and every field, the message
-    /// among them.
     #[derive(Debug)]
     struct LoggedEvent {
         level: tracing::Level,
@@ -4150,7 +3807,6 @@ mod tests {
         }
     }
 
-    /// Every event `work` emits, at every level.
     fn events_of(work: impl FnOnce()) -> Vec<LoggedEvent> {
         use tracing_subscriber::layer::SubscriberExt;
 
@@ -4159,11 +3815,8 @@ mod tests {
         std::mem::take(&mut *log.0.lock().unwrap())
     }
 
-    /// A fault's default-level events say which failure it was and what
-    /// it came from, and never its text: the planted marker reaches DEBUG
-    /// only (ADR-0040, amended 2026-11-08). `log_fault` runs where the
-    /// response is built, and the auth backend logs where its error
-    /// converts, so each is driven through that path.
+    /// `log_fault` runs where the response is built, and the auth backend logs
+    /// where its error converts, so each is driven through that path.
     #[test]
     fn default_fault_events_carry_no_error_text() {
         use crate::store::migrations::SchemaError;
@@ -4213,7 +3866,6 @@ mod tests {
             let events = events_of(|| drop(fault.into_response()));
             cases.push((label, class, cause, marker, events));
         }
-        // The conversion path, for every keystore failure that logs.
         for (failure, marker) in [
             (
                 fleet_auth::AuthError::Database(sqlx::Error::Protocol(PATH.into())),

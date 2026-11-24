@@ -3,18 +3,9 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The DSL text trawl-mcp reads itself, read on tokio's blocking pool.
-//!
-//! trawld prepares every query it runs. trawl-mcp only reads what a text
-//! means: the effects an executed query claims, the follow-ups a sightings
-//! read proposes, the search `fields` proposes and the search hints. A
-//! parse is CPU work, so each runs through [`parse_work`] and no tool
+//! A parse is CPU work, so each runs through [`parse_work`] and no tool
 //! handler parses on a reactor thread.
-//!
-//! A cancelled tool call drops the handler's future (`call_tool` in
-//! [`crate::server`]). A parse it already started finishes on the pool,
-//! within the parser's caps, and its answer is dropped.
 
-/// `work` on the blocking pool, awaited. A panic in `work` resumes here.
 pub(crate) async fn parse_work<T, F>(work: F) -> T
 where
     F: FnOnce() -> T + Send + 'static,
@@ -37,7 +28,6 @@ where
     }
 }
 
-/// The thread each [`parse_work`] call ran its work on, for a test.
 #[cfg(test)]
 pub(crate) mod record {
     use std::sync::{Arc, Mutex};
@@ -49,8 +39,6 @@ pub(crate) mod record {
         static THREADS: Threads;
     }
 
-    /// `future`'s output, and the thread of each [`super::parse_work`]
-    /// call it made, in call order.
     pub(crate) async fn threads<F: Future>(future: F) -> (F::Output, Vec<ThreadId>) {
         let threads = Threads::default();
         let output = THREADS.scope(Arc::clone(&threads), future).await;
@@ -58,12 +46,10 @@ pub(crate) mod record {
         (output, threads)
     }
 
-    /// The record of the [`threads`] scope this task runs in.
     pub(super) fn current() -> Option<Threads> {
         THREADS.try_with(Arc::clone).ok()
     }
 
-    /// Record the calling thread in `record`.
     pub(super) fn push(record: Option<&Threads>) {
         if let Some(record) = record {
             record
@@ -83,9 +69,7 @@ mod tests {
     use crate::support::{Fake, ok, refuse, schema_services};
     use crate::tools::fields;
 
-    /// `fields` on a service builds its proposed search from parsed DSL
-    /// text, and the parse runs off the runtime's thread: the test's
-    /// current-thread runtime polls the handler on this thread.
+    /// The test's current-thread runtime polls the handler on this thread.
     #[tokio::test]
     async fn a_tool_parses_off_the_reactor() {
         let backend = Fake {
