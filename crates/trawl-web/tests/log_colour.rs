@@ -2,15 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! trawl-web's log lines carry no ANSI colour when stdout is not a
-//! terminal.
-//!
-//! Under systemd and Kubernetes the proxy's stdout is a log stream, and a
-//! collector ships it into stored events, escapes and all. The test runs the
-//! real binary with its output captured, so stdout is a pipe, and with an
-//! empty environment, so `NO_COLOR` plays no part. The test holds the
-//! proxy's bind address itself, so the proxy logs `loaded config`, fails to
-//! bind, and exits.
+//! The test holds the proxy's bind address itself, so the proxy logs
+//! `loaded config`, fails to bind, and exits.
 
 use std::net::TcpListener;
 use std::process::{Command, Stdio};

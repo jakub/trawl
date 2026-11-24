@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Handler modules, composed into the final `axum::Router` in `build()`.
-
 pub mod auth;
 pub mod proxy;
 pub mod stream;
@@ -21,38 +19,22 @@ use crate::middleware::request_count::{PROXY_MAX_REQUESTS, RequestCount};
 use crate::middleware::security_headers;
 use crate::state::AppState;
 
-/// Env var: when set, serves the SPA dist directory as a static-file
-/// fallback, overriding the embedded bundle. Dev affordance that lets
-/// engineers iterate on the SPA (`trunk build`) without rebuilding
-/// `trawl-web`.
 pub const ENV_SPA_DIR: &str = "TRAWL_WEB_SPA_DIR";
 
-/// Compose the proxy's top-level `Router` from its sub-modules, under the
-/// production request count of [`PROXY_MAX_REQUESTS`].
 pub fn build(state: AppState) -> Router {
     build_with_count(state, RequestCount::new(PROXY_MAX_REQUESTS))
 }
 
-/// [`build`] under `count` instead of the production count, so a test can
-/// fill a small one.
-///
-/// Every route, the SPA fallback included, sits inside the count; only
-/// `/healthz` is merged in outside it, so the probes are never refused
-/// (`middleware::request_count`). The body deadline sits inside the
-/// count and outside every route, so whichever extractor or handler
-/// reads a body reads it under the deadline and a stalled body gives its
-/// count back at the deadline (`middleware::body_deadline`). The
-/// security headers wrap the refusals too.
+/// Only `/healthz` is merged in outside the count, so the probes are never
+/// refused. The body deadline sits inside the count and outside every route,
+/// so a stalled body gives its count back at the deadline.
 pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
     let (csp, hsts, xcto, refp, xfo) = security_headers::layers();
 
     // Auth endpoints live under /api/auth/ so the SPA owns the
     // top-level /login, /logout paths as client-side routes without
     // colliding with POST-only HTTP handlers (which would 405 on GET
-    // navigation and break deep-links to the login page). Their bodies
-    // are read and held to the login limit by the middleware, which hands
-    // the bytes to the extractor and answers an oversized one with the
-    // envelope. Their deadline is the router's, below.
+    // navigation and break deep-links to the login page).
     let auth_routes = Router::new()
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -61,17 +43,8 @@ pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
 
     let router = Router::new()
         .merge(auth_routes)
-        // SSE first — must outrank the generic forwarder (both are under /api/v1).
-        // Like the forwarder below, these are cookie-authenticated: the
-        // ADR-0016 origin guard reaches them through the `Auth` extractor
-        // rather than through anything written here. The 404 stubs
-        // (`block_ingest`, `not_found`) take no extractor at all, so they
-        // are never guarded and never reach upstream.
         .route("/api/v1/stream", get(stream::forward))
         .route("/api/v1/dashboard/stream", get(stream::forward_dashboard))
-        // Block /ingest before it can match the generic forwarder. The
-        // route is the exact path, so /api/v1/ingest/preview still reaches
-        // the forwarder with the session's bearer token (ADR-0049).
         .route("/api/v1/ingest", any(proxy::block_ingest))
         .route("/api/v1/{*path}", any(proxy::forward))
         // Keep unknown API namespaces out of the SPA fallback. The
@@ -81,8 +54,6 @@ pub fn build_with_count(state: AppState, count: RequestCount) -> Router {
         .route("/api", any(proxy::not_found))
         .route("/api/{*path}", any(proxy::not_found));
 
-    // Attach the SPA fallback. `TRAWL_WEB_SPA_DIR` wins when set
-    // (hot-iterate flow); otherwise the embedded bundle takes over.
     let router = if let Ok(dir) = std::env::var(ENV_SPA_DIR) {
         let path = PathBuf::from(shellexpand::tilde(&dir).into_owned());
         tracing::info!(spa_dir = %path.display(), "SPA static-file fallback (env override)");

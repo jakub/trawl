@@ -2,27 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The `public_origins` packaging contract.
-//!
-//! `[web] public_origins` has no default: an install that does not state
-//! its browser-visible origin does not start. That makes every packaged
-//! spelling of the knob load-bearing, and a wrong one is not a typo but an
-//! outage. Four artifacts state it: the Debian `trawld.toml`, the
-//! configuration reference, the operator guides, and the Helm chart. This file feeds each
-//! of them to the real parsers rather than eyeballing them.
-//!
-//! Precedent: `crates/trawl-web/tests/log_filter_contract.rs` and
-//! `crates/trawl-config/tests/derivation_packaging_contract.rs`. The chart
-//! is read through `helm template` when helm is on PATH, which is the real
-//! rendering, values plumbing included; only a missing binary falls back to
-//! `values.yaml`. A chart that fails to render when it should is a test
-//! failure, never a skip.
-//!
-//! The deployment guide's Helm TLS examples ride along (ADR-0048): each one
-//! is rendered and the `trawld.toml` it produces goes through trawl-web's
-//! own config resolution. That test requires helm, since only a render
-//! shows what the sidecar is given.
-
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -30,9 +9,6 @@ use fleet_auth::PublicOrigins;
 use trawl_config::Config;
 use trawl_web::config::{ENV_UPSTREAM_CA_PATH, ResolvedConfig, UpstreamTls};
 
-/// An origin an operator is told to write. Every example in every packaged
-/// artifact has to be one `PublicOrigins::parse` accepts, so this is the
-/// value the chart cases are rendered with.
 const EXAMPLE_ORIGIN: &str = "https://trawl.example.com";
 
 fn repo_root() -> PathBuf {
@@ -73,13 +49,9 @@ fn read(relative: &str) -> String {
     }
 }
 
-/// The double-quoted strings of a TOML array literal, in order.
-///
 /// Deliberately not a TOML parse: the docs page states the knob inside
 /// fenced code blocks, and the packaged files comment most of their knobs
-/// out. Same reader as
-/// `trawl-config/tests/derivation_packaging_contract.rs`, for the same
-/// reason.
+/// out.
 fn quoted_strings(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut rest = line;
@@ -92,7 +64,6 @@ fn quoted_strings(line: &str) -> Vec<String> {
     out
 }
 
-/// Every `public_origins = [ … ]` declaration in a document, in order.
 fn declared_origin_lists(source: &str) -> Vec<Vec<String>> {
     source
         .lines()
@@ -102,8 +73,6 @@ fn declared_origin_lists(source: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
-/// Every `publicOrigins:` list in a YAML example, in order: the `- item`
-/// lines that follow the key, trimmed.
 fn yaml_origin_lists(source: &str) -> Vec<Vec<String>> {
     let mut out = Vec::new();
     let mut lines = source.lines().map(str::trim).peekable();
@@ -121,9 +90,6 @@ fn yaml_origin_lists(source: &str) -> Vec<Vec<String>> {
     out
 }
 
-/// Run `helm template` over the chart, returning the rendered manifest or
-/// the error text helm refused with.
-///
 /// `None` means helm is not installed, which is the one case the callers
 /// fall back on. Anything else is an answer about the chart.
 fn helm_template(template: &str, extra: &[&str]) -> Option<Result<String, String>> {
@@ -148,10 +114,6 @@ fn helm_template(template: &str, extra: &[&str]) -> Option<Result<String, String
     }
 }
 
-/// The `web.publicOrigins` default as `values.yaml` states it: the empty
-/// list. Only reached when helm is missing, and it still proves the half
-/// of the contract a values file can prove — that the chart ships no
-/// origin of its own, so the operator must state one.
 fn values_declare_an_empty_default() {
     let values = read("chart/trawl/values.yaml");
     let declared = values
@@ -193,8 +155,6 @@ fn the_debian_config_states_origins_that_load() {
 
 #[test]
 fn every_documented_example_loads() {
-    // A documented origin that does not parse is worse than no example:
-    // it gets pasted into a config file and refuses to boot.
     let docs = read("docs/src/content/docs/reference/configuration.md");
     let examples = declared_origin_lists(&docs);
     assert!(
@@ -222,8 +182,6 @@ fn every_documented_example_loads() {
             .unwrap_or_else(|e| panic!("the docs document an unloadable list {entries:?}: {e}"));
     }
 
-    // The Debian example and the docs are one fact, not two: an operator
-    // reading either sees the list the package actually ships.
     let debian = read("crates/trawl-server/debian/trawld.toml");
     let packaged = declared_origin_lists(&debian);
     assert_eq!(packaged.len(), 1, "the .deb states the knob exactly once");
@@ -257,7 +215,6 @@ fn the_chart_renders_the_origins_it_is_given() {
     assert_eq!(quoted_strings(line), vec![EXAMPLE_ORIGIN.to_owned()]);
     PublicOrigins::parse(quoted_strings(line)).expect("what the chart renders must load");
 
-    // The sidecar gets the same list as an env var.
     let statefulset = helm_template(
         "statefulset.yaml",
         &[
@@ -297,11 +254,6 @@ fn the_chart_refuses_an_enabled_sidecar_with_no_origins() {
 
 #[test]
 fn the_chart_quick_start_forwards_the_port_its_origin_names() {
-    // The quick start tells the operator to allow http://localhost:8090
-    // and then hands them a port-forward command. If that command does not
-    // map 8090 locally, the browser never reaches the UI on the origin the
-    // allowlist just authorized, and the first thing a new install does is
-    // fail in a way that looks like the CSRF guard misfiring.
     let readme = read("chart/trawl/README.md");
     let quick_start = readme
         .split("## Quick start")
@@ -336,9 +288,6 @@ fn the_chart_quick_start_forwards_the_port_its_origin_names() {
     );
 }
 
-/// The Helm TLS examples of the deployment guide: every fenced `yaml` block
-/// under "Configure the daemon API certificate" that starts with `tls:`.
-/// Each is a values fragment an operator pastes into `trawl-values.yaml`.
 fn documented_helm_tls_examples(deployment: &str) -> Vec<String> {
     let section = deployment
         .split("\n### Configure the daemon API certificate\n")
@@ -367,9 +316,6 @@ fn documented_helm_tls_examples(deployment: &str) -> Vec<String> {
     examples
 }
 
-/// Render one template for a documented example. Helm is required here:
-/// the claim under test is that the chart, not a reading of the values
-/// file, turns the example into a config trawl-web accepts.
 fn render_documented_example(template: &str, values: &Path, example: &str) -> String {
     let values = values.to_str().expect("the temporary path must be UTF-8");
     helm_template(
@@ -390,7 +336,6 @@ fn render_documented_example(template: &str, values: &Path, example: &str) -> St
     .unwrap_or_else(|error| panic!("the documented example\n{example}\nmust render: {error}"))
 }
 
-/// The `trawld.toml` a rendered `ConfigMap` carries, de-indented.
 fn rendered_trawld_toml(configmap: &str) -> String {
     let mut lines = configmap
         .lines()
@@ -406,8 +351,6 @@ fn rendered_trawld_toml(configmap: &str) -> String {
         .join("\n")
 }
 
-/// The `mountPath` of every volume mount of the `trawl-web` container in a
-/// rendered `StatefulSet`.
 fn sidecar_mount_paths(statefulset: &str) -> Vec<PathBuf> {
     let container = statefulset
         .split("- name: trawl-web\n")
@@ -454,9 +397,7 @@ fn every_documented_helm_tls_example_renders_a_config_trawl_web_accepts() {
 
         // The rendered paths name files inside the pod. Resolution reads
         // them, so the test points them into an empty scratch root: the
-        // cookie key gets a real 32-byte file, and the pinned CA stays
-        // absent, which trawl-web accepts as pending. The host's own
-        // /etc/trawl or /var/lib/trawl never decides the result.
+        // host's own /etc/trawl or /var/lib/trawl never decides the result.
         let cookie = scratch.path().join("web.cookie");
         std::fs::write(&cookie, [7_u8; 32]).expect("write a cookie key");
         config.web.cookie_secret_path = Some(cookie);

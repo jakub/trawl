@@ -2,43 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The upstream: `proxy.upstream.trust` and `proxy.upstream.health`,
-//! with its `proxy.upstream.health.<key>` rows.
-//!
-//! `proxy.upstream.trust` owns whatever error arrives in the upstream slot
-//! of [`Ctx`]: a URL that is not https, carries a user name, password,
-//! query or fragment, or names no host, a connect address that does not
-//! fit it, and a pin path that is empty or not UTF-8. Each is a fixed
-//! sentence, and no request is sent. With a pinned CA it reads the file
-//! once through [`read::read_pin`], which expands `~` in the path on the
-//! reading thread, and parses it with the production parser. A pin that
-//! expands to an empty path fails as an empty pin does, as startup refuses
-//! both alike. The row shows the path as written. The
-//! roots go to the probe through [`Ctx::pinned_roots`], so the probe
-//! trusts exactly what was checked, and the file is never read twice. A
-//! pin that does not exist yet is `not_sampled`, reason `ca_not_present`:
-//! trawld writes its generated certificate on its first start.
-//!
-//! `proxy.upstream.health` sends one anonymous `GET /api/v1/health` through
-//! the production client rules ([`upstream_client`]): https only, no
-//! redirect, no proxy, the connect address, the pinned roots only. The
-//! doctor adds its own timeouts, no retry and no idle pool, so the probe is
-//! one request on one connection. Under the platform roots, building that
-//! client loads them, as startup's does: `SSL_CERT_FILE`, `SSL_CERT_DIR` or
-//! the system store, read synchronously. The build runs on the blocking
-//! pool under [`CLIENT_DEADLINE`], so a bundle on a stalled mount costs the
-//! probe its answer, `timed_out`, and not the run. Trust still reports the
-//! platform roots as the configured trust (D5): whether they load is the
-//! probe's first step. The status is judged first: a redirect is
-//! refused without reading where it points, and any status but 200 or 503
-//! fails without reading the body. The body is read in chunks up to
-//! [`BODY_MAX`] and judged by [`health::judge`], the judge every doctor
-//! shares, and mapped to rows as `trawld --doctor` maps them.
-//!
-//! A request that fails is classified by walking its error's typed sources,
-//! never by its text, which can quote the URL or a certificate name. No
-//! error is ever formatted.
-
 use std::error::Error as StdError;
 use std::io;
 use std::time::Duration;
@@ -60,27 +23,21 @@ use crate::upstream::upstream_client;
 /// The checks this group runs, in [`WebCheck::ALL`] order.
 pub(super) const CHECKS: [WebCheck; 2] = [WebCheck::UpstreamTrust, WebCheck::UpstreamHealth];
 
-/// The path the probe asks, joined to the upstream URL as the proxy joins
-/// every forwarded path.
 const HEALTH_PATH: &str = "/api/v1/health";
 
-/// How long the probe's connection, TCP and TLS, may take to open.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// How long the whole probe may take, from dialing to the body's end.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A backstop past [`REQUEST_TIMEOUT`], around the send and the body read
 /// together, so no step of the probe can hold the run.
 const PROBE_DEADLINE: Duration = Duration::from_secs(11);
 
-/// How long building the probe's client may take: a file read's budget.
 /// Under the platform roots the build reads them, from `SSL_CERT_FILE`,
 /// `SSL_CERT_DIR` or the system store, and a stalled mount or a FIFO there
 /// would hold it; [`PROBE_DEADLINE`] starts only once the client exists.
 const CLIENT_DEADLINE: Duration = read::READ_DEADLINE;
 
-/// Run the group's checks, each through the runner's gate.
 pub(super) async fn run(runner: &mut Runner, ctx: &mut Ctx) {
     for check in CHECKS {
         let Some(gate) = runner.gate(check) else {
@@ -100,11 +57,6 @@ pub(super) async fn run(runner: &mut Runner, ctx: &mut Ctx) {
     }
 }
 
-// -- proxy.upstream.trust ----------------------------------------------------
-
-/// `proxy.upstream.trust`: the upstream slot resolved, and the trust it
-/// names is usable. Fills [`Ctx::pinned_roots`] when a pinned CA read and
-/// parsed.
 async fn check_trust(ctx: &mut Ctx) -> Row {
     let check = WebCheck::UpstreamTrust;
     let plan = match &ctx.upstream {
@@ -152,8 +104,6 @@ async fn check_trust(ctx: &mut Ctx) -> Row {
     }
 }
 
-/// The trust row for a pinned CA file the bounded reader did not read.
-/// `config` is the `--config` path, which an empty pin's fix names.
 fn pin_fault(fault: PinFault, shown: &SelectedPath, config: &SelectedPath) -> Row {
     let check = WebCheck::UpstreamTrust;
     let fix = || Text::new("point upstream_ca_path at trawld's CA certificate, a regular file");
@@ -168,8 +118,6 @@ fn pin_fault(fault: PinFault, shown: &SelectedPath, config: &SelectedPath) -> Ro
         PinFault::Read(fault) => fault,
     };
     match fault {
-        // trawld writes its generated certificate on its first start, which
-        // may come after trawl-web's; the proxy starts and waits for it.
         ReadFault::Missing => Row::not_sampled(check, reason::CA_NOT_PRESENT)
             .detail(Text::new("nothing exists yet at ").path(shown))
             .next(Text::new("start trawld; it writes this certificate")),
@@ -195,10 +143,8 @@ fn pin_fault(fault: PinFault, shown: &SelectedPath, config: &SelectedPath) -> Ro
     }
 }
 
-/// The trust row for an upstream slot that did not resolve. Only the
-/// variants that reach this slot have a sentence of their own; the text of
-/// the error is never shown, since the rule the URL broke may be that it
-/// holds a password.
+/// The text of the error is never shown, since the rule the URL broke may
+/// be that it holds a password.
 fn upstream_fault(error: &ConfigError, config: &SelectedPath) -> Row {
     let check = WebCheck::UpstreamTrust;
     let fix = |what: &'static str| Text::new(what).path(config);
@@ -266,7 +212,6 @@ fn upstream_fault(error: &ConfigError, config: &SelectedPath) -> Row {
                 .lit(ENV_UPSTREAM_CA_PATH)
                 .lit(" to UTF-8 text, or unset it"),
         ),
-        // Resolution puts none of these in the upstream slot.
         ConfigError::ReadFile { .. }
         | ConfigError::ParseFile { .. }
         | ConfigError::EnvMissing { .. }
@@ -291,11 +236,6 @@ fn empty_pin(config: &SelectedPath) -> Row {
     )
 }
 
-// -- proxy.upstream.health ---------------------------------------------------
-
-/// `proxy.upstream.health` and its `proxy.upstream.health.<key>` rows: one
-/// anonymous request through the production client rules and the trust
-/// `proxy.upstream.trust` checked.
 async fn check_health(ctx: &Ctx) -> (Row, Vec<Row>) {
     // Trust completed, which it does only for a resolved upstream. The
     // slot's error is not formatted, even in a panic.
@@ -318,16 +258,12 @@ async fn check_health(ctx: &Ctx) -> (Row, Vec<Row>) {
     )
 }
 
-/// Send the probe and judge what came back.
 async fn probe(plan: &UpstreamPlan, pinned: Option<&[reqwest::Certificate]>) -> (Row, Vec<Row>) {
     let check = WebCheck::UpstreamHealth;
     let client = match build_client(plan, pinned).await {
         Ok(client) => client,
         Err(row) => return (row, Vec::new()),
     };
-    // `check_upstream_url` refused any credential before trust completed,
-    // so the probe cannot carry one; this holds that line where the request
-    // leaves.
     assert!(
         plan.checked_url.username().is_empty() && plan.checked_url.password().is_none(),
         "the probe carries no credential"
@@ -376,11 +312,6 @@ async fn probe(plan: &UpstreamPlan, pinned: Option<&[reqwest::Certificate]>) -> 
         .unwrap_or_else(|_| (timed_out_row(), Vec::new()))
 }
 
-/// The probe's client: the production rules ([`upstream_client`]) over
-/// the doctor's timeouts, built on the blocking pool under
-/// [`CLIENT_DEADLINE`]. Under the platform roots the build loads them
-/// synchronously, as startup's does, so it must not run on the doctor's
-/// one runtime thread unbounded.
 async fn build_client(
     plan: &UpstreamPlan,
     pinned: Option<&[reqwest::Certificate]>,
@@ -424,21 +355,13 @@ fn timed_out_row() -> Row {
         .detail(Text::new("the health answer did not arrive in time"))
 }
 
-/// What a failed request's typed error sources show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Transport {
-    /// rustls refused the upstream's certificate.
     CertificateNotTrusted,
-    /// A deadline passed.
     TimedOut,
-    /// Nothing accepts connections at the upstream's address.
     Refused,
-    /// The TLS handshake failed for another reason, or the upstream ended
-    /// the connection during it.
     Handshake,
-    /// The connection did not open for another reason.
     Connect,
-    /// The connection opened, and the exchange failed after it.
     Exchange,
 }
 
@@ -481,8 +404,6 @@ fn classify(error: &reqwest::Error) -> Transport {
     }
 }
 
-/// Whether an I/O error says the peer ended the connection, by a close or
-/// a reset.
 const fn cut_off(kind: io::ErrorKind) -> bool {
     matches!(
         kind,
@@ -493,7 +414,6 @@ const fn cut_off(kind: io::ErrorKind) -> bool {
     )
 }
 
-/// The health row for a request that got no HTTP answer.
 fn transport_row(error: &reqwest::Error) -> Row {
     let check = WebCheck::UpstreamHealth;
     match classify(error) {
@@ -529,7 +449,6 @@ fn transport_row(error: &reqwest::Error) -> Row {
     }
 }
 
-/// Why the health body was not read whole.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BodyFault {
     TooLarge,
@@ -537,8 +456,6 @@ enum BodyFault {
     Broken,
 }
 
-/// The response body, read chunk by chunk and refused past [`BODY_MAX`]
-/// bytes, before any of it is parsed.
 async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, BodyFault> {
     if response
         .content_length()
@@ -562,17 +479,12 @@ async fn read_capped(mut response: reqwest::Response) -> Result<Vec<u8>, BodyFau
     }
 }
 
-/// The next action for an answer that is not trawld's.
 const NOT_TRAWLD: &str = "check that trawld, and not another service, answers at the upstream URL";
 
-/// The health rows for a body that arrived whole with HTTP `status`, as
-/// the judge every doctor shares reads it ([`health::judge`]), mapped as
-/// `trawld --doctor` maps its listener's answer.
-///
 /// One rule is the web doctor's own: a health body without a `version` is
 /// not trawld's. trawld always sends one, `trawl doctor` requires it too,
 /// and this doctor dials trawld directly, so no proxy in between can have
-/// taken it away. A body that lacks it gets no per-check rows.
+/// taken it away.
 fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     let check = WebCheck::UpstreamHealth;
     let foreign = || {
@@ -611,8 +523,6 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
                 .next(Text::new("wait for trawld to finish recovery, then rerun")),
             Vec::new(),
         ),
-        // A capacity refusal is trawld's own answer, not another
-        // service's: the doctor could not look, and invents no checks.
         health::Answer::RequestLimit => (
             Row::not_sampled(check, reason::REQUEST_LIMIT_REACHED)
                 .detail(Text::new(health::REQUEST_LIMIT_REFUSED))
@@ -633,9 +543,6 @@ fn health_rows(status: u16, body: &[u8]) -> (Row, Vec<Row>) {
     }
 }
 
-/// The failed health row for an HTTP `status` trawld's health endpoint
-/// never sends, such as a 502 from something between: the status is shown,
-/// and nothing is said about TLS.
 fn status_failure(status: u16) -> Row {
     Row::failed(
         WebCheck::UpstreamHealth,
@@ -645,7 +552,6 @@ fn status_failure(status: u16) -> Row {
     .next(Text::new(NOT_TRAWLD))
 }
 
-/// The health row for an answer larger than the doctor reads.
 fn too_large_row() -> Row {
     Row::not_sampled(WebCheck::UpstreamHealth, reason::TOO_LARGE).detail(
         Text::new("the doctor reads at most ")
@@ -654,8 +560,7 @@ fn too_large_row() -> Row {
     )
 }
 
-/// One row per reported check, sorted by name. Names trawld's health
-/// endpoint does not report become one failed
+/// Names trawld's health endpoint does not report become one failed
 /// `proxy.upstream.health._invalid` row, and none of them is shown: even an
 /// identifier-shaped name may be a secret.
 fn keyed_rows(health: &Health) -> Vec<Row> {
@@ -676,18 +581,12 @@ fn keyed_rows(health: &Health) -> Vec<Row> {
     rows
 }
 
-/// The row for one reported check. No value the upstream sends is shown
-/// as sent: a known value is named by a literal of this doctor's, and a
-/// value it does not know is not shown at all.
 fn key_row(answer: &KeyAnswer) -> Row {
     let key = HealthKey::new(answer.name())
         .expect("the judge names only checks trawld's health endpoint reports");
     let row = |reason| Row::for_key(WebCheck::UpstreamHealth, key, answer.outcome(), reason);
     match answer.value() {
         Reported::Ok => row(None).detail(Text::new("reported ok")),
-        // A slow engine answered its latest sample past the budget, and
-        // answered within the last minute: trawld is degraded, not down
-        // (ADR-0056).
         Reported::Slow => row(None).detail(Text::new("reported slow")).next(
             Text::new("trawld is degraded, not down; read trawld's log if ")
                 .key(&key)
@@ -742,9 +641,6 @@ mod tests {
             .collect()
     }
 
-    /// trawld's answer keeps a row per known check, sorted; unknown names
-    /// fold into one `_invalid` row that shows none of them; a body without
-    /// `version` is not trawld's and has no rows.
     #[test]
     fn health_answers_map_to_rows() {
         let body = br#"{"status":"degraded","version":"1.0.0","checks":{
@@ -814,8 +710,6 @@ mod tests {
         );
     }
 
-    /// A starved engine answers 200 `degraded` with `duckdb: slow`. The
-    /// engine row is complete, not failed, and says what it saw (ADR-0056).
     #[test]
     fn a_slow_engine_is_degraded_not_failed() {
         let body = br#"{"status":"degraded","version":"1.0.0","checks":{"duckdb":"slow"}}"#;
@@ -834,7 +728,6 @@ mod tests {
                 .as_deref()
                 .is_some_and(|next| next.contains("degraded"))
         );
-        // `slow` is the engine's value alone; on another check it is unknown.
         let elsewhere =
             br#"{"status":"degraded","version":"1.0.0","checks":{"storage_db":"slow"}}"#;
         assert_eq!(
@@ -847,9 +740,6 @@ mod tests {
         );
     }
 
-    /// A pin that `~` expands to an empty path fails as an empty pin in the
-    /// slot does, with the same reason and fix, as startup refuses both
-    /// alike; it is not a CA that trawld has yet to write.
     #[test]
     fn an_empty_expanded_pin_fails_as_an_empty_pin() {
         let config = SelectedPath::new(
@@ -880,8 +770,6 @@ mod tests {
         assert_eq!(missing.reason.as_deref(), Some(reason::CA_NOT_PRESENT));
     }
 
-    /// Every slot error names its rule in a fixed sentence and quotes
-    /// nothing, not even the text an `Unparseable` carries.
     #[test]
     fn upstream_faults_quote_nothing() {
         let config = SelectedPath::new(

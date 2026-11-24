@@ -2,9 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Integration tests that verify baseline security headers are present
-//! on every response, including both API and unauthenticated paths.
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use tower::ServiceExt;
@@ -16,7 +13,6 @@ use trawl_web::state::AppState;
 fn test_state() -> AppState {
     let web = WebConfig {
         allow_insecure_cookies: true,
-        // Required since ADR-0016: resolution refuses an empty allowlist.
         public_origins: vec!["https://trawl.example.com".to_owned()],
         ..WebConfig::default()
     };
@@ -27,7 +23,6 @@ fn test_state() -> AppState {
 async fn every_response_has_csp_and_friends() {
     let app = routes::build(test_state());
 
-    // /healthz is unauthenticated and trivially passes through all layers.
     let req = Request::builder()
         .method("GET")
         .uri("/healthz")
@@ -79,8 +74,6 @@ async fn every_response_has_csp_and_friends() {
 async fn unauthorized_responses_still_carry_security_headers() {
     let app = routes::build(test_state());
 
-    // /me without cookie → 401. Security headers must still be applied
-    // so error responses don't become a weak link.
     let req = Request::builder()
         .method("GET")
         .uri("/api/auth/me")

@@ -4,42 +4,15 @@
 
 //! The client that reaches trawld, and the pinned CA behind it (ADR-0048).
 //!
-//! Under the platform roots the client never changes. Under a pinned CA,
-//! `[web] upstream_ca_path` may name a file that does not exist yet, since
-//! trawld writes its generated certificate on its first start, and an
-//! operator may rotate the file later. So [`Upstream`] reads the file again
-//! and swaps in a new client when its contents change:
-//!
-//! - On a fixed interval, [`CA_REREAD_INTERVAL`] in production, from a task
-//!   that `AppState::spawn_upstream_ca_reread` starts.
-//! - On a request while no client exists yet. The request takes the client
-//!   the read produced, or answers 503 `upstream certificate not
-//!   available`.
-//!
 //! Reads are single-flight, and each runs on tokio's blocking pool, never
 //! on a runtime worker: opening, reading and parsing the file and building
 //! a client are all synchronous, and a file on a stalled network volume
-//! can block for as long as the volume stalls. The open itself never
-//! waits, and a path that is not a regular file, such as a FIFO, is a
-//! refusal. A request waits for a read at most [`CA_READ_WAIT`], then
-//! answers 503; the read goes on, and what it finds is still used. A
-//! request that queued behind a read which started after it arrived takes
-//! that read's result instead of reading again. Routes that never reach
-//! trawld, `/healthz` among them, never wait on the file.
+//! can block for as long as the volume stalls. A request waits for a read
+//! at most [`CA_READ_WAIT`], then answers 503; the read goes on, and what
+//! it finds is still used.
 //!
 //! A read compares a BLAKE3 digest of the file's bytes with the digest of
 //! the bytes behind the client in use, never its modification time.
-//! Unchanged bytes do nothing. Bytes that parse become a new client. Bytes
-//! that do not parse, a file that disappears, a file that cannot be read,
-//! and a file larger than `config::MAX_PIN_FILE_BYTES` (1 MiB) are
-//! refusals: the last good client stays in use, and each distinct refusal
-//! logs one warning. Before any good load there is no client to keep, so
-//! requests stay at 503. Only digests are kept between reads, never a
-//! file's bytes.
-//!
-//! A request takes one client, a cheap clone, when it starts, and uses it
-//! until its response body ends. A swap changes what the next request
-//! takes and never touches a client already taken.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -52,16 +25,10 @@ use tokio::sync::{Mutex, OwnedMutexGuard};
 use crate::config::{UpstreamConnect, UpstreamTls, pinned_roots, read_pin_file};
 use crate::error::ProxyError;
 
-/// How often the pinned CA file is read again.
 pub const CA_REREAD_INTERVAL: Duration = Duration::from_secs(30);
 
-/// The longest a request waits for a read of the pin file, queueing
-/// behind another read included, before it answers 503. A local file reads
-/// in well under this; only a stalled volume takes longer, and then a
-/// prompt 503 serves the browser better than a hung request.
 pub const CA_READ_WAIT: Duration = Duration::from_secs(5);
 
-/// The upstream client for one trust mode.
 pub struct Upstream(Trust);
 
 enum Trust {
@@ -75,8 +42,6 @@ struct Pin {
     /// The pin file, tilde-expanded.
     path: PathBuf,
     connect: Option<UpstreamConnect>,
-    /// The head deadline each rebuilt client carries as its connections'
-    /// `TCP_USER_TIMEOUT` ([`proxy_client_builder`]).
     head_deadline: Duration,
     /// The client built from the file's last good contents, `None` until
     /// the file first holds a usable certificate. The lock is held only to
@@ -91,25 +56,16 @@ struct Pin {
     /// arrival and now holds the mutex knows a read that began after it
     /// arrived has finished.
     reads_started: AtomicU64,
-    /// Write-locked by a test to stall reads on the blocking pool, as a
-    /// stalled volume would.
     #[cfg(test)]
     stall: tokio::sync::RwLock<()>,
 }
 
-/// What earlier reads of the pin file found.
 struct Observed {
-    /// The digest of the contents behind the client in use; `None` while no
-    /// client exists.
     loaded: Option<blake3::Hash>,
-    /// The refusal last logged, so the same refusal is not logged again.
-    /// Cleared by a read that finds the loaded contents or loads new ones.
     refusal: Option<Refusal>,
 }
 
-/// Why a read of the pin file produced no client. Two refusals are the
-/// same when a re-read would log the same thing: the same kind, and for
-/// contents, the same digest.
+/// Two refusals are the same when a re-read would log the same thing.
 #[derive(Debug, PartialEq, Eq)]
 enum Refusal {
     Absent,
@@ -118,15 +74,8 @@ enum Refusal {
 }
 
 impl Upstream {
-    /// The upstream client for `tls`, dialing `connect` when set, whose
-    /// connections carry `head_deadline` as their `TCP_USER_TIMEOUT`
-    /// ([`proxy_client_builder`]).
-    ///
     /// A pin whose file did not exist at resolution starts with no client.
     /// Resolution already logged that once.
-    ///
-    /// # Errors
-    /// Returns the `reqwest::Error` if the client cannot be built.
     pub fn new(
         tls: UpstreamTls,
         connect: Option<UpstreamConnect>,
@@ -175,22 +124,10 @@ impl Upstream {
         }
     }
 
-    /// Whether the client can change, so a re-read task has work to do.
     pub fn is_pinned(&self) -> bool {
         matches!(self.0, Trust::Pinned(_))
     }
 
-    /// The client for one request.
-    ///
-    /// While a pin has no client, this reads the file once, single-flight
-    /// with every other read, and takes the client that read produced. A
-    /// read that started after this request arrived and finished while it
-    /// queued serves instead of a new one.
-    ///
-    /// # Errors
-    /// [`ProxyError::UpstreamCertificateUnavailable`] when the pin file has
-    /// never held a usable certificate, or no read finished within
-    /// [`CA_READ_WAIT`].
     pub async fn client(&self) -> Result<Client, ProxyError> {
         let pin = match &self.0 {
             Trust::System(client) => return Ok(client.clone()),
@@ -210,15 +147,11 @@ impl Upstream {
             }
             Pin::observe(Arc::clone(pin), observed).await;
         };
-        // On timeout the read in flight, this request's or another's, goes
-        // on and installs what it finds; only the wait ends.
         let _ = tokio::time::timeout(CA_READ_WAIT, read).await;
         pin.current()
             .ok_or(ProxyError::UpstreamCertificateUnavailable)
     }
 
-    /// Read the pin file again, and swap in a new client if its contents
-    /// changed and parse. Nothing to do under the platform roots.
     pub async fn reread(&self) {
         if let Trust::Pinned(pin) = &self.0 {
             let observed = Arc::clone(&pin.reread).lock_owned().await;
@@ -235,9 +168,6 @@ impl Pin {
             .clone()
     }
 
-    /// Read the file once on the blocking pool, holding `observed`, the
-    /// re-read mutex, until the read has acted on what it found.
-    ///
     /// The read cannot be cancelled: dropping this future stops only the
     /// wait for it.
     async fn observe(pin: Arc<Self>, mut observed: OwnedMutexGuard<Observed>) {
@@ -262,8 +192,6 @@ impl Pin {
         }
     }
 
-    /// Read the file once and act on what it holds. Blocks; the caller
-    /// holds the re-read mutex, whose contents `observed` is.
     fn observe_blocking(&self, observed: &mut Observed) {
         let read = read_pin_file(&self.path).map(|pem| {
             let digest = blake3::hash(&pem);
@@ -323,7 +251,6 @@ impl Pin {
         }
     }
 
-    /// A client trusting only the certificates in `pem`.
     fn build(&self, pem: &[u8]) -> Result<Client, &'static str> {
         let roots = pinned_roots(pem)?;
         upstream_client(
@@ -350,33 +277,12 @@ impl std::fmt::Debug for Upstream {
     }
 }
 
-/// Set the upstream trust and dialing rules on `builder`.
-///
-/// In every mode the client:
-///
-/// - Speaks https only. Resolution already refuses a plain-http
-///   `upstream_url`; this also refuses any other cleartext hop.
 /// - Follows no redirect. trawld never sends one, and a followed 3xx would
 ///   carry the signed-in user's key to whatever host the `Location` names
 ///   and the trust mode accepts: under the platform roots, any host with a
 ///   public certificate.
-/// - Ignores proxy settings, such as `HTTPS_PROXY`. trawl-web always dials
-///   trawld directly. A proxy would also resolve the host name on its own
-///   side, past any connect address.
-///
-/// With a connect address (`[web] upstream_connect_addr`), the client dials
-/// that address for the URL's host and never asks the resolver. TLS still
-/// verifies the host name from the URL.
-///
-/// `pinned` certificates replace the platform roots, with host-name
-/// verification left on. `None` trusts the platform roots.
-///
-/// Takes a builder so a caller can add settings the rules leave alone. The
-/// proxy passes [`proxy_client_builder`], which bounds a send trawld never
-/// takes; a test passes one with its own resolver or proxy and sees what
-/// the rules override; the doctor passes one with its timeouts, no retries
-/// and no connection pool, and so probes trawld through the same rules
-/// the proxy's requests use.
+/// - Ignores proxy settings, such as `HTTPS_PROXY`. A proxy would also
+///   resolve the host name on its own side, past any connect address.
 pub(crate) fn upstream_client(
     builder: ClientBuilder,
     pinned: Option<&[Certificate]>,
@@ -396,29 +302,7 @@ pub(crate) fn upstream_client(
     }
 }
 
-/// The builder each of the proxy's own clients starts from: reqwest's
-/// defaults, with every connection's `TCP_USER_TIMEOUT` at
-/// `head_deadline`, the proxy's deadline for trawld's response head
-/// (`ProxyLimits::upstream_head_timeout`, `[server] timeout_secs` plus
-/// 10 s).
-///
-/// The kernel then closes a connection whose sent bytes trawld has not
-/// acknowledged, or whose queued bytes trawld's closed window has not
-/// taken, for that long. hyper drops the connection's write queue with
-/// it, so a buffered request body still queued there is freed, and its
-/// budget reservation with it (`routes::proxy::ReservedBody`). Without a
-/// bound, a body sent to a route whose handler ignores it, answered with
-/// a response the browser then stops reading, wedged both ends for good
-/// (ADR-0054, amended 2026-10-18): trawld had closed its reads and
-/// blocked on its writes, the proxy blocked on its send, and the body
-/// stayed charged to the budget. reqwest's own default is a fixed 30 s;
-/// this follows `[server] timeout_secs`, as the head deadline does, so a
-/// trawld that is only slow is given the same time either way.
-///
-/// The option exists on Linux, Android and Fuchsia, where every build of
-/// trawl-web runs (the deb, the chart's image, CI). On another OS reqwest
-/// offers no such setting, the bound is not set, and the kernel's own
-/// retransmission limit is the only end to such a connection.
+/// Every connection's `TCP_USER_TIMEOUT` at `head_deadline` (ADR-0054).
 fn proxy_client_builder(head_deadline: Duration) -> ClientBuilder {
     let builder = Client::builder();
     #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
@@ -441,8 +325,6 @@ mod tests {
     use crate::config::MAX_PIN_FILE_BYTES;
     use crate::test_support::{TestCa, TlsUpstream, captured_logs};
 
-    /// The platform roots and a pin to a fresh CA: the rules under test do
-    /// not depend on which roots are trusted.
     fn every_mode() -> [Option<Vec<Certificate>>; 2] {
         let ca = TestCa::generate();
         let roots = pinned_roots(ca.pem().as_bytes()).expect("test CA parses");
@@ -453,9 +335,8 @@ mod tests {
         if pinned.is_some() { "pinned" } else { "system" }
     }
 
-    /// Send one request to `url` with `client` and report whether
-    /// `listener` saw a connection. The TLS handshake then fails, since
-    /// the listener speaks no TLS; only the dial matters here.
+    /// The TLS handshake then fails, since the listener speaks no TLS; only
+    /// the dial matters here.
     async fn dials(client: &Client, url: String, listener: &TcpListener) -> bool {
         let request = tokio::spawn(client.get(url).send());
         let accepted = tokio::time::timeout(Duration::from_secs(5), listener.accept())
@@ -465,8 +346,6 @@ mod tests {
         accepted
     }
 
-    /// A host resolver that answers nothing and counts how often it is
-    /// asked, standing in for one that would name another machine.
     struct RefusingResolver(Arc<AtomicUsize>);
 
     impl Resolve for RefusingResolver {
@@ -578,8 +457,6 @@ mod tests {
         }
     }
 
-    /// A pin resolved from `path`, as startup resolves it, under the
-    /// default head deadline.
     fn pinned(path: &Path) -> Upstream {
         let tls = crate::config::resolve_upstream_tls(Some(path)).expect("the pin resolves");
         Upstream::new(
@@ -590,8 +467,6 @@ mod tests {
         .expect("the client builds")
     }
 
-    /// Whether `client` completes a request to `upstream`: its certificate
-    /// chain and name are trusted. Bounded, so a hang fails the test.
     async fn trusts(client: &Client, upstream: &TlsUpstream) -> bool {
         tokio::time::timeout(
             Duration::from_secs(10),
@@ -602,9 +477,6 @@ mod tests {
         .is_ok()
     }
 
-    /// A pending pin answers 503 without dialing anything, and each
-    /// request reads the file again, so the first one after it appears
-    /// gets a client.
     #[tokio::test]
     async fn a_pending_pin_is_unavailable_until_its_file_appears() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -624,9 +496,6 @@ mod tests {
         assert!(trusts(&client, &front).await);
     }
 
-    /// A swap changes the client the next request takes, never one a
-    /// request already holds: a request keeps the trust it started with
-    /// until it ends.
     #[tokio::test]
     async fn a_client_taken_before_a_swap_keeps_its_roots() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -657,8 +526,6 @@ mod tests {
         }
     }
 
-    /// A read that outlasts [`CA_READ_WAIT`]: the request answers 503 when
-    /// its wait ends, and the read goes on to install the client it builds.
     #[tokio::test]
     async fn a_request_stops_waiting_for_a_stalled_read() {
         let _ = rustls::crypto::ring::default_provider().install_default();
@@ -733,8 +600,6 @@ mod tests {
         );
     }
 
-    /// Each distinct refusal logs one warning, however often a re-read
-    /// meets it.
     #[test]
     fn a_refusal_warns_once_until_the_file_changes() {
         let dir = tempfile::tempdir().unwrap();
@@ -767,7 +632,6 @@ mod tests {
         let warnings: Vec<_> = lines.iter().filter(|l| l.starts_with("WARN")).collect();
         assert_eq!(warnings.len(), 1, "{lines:?}");
 
-        // The file disappearing is another refusal, logged once too.
         let ((), lines) = captured_logs(|| {
             std::fs::remove_file(&path).unwrap();
             runtime.block_on(upstream.reread());
@@ -777,12 +641,9 @@ mod tests {
         assert_eq!(warnings.len(), 1, "{lines:?}");
         assert!(warnings[0].contains("does not exist"), "{lines:?}");
 
-        // Throughout, the last good client stays in use.
         assert!(runtime.block_on(upstream.client()).is_ok());
     }
 
-    /// A pin file that grows past [`MAX_PIN_FILE_BYTES`] after startup is a
-    /// refusal like any other: one warning, and the last good client stays.
     /// The file is sparse, so the test allocates nothing.
     #[test]
     fn an_oversized_pin_file_is_refused_on_reread() {
@@ -821,9 +682,7 @@ mod tests {
         );
     }
 
-    /// A pin still waiting for its first good file: its absence was logged
-    /// at resolution and is not logged again, while unusable contents are
-    /// logged once each.
+    /// Its absence was logged at resolution and is not logged again.
     #[test]
     fn a_pending_pin_warns_once_per_unusable_file() {
         let dir = tempfile::tempdir().unwrap();

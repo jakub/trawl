@@ -2,26 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The proxy never follows an upstream redirect, and never hands one to
-//! the browser.
-//!
-//! Every request the proxy sends upstream carries the signed-in user's key
-//! as a bearer token. A followed 3xx would hand that key to whatever host
-//! the `Location` names, as long as the trust mode accepts its
-//! certificate: any host the pinned CA issued for, or, under the platform
-//! roots, any host with a public certificate. So the upstream client
-//! follows no redirect in any trust mode. Passing the 3xx through is no
-//! better: the browser would follow it, and a `Location` naming another
-//! port on the browser's host carries the host-scoped session cookie to
-//! whatever listens there. So every browser-facing route answers an
-//! upstream 3xx with the proxy's own 502 and no `Location`.
-//!
-//! Each test runs two real listeners: the upstream answers 307 to the
-//! other, and the other must see no request at all. Both are TLS fronts
-//! whose certificates come from the pinned CA, so the second one is a
-//! target the client could reach, and only the redirect policy keeps it
-//! away.
-
 use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde_json::json;
@@ -40,7 +20,6 @@ use test_support::{TestCa, TlsUpstream};
 
 const ORIGIN: &str = "https://trawl.example.com";
 
-/// The two listeners of one test run.
 struct Leg {
     upstream: TlsUpstream,
     elsewhere: TlsUpstream,
@@ -74,9 +53,6 @@ impl Leg {
         AppState::from_config(resolved).expect("build state")
     }
 
-    /// Answer `route` on the upstream with a 307 to the same path on the
-    /// second listener, and answer it there as if the redirect were
-    /// legitimate.
     async fn redirect(&self, route: &str, ok: ResponseTemplate) {
         Mock::given(method("GET"))
             .and(path(route))
@@ -93,9 +69,6 @@ impl Leg {
             .await;
     }
 
-    /// The upstream answered `route` with its redirect after `before`
-    /// earlier requests (the positive control: the redirect path really
-    /// ran), and the proxy never contacted the second listener.
     async fn assert_untouched(&self, route: &str, before: usize) {
         assert!(
             requests_to(self.upstream.mock(), route).await > before,
@@ -141,7 +114,6 @@ async fn requests_to(server: &MockServer, route: &str) -> usize {
     seen.iter().filter(|r| r.url.path() == route).count()
 }
 
-/// Login asks the upstream `/whoami` with the key as a bearer token.
 #[tokio::test]
 async fn login_does_not_follow_an_upstream_redirect() {
     let leg = Leg::start().await;
@@ -157,9 +129,8 @@ async fn login_does_not_follow_an_upstream_redirect() {
     leg.assert_untouched("/api/v1/whoami", before).await;
 }
 
-/// Log in against an upstream whose `/whoami` answers once, and return
-/// the session cookie pair. Mount the route's redirect after this, so the
-/// redirect is what the route sees and not the login.
+/// Mount the route's redirect after this, so the redirect is what the
+/// route sees and not the login.
 async fn session_cookie(state: AppState, upstream: &MockServer) -> String {
     Mock::given(method("GET"))
         .and(path("/api/v1/whoami"))
@@ -181,8 +152,6 @@ async fn session_cookie(state: AppState, upstream: &MockServer) -> String {
         .to_owned()
 }
 
-/// Send `uri` with the session cookie and check the browser gets the
-/// proxy's upstream error: a 502, no redirect status, no `Location`.
 async fn assert_redirect_refused(state: AppState, cookie: &str, uri: &str) {
     let request = Request::builder()
         .uri(uri)
@@ -206,7 +175,6 @@ async fn assert_redirect_refused(state: AppState, cookie: &str, uri: &str) {
     );
 }
 
-/// The generic `/api/v1/*` forwarder.
 #[tokio::test]
 async fn forwarding_does_not_follow_or_pass_on_an_upstream_redirect() {
     let leg = Leg::start().await;
@@ -223,7 +191,6 @@ async fn forwarding_does_not_follow_or_pass_on_an_upstream_redirect() {
     leg.assert_untouched("/api/v1/schema", before).await;
 }
 
-/// `/api/auth/me` asks the upstream `/whoami` on every call.
 #[tokio::test]
 async fn me_does_not_follow_or_pass_on_an_upstream_redirect() {
     let leg = Leg::start().await;
@@ -236,7 +203,6 @@ async fn me_does_not_follow_or_pass_on_an_upstream_redirect() {
     leg.assert_untouched("/api/v1/whoami", before).await;
 }
 
-/// Both SSE forwarders, which stream rather than buffer.
 #[tokio::test]
 async fn streams_do_not_follow_or_pass_on_an_upstream_redirect() {
     for (route, uri) in [

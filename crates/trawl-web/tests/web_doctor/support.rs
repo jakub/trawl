@@ -2,21 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! What every `trawl-web --doctor` test runs the doctor with.
-//!
-//! [`run_web_doctor`] runs the real `trawl-web` binary as a child process
-//! with an empty environment plus the variables the test names, so no
-//! ambient `TRAWL_*`, `FLEET_SESSION_*` or proxy variable reaches it. It
-//! always applies [`assert_no_values`] to both output streams before it
-//! returns, and it watches the doctor for child processes, which it starts
-//! none of. [`run_web_doctor_in_userns`] does the same as root in a user
-//! namespace ([`Userns`]).
-//!
-//! The fixtures write what a doctor run reads: a `trawld.toml`
-//! ([`WebDoctorConfig`]), a cookie key file ([`write_key`]) and a pinned
-//! CA ([`write_ca`]). [`fs_snapshot`] and [`assert_unchanged`] prove a run
-//! wrote nothing.
-
 #![allow(dead_code, reason = "each group uses a subset of these helpers")]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,25 +17,15 @@ mod shapes;
 
 pub use shapes::forbidden_shape;
 
-/// The secret planted in every value a doctor test hands the doctor that
-/// the report must not show. It must never appear in the doctor's output.
 pub const SECRET: &str = "private-secret";
 
-/// A browser origin that carries [`SECRET`] in its host.
 pub const PLANTED_ORIGIN: &str = "https://proxy.private-secret.example";
 
-/// The subject of the CA [`write_ca`] makes; it carries [`SECRET`].
 pub const PLANTED_CA_SUBJECT: &str = "trawl doctor private-secret CA";
 
-/// The 32 key bytes [`write_key`] writes, cut or padded to the length a
-/// test asks for; they carry [`SECRET`].
 pub const PLANTED_KEY: &[u8; 32] = b"private-secret-private-secret-ab";
 
-/// Error text fragments. Any of them in the output means the `Display` of
-/// a configuration, TOML, OS, TLS or HTTP error reached the report.
-/// Matched without regard to case.
 pub const ERROR_FRAGMENTS: &[&str] = &[
-    // trawl-web's `ConfigError`.
     "failed to read config file",
     "failed to parse config file",
     "is referenced by config but not set",
@@ -59,15 +34,12 @@ pub const ERROR_FRAGMENTS: &[&str] = &[
     "cookie secret file error",
     "invalid fleet session value",
     "upstream ca file",
-    // TOML.
     "toml parse error",
     "invalid basic string",
-    // The OS.
     "os error",
     "no such file",
     "connection refused",
     "permission denied (os",
-    // reqwest, hyper and rustls.
     "error sending request",
     "client error (connect)",
     "tcp connect error",
@@ -81,34 +53,19 @@ pub const ERROR_FRAGMENTS: &[&str] = &[
 /// step the doctor takes has its own deadline of at most 11 s.
 const RUN_DEADLINE: Duration = Duration::from_secs(60);
 
-/// A `trawl-web` command with an empty environment.
 pub fn trawl_web() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_trawl-web"));
     command.env_clear();
     command
 }
 
-/// What one doctor run printed.
 #[derive(Debug)]
 pub struct Observed {
-    /// The exit status.
     pub code: i32,
-    /// Everything it wrote to stdout.
     pub stdout: String,
-    /// Everything it wrote to stderr.
     pub stderr: String,
 }
 
-/// Run `trawl-web` with `args` and exactly the environment `env`, check
-/// both output streams with [`assert_no_values`] for `planted`, and return
-/// what it printed.
-///
-/// The working directory is `HOME` when `env` sets it, so relative paths in
-/// a test's configuration resolve inside the test's own directory.
-///
-/// # Panics
-/// When the run leaks a value, does not finish within [`RUN_DEADLINE`],
-/// ends by a signal, or was seen with a child process.
 pub fn run_web_doctor<A, K, V>(args: &[A], env: &[(K, V)], planted: &[&str]) -> Observed
 where
     A: AsRef<OsStr>,
@@ -122,12 +79,6 @@ where
     observed
 }
 
-/// [`run_web_doctor`] as root in a user namespace, with `read_only`, when
-/// given, bind-mounted read-only over itself for the run.
-///
-/// # Panics
-/// As [`run_web_doctor`], and when the namespace set-up fails after
-/// [`Userns::probe`] succeeded.
 pub fn run_web_doctor_in_userns<A, K, V>(
     userns: &Userns,
     read_only: Option<&Path>,
@@ -153,8 +104,6 @@ where
     observed
 }
 
-/// Run `command`, a doctor run as built by [`trawl_web`] or [`Userns`],
-/// with `env` added, and watch it until it exits.
 fn observe<A, K, V>(mut command: Command, args: &[A], env: &[(K, V)]) -> Observed
 where
     A: AsRef<OsStr>,
@@ -230,8 +179,6 @@ fn read_all(stream: &mut impl std::io::Read) -> String {
     String::from_utf8_lossy(&bytes).into_owned()
 }
 
-/// Watches one process for children, on Linux through
-/// `/proc/<pid>/task/*/children`.
 struct ChildWatch {
     pid: u32,
     seen: BTreeSet<u32>,
@@ -271,14 +218,6 @@ impl ChildWatch {
     }
 }
 
-/// Fail when either stream shows [`SECRET`], a value in `planted`, an
-/// [`ERROR_FRAGMENTS`] entry, or the shape of a value no report may show
-/// ([`forbidden_shape`]: a catalog id, a certificate fingerprint, an IP
-/// address). So a test that did not think to plant its upstream's address
-/// is still covered.
-///
-/// # Panics
-/// When either stream contains one of them.
 pub fn assert_no_values(stdout: &str, stderr: &str, planted: &[&str]) {
     for (name, stream) in [("stdout", stdout), ("stderr", stderr)] {
         for value in std::iter::once(&SECRET).chain(planted) {
@@ -300,17 +239,11 @@ pub fn assert_no_values(stdout: &str, stderr: &str, planted: &[&str]) {
     }
 }
 
-// -- Root in a user namespace ----------------------------------------------
-
 /// The name that makes an unavailable user namespace a test failure rather
 /// than a skip. CI sets it, so a privileged test that did not run there is
 /// never counted as passing evidence.
 pub const REQUIRE_USERNS: &str = "TRAWL_TEST_REQUIRE_USERNS";
 
-/// Running the doctor as root inside an unprivileged user namespace:
-/// `unshare --user --map-root-user --mount`, which maps this test's uid to
-/// 0, so the doctor sees euid 0 and the files the test made as owned by
-/// root.
 #[derive(Debug, Clone)]
 pub struct Userns {
     unshare: PathBuf,
@@ -318,11 +251,6 @@ pub struct Userns {
     shell: PathBuf,
 }
 
-/// Inside the namespace: bind the directory `$2` onto itself read-only when
-/// it is not empty, then exec the rest of the arguments from the same
-/// working directory. `$1` is `mount`.
-/// Any failure ends the run before the doctor starts, with a status the
-/// doctor never exits with.
 const USERNS_SCRIPT: &str = r#"set -e
 mount="$1"
 ro="$2"
@@ -338,12 +266,6 @@ exec "$@"
 "#;
 
 impl Userns {
-    /// The namespace tools, once a probe proved this host lets this user
-    /// make the namespace, be root in it, and mount a directory read-only
-    /// there; otherwise why not.
-    ///
-    /// # Errors
-    /// The reason the namespace is unavailable.
     pub fn probe() -> Result<Self, String> {
         let find = |name: &str| {
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -361,8 +283,6 @@ impl Userns {
         let dir = tempfile::tempdir().map_err(|e| format!("a probe directory: {e}"))?;
         let probe = dir.path().join("probe");
         std::fs::write(&probe, b"probe").map_err(|e| format!("a probe file: {e}"))?;
-        // As root in the namespace, a write to the read-only bind mount must
-        // fail; `id -u` must say 0.
         let output = tools
             .command(Some(dir.path()))
             .args([
@@ -396,11 +316,6 @@ impl Userns {
         Ok(tools)
     }
 
-    /// [`Userns::probe`] for the test `test`: the tools, or `None` after
-    /// printing `SKIPPED: ...` when the namespace is unavailable.
-    ///
-    /// # Panics
-    /// When the namespace is unavailable and [`REQUIRE_USERNS`] is `1`.
     pub fn for_test(test: &str) -> Option<Self> {
         match Self::probe() {
             Ok(tools) => Some(tools),
@@ -414,8 +329,6 @@ impl Userns {
         }
     }
 
-    /// `unshare` with an empty environment, set to run [`USERNS_SCRIPT`]'s
-    /// arguments, with `read_only` bound read-only.
     fn command(&self, read_only: Option<&Path>) -> Command {
         let mut command = Command::new(&self.unshare);
         command.env_clear();
@@ -428,8 +341,6 @@ impl Userns {
         command
     }
 }
-
-// -- Proof that nothing was written ----------------------------------------
 
 /// One entry of a [`fs_snapshot`]: everything a write changes, and not the
 /// access time, which a read changes.
@@ -446,9 +357,7 @@ pub struct Entry {
     content: Vec<u8>,
 }
 
-/// Every entry under `root`, `root` itself included as `.`, by its path
-/// relative to `root`. Files the test cannot read (mode 000) are recorded
-/// without their content.
+/// Files the test cannot read (mode 000) are recorded without their content.
 pub fn fs_snapshot(root: &Path) -> BTreeMap<String, Entry> {
     use std::os::unix::fs::MetadataExt as _;
     fn walk(root: &Path, path: &Path, into: &mut BTreeMap<String, Entry>) {
@@ -503,11 +412,6 @@ pub fn fs_snapshot(root: &Path) -> BTreeMap<String, Entry> {
     entries
 }
 
-/// Fail, naming only the entries that differ, when `after` is not
-/// `before`.
-///
-/// # Panics
-/// When an entry was added, removed or changed.
 pub fn assert_unchanged(
     before: &BTreeMap<String, Entry>,
     after: &BTreeMap<String, Entry>,
@@ -542,38 +446,21 @@ pub fn assert_unchanged(
     );
 }
 
-// -- Fixtures ----------------------------------------------------------------
-
-/// The settings of a `trawld.toml` a web doctor test writes: the `[web]`
-/// block, and the `[server]` listen address the upstream URL derives from
-/// when `upstream_url` is unset.
 #[derive(Debug, Clone)]
 pub struct WebDoctorConfig {
-    /// `[server] http_addr`.
     pub http_addr: String,
     /// `[data] path`, which the schema requires and trawl-web ignores.
     pub data_path: PathBuf,
-    /// `[web] bind_addr`.
     pub bind_addr: Option<String>,
-    /// `[web] public_origins`.
     pub public_origins: Vec<String>,
-    /// `[web] upstream_url`.
     pub upstream_url: Option<String>,
-    /// `[web] upstream_connect_addr`.
     pub upstream_connect_addr: Option<String>,
-    /// `[web] upstream_ca_path`.
     pub upstream_ca_path: Option<PathBuf>,
-    /// `[web] cookie_secret_path`.
     pub cookie_secret_path: Option<PathBuf>,
-    /// `[web] cookie_secret_env`.
     pub cookie_secret_env: Option<String>,
-    /// `[web] session_ttl_secs`.
     pub session_ttl_secs: Option<u64>,
-    /// `[web] allow_insecure_cookies`.
     pub allow_insecure_cookies: bool,
-    /// `[web] shared_domain`.
     pub shared_domain: Option<String>,
-    /// TOML appended as it is, for settings the fields above do not name.
     pub extra: String,
 }
 
@@ -621,7 +508,6 @@ impl WebDoctorConfig {
     }
 }
 
-/// Write `config` as `dir/trawld.toml` and return its path.
 pub fn write_config(dir: &Path, config: &WebDoctorConfig) -> PathBuf {
     use std::fmt::Write as _;
     let quote = |path: &Path| toml_string(&path.to_string_lossy());
@@ -671,7 +557,6 @@ pub fn write_config(dir: &Path, config: &WebDoctorConfig) -> PathBuf {
     path
 }
 
-/// `value` as a TOML basic string.
 pub fn toml_string(value: &str) -> String {
     let mut quoted = String::from("\"");
     for c in value.chars() {
@@ -689,9 +574,6 @@ pub fn toml_string(value: &str) -> String {
     quoted
 }
 
-/// Write a cookie key file of `len` bytes at `path`, mode 0600: the start
-/// of [`PLANTED_KEY`], padded with `x` past 32 bytes. Its parent directory
-/// is created.
 pub fn write_key(path: &Path, len: usize) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
     let mut bytes = PLANTED_KEY.to_vec();
@@ -704,9 +586,6 @@ pub fn write_key(path: &Path, len: usize) -> PathBuf {
     path.to_owned()
 }
 
-/// Write a self-signed CA certificate whose subject is
-/// [`PLANTED_CA_SUBJECT`] at `path`, as PEM, and return the path. Its
-/// parent directory is created.
 pub fn write_ca(path: &Path) -> PathBuf {
     let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).expect("CA params");
     params
@@ -726,11 +605,8 @@ pub fn write_ca(path: &Path) -> PathBuf {
     path.to_owned()
 }
 
-/// The path of trawld's health endpoint, the one request the doctor sends.
 pub const HEALTH_PATH: &str = "/api/v1/health";
 
-/// trawld's healthy answer to `GET /api/v1/health`: `status: ok`, every
-/// check trawld reports `ok`, and a version.
 pub fn healthy_answer() -> wiremock::ResponseTemplate {
     let checks: serde_json::Map<String, serde_json::Value> =
         trawl_api::doctor::health::HEALTH_CHECK_NAMES
@@ -744,10 +620,6 @@ pub fn healthy_answer() -> wiremock::ResponseTemplate {
     }))
 }
 
-/// Every request `mock` saw is the anonymous probe: exactly
-/// `GET /api/v1/health`, no query, and no `Authorization`, `Cookie` or
-/// `Proxy-Authorization` header in any spelling. There are `expected` of
-/// them.
 pub async fn assert_anonymous_probes(mock: &wiremock::MockServer, expected: usize) {
     let requests = mock.received_requests().await.expect("recording on");
     assert_eq!(
@@ -774,7 +646,6 @@ pub async fn assert_anonymous_probes(mock: &wiremock::MockServer, expected: usiz
     }
 }
 
-/// Answer `GET /api/v1/health` on `mock` with `answer`.
 pub async fn serve_health(mock: &wiremock::MockServer, answer: wiremock::ResponseTemplate) {
     use wiremock::matchers::{method, path};
 
@@ -785,9 +656,6 @@ pub async fn serve_health(mock: &wiremock::MockServer, answer: wiremock::Respons
         .await;
 }
 
-/// A real rustls upstream serving [`healthy_answer`], under a fresh CA
-/// whose subject is [`PLANTED_CA_SUBJECT`]. Point `upstream_url` at its
-/// `url()` and pin its `ca_path()`, and both upstream checks pass.
 pub async fn healthy_upstream() -> crate::test_support::TlsUpstream {
     let ca = crate::test_support::TestCa::named(PLANTED_CA_SUBJECT);
     let upstream = crate::test_support::TlsUpstream::issued_by(&ca).await;
@@ -795,12 +663,10 @@ pub async fn healthy_upstream() -> crate::test_support::TlsUpstream {
     upstream
 }
 
-/// The environment of a doctor run in `home`: `HOME` alone.
 pub fn home_env(home: &Path) -> Vec<(&'static str, OsString)> {
     vec![("HOME", home.as_os_str().to_owned())]
 }
 
-/// The doctor's arguments for `config` in `format`.
 pub fn doctor_args(config: &Path, format: &str) -> [OsString; 5] {
     [
         "--doctor".into(),
@@ -811,13 +677,6 @@ pub fn doctor_args(config: &Path, format: &str) -> [OsString; 5] {
     ]
 }
 
-/// Run the doctor over `config` with `env`, in JSON and then in table
-/// form, each checked for `planted`, and return the exit status and the
-/// JSON report. Both forms must exit alike, the exit status must be the
-/// report's verdict, and a report run writes nothing to stderr.
-///
-/// # Panics
-/// As [`run_web_doctor`], and when the two runs disagree.
 pub fn doctor(config: &Path, env: &[(&str, OsString)], planted: &[String]) -> (i32, Report) {
     let planted: Vec<&str> = planted.iter().map(String::as_str).collect();
     let json = run_web_doctor(&doctor_args(config, "json"), env, &planted);
@@ -840,10 +699,6 @@ pub fn doctor(config: &Path, env: &[(&str, OsString)], planted: &[String]) -> (i
     (json.code, parsed)
 }
 
-/// Parse a JSON report the doctor printed.
-///
-/// # Panics
-/// When `stdout` is not one, or not the web vantage's.
 pub fn report(stdout: &str) -> Report {
     let report: Report = serde_json::from_str(stdout)
         .unwrap_or_else(|error| panic!("not a doctor report ({error}):\n{stdout}"));
@@ -855,10 +710,6 @@ pub fn report(stdout: &str) -> Report {
     report
 }
 
-/// The row `id` of `report`.
-///
-/// # Panics
-/// When there is none.
 pub fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
     report
         .checks()
@@ -867,14 +718,11 @@ pub fn row<'a>(report: &'a Report, id: &str) -> &'a Check {
         .unwrap_or_else(|| panic!("no {id} row: {report:?}"))
 }
 
-/// `(outcome, reason)` of one row.
 pub fn verdict<'a>(report: &'a Report, id: &str) -> (Outcome, Option<&'a str>) {
     let check = row(report, id);
     (check.outcome, check.reason.as_deref())
 }
 
-/// The ids of the checks every report carries, in order, before any
-/// `proxy.upstream.health.<key>` row.
 pub const CHECK_IDS: [&str; 7] = [
     "proxy.config",
     "proxy.identity",

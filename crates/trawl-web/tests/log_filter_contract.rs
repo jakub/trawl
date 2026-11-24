@@ -2,14 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The trawl-web log-filter contract.
-//!
-//! trawl-web is a separate process under its own tracing target, so it must
-//! never inherit trawld's target-only filter: that filter names no
-//! `trawl_web` target, and a non-empty target-only filter drops everything
-//! it does not name. These tests take the filter the Helm chart actually
-//! installs into the sidecar container and prove representative trawl-web
-//! diagnostics pass it.
+//! trawl-web must never inherit trawld's target-only filter: that filter names
+//! no `trawl_web` target, and a non-empty target-only filter drops everything
+//! it does not name.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -26,13 +21,9 @@ fn chart_dir() -> PathBuf {
         .expect("chart/trawl must exist relative to the crate")
 }
 
-/// The `RUST_LOG` the chart installs into the `trawl-web` sidecar.
-///
-/// Rendered with `helm template` when helm is on PATH — the real thing,
-/// values plumbing included. Only a missing helm binary falls back to
-/// reading `values.yaml`, so the contract is still enforced everywhere (a
-/// test that silently skips proves nothing) and a chart that fails to
-/// render is a failure, not a fallback.
+/// Only a missing helm binary falls back to reading `values.yaml`, so the
+/// contract is still enforced everywhere (a test that silently skips proves
+/// nothing).
 fn rendered_sidecar_rust_log() -> String {
     let chart = chart_dir();
     let rendered = Command::new("helm")
@@ -40,11 +31,8 @@ fn rendered_sidecar_rust_log() -> String {
         .arg(&chart)
         .args(["--show-only", "templates/statefulset.yaml"])
         .args(["--set-string", "image.tag=source-render-test"])
-        // Both DSN Secrets are `required`; the names are irrelevant here.
         .args(["--set", "auth.database.existingSecret=test-fleet-dsn"])
         .args(["--set", "storage.database.existingSecret=test-trawl-dsn"])
-        // The web sidecar refuses to render without a browser-origin
-        // allowlist (ADR-0016); the value is irrelevant here.
         .args([
             "--set-string",
             "web.publicOrigins[0]=https://trawl.example.com",
@@ -70,11 +58,6 @@ fn rendered_sidecar_rust_log() -> String {
     }
 }
 
-/// Pull `value:` for `env_name` out of the named container's block.
-///
-/// Container blocks start at `- name: <container>` and run until the next
-/// list item at the same indentation, which is enough structure to find one
-/// env var without pulling in a YAML parser.
 fn container_env_value(manifest: &str, container: &str, env_name: &str) -> Option<String> {
     let start_marker = format!("- name: {container}");
     let mut lines = manifest.lines();
@@ -88,7 +71,6 @@ fn container_env_value(manifest: &str, container: &str, env_name: &str) -> Optio
             continue;
         }
         let line_indent = line.len() - line.trim_start().len();
-        // Next container (same indentation, new list item) ends this block.
         if line_indent <= indent && trimmed.starts_with("- ") {
             return None;
         }
@@ -103,8 +85,6 @@ fn container_env_value(manifest: &str, container: &str, env_name: &str) -> Optio
     None
 }
 
-/// Read `parent.key` out of a values file: the first `key:` line indented
-/// under a top-level `parent:` mapping.
 fn nested_scalar(values: &str, parent: &str, key: &str) -> Option<String> {
     let parent_marker = format!("{parent}:");
     let mut lines = values.lines();
@@ -112,7 +92,7 @@ fn nested_scalar(values: &str, parent: &str, key: &str) -> Option<String> {
     let key_marker = format!("{key}:");
     for line in lines {
         if !line.starts_with([' ', '#']) && !line.trim().is_empty() {
-            return None; // left the block
+            return None;
         }
         let trimmed = line.trim_start();
         if let Some(value) = trimmed.strip_prefix(&key_marker) {
@@ -122,7 +102,6 @@ fn nested_scalar(values: &str, parent: &str, key: &str) -> Option<String> {
     None
 }
 
-/// Capture layer recording event targets.
 #[derive(Clone, Default)]
 struct CaptureLayer {
     targets: Arc<Mutex<Vec<String>>>,
@@ -149,9 +128,6 @@ fn targets_passing(directives: &str) -> Vec<String> {
     let subscriber = tracing_subscriber::registry().with(capture.with_filter(filter));
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    // Representative trawl-web diagnostics: startup, session, upstream —
-    // plus the origin rejection fleet_auth::session emits on the proxy's
-    // behalf, and dependency noise that must stay out.
     tracing::info!(target: "trawl_web", "trawl-web listening");
     tracing::warn!(target: "trawl_web::middleware::session", "session rejected");
     tracing::warn!(target: "trawl_web::routes::proxy", "upstream request failed");
@@ -199,9 +175,6 @@ fn representative_trawl_web_events_pass_the_installed_chart_filter() {
 
 #[test]
 fn trawld_filter_would_silence_the_sidecar() {
-    // Why the sidecar needs its own value: trawld's filter is target-only
-    // and names no trawl_web target, so inheriting it drops every proxy
-    // diagnostic.
     let targets =
         targets_passing("trawl_server=info,trawld=info,auth.backend=info,storage.backend=info");
     assert!(

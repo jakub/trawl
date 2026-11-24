@@ -2,35 +2,11 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! `trawl-web --doctor`: check, from where the web proxy runs, whether
-//! trawl-web will start, keep sessions, and reach trawld with a verified
-//! certificate (ADR-0047 and its 2026-09-28 amendment, #271).
+//! `trawl-web --doctor` (ADR-0047).
 //!
-//! `main` reaches [`run`] before it installs a tracing subscriber and
-//! before anything of startup runs. The doctor reads the `--config` file
-//! and the process environment, resolves them through
-//! [`Sources::resolve`], which has no side effect, and asks trawld's
-//! health endpoint through the production client. It resolves the listen
-//! address as startup's listener does but never binds it, never generates
-//! a session key, and writes nothing.
-//!
-//! The checks and their prerequisites are data ([`WebCheck`]). One
-//! [`Runner`] visits them in [`WebCheck::ALL`] order: a check whose
-//! prerequisite did not complete becomes `not_sampled`, reason `blocked`,
-//! naming that prerequisite, and never looks. `proxy.config` and
-//! `proxy.identity` are checked here; the rest belong to two groups, each
-//! in its own file and each writing rows only through the runner:
-//!
-//! - [`settings`]: the public origins, the cookie settings and the cookie
-//!   key.
-//! - [`upstream`]: the upstream's trust and its health.
-//!
-//! Each component row owns whatever error arrives in its slot of
-//! [`Sources`]; `proxy.config` owns the file's read and parse and the
-//! listen address. Every row is built from [`output`]'s constructors,
-//! which accept no free-form text, so no error text, origin, upstream URL,
-//! certificate name or key reaches the report. Every file is read through
-//! [`read`].
+//! Every row is built from [`output`]'s constructors, which accept no
+//! free-form text, so no error text, origin, upstream URL, certificate
+//! name or key reaches the report.
 
 use std::io::{self, Write};
 use std::net::ToSocketAddrs;
@@ -52,7 +28,6 @@ mod upstream;
 pub use output::Format;
 use output::{Row, SelectedPath, Selection, Text, UserName};
 
-/// The named checks `trawl-web --doctor` runs, in order.
 /// `proxy.upstream.health.<key>` rows are part of
 /// [`WebCheck::UpstreamHealth`] and share its prerequisite.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,7 +51,6 @@ pub enum WebCheck {
 }
 
 impl WebCheck {
-    /// Every check, in the order the runner visits them.
     pub const ALL: [Self; 7] = [
         Self::Config,
         Self::Identity,
@@ -87,7 +61,6 @@ impl WebCheck {
         Self::UpstreamHealth,
     ];
 
-    /// The stable id the report carries.
     #[must_use]
     pub const fn id(self) -> &'static str {
         match self {
@@ -117,28 +90,22 @@ impl WebCheck {
         }
     }
 
-    /// Whether the check may assert that the running user can read
-    /// something. Only the cookie key does, and only for a
-    /// `cookie_secret_path` file: its row carries [`Row::access`], and a
-    /// root run reports that row's `complete` as `not_sampled`, reason
-    /// `ran_as_root` (D12). A key from the environment is content.
+    /// Only the cookie key asserts access, and only for a `cookie_secret_path`
+    /// file: its row carries [`Row::access`], and a root run reports that
+    /// row's `complete` as `not_sampled`, reason `ran_as_root`.
     #[must_use]
     pub const fn is_access(self) -> bool {
         matches!(self, Self::CookieKey)
     }
 }
 
-/// The user the doctor runs as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RunAs {
-    /// The effective uid, where the platform has one.
     pub uid: Option<u32>,
-    /// Whether that uid is 0.
     pub root: bool,
 }
 
 impl RunAs {
-    /// The running process's effective user.
     #[must_use]
     pub fn current() -> Self {
         #[cfg(unix)]
@@ -159,30 +126,15 @@ impl RunAs {
     }
 }
 
-/// Everything the check groups share, built once `proxy.config` resolved
-/// the configuration.
-///
-/// The component slots are [`Sources`]' own, moved here whole: each holds
-/// its component's selection and source, or the error that component
-/// failed with, which only that component's row reports. A group takes
-/// what it needs from its own slots; no group reads another's.
-///
-/// - [`settings`] reads `public_origins`, `cookie_settings` and
-///   `cookie_key`.
-/// - [`upstream`] reads `upstream`, and `proxy.upstream.trust` fills
-///   `pinned_roots` for `proxy.upstream.health`.
+/// Each component slot holds its component's selection and source, or the
+/// error that component failed with, which only that component's row
+/// reports. No group reads another's slots.
 pub(crate) struct Ctx {
-    /// The `--config` path, as the report may name it.
     pub(crate) config_path: SelectedPath,
-    /// The user the doctor runs as.
     pub(crate) run_as: RunAs,
-    /// [`Sources::public_origins`]: `proxy.public_origins`.
     pub(crate) public_origins: Result<Origins, ConfigError>,
-    /// [`Sources::cookie_settings`]: `proxy.cookie_settings`.
     pub(crate) cookie_settings: Result<CookieSettings, ConfigError>,
-    /// [`Sources::cookie_key`]: `proxy.cookie_key`.
     pub(crate) cookie_key: Result<KeySource, ConfigError>,
-    /// [`Sources::upstream`]: `proxy.upstream.trust`.
     pub(crate) upstream: Result<UpstreamPlan, ConfigError>,
     /// Filled by `proxy.upstream.trust` when the trust source is a pinned
     /// CA file and it read and parsed: the roots the probe trusts, so the
@@ -214,8 +166,6 @@ impl std::fmt::Debug for Ctx {
     }
 }
 
-/// Leave to look at one check, from [`Runner::gate`]. Only the runner makes
-/// one, and [`Runner::record`] consumes it.
 #[derive(Debug)]
 #[must_use = "a gated check must record its row"]
 pub(crate) struct Gate {
@@ -223,26 +173,22 @@ pub(crate) struct Gate {
 }
 
 impl Gate {
-    /// The check this gate opens.
     pub(crate) const fn check(&self) -> WebCheck {
         self.check
     }
 }
 
-/// Visits the checks in [`WebCheck::ALL`] order and collects their rows.
 #[derive(Debug)]
 pub(crate) struct Runner {
     root: bool,
     /// Each check's own row, in order: what prerequisites are judged on.
     outcomes: Vec<(WebCheck, Outcome, Option<&'static str>)>,
-    /// The check gated and not yet recorded.
     open: Option<WebCheck>,
     rows: Vec<Row>,
     notes: Vec<String>,
 }
 
 impl Runner {
-    /// A runner for a run as `run_as`.
     pub(crate) fn new(run_as: RunAs) -> Self {
         Self {
             root: run_as.root,
@@ -253,12 +199,6 @@ impl Runner {
         }
     }
 
-    /// Ask to look at `check`, the next check in [`WebCheck::ALL`].
-    ///
-    /// When a prerequisite is not satisfied, the runner records `check` as
-    /// `not_sampled`, reason `blocked`, naming the first such prerequisite,
-    /// and returns `None`: the check does not look.
-    ///
     /// # Panics
     /// When `check` is not the next check, or the last gate was not
     /// recorded. Both are bugs in a group, never input.
@@ -281,10 +221,6 @@ impl Runner {
         Some(Gate { check })
     }
 
-    /// Record the row of a gated check.
-    ///
-    /// # Panics
-    /// When the row is not the gated check's own row.
     pub(crate) fn record(&mut self, gate: Gate, row: Row) {
         self.record_with(gate, row, Vec::new());
     }
@@ -292,14 +228,6 @@ impl Runner {
     /// Record the row of a gated check and its per-key rows, such as
     /// `proxy.upstream.health` and its `proxy.upstream.health.<key>` rows.
     /// The check's own row is what its dependents are judged on.
-    ///
-    /// Run as root, an own row marked [`Row::access`] that is `complete`
-    /// is recorded as `not_sampled`, reason `ran_as_root`.
-    ///
-    /// # Panics
-    /// When `row` is not the gated check's own row, a keyed row belongs to
-    /// another check, or a row carries the access mark on a check that
-    /// asserts no access.
     #[expect(
         clippy::needless_pass_by_value,
         reason = "taking the gate by value spends it: one row per gate"
@@ -326,7 +254,6 @@ impl Runner {
         self.rows.extend(keyed);
     }
 
-    /// The outcome and reason `check` recorded, once it has.
     pub(crate) fn outcome(&self, check: WebCheck) -> Option<(Outcome, Option<&'static str>)> {
         self.outcomes
             .iter()
@@ -354,7 +281,6 @@ impl Runner {
         self.rows.push(row);
     }
 
-    /// Every check has a row: build the report.
     fn finish(self, target: Target) -> Report {
         assert_eq!(
             self.outcomes.len(),
@@ -366,8 +292,6 @@ impl Runner {
     }
 }
 
-/// How long the doctor waits, at exit, for blocking work still running,
-/// such as a file read past its deadline.
 const SHUTDOWN_BUDGET: Duration = Duration::from_secs(1);
 
 /// How long expanding `~` in the `--config` path may take: a file read's
@@ -385,10 +309,6 @@ const LISTEN_RESOLVE_DEADLINE: Duration = read::READ_DEADLINE;
 /// database can be a network service.
 const USER_LOOKUP_DEADLINE: Duration = Duration::from_secs(2);
 
-/// Run `trawl-web --doctor --config <config>` and return its exit status:
-/// 0 pass, 1 fail, 3 incomplete (ADR-0047). `config` is the argument as
-/// given; `proxy.config` expands its `~`.
-///
 /// Call on the main thread, before any runtime or subscriber exists.
 #[must_use]
 pub fn run(config: &Path, format: Option<Format>) -> u8 {
@@ -418,12 +338,9 @@ pub fn run(config: &Path, format: Option<Format>) -> u8 {
     report.verdict().exit_code()
 }
 
-/// The one line the doctor's panic hook prints.
 const PANIC_LINE: &str = "[trawl-web] doctor stopped a check: an internal error occurred";
 
-/// Replace the default panic hook, which prints the panic's message and
-/// location, with one that writes [`PANIC_LINE`] to `sink` and nothing
-/// else. A dependency's panic message can quote what it was given, such as
+/// A dependency's panic message can quote what it was given, such as
 /// an upstream URL, so no part of it reaches the output.
 fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
     std::panic::set_hook(Box::new(move |_| {
@@ -431,8 +348,6 @@ fn install_panic_hook<W: Write>(sink: impl Fn() -> W + Send + Sync + 'static) {
     }));
 }
 
-/// Run every check and build the report. Nothing is rendered until the
-/// whole report exists. `config_arg` is the `--config` argument as given.
 pub async fn check(config_arg: &Path) -> Report {
     let run_as = RunAs::current();
     let mut runner = Runner::new(run_as);
@@ -460,7 +375,6 @@ pub async fn check(config_arg: &Path) -> Report {
         settings::run(&mut runner, &mut ctx).await;
         upstream::run(&mut runner, &mut ctx).await;
     } else {
-        // Every other check reads the configuration, so each is blocked.
         for check in &WebCheck::ALL[2..] {
             let gate = runner.gate(*check);
             assert!(
@@ -476,26 +390,10 @@ pub async fn check(config_arg: &Path) -> Report {
     })
 }
 
-/// Expand `~` in `path` as startup expands the `--config` path. With HOME
-/// unset or empty, `~` resolves through the password database.
 fn tilde_path(path: &Path) -> PathBuf {
     PathBuf::from(shellexpand::tilde(&path.to_string_lossy()).into_owned())
 }
 
-/// `proxy.config`: expand `~` in the `--config` argument, read the file
-/// through the bounded reader, parse it as the whole schema, observe the
-/// environment once, and resolve the sources as startup does. Expanding
-/// runs on the blocking pool under [`VALIDATE_DEADLINE`]. Resolving the
-/// sources looks nothing up: the key and pin paths stay as written until
-/// their reads. The selected listen address then resolves as startup's
-/// listener resolves it ([`listen_addr_resolves`]), on the blocking pool
-/// under [`LISTEN_RESOLVE_DEADLINE`], and is never bound.
-///
-/// The row owns the file's read and parse and the listen address; every
-/// other component's error stays in its slot for its own row. Returns the
-/// `--config` path as the report names it, expanded when the expansion
-/// finished, and the sources when the file parsed and the listen address
-/// resolved.
 async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<Sources>) {
     let gate = runner
         .gate(WebCheck::Config)
@@ -571,8 +469,6 @@ async fn check_config(runner: &mut Runner, arg: &Path) -> (SelectedPath, Option<
     }
 }
 
-/// The `proxy.config` row for a `--config` file the bounded reader did not
-/// read.
 fn config_read_fault(fault: read::ReadFault) -> Row {
     use read::ReadFault;
     let check = WebCheck::Config;
@@ -626,9 +522,8 @@ fn listen_addr_resolves(addr: &str) -> bool {
         .is_ok_and(|mut found| found.next().is_some())
 }
 
-/// The `proxy.config` row for a selected listen address that does not
-/// resolve, naming where it came from. Neither the address nor the
-/// resolver's error is shown: both quote the operator's text.
+/// Neither the address nor the resolver's error is shown: both quote the
+/// operator's text.
 fn unresolved_listen_addr(from: SettingSource) -> Row {
     Row::failed(
         WebCheck::Config,
@@ -640,16 +535,12 @@ fn unresolved_listen_addr(from: SettingSource) -> Row {
     ))
 }
 
-/// Why blocking work gave no answer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Unfinished {
-    /// It was still running at the deadline, and was left behind.
     TimedOut,
-    /// It panicked.
     Panicked,
 }
 
-/// Run `work` on the blocking pool and wait at most `deadline` for it.
 /// Work past the deadline is left on its thread, which the runtime's
 /// bounded shutdown ([`SHUTDOWN_BUDGET`]) does not wait out.
 async fn blocking_within<T: Send + 'static>(
@@ -663,8 +554,6 @@ async fn blocking_within<T: Send + 'static>(
     }
 }
 
-/// The `proxy.config` row for a blocking step that gave no answer; `what`
-/// says which step, when it ran out of time.
 fn unfinished_config(unfinished: Unfinished, what: &'static str) -> Row {
     let check = WebCheck::Config;
     match unfinished {
@@ -673,12 +562,6 @@ fn unfinished_config(unfinished: Unfinished, what: &'static str) -> Row {
     }
 }
 
-/// `proxy.identity`: the effective uid and, when the password database
-/// answers in time with a plain name, the user name.
-///
-/// Run as root it is `not_sampled`, reason `ran_as_root`, always (D12):
-/// root reads what the service user may not, so a root run proves nothing
-/// about the service's access and never exits 0. Otherwise `complete`.
 async fn check_identity(runner: &mut Runner, run_as: RunAs) {
     let gate = runner
         .gate(WebCheck::Identity)
@@ -708,9 +591,6 @@ async fn check_identity(runner: &mut Runner, run_as: RunAs) {
     runner.record(gate, row);
 }
 
-/// The name of `uid` in the password database, on the blocking pool under
-/// [`USER_LOOKUP_DEADLINE`]. `None` when there is none, it is not a plain
-/// name, or the lookup failed or ran out of time.
 async fn user_name(uid: u32) -> Option<UserName> {
     #[cfg(unix)]
     {
@@ -737,10 +617,6 @@ async fn user_name(uid: u32) -> Option<UserName> {
 mod tests {
     use super::*;
 
-    /// The graph is data: ids are unique and stable, every prerequisite
-    /// comes earlier in `ALL`, the edges are the design's (D14), only the
-    /// cookie key is an access check, and the two groups cover every check
-    /// after config and identity, in order.
     #[test]
     fn web_checks_form_an_ordered_graph() {
         use WebCheck as C;
@@ -796,7 +672,6 @@ mod tests {
         }
     }
 
-    /// Record `row` for `check`, or nothing when the runner blocked it.
     fn step(runner: &mut Runner, check: WebCheck, row: impl FnOnce() -> Row) {
         if let Some(gate) = runner.gate(check) {
             runner.record(gate, row());
@@ -825,8 +700,6 @@ mod tests {
         }
     }
 
-    /// Every check gets exactly one row, in order, plus the keyed rows its
-    /// own row brings; the report is the web vantage's.
     #[test]
     fn every_check_gets_exactly_one_row() {
         use WebCheck as C;
@@ -917,8 +790,6 @@ mod tests {
         let _ = runner.finish(target());
     }
 
-    /// A check that did not complete blocks its dependents, transitively,
-    /// each naming its own first unsatisfied prerequisite, and never looks.
     #[test]
     fn a_prerequisite_that_did_not_complete_blocks_its_dependents() {
         use WebCheck as C;
@@ -958,7 +829,6 @@ mod tests {
         );
         assert_eq!(report.verdict(), trawl_api::doctor::Verdict::Fail);
 
-        // A failed config blocks every component, naming the config.
         let mut runner = Runner::new(run_as(false));
         step(&mut runner, C::Config, || {
             Row::failed(C::Config, "the configuration does not parse")
@@ -980,9 +850,6 @@ mod tests {
         }
     }
 
-    /// Run as root, only a `complete` row marked as asserting access
-    /// becomes `not_sampled`, `ran_as_root`; content rows keep their
-    /// outcome, a failed access row stays failed, and the run cannot pass.
     #[test]
     fn a_root_run_samples_content_not_access() {
         use WebCheck as C;
@@ -1011,7 +878,6 @@ mod tests {
         }
         assert_eq!(report.verdict(), trawl_api::doctor::Verdict::Incomplete);
 
-        // A key from the environment is content: complete, even as root.
         let mut runner = Runner::new(run_as(true));
         for check in &C::ALL[..5] {
             step(&mut runner, *check, || Row::complete(*check));
@@ -1021,7 +887,6 @@ mod tests {
             Some((Outcome::Complete, None))
         );
 
-        // A failed access row stays failed as root.
         let mut runner = Runner::new(run_as(true));
         for check in &C::ALL[..4] {
             step(&mut runner, *check, || Row::complete(*check));
@@ -1035,8 +900,6 @@ mod tests {
         );
     }
 
-    /// Run as root, the identity row is `not_sampled`, `ran_as_root`, so
-    /// no root run exits 0 (D12); as another user it is `complete`.
     #[tokio::test]
     async fn identity_as_root_is_never_complete() {
         for (root, outcome) in [(true, Outcome::NotSampled), (false, Outcome::Complete)] {
@@ -1053,9 +916,8 @@ mod tests {
         }
     }
 
-    /// A panic under the doctor's hook writes the fixed line and nothing of
-    /// its message or location. The hook is process-global, so another
-    /// test panicking meanwhile may add lines; each must be the fixed one.
+    /// The hook is process-global, so another test panicking meanwhile may
+    /// add lines; each must be the fixed one.
     #[test]
     fn the_panic_hook_prints_only_a_fixed_line() {
         use std::sync::{Arc, Mutex};
@@ -1089,8 +951,6 @@ mod tests {
         }
     }
 
-    /// Work that outlives its deadline costs the step its answer and does
-    /// not hold the run; work that finishes answers.
     #[tokio::test]
     async fn blocking_work_past_its_deadline_is_timed_out() {
         let (release, blocked) = std::sync::mpsc::channel::<()>();
@@ -1116,7 +976,6 @@ mod tests {
         );
     }
 
-    /// `Ctx`'s `Debug` shows no configured value.
     #[test]
     fn ctx_debug_shows_no_value() {
         let ctx = Ctx {
@@ -1140,8 +999,7 @@ mod tests {
         assert!(!shown.contains("PRIVATE"), "{shown}");
     }
 
-    /// The source files of the doctor, as compiled, and their names. The
-    /// directory must hold exactly these, so a new file joins the guard.
+    /// The directory must hold exactly these, so a new file joins the guard.
     const DOCTOR_SOURCES: [(&str, &str); 5] = [
         ("mod.rs", include_str!("mod.rs")),
         ("output.rs", include_str!("output.rs")),
@@ -1150,14 +1008,10 @@ mod tests {
         ("upstream.rs", include_str!("upstream.rs")),
     ];
 
-    /// Words the doctor's code must not contain (D15), in any path or
-    /// import: startup's configuration, state, key generation and log
-    /// setup; listeners and sockets; every call that creates, writes,
-    /// moves or removes a file; and `macro_rules`. A macro such as `write!`
-    /// is not a call of the same name: it formats into the sink it is
-    /// given. `macro_rules!` is refused with its `!`: the doctor declares
-    /// no macro, and one could rewrite what the scan reads, such as
-    /// unwrapping a test module into running code.
+    /// A macro such as `write!` is not a call of the same name: it formats
+    /// into the sink it is given. `macro_rules!` is refused with its `!`: the
+    /// doctor declares no macro, and one could rewrite what the scan reads,
+    /// such as unwrapping a test module into running code.
     const FORBIDDEN_WORDS: [&str; 31] = [
         "ResolvedConfig",
         "AppState",
@@ -1192,7 +1046,6 @@ mod tests {
         "macro_rules",
     ];
 
-    /// The one forbidden word refused even as a macro: it defines macros.
     const MACRO_DEFINITION: &str = "macro_rules";
 
     /// Modules whose items the doctor names only as `module::Item` with the
@@ -1374,9 +1227,6 @@ mod tests {
         code
     }
 
-    /// What `source`'s runtime code names that D15 forbids: each forbidden
-    /// word, and each file-system or network path that is not a listed
-    /// `module::Item`.
     fn violations(source: &str) -> Vec<String> {
         let code = runtime_tokens(source);
         let mut found = Vec::new();
@@ -1402,25 +1252,6 @@ mod tests {
         found
     }
 
-    /// The doctor's code names none of startup's side effects (D15): the
-    /// running configuration or state, its only constructor, key
-    /// generation, log setup, a listener, a socket, or a file write, and
-    /// reaches the file system and the network only through listed items.
-    ///
-    /// Threat model. This is a drift guard against honest mistakes by the
-    /// people who write this crate: a later change that imports a write,
-    /// reaches for `ResolvedConfig`, or binds a socket, in whatever
-    /// spelling came naturally. It reads tokens, not a parsed crate, so it
-    /// is not a scanner for deliberately obfuscated code, and it does not
-    /// try to be: code written to hide a write from it (a macro from
-    /// another crate, a `cfg` trick, a build script) is out of its scope,
-    /// and the answer to such code is review, not another guard rule. Its
-    /// rules close the spellings review has shown to be plausible slips:
-    /// grouped and renamed imports, raw identifiers, code after the test
-    /// module, and a test module that a macro could unwrap, which is why
-    /// `macro_rules` is refused and only a top-level test module is left
-    /// out of the scan.
-    ///
     /// The behavioral proof that the doctor never binds, never generates a
     /// key and never writes is not this guard. It is the subprocess tests,
     /// which run the real binary against filesystem snapshots:
@@ -1454,17 +1285,11 @@ mod tests {
             );
         }
 
-        // The scan sees code and skips tests and comments.
         let planted = "fn f() {\n    // AppState is fine here\n    let s = App\
                        State::new();\n}\n#[cfg(test)]\nmod tests {\n    fs::write(x);\n}\n";
         assert_eq!(violations(planted), ["AppState"]);
     }
 
-    /// Each way around a text scan that review named is caught: code after
-    /// the test module, grouped and aliased imports of the file system and
-    /// the network, and a write spelled without its module. Comments,
-    /// literals, macros and the test module itself are not code the doctor
-    /// runs, and stay out of the scan.
     #[test]
     fn the_guard_sees_through_every_spelling() {
         let caught = [
@@ -1517,8 +1342,6 @@ mod tests {
             assert!(!violations(planted).is_empty(), "missed {name}");
         }
 
-        // A test module inside another item or a macro call is scanned: a
-        // macro from elsewhere could unwrap it too.
         for nested in [
             "other::unwrap! {\n    #[cfg(test)]\n    mod tests {\n        fn f() {\n            std::fs::write(p, b).ok();\n        }\n    }\n}\n",
             "other::unwrap!(#[cfg(test)] mod tests { fn f() { std::fs::write(p, b).ok(); } });\n",

@@ -2,26 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The session settings: `proxy.public_origins`, `proxy.cookie_settings`
-//! and `proxy.cookie_key` (#271, D7, D8).
-//!
-//! Each row reads only its own slot of [`Ctx`], which holds what
-//! [`crate::config::Sources::resolve`] selected, or the error that
-//! component failed with. A row reports sources and counts, never a
-//! value: no origin, no cookie domain, no key, and a `cookie_secret_env`
-//! name only through [`EnvName`]. No `ConfigError` is formatted; each
-//! variant maps to a fixed sentence, with at most an entry index or a
-//! crate constant's variable name and fleet-auth's static reason.
-//!
-//! The cookie key is the one row that reads a file: `cookie_secret_path`,
-//! through [`read::secret_len`] with the key's cap, which expands `~` in
-//! the path, reads the bytes into a scrubbed buffer on the blocking thread
-//! and returns only their count. The row shows the path as written, the
-//! form the operator finds in the file. That row carries the access mark, so a
-//! root run reports its `complete` as `not_sampled`, `ran_as_root` (D12).
-//! Nothing here generates a key: no key source is `not_configured`,
-//! `ephemeral_each_start`.
-
 use fleet_auth::{
     ENV_SESSION_AEAD_KEY, ENV_SESSION_COOKIE_DOMAIN, ENV_SESSION_COOKIE_PATH,
     ENV_SESSION_COOKIE_SECURE, ENV_SESSION_PUBLIC_ORIGINS, KEY_LEN, PublicOriginsError,
@@ -43,7 +23,6 @@ pub(super) const CHECKS: [WebCheck; 3] = [
     WebCheck::CookieKey,
 ];
 
-/// Run the group's checks, each through the runner's gate.
 pub(super) async fn run(runner: &mut Runner, ctx: &mut Ctx) {
     for check in CHECKS {
         let Some(gate) = runner.gate(check) else {
@@ -59,17 +38,10 @@ pub(super) async fn run(runner: &mut Runner, ctx: &mut Ctx) {
     }
 }
 
-/// "origin" or "origins", for `n` of them.
 const fn origins_word(n: usize) -> &'static str {
     if n == 1 { " origin" } else { " origins" }
 }
 
-// -- proxy.public_origins ------------------------------------------------------
-
-/// `proxy.public_origins`: a non-empty, valid allowlist resolved. The row
-/// names its source, the count, and whether the environment replaced the
-/// file's list; never an entry. A refused list names the failing entry's
-/// index, never the entry.
 fn public_origins(ctx: &Ctx) -> Row {
     let check = WebCheck::PublicOrigins;
     let from_file = || Text::new("[web] public_origins in ").path(&ctx.config_path);
@@ -164,28 +136,18 @@ fn public_origins(ctx: &Ctx) -> Row {
         ConfigError::EnvUtf8 { .. } => Row::failed(check, "the origin list is not UTF-8 text")
             .source(from_env())
             .next(fix_env()),
-        // Resolving the origins produces no other error; the slot's owner
-        // still reports one, in a fixed sentence.
         _ => Row::failed(check, "the origin list does not resolve").source(from_file()),
     }
 }
 
-// -- proxy.cookie_settings -----------------------------------------------------
-
-/// The `FLEET_SESSION_*` variables the cookie settings read, so an error
-/// that carries one's name as a `String` names it as the constant.
 const COOKIE_VARIABLES: [&str; 3] = [
     ENV_SESSION_COOKIE_PATH,
     ENV_SESSION_COOKIE_SECURE,
     ENV_SESSION_COOKIE_DOMAIN,
 ];
 
-/// `proxy.cookie_settings`: the cookie's Secure flag, domain, path and
-/// lifetime resolved, each reported with its source; a shared domain is
-/// named as such, never by value.
-///
 /// Secure off while any effective public origin is not loopback is
-/// `failed` (D8): a browser on another host would send the session cookie
+/// `failed`: a browser on another host would send the session cookie
 /// in the clear.
 fn cookie_settings(ctx: &Ctx) -> Row {
     let check = WebCheck::CookieSettings;
@@ -229,7 +191,6 @@ fn cookie_settings(ctx: &Ctx) -> Row {
         .next(next)
 }
 
-/// Every cookie setting and where it came from, in fixed words.
 fn settings_detail(settings: &CookieSettings) -> Text {
     let from = |text: Text, source: SettingSource| text.lit(" (").setting(source).lit(")");
     let text = Text::new("Secure ").lit(if settings.secure { "on" } else { "off" });
@@ -249,9 +210,6 @@ fn settings_detail(settings: &CookieSettings) -> Text {
     from(text, settings.ttl_from)
 }
 
-/// The `proxy.cookie_settings` row for an error in its slot: a
-/// `FLEET_SESSION_COOKIE_*` variable that does not parse, named with
-/// fleet-auth's static reason and never its value.
 fn cookie_settings_fault(error: &ConfigError) -> Row {
     let check = WebCheck::CookieSettings;
     let named = |name: &'static str| {
@@ -273,20 +231,12 @@ fn cookie_settings_fault(error: &ConfigError) -> Row {
                 None => row,
             }
         }
-        // Resolving the cookie settings produces no other error; the
-        // slot's owner still reports one, in a fixed sentence.
         _ => Row::failed(check, "the session cookie settings do not resolve"),
     }
 }
 
-// -- proxy.cookie_key ----------------------------------------------------------
-
-/// What to do when no key survives a restart. The spec fixes the words.
 const PERSIST_KEY: &str = "set `cookie_secret_path` so sessions survive restarts";
 
-/// `proxy.cookie_key`: a persistent key source is selected and usable,
-/// in startup's precedence (D7). The row names the source: the variable,
-/// or the file's path. It never generates a key.
 async fn cookie_key(ctx: &Ctx) -> Row {
     let check = WebCheck::CookieKey;
     match &ctx.cookie_key {
@@ -297,8 +247,6 @@ async fn cookie_key(ctx: &Ctx) -> Row {
         Ok(KeySource::File { path }) => {
             // Shown as written; `~` expands on the reading thread.
             let shown = SelectedPath::new(Selection::CookieSecretPath, path);
-            // Only the length is judged, so only the length comes back:
-            // the bytes are scrubbed on the reading thread.
             let len = read::secret_len(path.clone(), read::cap::KEY).await;
             key_file_row(ctx, &shown, len)
         }
@@ -311,9 +259,6 @@ async fn cookie_key(ctx: &Ctx) -> Row {
     }
 }
 
-/// The row for an error in the cookie key's slot: `FLEET_SESSION_AEAD_KEY`
-/// set to what is not a key. Selected first, it fails the component with
-/// no fallback to the configured sources, as at startup.
 fn fleet_env_key_fault(error: &ConfigError) -> Row {
     let check = WebCheck::CookieKey;
     let fix = Text::new("set ")
@@ -323,16 +268,11 @@ fn fleet_env_key_fault(error: &ConfigError) -> Row {
         ConfigError::EnvUtf8 { .. } => Row::failed(check, "the session key is not UTF-8 text"),
         ConfigError::EnvKey { .. } => Row::failed(check, "the session key is not valid")
             .detail(Text::new("expected the base64 of exactly 32 bytes")),
-        // Selecting the key source produces no other error; the slot's
-        // owner still reports one, in a fixed sentence.
         _ => Row::failed(check, "the session key does not resolve"),
     };
     row.source(Text::new(ENV_SESSION_AEAD_KEY)).next(fix)
 }
 
-/// The key from the variable `[web] cookie_secret_env` names, read here
-/// as startup reads it. The name is shown only through [`EnvName`]; the
-/// key is dropped at once.
 fn config_env_key(ctx: &Ctx, name: &str) -> Row {
     let check = WebCheck::CookieKey;
     let shown = EnvName::new(name);
@@ -367,18 +307,11 @@ fn config_env_key(ctx: &Ctx, name: &str) -> Row {
             "the variable cookie_secret_env names does not hold a key",
         )
         .detail(Text::new("expected the base64 of exactly 32 bytes")),
-        // Reading the variable produces no other error; the slot's owner
-        // still reports one, in a fixed sentence.
         Err(_) => Row::failed(check, "the session key does not resolve"),
     };
     row.source(source).next(fix())
 }
 
-/// The row for the `cookie_secret_path` file, from how many bytes the
-/// bounded read returned, or why it returned none. Every row of a file
-/// source carries the access mark: only a `complete` one asserts that
-/// the running user may read the key, and a root run reports that
-/// `complete` as `not_sampled`, `ran_as_root`.
 fn key_file_row(ctx: &Ctx, shown: &SelectedPath, read: Result<usize, ReadFault>) -> Row {
     let check = WebCheck::CookieKey;
     let not_a_key = "the key file is not 32 bytes";
@@ -471,7 +404,6 @@ mod tests {
         }
     }
 
-    /// Run config and identity as complete, then this group, as `run_as`.
     async fn settings_rows(ctx: &mut Ctx, root: bool) -> Runner {
         let mut runner = Runner::new(RunAs {
             uid: Some(if root { 0 } else { 1000 }),
@@ -485,8 +417,6 @@ mod tests {
         runner
     }
 
-    /// No key source is `not_configured`, which never fails a run: with
-    /// every other check complete, the verdict is a pass, exit 0 (AC6).
     #[tokio::test]
     async fn no_key_source_can_still_pass() {
         let mut ctx = ctx(&["https://trawl.example.com"], true, KeySource::None);
@@ -513,8 +443,6 @@ mod tests {
         assert_eq!(key.next_action.as_deref(), Some(PERSIST_KEY));
     }
 
-    /// The Secure rule (D8): Secure off fails only when an effective
-    /// origin is not loopback; `localhost`, 127/8 and `[::1]` are.
     #[tokio::test]
     async fn insecure_cookies_fail_only_off_loopback() {
         let cases: [(&[&str], bool, Outcome); 5] = [
@@ -540,9 +468,6 @@ mod tests {
         }
     }
 
-    /// A key from the environment is content, so a root run still reports
-    /// it `complete`; a key file's `complete` is access, so a root run
-    /// reports it `not_sampled`, `ran_as_root` (D12).
     #[tokio::test]
     async fn only_a_key_file_is_access() {
         let key = SessionKey::from_bytes([7; KEY_LEN]);

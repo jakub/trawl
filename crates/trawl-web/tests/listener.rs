@@ -3,12 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The proxy's listener deadline and shutdown, through the production
-//! serving function (ADR-0054, amended 2026-10-17).
-//!
-//! Each case binds a loopback port, serves the production router on it
-//! through `trawl_web::listener::serve` with a deadline short enough to
-//! wait out, and talks to it over a plain TCP stream with hand-written
-//! HTTP/1.1. Only `/healthz` is asked, so no upstream exists.
+//! serving function (ADR-0054).
 
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -23,7 +18,6 @@ use trawl_web::listener::{ConnectionTimeouts, serve};
 use trawl_web::routes;
 use trawl_web::state::AppState;
 
-/// A deadline a case can wait out several times over.
 const SHORT: ConnectionTimeouts = ConnectionTimeouts {
     header_read: Duration::from_millis(500),
 };
@@ -39,7 +33,6 @@ fn no_sooner_than(deadline: Duration) -> Duration {
     deadline.mul_f32(0.8)
 }
 
-/// The production router over a state that dials no upstream.
 fn router() -> axum::Router {
     let web = WebConfig {
         upstream_url: Some("https://127.0.0.1:9".to_owned()),
@@ -51,8 +44,6 @@ fn router() -> axum::Router {
     routes::build(AppState::from_config(cfg).expect("the fixture state builds"))
 }
 
-/// Serve the router on a loopback port at `timeouts`: its address, the
-/// sender that shuts it down, and the serve task.
 async fn spawn(
     timeouts: ConnectionTimeouts,
 ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
@@ -83,14 +74,12 @@ async fn closed_within(stream: &mut TcpStream, within: Duration) -> Result<Vec<u
     }
 }
 
-/// One `/healthz` exchange on `stream`, which must stay open after it.
 async fn healthz(stream: &mut TcpStream) {
     stream
         .write_all(b"GET /healthz HTTP/1.1\r\nhost: localhost\r\n\r\n")
         .await
         .unwrap();
     let mut raw = Vec::new();
-    // The whole answer: the head, then the two-byte body `ok`.
     while !raw.ends_with(b"\r\n\r\nok") {
         let mut buf = [0_u8; 1024];
         let n = tokio::time::timeout(SLACK, stream.read(&mut buf))
@@ -105,8 +94,6 @@ async fn healthz(stream: &mut TcpStream) {
     assert!(!head.contains("connection: close"), "{head}");
 }
 
-/// A request whose headers keep arriving one byte at a time is dropped at
-/// the header deadline all the same: progress does not move it.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_drops_partial_headers_despite_byte_progress() {
     let (addr, _shutdown, task) = spawn(SHORT).await;
@@ -120,8 +107,7 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
     let trickle = Duration::from_millis(50);
     let mut trickled = 0_usize;
     let closed_after = loop {
-        // One byte of a header that never ends, then a short wait for the
-        // server's close. A write error after the close is the close.
+        // A write error after the close is the close.
         if stream.write_all(b"a").await.is_err() {
             break started.elapsed();
         }
@@ -153,8 +139,6 @@ async fn listener_drops_partial_headers_despite_byte_progress() {
     task.abort();
 }
 
-/// After one complete exchange, a connection left idle is closed at the
-/// header deadline: hyper arms the timer again for the next request.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_closes_idle_keep_alive() {
     let (addr, _shutdown, task) = spawn(SHORT).await;
@@ -178,8 +162,6 @@ async fn listener_closes_idle_keep_alive() {
     task.abort();
 }
 
-/// The shutdown future stops the listener and closes an idle keep-alive
-/// connection at once, without waiting out the header deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn listener_shutdown_closes_idle_connections_and_returns() {
     let long = ConnectionTimeouts {

@@ -2,13 +2,9 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! SPA asset delivery with precompressed representation negotiation.
-//!
-//! `rust-embed` bakes `../trawl-web-ui/dist/` into the production binary.
 //! Release builds add `.br` and `.gz` sidecars with `cargo xtask
 //! compress-web`; this module chooses the best representation accepted by
-//! the browser without compressing on the request path. The
-//! `TRAWL_WEB_SPA_DIR` development override uses the same code and headers.
+//! the browser without compressing on the request path.
 
 use std::cmp::Reverse;
 use std::path::{Component, Path, PathBuf};
@@ -55,7 +51,6 @@ impl Encoding {
     }
 }
 
-/// Serve an embedded SPA path, falling back to `index.html` for deep links.
 #[must_use]
 pub fn serve_embedded(
     request_path: &str,
@@ -81,11 +76,8 @@ pub fn serve_embedded(
     })
 }
 
-/// Serve a disk-backed SPA path with the same negotiation as embedded assets.
-///
-/// Used by `TRAWL_WEB_SPA_DIR` and exposed so integration tests can verify the
-/// production HTTP contract without compiling generated `dist/` files into
-/// the test binary.
+/// Exposed so integration tests can verify the production HTTP contract
+/// without compiling generated `dist/` files into the test binary.
 pub async fn serve_from_dir(
     root: &Path,
     request_path: &str,

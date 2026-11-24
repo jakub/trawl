@@ -16,13 +16,8 @@ axum = { workspace = true }
 blake3 = { workspace = true }
 chrono = { workspace = true }
 clap = { workspace = true }
-# Session cookie AEAD + cookie builders + origin validation come from the
-# shared substrate. `session` only — no pg pool, no keystore, no axum
-# handlers (the thin proxy validates keys via upstream /whoami instead).
 fleet-auth = { workspace = true, features = ["session"] }
 futures = { workspace = true }
-# The listener: hyper's HTTP/1 builder and the tokio timer its header
-# deadline needs. `axum::serve` exposes neither.
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 mime_guess = { workspace = true }
@@ -44,10 +39,7 @@ trawl-config = { workspace = true }
 zeroize = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
-# `O_NONBLOCK` for opening the pinned CA file without waiting on a FIFO.
 libc = { workspace = true }
-# `--doctor`'s identity row: the effective uid, and its name from the
-# password database.
 nix = { workspace = true }
 rustix = { workspace = true, features = ["process"] }
 

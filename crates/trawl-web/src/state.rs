@@ -2,14 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Shared request-scoped state.
-//!
-//! `AppState` is cloned into every handler via axum's `State` extractor.
-//! Heavy values (the upstream client, session key) live behind `Arc` so
-//! clones are cheap.
-//!
-//! `AppState` is also the single source of truth for session cookie
-//! headers: [`AppState::build_session_cookie`] (login) and
+//! [`AppState::build_session_cookie`] (login) and
 //! [`AppState::build_clear_cookie`] (logout, the session extractor's
 //! expired-cookie path, `auth::me` on an upstream 401) emit one attribute
 //! set, because browsers ignore a clear directive whose
@@ -32,7 +25,6 @@ use crate::config::{ProxyLimits, ResolvedConfig};
 use crate::error::ProxyError;
 use crate::upstream::Upstream;
 
-/// Handler-visible runtime state.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<Inner>,
@@ -47,28 +39,12 @@ struct Inner {
     shared_domain: Option<String>,
     public_origins: PublicOrigins,
     limits: ProxyLimits,
-    /// The budget the forwarder reserves each buffered body from, sized
-    /// by `limits.body_budget_bytes`. Lives here so every clone of the
-    /// state, and so every route, shares the one budget.
     body_budget: BodyBudget,
 }
 
 impl AppState {
-    /// Build state from resolved config. Constructs the upstream client
-    /// (connection pooling + keep-alive are implicit). Installs the
-    /// rustls `ring` crypto provider on first call (idempotent — ignored
-    /// if another provider is already installed).
-    ///
-    /// The client's certificate trust comes from
-    /// [`ResolvedConfig::upstream_tls`], already validated at resolution;
-    /// see [`crate::upstream`] for how a pinned CA is read again. Its
-    /// connections carry the head deadline as their `TCP_USER_TIMEOUT`, so
-    /// a request body trawld never takes is torn down after it. Starts no
-    /// task: the caller starts the re-read with
+    /// Starts no task: the caller starts the re-read with
     /// [`Self::spawn_upstream_ca_reread`].
-    ///
-    /// # Errors
-    /// Propagates `reqwest::Error` if the client can't be built.
     pub fn from_config(cfg: ResolvedConfig) -> Result<Self, reqwest::Error> {
         let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -93,29 +69,16 @@ impl AppState {
         })
     }
 
-    /// The bounds every request is held to: the body limit, the body
-    /// deadline and the upstream head deadline.
     #[must_use]
     pub fn limits(&self) -> &ProxyLimits {
         &self.inner.limits
     }
 
-    /// The budget every buffered request body is reserved from.
     #[must_use]
     pub fn body_budget(&self) -> &BodyBudget {
         &self.inner.body_budget
     }
 
-    /// Send `request` to trawld and wait for its response head within
-    /// [`ProxyLimits::upstream_head_timeout`]. Every call to trawld goes
-    /// through here, so no handler can wait on a silent trawld for
-    /// longer than the deadline. The returned response's body is not
-    /// under the deadline: a stream it opens runs as long as trawld
-    /// keeps it open.
-    ///
-    /// # Errors
-    /// [`ProxyError::UpstreamHeadTimeout`] past the deadline;
-    /// [`ProxyError::Network`] when the call fails before a head.
     pub async fn send_to_upstream(
         &self,
         request: reqwest::RequestBuilder,
@@ -131,36 +94,21 @@ impl AppState {
         &self.inner.cookie_key
     }
 
-    /// Name of the session cookie: the fleet-wide `fleet_session`
-    /// (hardcoded — the shared name IS the SSO contract, not a config knob).
     #[must_use]
     pub fn cookie_name(&self) -> &'static str {
         DEFAULT_COOKIE_NAME
     }
 
-    /// The deployment's browser-visible origins, the CSRF allowlist a
-    /// present `Origin` header is compared against (ADR-0016).
-    ///
-    /// State owns it because the guard runs per request and the list is
-    /// resolved once at startup; it is non-empty by construction, so there
-    /// is no "not configured" case for a handler to interpret.
     #[must_use]
     pub fn public_origins(&self) -> &PublicOrigins {
         &self.inner.public_origins
     }
 
-    /// Parent domain for the SSO cookie's `Domain=` attribute, or `None`
-    /// in standalone mode.
     #[must_use]
     pub fn shared_domain(&self) -> Option<&str> {
         self.inner.shared_domain.as_deref()
     }
 
-    /// Build the `Set-Cookie` header value for a live session cookie.
-    ///
-    /// `SameSite=Lax` is hardcoded — a correctness requirement for
-    /// parent-domain SSO (ADR-0030); `Strict` would silently break
-    /// cross-subdomain navigation.
     #[must_use]
     pub fn build_session_cookie(&self, value: String) -> String {
         build_session_cookie_header(
@@ -173,20 +121,6 @@ impl AppState {
         )
     }
 
-    /// Build the `Set-Cookie` header value that clears the session cookie.
-    ///
-    /// Attributes are guaranteed to match [`Self::build_session_cookie`]
-    /// (same name, `SameSite`, `Path`, `Secure`, `Domain`) — a mismatched
-    /// clear is silently ignored by browsers.
-    ///
-    /// Returns a validated [`HeaderValue`] so callers carry a typed clear
-    /// directive rather than a stringly-typed one that could fail to parse
-    /// (and be silently dropped) at response-assembly time.
-    ///
-    /// # Errors
-    /// Returns [`InvalidHeaderValue`] if the serialized cookie isn't a valid
-    /// header value — impossible for the fully-controlled attribute set, but
-    /// surfaced explicitly rather than degrading to a missing `Set-Cookie`.
     pub fn build_clear_cookie(&self) -> Result<HeaderValue, InvalidHeaderValue> {
         build_clear_cookie_header(
             self.cookie_name(),
@@ -201,20 +135,10 @@ impl AppState {
     /// streamed response bodies included. A handler takes it once, after
     /// its local checks, so a request that fails those never waits on the
     /// pin file.
-    ///
-    /// # Errors
-    /// [`ProxyError::UpstreamCertificateUnavailable`] while a pinned CA
-    /// file has never held a usable certificate, or when no read of it
-    /// finished within [`crate::upstream::CA_READ_WAIT`].
     pub async fn upstream_client(&self) -> Result<Client, ProxyError> {
         self.inner.upstream.client().await
     }
 
-    /// Start the task that reads a pinned CA file again every `interval`,
-    /// or `None` under the platform roots, where nothing can change.
-    ///
-    /// The task holds the state weakly and ends once the last `AppState`
-    /// clone is gone.
     #[must_use]
     pub fn spawn_upstream_ca_reread(&self, interval: Duration) -> Option<JoinHandle<()>> {
         if !self.inner.upstream.is_pinned() {
@@ -232,7 +156,6 @@ impl AppState {
         }))
     }
 
-    /// Read a pinned CA file again now, as the interval task does.
     pub async fn reread_upstream_ca(&self) {
         self.inner.upstream.reread().await;
     }
@@ -281,7 +204,6 @@ mod tests {
         );
     }
 
-    /// The task holds no strong reference, so dropping the state ends it.
     #[tokio::test]
     async fn the_reread_task_ends_with_its_state() {
         let dir = tempfile::tempdir().unwrap();
