@@ -4,15 +4,11 @@
 
 //! Tool inputs and the tool definitions `tools/list` sends (ADR-0058).
 //!
-//! Inputs are flat objects: one enum `mode`, `action` or `source` field
-//! picks the variant, and the fields only one variant reads are optional.
-//! No schema has a root `anyOf` or `oneOf`, and every property name stays
-//! within `[A-Za-z0-9_.-]`, because Claude Code drops a tool that breaks
-//! either rule. Schemas are generated as JSON Schema 2020-12 by rmcp's
+//! Schemas are generated as JSON Schema 2020-12 by rmcp's
 //! `schema_for_input` and `schema_for_output`, and `tool` then drops every
-//! `format` that 2020-12 does not define; `tests/schemas.rs` holds them to
-//! those rules. An optional field without a default skips `None`, so its
-//! schema carries no `"default": null` its type refuses.
+//! `format` that 2020-12 does not define. An optional field without a
+//! default skips `None`, so its schema carries no `"default": null` its
+//! type refuses.
 
 use std::sync::Arc;
 
@@ -33,37 +29,23 @@ use crate::reply::{
     InvestigationReply, OrientReply, ReadAction, ReadReply, SearchMode, SearchReply,
 };
 
-/// The `orient` tool's name.
 pub const ORIENT: &str = "orient";
-/// The `search` tool's name.
 pub const SEARCH: &str = "search";
-/// The `read` tool's name.
 pub const READ: &str = "read";
-/// The `fields` tool's name.
 pub const FIELDS: &str = "fields";
-/// The `context` tool's name.
 pub const CONTEXT: &str = "context";
-/// The `sightings` tool's name.
 pub const SIGHTINGS: &str = "sightings";
-/// The `compare` tool's name.
 pub const COMPARE: &str = "compare";
-/// The `investigation` tool's name.
 pub const INVESTIGATION: &str = "investigation";
 
-/// The most fields a `sightings` call may restrict attribution to.
 pub const SIGHTINGS_MAX_FIELDS: usize = 16;
-/// The most column names a `read` page may project to.
 pub const PAGE_MAX_COLUMNS: usize = 16;
-/// The longest literal a `sightings` call may send, in bytes.
 pub const SIGHTINGS_MAX_LITERAL_BYTES: usize = 1024;
 
-/// Rows a response prints when the call names none.
 pub const DEFAULT_ROWS: u32 = 50;
-/// The most rows one response prints.
 pub const MAX_ROWS: u32 = 200;
 /// The response budget, text block plus mirror, when the call names none.
 pub const DEFAULT_MAX_BYTES: u32 = 16 * 1024;
-/// The smallest response budget a call may ask for.
 pub const MIN_MAX_BYTES: u32 = 4 * 1024;
 /// The hard response budget, text block plus mirror.
 pub const HARD_MAX_BYTES: u32 = 32 * 1024;
@@ -500,7 +482,6 @@ pub struct InvestigationInput {
     pub max_bytes: Option<u32>,
 }
 
-/// The tools in the fixed order `tools/list` sends them.
 #[must_use]
 pub fn tools() -> Vec<Tool> {
     vec![
@@ -525,7 +506,6 @@ fn corpus_annotations(title: &str) -> ToolAnnotations {
         .open_world(true)
 }
 
-/// A read-only tool: it changes nothing, so repeating it is harmless.
 fn read_only_annotations(title: &str) -> ToolAnnotations {
     ToolAnnotations::with_title(title)
         .read_only(true)
@@ -668,9 +648,6 @@ const STANDARD_FORMATS: [&str; 19] = [
     "regex",
 ];
 
-/// A copy of `schema` without the `format` keyword of any schema object,
-/// at any depth, whose format is not one of [`STANDARD_FORMATS`].
-///
 /// The walk is schemars' own: it visits subschema positions only, so a
 /// property named `format` and a `format` key inside `default`, `enum`,
 /// `const` or `examples` data stay. It works on a copy, because rmcp hands
@@ -699,9 +676,6 @@ mod tests {
 
     use super::*;
 
-    /// The walk visits schema positions only: a property named `format` is
-    /// a key under `properties`, and the data in `default` and `enum` is
-    /// not a schema, so a `format` key inside either stays.
     #[test]
     fn a_property_named_format_is_not_a_keyword() {
         let data = json!({ "format": "uint64", "x": 1 });

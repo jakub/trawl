@@ -4,13 +4,6 @@
 
 //! What one MCP session has seen of each investigation (ADR-0059).
 //!
-//! The live board is pull, both ways: the MCP server holds a `seen_seq`
-//! per investigation per session and sends it with every attached call,
-//! append and overwrite, and trawld answers with the entries other keys
-//! changed after it. One stdio session is one process, so the map lives in
-//! [`crate::TrawlServer`]. Nothing here is stored at trawld: two sessions
-//! on one key each see every entry once.
-//!
 //! The rules, which [`crate::tools::investigation`] applies, and `search`,
 //! `context`, `sightings` and `compare` apply through `tools::attach`:
 //!
@@ -45,47 +38,35 @@ use std::collections::HashMap;
 use tokio::sync::{Mutex, MutexGuard};
 use trawl_api::investigations::InvestigationId;
 
-/// The `seen_seq` of each investigation this session has touched.
 #[derive(Debug, Default)]
 pub struct Seen {
     map: Mutex<HashMap<InvestigationId, u64>>,
 }
 
 impl Seen {
-    /// The map, held until the guard drops.
     pub async fn lock(&self) -> SeenGuard<'_> {
         SeenGuard(self.map.lock().await)
     }
 }
 
-/// [`Seen`], held by one call.
 #[derive(Debug)]
 pub struct SeenGuard<'a>(MutexGuard<'a, HashMap<InvestigationId, u64>>);
 
 impl SeenGuard<'_> {
-    /// The `seen_seq` to send for `id`; `None` before the session touched
-    /// it.
     #[must_use]
     pub fn get(&self, id: &InvestigationId) -> Option<u64> {
         self.0.get(id).copied()
     }
 
-    /// Count the entries of `id` through `seq` as seen. `seen` only grows.
     pub fn advance(&mut self, id: &InvestigationId, seq: u64) {
         let seen = self.0.entry(id.clone()).or_insert(seq);
         *seen = (*seen).max(seq);
     }
 
-    /// Start counting `id` from `seq` if the session has not touched it;
-    /// leave it as it is otherwise.
     pub fn touch(&mut self, id: &InvestigationId, seq: u64) {
         self.0.entry(id.clone()).or_insert(seq);
     }
 
-    /// After a reply showed the entries of `id` changed after `since`,
-    /// through `through`: move `seen` when the read left no gap, that is,
-    /// when it started at or before `seen`, or when the session had not
-    /// touched `id`.
     pub fn printed(&mut self, id: &InvestigationId, since: u64, through: Option<u64>) {
         let Some(through) = through else {
             return;

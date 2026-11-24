@@ -2,10 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Every tool schema passes Claude Code's rules (ADR-0058, #308 AC7):
-//! property names in `[A-Za-z0-9_.-]` of 1 to 64 characters, valid JSON
-//! Schema 2020-12, an object root with no `anyOf` or `oneOf`, names under
-//! 128 characters, and the annotations exactly as specified.
+//! Every tool schema passes Claude Code's rules (ADR-0058).
 
 use rmcp::model::{Tool, ToolAnnotations};
 use serde_json::{Value, json};
@@ -27,7 +24,6 @@ fn schemas(tool: &Tool) -> Vec<(&'static str, Value)> {
     out
 }
 
-/// Every property name under every `properties` keyword, recursively.
 fn property_names(schema: &Value, names: &mut Vec<String>) {
     match schema {
         Value::Object(map) => {
@@ -77,8 +73,6 @@ fn tools_list_is_deterministic() {
     }
 }
 
-/// The JSON Schema `type` names of a property, `null` excluded so a nullable
-/// scalar still counts as a scalar.
 fn type_names(schema: &Value) -> Vec<&str> {
     match &schema["type"] {
         Value::String(name) => vec![name.as_str()],
@@ -98,7 +92,6 @@ fn is_scalar_schema(schema: &Value) -> bool {
             .all(|name| matches!(*name, "string" | "integer" | "number" | "boolean"))
 }
 
-/// `schema` with a local `$ref` (`#/$defs/Name`) followed to its definition.
 fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
     match schema["$ref"].as_str().and_then(|r| r.strip_prefix('#')) {
         Some(pointer) => root.pointer(pointer).unwrap_or(schema),
@@ -106,10 +99,6 @@ fn resolve<'a>(root: &'a Value, schema: &'a Value) -> &'a Value {
     }
 }
 
-/// Violations of ADR-0058's flat-input rule: an object root with no root-level
-/// `anyOf` or `oneOf`; every root property a scalar, an array of scalars, or
-/// an array of objects whose own properties are all scalars; every property
-/// name at every depth in `[A-Za-z0-9_.-]+`. Empty means the schema passes.
 fn flat_input_violations(tool: &str, input: &Value) -> Vec<String> {
     let mut violations = Vec::new();
     if input["type"] != json!("object") {
@@ -343,8 +332,6 @@ fn annotations_are_exactly_as_specified() {
             Some(true),
         )
     };
-    // A corpus tool records a new captured result each call: not
-    // read-only, not idempotent, never destructive.
     let corpus = |title: &str| {
         ToolAnnotations::from_raw(
             Some(title.to_owned()),
@@ -492,9 +479,8 @@ fn input_schemas_accept_flat_calls_and_refuse_out_of_range_values() {
     }
 }
 
-/// `read`'s `columns` states the bounds the tool holds a call to at run
-/// time: 1 to 16 names, each 1 to 255 long. JSON Schema counts a string's
-/// length in characters, so only the run-time check bounds a name's bytes.
+/// JSON Schema counts a string's length in characters, so only the run-time
+/// check bounds a name's bytes.
 #[test]
 fn the_read_input_bounds_columns_to_sixteen_names() {
     let tool = tools()
@@ -517,8 +503,6 @@ fn the_read_input_bounds_columns_to_sixteen_names() {
     );
 }
 
-/// `context`, `sightings` and `compare` attach as `search` does: a flat
-/// optional `investigation` and `purpose`, the purpose held to 1024 bytes.
 #[test]
 fn the_correlation_inputs_take_an_investigation_and_a_purpose() {
     let calls = [
@@ -697,10 +681,6 @@ fn a_filled_search_reply_validates_against_its_output_schema() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-/// The count of advice hints is the fitting's own bookkeeping: no tool's
-/// output schema names it, and a reply carrying advice serializes without
-/// it. The validation verdict's drop fact is on the wire, and a verdict
-/// that says its hints were dropped validates.
 #[test]
 fn query_advice_metadata_is_not_in_the_output_schema() {
     let mut names = Vec::new();
@@ -740,8 +720,6 @@ fn query_advice_metadata_is_not_in_the_output_schema() {
     assert!(errors.is_empty(), "{errors:?}");
 }
 
-/// The raw schemas rmcp generates for each tool, before the format walk,
-/// in the order `tools()` lists the tools.
 fn raw_schemas() -> Vec<(&'static str, Value, Value)> {
     use rmcp::handler::server::tool::{schema_for_input, schema_for_output};
     use trawl_mcp::reply::{
@@ -801,8 +779,6 @@ const VOCABULARY: [&str; 19] = [
     "regex",
 ];
 
-/// The JSON pointer of every string-valued `format` key outside the
-/// vocabulary, at any depth.
 fn nonstandard_formats(value: &Value, pointer: &str, found: &mut Vec<String>) {
     match value {
         Value::Object(map) => {
@@ -827,7 +803,6 @@ fn nonstandard_formats(value: &Value, pointer: &str, found: &mut Vec<String>) {
     }
 }
 
-/// `value` without its non-standard string `format` keys, at any depth.
 fn without_nonstandard_formats(value: &mut Value) {
     match value {
         Value::Object(map) => {
@@ -855,8 +830,7 @@ fn has_key(value: &Value, wanted: &str) -> bool {
 }
 
 /// Claude Code warns once per field about a format it does not know, so
-/// the schemas carry only the 2020-12 vocabulary, and the walk removes
-/// nothing else: every bound and keyword the raw schema had is still there.
+/// the schemas carry only the 2020-12 vocabulary.
 #[test]
 fn tool_schemas_have_only_standard_formats() {
     let raw = raw_schemas();

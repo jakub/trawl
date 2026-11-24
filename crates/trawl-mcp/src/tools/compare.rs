@@ -3,20 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `compare`: one filter's counts in two windows (ADR-0058).
-//!
-//! Reads trawld's capabilities once, first, then sends
-//! `POST /api/v1/results/compare` with the filter, both windows, the group
-//! fields and the minimum count, and answers with the first page of the
-//! ranked groups and its block: both windows with their durations, the
-//! grouping, the rate unit and every warning trawld raised, in its words.
-//! A baseline with neither bound is left to trawld, which takes the window
-//! of equal duration just before the foreground. Overlapping windows are
-//! trawld's `windows_overlap` refusal.
-//!
-//! With `investigation`, the read attaches to that investigation as
-//! `search` attaches (ADR-0059, [`super::attach`]): trawld records it as a
-//! step, keeps the ranked groups as evidence, and answers with what other
-//! keys changed since the session's `seen_seq`.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{COMPARE_DEFAULT_MIN_COUNT, CaptureWindow, CompareRequest};
@@ -28,7 +14,6 @@ use crate::backend::Backend;
 use crate::render::Budget;
 use crate::session::Seen;
 
-/// How `compare` names itself when it attaches.
 const CALLER: Caller = Caller {
     tool: COMPARE,
     input: COMPARE,
@@ -36,8 +21,6 @@ const CALLER: Caller = Caller {
     answer: "compare answer",
 };
 
-/// Run `compare` against `backend`, with `seen` the session's bookkeeping
-/// an attached read reads and advances.
 pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: CompareInput) -> CallToolResult {
     let attachment =
         match attach::attachment(CALLER, input.investigation.as_ref(), input.purpose.as_ref()) {

@@ -3,25 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `sightings`: where one literal occurs (ADR-0058).
-//!
-//! Reads trawld's capabilities once, first, then sends
-//! `POST /api/v1/results/sightings` with the literal, the bounds and the
-//! optional `fields`, and answers with the first page of the captured
-//! matches and its block. The block names both denominators: field counts
-//! are over the captured matches, service counts over every match. `fields`
-//! restricts which fields the literal is attributed to and never which
-//! events match, so the counts stay those of the same population. The
-//! restriction is frozen in the captured facts, so `read` states it on
-//! every page. trawld lists at most 256 fields holding the literal and
-//! counts the rest; the block says how many and that `fields` attributes
-//! them. The read's follow-up queries become `search` calls over the
-//! result's own bounds.
-//!
-//! With `investigation`, the read attaches to that investigation as
-//! `search` attaches (ADR-0059, [`super::attach`]): trawld records it as a
-//! step, keeps the matches as evidence, and answers with what other keys
-//! changed since the session's `seen_seq`. Its follow-up searches attach
-//! to the same investigation, without the read's purpose.
 
 use rmcp::model::CallToolResult;
 use trawl_api::results::{CaptureWindow, SightingsRequest};
@@ -33,7 +14,6 @@ use crate::backend::Backend;
 use crate::render::Budget;
 use crate::session::Seen;
 
-/// How `sightings` names itself when it attaches.
 const CALLER: Caller = Caller {
     tool: SIGHTINGS,
     input: SIGHTINGS,
@@ -41,8 +21,6 @@ const CALLER: Caller = Caller {
     answer: "sightings answer",
 };
 
-/// Run `sightings` against `backend`, with `seen` the session's
-/// bookkeeping an attached read reads and advances.
 pub async fn run<B: Backend>(backend: &B, seen: &Seen, input: SightingsInput) -> CallToolResult {
     let attachment =
         match attach::attachment(CALLER, input.investigation.as_ref(), input.purpose.as_ref()) {

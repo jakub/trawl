@@ -4,31 +4,6 @@
 
 //! Computed hints for a `search` reply (ADR-0058).
 //!
-//! A hint is computed, never generated. [`advice`] reads only the query
-//! text the call sent: trawl-core's advice on a valid query (ADR-0068),
-//! one line per finding, ahead of every other hint. It never changes
-//! whether the query is valid or what the reply proposes, and the budget
-//! fitting drops it before anything else. Every other hint is computed
-//! from facts trawld answered, and names the population it was computed
-//! over:
-//!
-//! - [`dominance`]: one value of `service` or `host` holds at least
-//!   [`DOMINANCE_PERCENT`] of the captured rows, from the capture's column
-//!   facts.
-//! - [`lag`]: a sender whose `_ingested` runs more than
-//!   [`LAG_THRESHOLD_SECS`] ahead of `_time`, over the rows the response
-//!   read.
-//! - [`never_observed`]: a field the search stage names, or a pipe stage
-//!   reads from the events before any stage made or removed that name,
-//!   that the catalog holds no observation of in the service the query
-//!   names, or no pin for at all. The catalog evicts pins and
-//!   observations, so the hint states what it holds now, not what was
-//!   ever sent.
-//! - [`nearest_bounds`]: for a capture with no rows whose query is a plain
-//!   search stage, the last event before and the first event after its
-//!   bounds that match the same search, within [`NEAREST_REACH_DAYS`]
-//!   either side. Any other shape says it was not computed.
-//!
 //! The two that read trawld ([`never_observed`] and [`nearest_bounds`])
 //! make a bounded number of calls and stay quiet when a call is refused:
 //! a hint never turns a search into an error.
@@ -62,41 +37,23 @@ use crate::blocking::parse_work;
 use crate::render::rows::{json_string, json_text};
 use crate::tools::failure_summary;
 
-/// A value dominates when it holds at least this percentage of the
-/// captured rows.
 pub const DOMINANCE_PERCENT: u64 = 80;
 
-/// Dominance needs at least this many distinct non-null values: one value
-/// out of one is the filter, not a finding.
+/// One value out of one is the filter, not a finding.
 pub const DOMINANCE_MIN_DISTINCT: u64 = 2;
 
-/// The fields whose dominance is reported.
 pub const DOMINANCE_FIELDS: [&str; 2] = ["service", "host"];
 
-/// A sender lags when `_ingested - _time` is more than this many seconds
-/// on some row it sent.
 pub const LAG_THRESHOLD_SECS: i64 = 300;
 
-/// How far before the earliest bound and after the latest bound the
-/// nearest-bounds query looks, in days. The far end is clipped at now.
 pub const NEAREST_REACH_DAYS: i64 = 7;
 
-/// The most fields the never-observed check asks the catalog about.
 pub const MAX_FIELD_CHECKS: usize = 4;
 
-/// Observations the never-observed check reads per catalog page.
 pub const CATALOG_PAGE_ROWS: usize = 100;
 
-/// The most catalog pages the never-observed check reads per field; past
-/// it the answer is unknown and no hint is given.
 pub const CATALOG_MAX_PAGES: usize = 3;
 
-/// The advice hints for the query text `query`: one line per finding
-/// trawl-core's [`advise`] gives, its message then its hint, and one more
-/// line counting the findings it left out, if any. Empty when `query` does
-/// not parse: a text with any error shows only its errors.
-///
-/// Parses with [`parse_unbuilt`], so it builds no regex from the text.
 #[must_use]
 pub fn advice(query: &str) -> Vec<String> {
     let Ok(parsed) = parse_unbuilt(query) else {
@@ -118,20 +75,14 @@ pub fn advice(query: &str) -> Vec<String> {
     lines
 }
 
-/// [`advice`] for `query`, on the blocking pool.
 pub(crate) async fn query_advice(query: &str) -> Vec<String> {
     let query = query.to_owned();
     parse_work(move || advice(&query)).await
 }
 
-/// The hint for a zero-row result whose query is not a plain search stage.
 pub const NEAREST_NOT_COMPUTED: &str = "nearest bounds: not computed for this shape; only a \
 plain search stage with no pipe stages is widened to find the nearest events";
 
-/// Dominance hints over the capture's column facts: for `service` and
-/// `host`, a value holding at least [`DOMINANCE_PERCENT`] of the captured
-/// rows among at least [`DOMINANCE_MIN_DISTINCT`] distinct values.
-///
 /// The facts list values only for a column with at most five distinct
 /// values; a column with more is not judged.
 #[must_use]
@@ -175,10 +126,6 @@ pub fn dominance(result: &CapturedResult) -> Vec<String> {
     hints
 }
 
-/// The lag hint over the rows of `page`: the sender, a (`service`, `host`)
-/// pair, whose largest `_ingested - _time` is the largest of all, when it
-/// is over [`LAG_THRESHOLD_SECS`]. `None` when no sender lags or the page
-/// lacks a column it needs.
 #[must_use]
 pub fn lag(page: &QueryResult) -> Option<String> {
     let column = |name: &str| page.columns.iter().position(|c| c.name == name);
@@ -218,15 +165,12 @@ pub fn lag(page: &QueryResult) -> Option<String> {
     Some(hint)
 }
 
-/// A cell of `row` at `index` as JSON text; a missing column is `null`.
 fn cell_json(row: &[Value], index: Option<usize>) -> String {
     index
         .and_then(|i| row.get(i))
         .map_or_else(|| "null".to_owned(), |v| json_text(&v.to_plain_json()))
 }
 
-/// A timestamp cell as an instant in UTC: RFC 3339, or a naive date and
-/// time read as UTC.
 fn instant(cell: &Value) -> Option<DateTime<Utc>> {
     let Value::String(text) = cell else {
         return None;
@@ -240,31 +184,13 @@ fn instant(cell: &Value) -> Option<DateTime<Utc>> {
         .map(|naive| naive.and_utc())
 }
 
-/// Hints for fields the query reads that are not in the catalog: the
-/// fields its search stage names, then the fields its pipe stages read
-/// from the events before any stage made or removed that name. A field is
-/// named with no observation in the one service the search stage names
-/// with `service=<value>`, or with no pin when it names none or the
-/// catalog has no pin for the field.
-///
-/// The hint states what the catalog holds now. Pins and observations are
-/// evicted, so stored events can still carry a field the catalog no
-/// longer holds.
-///
-/// Envelope fields are not checked. At most [`MAX_FIELD_CHECKS`] fields
-/// are checked, each over at most [`CATALOG_MAX_PAGES`] pages of
-/// observations; a refused or unfinished check gives no hint.
 pub async fn never_observed<B: Backend>(backend: &B, query: &str) -> Vec<String> {
     let query = query.to_owned();
     check_fields(backend, parse_work(move || fields_to_check(&query)).await).await
 }
 
-/// The hints of an executed search: the [`advice`] on `sent`, the text the
-/// call sent, then the hints that read trawld for `result`:
-/// [`nearest_bounds`] when it has no rows, and [`never_observed`]. All
-/// three read their text in one task on the blocking pool, each from its
-/// own parse, so one that finds nothing never empties another; then the
-/// trawld calls run together, the nearest bounds' first.
+/// All three read their text in one task on the blocking pool, each from its
+/// own parse, so one that finds nothing never empties another.
 pub(crate) async fn search_hints<B: Backend>(
     backend: &B,
     result: &CapturedResult,
@@ -295,8 +221,6 @@ pub(crate) async fn search_hints<B: Backend>(
     (advice, nearest, unobserved)
 }
 
-/// The [`never_observed`] hints for the service and fields
-/// [`fields_to_check`] read.
 async fn check_fields<B: Backend>(
     backend: &B,
     checks: Option<(Option<String>, Vec<String>)>,
@@ -313,10 +237,6 @@ async fn check_fields<B: Backend>(
     hints
 }
 
-/// The service `query`'s search stage names and the fields
-/// [`never_observed`] checks: the search stage's fields in key order, then
-/// [`stage_reads`] in pipeline order, each once under the DSL's field
-/// fold. `None` when `query` does not parse.
 fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
     let mut parsed = parse_unbuilt(query).ok()?;
     let service = named_service(&parsed);
@@ -336,15 +256,9 @@ fn fields_to_check(query: &str) -> Option<(Option<String>, Vec<String>)> {
     Some((service, fields))
 }
 
-/// The fields `pipeline` reads from the events, folded, in pipeline order
-/// and source order within a stage, possibly repeated.
-///
-/// A name an earlier stage made or removed is not a read: `made` holds
-/// those, so a computed name is never checked. The walk stops after a
-/// stage that replaces the relation, since every later name is its
-/// output, and after an `extract` whose outputs it cannot name. A
-/// pipeline with `from saved` reads a recorded run, not the events, and
-/// gives nothing.
+/// The walk stops after a stage that replaces the relation, since every later
+/// name is its output. A pipeline with `from saved` reads a recorded run, not
+/// the events, and gives nothing.
 fn stage_reads(pipeline: &[Spanned<PipeStage>]) -> Vec<String> {
     let mut reads = Vec::new();
     if pipeline
@@ -362,8 +276,7 @@ fn stage_reads(pipeline: &[Spanned<PipeStage>]) -> Vec<String> {
     reads
 }
 
-/// Push the reads of one stage that `made` does not hold, and add the
-/// names it makes or removes to `made`. False when the walk stops here.
+/// False when the walk stops here.
 fn stage_read(stage: &PipeStage, made: &mut BTreeSet<String>, reads: &mut Vec<String>) -> bool {
     // Exhaustive on purpose: a new stage states its rule here.
     match stage {
@@ -449,12 +362,10 @@ fn stage_read(stage: &PipeStage, made: &mut BTreeSet<String>, reads: &mut Vec<St
     true
 }
 
-/// `names` as string slices.
 fn fields(names: &[String]) -> impl Iterator<Item = &str> {
     names.iter().map(String::as_str)
 }
 
-/// Push each of `names`, folded, that `made` does not hold.
 fn read<'a>(
     names: impl IntoIterator<Item = &'a str>,
     made: &BTreeSet<String>,
@@ -468,14 +379,12 @@ fn read<'a>(
     );
 }
 
-/// The field reads of every argument of `aggs`, in source order.
 fn aggs_reads(aggs: &[AggExpr]) -> impl Iterator<Item = &str> {
     aggs.iter()
         .flat_map(|agg| &agg.args)
         .flat_map(|arg| expr_reads(&arg.node))
 }
 
-/// The field reads of `expr`, in source order.
 fn expr_reads(expr: &Expr) -> Vec<&str> {
     fn walk<'a>(expr: &'a Expr, out: &mut Vec<&'a str>) {
         match expr {
@@ -504,8 +413,6 @@ fn expr_reads(expr: &Expr) -> Vec<&str> {
     out
 }
 
-/// The service a search stage names with one top-level `service=<value>`,
-/// when it has one group.
 fn named_service(query: &Query) -> Option<String> {
     let [group] = query.search.groups.as_slice() else {
         return None;
@@ -525,8 +432,6 @@ fn named_service(query: &Query) -> Option<String> {
     })
 }
 
-/// The not-in-the-catalog hint for one field, if the catalog's answer
-/// proves it.
 async fn field_check<B: Backend>(
     backend: &B,
     field: &str,
@@ -569,15 +474,6 @@ async fn field_check<B: Backend>(
     None
 }
 
-/// The nearest-bounds hint for a capture with no rows.
-///
-/// Only a plain search stage is widened: the caller's query without pipe
-/// stages. Its time clauses are removed from the parsed search stage and
-/// bounds [`NEAREST_REACH_DAYS`] before the earliest bound and after the
-/// latest bound, clipped at `now`, put in their place; one aggregate over
-/// that search reports the newest event before the bounds, the oldest
-/// after, and any that now fall inside them. Any other shape answers
-/// [`NEAREST_NOT_COMPUTED`].
 pub async fn nearest_bounds<B: Backend>(
     backend: &B,
     result: &CapturedResult,
@@ -594,8 +490,6 @@ pub async fn nearest_bounds<B: Backend>(
     nearest_from(backend, plan).await
 }
 
-/// The nearest-bounds hint from `plan`, the widened query
-/// [`NearestPlan::of`] built, if it built one.
 async fn nearest_from<B: Backend>(backend: &B, plan: Option<NearestPlan>) -> String {
     let Some(plan) = plan else {
         return NEAREST_NOT_COMPUTED.to_owned();
@@ -609,7 +503,6 @@ async fn nearest_from<B: Backend>(backend: &B, plan: Option<NearestPlan>) -> Str
     }
 }
 
-/// The widened query and the bounds it was built from.
 struct NearestPlan {
     dsl: String,
     from: String,
@@ -619,7 +512,6 @@ struct NearestPlan {
 }
 
 impl NearestPlan {
-    /// [`Self::new`] for a capture's query and bounds, when it has both.
     fn of(
         query: &str,
         earliest: Option<&str>,
@@ -683,7 +575,6 @@ impl NearestPlan {
         })
     }
 
-    /// The hint from the aggregate's rows.
     fn describe(&self, answer: &QueryResult) -> String {
         let column = |name: &str| answer.columns.iter().position(|c| c.name == name);
         let (Some(side), Some(newest), Some(oldest), Some(events)) = (
@@ -789,15 +680,9 @@ mod tests {
 
     use super::{NearestPlan, fields_to_check};
 
-    /// A hint reads a stored capture's query to learn what it means and
-    /// runs none of its patterns, so it builds no regex from that text: the
-    /// query is the caller's, stored, and may be one whose patterns cost
-    /// the most a build may cost. Parsing the same text for a run does
-    /// build them.
-    ///
     /// The count is per thread and [`crate::blocking::parse_work`] runs the
     /// hints' parses on pool threads, so this calls the functions it runs
-    /// on the test's own thread. `tests/hints.rs` shows the hints answer.
+    /// on the test's own thread.
     #[test]
     fn hints_build_no_regex_from_stored_text() {
         let search = r"service=api path=/v[0-9]+\.(users|orders)/ host=web-* error";
@@ -820,14 +705,11 @@ mod tests {
             now,
         );
         assert_eq!(thread_builds(), before, "the hints built a regex");
-        // Both read the text: one named its fields, one widened it.
         assert!(checks.is_some_and(|(_, fields)| fields.contains(&"path".to_owned())));
         assert!(plan.is_some());
     }
 
-    /// The advice on a query text builds no regex from it, and both search
-    /// modes compute it on the blocking pool, never on the reactor: the
-    /// test's current-thread runtime polls the handler on this thread.
+    /// The test's current-thread runtime polls the handler on this thread.
     #[tokio::test]
     async fn query_advice_builds_no_regex_and_runs_off_the_reactor() {
         use serde_json::json;
@@ -901,18 +783,14 @@ mod tests {
         );
     }
 
-    /// A quarter of a worker's 2 MiB stack.
     const QUARTER_STACK: usize = 512 * 1024;
 
-    /// The tree depth limit #447 sets.
     const LIMIT: usize = 64;
 
-    /// `n` terms joined by `+`: an operator chain `n - 1` levels deep.
     fn chain(n: usize) -> String {
         vec!["1"; n].join(" + ")
     }
 
-    /// `a == 0 <op> a == 1 …`: `n` comparisons, `n` levels deep.
     fn comparisons(n: usize, op: &str) -> String {
         (0..n)
             .map(|i| format!("a == {i}"))
@@ -920,7 +798,6 @@ mod tests {
             .join(&format!(" {op} "))
     }
 
-    /// `body` wrapped in `n` nested calls to `function`.
     fn calls(function: &str, n: usize, body: &str) -> String {
         format!(
             "{}{body}{}",
@@ -929,13 +806,7 @@ mod tests {
         )
     }
 
-    /// The hints' recursive walks fit a quarter of a worker's stack at
-    /// #447's 64-level tree depth limit: `expr_reads`' walk through
-    /// [`fields_to_check`] on every expression shape, and `search_terms`
-    /// and `unspanned` through [`NearestPlan::of`] on every search shape.
-    /// The shapes are those of `trawl-core/tests/tree_depth_stack.rs`,
-    /// which counts their depth. The hints parse on `parse_work`'s pool
-    /// threads, whose stacks are 2 MiB.
+    /// The hints parse on `parse_work`'s pool threads, whose stacks are 2 MiB.
     ///
     /// `where` after `extract kv` is parsed, but `stage_reads` stops at
     /// the kv extract, whose outputs the data names, so `expr_reads` does
@@ -996,12 +867,7 @@ mod tests {
             .expect("every hint walk must fit 512 KiB at depth 64");
     }
 
-    /// A query over the 64-level limit gets no query-derived hint, and the
-    /// hints never walk its tree: both entry points start with
-    /// `parse_unbuilt(…).ok()?`, which refuses the text before any walk.
-    ///
-    /// The 65-level `where` and `NOT` run show the boundary. The same
-    /// shapes thousands of levels deep show that nothing walks the tree:
+    /// The same shapes thousands of levels deep show that nothing walks the tree:
     /// on a quarter of a worker's stack, any recursive walk of a 32 000-term
     /// chain or a 16 000-`NOT` run would overflow and abort the test
     /// binary, where the refusal costs heap.

@@ -3,32 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A corpus call attached to an investigation (ADR-0059).
-//!
-//! `search` with `mode: execute`, `context`, `sightings` and `compare`
-//! attach the same way, through the pieces here, each worded for its
-//! [`Caller`]:
-//!
-//! - [`attachment`] checks the call's flat `investigation` and `purpose`
-//!   before any request: the id's shape, the purpose's bound and that it
-//!   holds no NUL, which trawld refuses, and no purpose without an
-//!   investigation.
-//! - [`hold`] takes the session's lock for an attached call, before it
-//!   sends anything, and reads the `seen_seq` it sends; [`Held::record`]
-//!   moves `seen` after the render under [`crate::session`]'s rules. An
-//!   unattached call takes no lock.
-//! - [`unsound`] refuses an answer nothing here can stand behind before
-//!   anything prints its result id.
-//! - [`acknowledgement`] is the line every error opens with once trawld
-//!   accepted the attached call, and [`acknowledged`] puts it in front of
-//!   a render that failed.
-//! - [`view`] is the attached view the reply prints: the kept result and
-//!   the activity since `seen_seq`, or where the session's following
-//!   starts.
-//! - [`refused`] names the way back from trawld's refusal.
-//! - [`may_attach`] says whether this key may make an attached call, for
-//!   a reply that proposes one it did not just make.
-//!
-//! Nothing here retries.
 
 use rmcp::model::CallToolResult;
 use trawl_api::investigations::PURPOSE_MAX_BYTES;
@@ -41,17 +15,14 @@ use crate::render::rows::json_string;
 use crate::reply::{AttachedView, InvestigationAction};
 use crate::session::{Seen, SeenGuard};
 
-/// The permissions an attached call needs, in words.
 const ATTACHED_NEEDS: &str = "query, investigation_read and investigation_write";
 
-/// The permissions an attached call needs, as `whoami` names them.
 const ATTACHED_PERMISSIONS: [&str; 3] = ["query", "investigation_read", "investigation_write"];
 
-/// Whether this key holds every permission an attached call needs, by its
-/// `whoami`. A key that reads an investigation can read its kept evidence
-/// without being able to write to it, and an attached call it was proposed
-/// would be refused 403. A failed `whoami` answers no: the proposal then
-/// attaches to nothing, which the key can still run.
+/// A key that reads an investigation can read its kept evidence without
+/// being able to write to it, and an attached call it was proposed would be
+/// refused 403. A failed `whoami` answers no: the proposal then attaches to
+/// nothing, which the key can still run.
 pub(crate) async fn may_attach<B: Backend>(backend: &B) -> bool {
     backend.whoami().await.is_ok_and(|whoami| {
         ATTACHED_PERMISSIONS
@@ -60,7 +31,6 @@ pub(crate) async fn may_attach<B: Backend>(backend: &B) -> bool {
     })
 }
 
-/// How a tool that attaches is named in what it says.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Caller {
     /// The tool's name, as its errors open: `search`.
@@ -73,17 +43,13 @@ pub(crate) struct Caller {
     pub answer: &'static str,
 }
 
-/// The investigation a call attaches to, and why.
 #[derive(Debug, Clone)]
 pub(crate) struct Attachment {
-    /// The investigation.
     pub id: InvestigationId,
     /// The sentence the step records.
     pub purpose: Option<String>,
 }
 
-/// The attachment of a call naming `investigation` and `purpose`, checked
-/// before any request; `None` for a call attached to nothing.
 pub(crate) fn attachment(
     caller: Caller,
     investigation: Option<&String>,
@@ -150,17 +116,14 @@ pub(crate) async fn hold(seen: &Seen, attachment: Option<Attachment>) -> Option<
 }
 
 impl Held<'_> {
-    /// The investigation.
     pub(crate) fn id(&self) -> &InvestigationId {
         &self.attachment.id
     }
 
-    /// The session's `seen_seq` for it, sent with the call.
     pub(crate) fn seen_seq(&self) -> Option<u64> {
         self.seen_seq
     }
 
-    /// The attachment the request carries.
     pub(crate) fn attach(&self) -> Attach {
         Attach {
             id: self.attachment.id.clone(),
@@ -169,11 +132,6 @@ impl Held<'_> {
         }
     }
 
-    /// Move `seen` after the reply `result` rendered: through the last
-    /// activity entry its `part` printed; or, for a session that had seen
-    /// nothing of the investigation, to the step the call appended
-    /// (`step_seq`), once the reply saying so fitted: the entries after it
-    /// are what the next attached call asks for.
     pub(crate) fn record(&mut self, result: &CallToolResult, part: &[&str], step_seq: Option<u64>) {
         let id = &self.attachment.id;
         match (self.seen_seq, step_seq) {
@@ -187,16 +145,7 @@ impl Held<'_> {
 }
 
 /// The error for an answer nothing here can stand behind, before anything
-/// prints its result id; `None` for a sound one. An unsound answer names a
-/// result id that is not 32 lowercase hex digits, which trawld never mints
-/// and no read can page, or, for a call attached to investigation
-/// `attached`, a result trawld does not say it keeps for that
-/// investigation.
-///
-/// The error names no result. An attached call's step may stand whatever
-/// the answer said, so its error says so and names the board read from
-/// `seen_seq`, the session's sequence, whose step entry for this call
-/// names the result kept.
+/// prints its result id; `None` for a sound one.
 pub(crate) fn unsound(
     caller: Caller,
     captured: &CapturedResult,
@@ -236,9 +185,6 @@ pub(crate) fn unsound(
     )))
 }
 
-/// The line an error opens with after trawld recorded the call as a step
-/// of investigation `id` and kept result `result_id` for it, as an
-/// investigation write's error opens with its acknowledgement.
 pub(crate) fn acknowledgement(caller: Caller, id: &InvestigationId, result_id: &str) -> String {
     format!(
         "Investigation {} recorded this {} as a step and keeps result {} for it.",
@@ -264,11 +210,6 @@ pub(crate) fn acknowledged(acknowledgement: &str, result: CallToolResult) -> Cal
     refusal::error_after(acknowledgement, text)
 }
 
-/// The attached view of a result kept for investigation `id`: the activity
-/// since `seen_seq`, or why there is none. A first call, with no
-/// `seen_seq`, says where the session's following starts: at the step the
-/// call appended (`step_seq`), or, when trawld named none, at the
-/// session's next write.
 pub(crate) fn view(
     caller: Caller,
     id: &InvestigationId,
@@ -310,8 +251,6 @@ pub(crate) fn view(
     }
 }
 
-/// The refusal of an attached call trawld refused, with the way back.
-/// `sent` is the query text an excerpt is cut from, if any.
 pub(crate) fn refused(
     caller: Caller,
     id: &InvestigationId,

@@ -4,32 +4,13 @@
 
 //! The reply model: what each tool answers, as data (ADR-0058).
 //!
-//! Every successful tool result has one text block that stands alone and a
-//! `structuredContent` object that mirrors it. The structs here are that
-//! mirror: a tool fills one, the renderer prints its text block from it,
-//! and its schema is the tool's `outputSchema`. A refused call is
-//! `isError` with text only, so these describe success.
-//!
-//! The text block's layout, top to bottom, is the field order of
-//! [`ResultView`]: the outcome line, the bounds and the executed text, the
-//! four truncation facts, the facets, the proposed next actions, the link
-//! to Search, one columns line, then the rows as JSON arrays. A
-//! [`CorrelationReply`] prints its [`CorrelationView`] between the
-//! truncation facts and the next actions, and so does a `read` page of a
-//! correlation result.
-//!
-//! Schema rules every struct here keeps, because Claude Code drops a tool
-//! that breaks them: property names stay within `[A-Za-z0-9_.-]`, the root
-//! is an object with no `anyOf` or `oneOf`, alternatives are flat structs
-//! with optional fields, and enums are inlined string enums whose variants
-//! carry no doc comments, so each is one `enum` keyword rather than a
-//! `oneOf` of constants: the enum's own doc names every variant.
+//! Enums are inlined string enums whose variants carry no doc comments, so
+//! each is one `enum` keyword rather than a `oneOf` of constants: the
+//! enum's own doc names every variant.
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
-
-// -- shared pieces ------------------------------------------------------------
 
 /// Which `search` mode ran: `validate` checks the query without running
 /// it (`/api/v1/validate`); `execute` runs it as a capture (ADR-0057).
@@ -296,7 +277,6 @@ pub struct PageRead {
     /// For each column of the page, by index, whether its cell was JSON
     /// null in every row read; empty when the page read no row.
     pub(crate) null_columns: Vec<bool>,
-    /// The columns the page carried.
     pub(crate) columns: u64,
     /// The columns trawld's projection left out: `columns_omitted` before
     /// the renderer omitted any.
@@ -375,8 +355,6 @@ pub enum FormatRefusalKind {
     /// The formatter could not write text that reads back as the query.
     Unfaithful,
 }
-
-// -- per-tool replies ---------------------------------------------------------
 
 /// `orient`: the installation in one call.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -835,8 +813,6 @@ pub struct WarningView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub field: Option<String>,
 }
-
-// -- investigations (ADR-0059) ------------------------------------------------
 
 /// Who wrote something: the key's stable prefix and its name when it
 /// wrote. Attribution only.

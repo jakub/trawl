@@ -4,27 +4,10 @@
 
 //! `orient`: the installation in one call (ADR-0058).
 //!
-//! One call reads the key (`whoami`), what the server applies
-//! (`capabilities`), health, and the per-service schema, all at once, and
-//! then, as the key allows, one bounded inventory query and the retention
-//! reach. Nothing is read at startup: a server that is down answers the
-//! first `orient` with a refusal, not the process with an exit.
-//!
-//! - The key and the capabilities are the answer; when either is refused,
-//!   `orient` is refused with trawld's code.
-//! - The inventory is one `/query` aggregate over the last 24 hours,
-//!   grouped by environment, service and host ([`INVENTORY_QUERY`]). It
-//!   needs the `query` permission and a corpus trawld will read; without
-//!   either, one line says why and the rest still answers.
-//! - Retention reach is read from the dashboard only when the key holds
-//!   `server_manage`, so `orient` widens nothing a key could learn;
-//!   without it, one line says it is not readable with this key.
-//! - Open investigations are listed when the key holds `query` and
-//!   `investigation_read` (ADR-0059): at most [`OPEN_INVESTIGATIONS_MAX`],
-//!   most recently changed first. A list trawld refuses is one line, never
-//!   an error.
-//! - Times print in UTC and in the display zone, the `ui.timezone` of the
-//!   machine that runs `trawl mcp`, labelled as that machine's setting.
+//! Nothing is read at startup: a server that is down answers the first
+//! `orient` with a refusal, not the process with an exit. Retention reach
+//! is read from the dashboard only when the key holds `server_manage`, so
+//! `orient` widens nothing a key could learn.
 
 use chrono::{DateTime, FixedOffset, NaiveDate, Utc};
 use rmcp::model::CallToolResult;
@@ -49,27 +32,15 @@ use crate::reply::{
 };
 use crate::{dsl, render::refusal};
 
-/// The inventory: every environment, service and host that sent events in
-/// the last 24 hours, with the count and the newest `_time`, busiest first.
-///
-/// A constant: no caller text enters it. A test holds it to trawl-core's
-/// grammar.
 pub const INVENTORY_QUERY: &str = "last=24h \
 | stats count() as events, max(_time) as last_seen by env, service, host \
 | sort -events";
 
-/// The most inventory rows `orient` asks for; the response says how many
-/// groups there were in all.
 pub const INVENTORY_MAX_ROWS: usize = 200;
 
-/// The permission a key needs to run the inventory query.
 const QUERY_PERMISSION: &str = "query";
-/// The permission a key needs to read the dashboard and its retention
-/// reach.
 const SERVER_MANAGE_PERMISSION: &str = "server_manage";
-/// The permission a key needs for `fields` on a service.
 const SCHEMA_READ_PERMISSION: &str = "schema_read";
-/// The permission a key needs, with `query`, to list investigations.
 const INVESTIGATION_READ_PERMISSION: &str = "investigation_read";
 
 /// The most open investigations `orient` lists: a glance that leaves
@@ -77,14 +48,10 @@ const INVESTIGATION_READ_PERMISSION: &str = "investigation_read";
 /// trawl-api's 200-byte bound; `investigation action=list` lists the rest.
 pub const OPEN_INVESTIGATIONS_MAX: usize = 5;
 
-/// The note when the key cannot read retention reach.
 pub const RETENTION_NOT_READABLE: &str = "not readable with this key";
 
-/// The query `orient` proposes as a first search.
 const FIRST_SEARCH: &str = "_severity>=error last=1h | stats count() by service | sort -count";
 
-/// Run `orient` against `backend`, with `display_zone` the MCP host's
-/// display setting and `now` the instant it reports as now.
 pub async fn run<B: Backend>(
     backend: &B,
     display_zone: DisplayZone,
@@ -174,9 +141,6 @@ pub async fn run<B: Backend>(
     render::orient(reply, Budget::DEFAULT)
 }
 
-/// The reads a permission gates, run together: the inventory query when
-/// the key holds `query`, the dashboard when it holds `server_manage`, the
-/// investigation list when it may list them.
 async fn gated_reads<B: Backend>(
     backend: &B,
     may_query: bool,
@@ -216,9 +180,6 @@ async fn gated_reads<B: Backend>(
     )
 }
 
-/// The open investigations of `listed`, most recently changed first, at
-/// most [`OPEN_INVESTIGATIONS_MAX`], and the line that says what the list
-/// leaves out or why there is none; nothing for a key that cannot list.
 fn open_part(
     listed: Option<Result<InvestigationList, ClientError>>,
 ) -> (Vec<InvestigationSummaryView>, Option<String>) {
@@ -261,8 +222,6 @@ fn open_part(
     (views, note)
 }
 
-/// The outcome line: the version, health, and how many groups sent events
-/// in the last 24 hours, or `None` when the key cannot run queries.
 fn outcome(version: &str, health: &str, groups: Option<usize>) -> String {
     match groups {
         Some(1) => format!(
@@ -277,8 +236,6 @@ fn outcome(version: &str, health: &str, groups: Option<usize>) -> String {
     }
 }
 
-/// The inventory and its note, from the inventory query's answer, or
-/// `None` when the key may not run it.
 fn inventory_part(
     answer: Option<Result<QueryResponse, ClientError>>,
 ) -> (Vec<InventoryRow>, Option<String>) {
@@ -292,8 +249,6 @@ fn inventory_part(
     }
 }
 
-/// Retention reach and its note, from the dashboard, or `None` when the
-/// key may not read it.
 fn retention_part(
     answer: Option<Result<DashboardSnapshot, ClientError>>,
     today: NaiveDate,
@@ -322,8 +277,6 @@ fn retention_part(
     }
 }
 
-/// The degraded fields across services, or the note saying why they are
-/// unknown.
 fn degraded_part(
     answer: Result<ServiceSchemaResponse, ClientError>,
 ) -> (Vec<String>, Option<String>) {
@@ -348,9 +301,6 @@ fn degraded_part(
     }
 }
 
-/// The display zone's label in `orient`: its canonical spelling, with the
-/// offset at `now` for `local`, named as the setting of the machine that
-/// runs `trawl mcp`.
 fn display_zone_label(zone: DisplayZone, now: DateTime<Utc>) -> String {
     const SETTING: &str = "the mcp host's setting";
     match zone {
@@ -359,12 +309,10 @@ fn display_zone_label(zone: DisplayZone, now: DateTime<Utc>) -> String {
     }
 }
 
-/// `now` in the wire's spelling at `offset`, through trawl-api's presenter.
 fn now_text(now: DateTime<Utc>, offset: FixedOffset) -> String {
     wire_timestamp(now.timestamp_micros(), offset)
 }
 
-/// The inventory rows and their note from the inventory query's answer.
 fn inventory_rows(response: &QueryResponse) -> (Vec<InventoryRow>, Option<String>) {
     let result = &response.result;
     let column = |name: &str| result.columns.iter().position(|c| c.name == name);
@@ -405,7 +353,6 @@ fn inventory_rows(response: &QueryResponse) -> (Vec<InventoryRow>, Option<String
     (rows, note)
 }
 
-/// A cell as text; null is absent.
 fn text(cell: Option<&Value>) -> Option<String> {
     match cell? {
         Value::Null => None,
@@ -414,7 +361,6 @@ fn text(cell: Option<&Value>) -> Option<String> {
     }
 }
 
-/// A count cell as a number; anything else is 0.
 fn count(cell: Option<&Value>) -> u64 {
     match cell {
         Some(Value::Integer(n)) => u64::try_from(*n).unwrap_or(0),
@@ -423,7 +369,6 @@ fn count(cell: Option<&Value>) -> u64 {
     }
 }
 
-/// Why the inventory is absent, from the inventory query's refusal.
 fn inventory_failure(error: &ClientError) -> String {
     match error.error_code() {
         Some(ErrorCode::CorpusRecovering) => "absent: trawld is refusing corpus reads while it \
@@ -437,7 +382,6 @@ fn inventory_failure(error: &ClientError) -> String {
     }
 }
 
-/// Health as trawld reported it, with the checks that are not ok.
 fn health_view(http_status: u16, health: &trawl_client::HealthResponse) -> HealthView {
     let status = match health.status {
         HealthStatus::Ok => "ok",
@@ -459,7 +403,6 @@ fn health_view(http_status: u16, health: &trawl_client::HealthResponse) -> Healt
     }
 }
 
-/// One environment's retention reach, counted to `today` in UTC.
 fn retention_reach(env: &trawl_api::EnvironmentCapacity, today: NaiveDate) -> RetentionReach {
     let days_kept = NaiveDate::parse_from_str(&env.oldest_date, "%Y-%m-%d")
         .ok()
@@ -520,8 +463,6 @@ fn projection(reach: &Reach, max_age_days: u64) -> String {
     }
 }
 
-/// The applied bounds, quotas and admission numbers, named by the setting
-/// that holds each.
 fn limits(capabilities: &CapabilitiesResponse) -> Vec<NamedValue> {
     let b = &capabilities.bounds;
     let q = &capabilities.quotas;
@@ -577,8 +518,6 @@ fn limits(capabilities: &CapabilitiesResponse) -> Vec<NamedValue> {
     ]
 }
 
-/// At most two first calls: a search, when the key may run one, and the
-/// fields of the busiest service, when the key may read the schema.
 fn next_actions(may_query: bool, may_read_schema: bool, service: Option<&str>) -> Vec<NextAction> {
     let mut actions = Vec::new();
     if may_query {
@@ -598,7 +537,6 @@ fn next_actions(may_query: bool, may_read_schema: bool, service: Option<&str>) -
     actions
 }
 
-/// A JSON object literal as the map a [`NextAction`] carries.
 pub(crate) fn object(value: Json) -> Map<String, Json> {
     match value {
         Json::Object(map) => map,

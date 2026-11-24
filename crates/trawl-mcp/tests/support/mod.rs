@@ -4,10 +4,6 @@
 
 //! A recording [`Backend`] over fixtures, and the fixtures the tool tests
 //! share.
-//!
-//! Each method answers from a handler the test set, and records the call
-//! with its arguments. A method with no handler panics, so a test that
-//! does not expect a call fails loudly when it happens.
 
 #![allow(
     dead_code,
@@ -42,7 +38,6 @@ use trawl_mcp::Backend;
 
 pub type Handler<T> = Box<dyn Fn() -> Result<T, ClientError> + Send + Sync>;
 
-/// A backend answering from per-method handlers and recording each call.
 #[derive(Default)]
 pub struct Fake {
     pub calls: Mutex<Vec<String>>,
@@ -53,7 +48,6 @@ pub struct Fake {
     pub schema_services: Option<Handler<ServiceSchemaResponse>>,
     pub schema: Option<Handler<SchemaResponse>>,
     pub catalog_fields: Option<Handler<CatalogFieldsResponse>>,
-    /// By field name; a name without an entry answers 404 `not_found`.
     pub catalog_field: HashMap<String, CatalogFieldResponse>,
     pub field_values: Option<Handler<FieldValuesResponse>>,
     pub query: Option<Handler<QueryResponse>>,
@@ -80,12 +74,10 @@ pub struct Fake {
 }
 
 impl Fake {
-    /// Every call so far, in order, each as `method arg...`.
     pub fn calls(&self) -> Vec<String> {
         self.calls.lock().unwrap().clone()
     }
 
-    /// The method names called so far, in order.
     pub fn methods(&self) -> Vec<String> {
         self.calls()
             .iter()
@@ -97,7 +89,6 @@ impl Fake {
         self.calls.lock().unwrap().push(call);
     }
 
-    /// Wait for a permit of `correlation_gate`, when it is set.
     async fn correlation_wait(&self) {
         if let Some(gate) = &self.correlation_gate {
             gate.acquire().await.expect("the gate stays open").forget();
@@ -110,13 +101,10 @@ impl Fake {
     }
 }
 
-/// A handler answering `value` every time.
 pub fn ok<T: Clone + Send + Sync + 'static>(value: T) -> Option<Handler<T>> {
     Some(Box::new(move || Ok(value.clone())))
 }
 
-/// A handler answering `answers` in order, one per call; a call past the
-/// last panics.
 pub fn each<T: Send + 'static>(answers: Vec<Result<T, ClientError>>) -> Option<Handler<T>> {
     let queue = Mutex::new(std::collections::VecDeque::from(answers));
     Some(Box::new(move || {
@@ -128,7 +116,6 @@ pub fn each<T: Send + 'static>(answers: Vec<Result<T, ClientError>>) -> Option<H
     }))
 }
 
-/// A handler refusing every time with `status` and `code`.
 pub fn refuse<T>(status: u16, code: ErrorCode, message: &str) -> Option<Handler<T>> {
     let message = message.to_owned();
     Some(Box::new(move || {
@@ -136,7 +123,6 @@ pub fn refuse<T>(status: u16, code: ErrorCode, message: &str) -> Option<Handler<
     }))
 }
 
-/// A refusal as trawl-client returns it.
 pub fn server_error(status: u16, code: ErrorCode, message: &str) -> ClientError {
     ClientError::Server {
         status,
@@ -242,8 +228,6 @@ impl Backend for Fake {
         self.answer("capture", self.capture.as_ref())
     }
 
-    /// Recorded as `context` and the request as compact JSON, its
-    /// `investigation` attachment among it.
     async fn context(&self, request: &ContextRequest) -> Result<CorrelationResponse, ClientError> {
         self.record(format!(
             "context {}",
@@ -253,7 +237,6 @@ impl Backend for Fake {
         self.answer("context", self.context.as_ref())
     }
 
-    /// Recorded as `sightings` and the request as compact JSON.
     async fn sightings(
         &self,
         request: &SightingsRequest,
@@ -266,7 +249,6 @@ impl Backend for Fake {
         self.answer("sightings", self.sightings.as_ref())
     }
 
-    /// Recorded as `compare` and the request as compact JSON.
     async fn compare(&self, request: &CompareRequest) -> Result<CorrelationResponse, ClientError> {
         self.record(format!(
             "compare {}",
@@ -383,12 +365,9 @@ impl Backend for Fake {
     }
 }
 
-// -- fixtures -----------------------------------------------------------------
-
 pub const RESULT_ID: &str = "0123456789abcdef0123456789abcdef";
 pub const ORIGIN: &str = "https://trawl.example.com";
 
-/// A key holding `permissions`.
 pub fn whoami(permissions: &[&str]) -> WhoAmIResponse {
     serde_json::from_value(json!({
         "prefix": "abcd1234",
@@ -400,7 +379,6 @@ pub fn whoami(permissions: &[&str]) -> WhoAmIResponse {
     .unwrap()
 }
 
-/// A healthy report.
 pub fn health() -> HealthResponse {
     HealthResponse {
         status: HealthStatus::Ok,
@@ -414,7 +392,6 @@ pub fn health() -> HealthResponse {
     }
 }
 
-/// Capabilities with `link_origin`.
 pub fn capabilities(link_origin: Option<&str>) -> CapabilitiesResponse {
     CapabilitiesResponse {
         version: "0.9.3".to_owned(),
@@ -458,7 +435,6 @@ pub fn capabilities(link_origin: Option<&str>) -> CapabilitiesResponse {
     }
 }
 
-/// Two services, one with a degraded field.
 pub fn schema_services() -> ServiceSchemaResponse {
     serde_json::from_value(json!({
         "services": [
@@ -484,7 +460,6 @@ pub fn schema_services() -> ServiceSchemaResponse {
     .unwrap()
 }
 
-/// A query answer with `columns` and `rows`, `total` rows produced.
 pub fn query_response(columns: Vec<Column>, rows: Vec<Vec<Value>>, total: usize) -> QueryResponse {
     let returned = rows.len();
     QueryResponse {
@@ -502,12 +477,10 @@ pub fn query_response(columns: Vec<Column>, rows: Vec<Vec<Value>>, total: usize)
     }
 }
 
-/// A string cell.
 pub fn s(text: &str) -> Value {
     Value::String(text.to_owned())
 }
 
-/// A captured result over `columns` with `facts`, live, event-shaped.
 pub fn captured(
     query: &str,
     columns: &[(&str, ColumnType)],
@@ -553,7 +526,6 @@ pub fn captured(
     }
 }
 
-/// Facts for a column with no listed values.
 pub fn no_values(distinct: u64) -> ColumnFacts {
     ColumnFacts {
         nulls: 0,
@@ -565,7 +537,6 @@ pub fn no_values(distinct: u64) -> ColumnFacts {
     }
 }
 
-/// Facts for a column holding `values` with their counts.
 pub fn values(values: &[(Value, u64)]) -> ColumnFacts {
     ColumnFacts {
         nulls: 0,
@@ -585,7 +556,6 @@ pub fn values(values: &[(Value, u64)]) -> ColumnFacts {
     }
 }
 
-/// A page of `result` holding `rows` from `offset`, every column.
 pub fn page(result: &CapturedResult, rows: Vec<Vec<Value>>, offset: u64) -> ResultPage {
     let returned = rows.len();
     ResultPage {
@@ -608,7 +578,6 @@ pub fn page(result: &CapturedResult, rows: Vec<Vec<Value>>, offset: u64) -> Resu
     }
 }
 
-/// A dashboard whose capacity lists `environments`.
 pub fn dashboard(environments: Vec<trawl_api::EnvironmentCapacity>) -> DashboardSnapshot {
     use trawl_api::{
         Capacity, HeadroomReading, PressureEvidence, StorageMeasurement, StorageMeasurementStatus,
@@ -677,11 +646,8 @@ pub fn dashboard(environments: Vec<trawl_api::EnvironmentCapacity>) -> Dashboard
     }
 }
 
-// -- investigation fixtures -------------------------------------------------
-
 pub const INVESTIGATION_ID: &str = "fedcba9876543210fedcba9876543210";
 
-/// The agent key as an actor.
 pub fn agent() -> Actor {
     Actor {
         prefix: "abcd1234".to_owned(),
@@ -689,7 +655,6 @@ pub fn agent() -> Actor {
     }
 }
 
-/// The human key as an actor.
 pub fn human() -> Actor {
     Actor {
         prefix: "Zy9x8w7v".to_owned(),
@@ -697,7 +662,6 @@ pub fn human() -> Actor {
     }
 }
 
-/// An open investigation at `seq`.
 pub fn investigation(seq: u64) -> Investigation {
     Investigation {
         id: InvestigationId::parse(INVESTIGATION_ID).unwrap(),
@@ -715,7 +679,6 @@ pub fn investigation(seq: u64) -> Investigation {
     }
 }
 
-/// A note `text` by `actor` at `seq`.
 pub fn note(seq: u64, actor: Actor, text: &str) -> LogEntry {
     LogEntry {
         seq,

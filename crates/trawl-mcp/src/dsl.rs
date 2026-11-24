@@ -4,33 +4,20 @@
 
 //! The DSL reference as MCP resources, and the essentials block `orient`
 //! prints (ADR-0058).
-//!
-//! The reference is the published page, `reference/dsl.md`, compiled in.
-//! It is served in sections so no resource read exceeds the response hard
-//! cap: one resource per `## ` section, and when a section is larger than
-//! [`SECTION_CAP`], one for its text before the first `### ` heading and
-//! one per `### ` section. The text before the first `## ` heading, without
-//! the page's front matter, is the `overview`. Headings inside fenced code
-//! blocks do not split. URIs are `trawl://dsl/<slug>`, or
-//! `trawl://dsl/<slug>/<sub-slug>` for a split section, in page order.
 
 use std::sync::LazyLock;
 
-/// The published DSL reference page.
 pub const REFERENCE: &str = include_str!("../../../docs/src/content/docs/reference/dsl.md");
 
 /// The most bytes of markdown one resource holds: the hard response cap.
 pub const SECTION_CAP: usize = 32 * 1024;
 
-/// Every DSL resource URI starts with this.
 pub const URI_PREFIX: &str = "trawl://dsl/";
 
-/// The MIME type of every DSL resource.
 pub const MIME_TYPE: &str = "text/markdown";
 
-/// The DSL in a few lines, for a client that reads no resources. Every
-/// backticked span and every indented example line is a whole query that
-/// parses and validates; a test holds them to it.
+/// Every backticked span and every indented example line is a whole query
+/// that parses and validates; a test holds them to it.
 pub const ESSENTIALS: &str = "\
 DSL essentials (the full reference is in the trawl://dsl/ resources):
 - A query is a search stage, then pipe stages, each after `|`.
@@ -55,33 +42,25 @@ Never mix last= with earliest= or latest=.
   status=200 last=24h | where duration > 1000 | stats avg(duration) by uri | sort -avg_duration | head 10
 ";
 
-/// One DSL reference resource.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Section {
-    /// `trawl://dsl/<slug>` or `trawl://dsl/<slug>/<sub-slug>`.
     pub uri: String,
-    /// The slug path after [`URI_PREFIX`], used as the resource name.
     pub name: String,
-    /// The heading, or `<heading>: <sub-heading>` for a split section.
     pub title: String,
-    /// The section's markdown, its heading line included.
     pub text: String,
 }
 
-/// The sections of [`REFERENCE`], in page order.
 #[must_use]
 pub fn sections() -> &'static [Section] {
     static SECTIONS: LazyLock<Vec<Section>> = LazyLock::new(|| split(REFERENCE, SECTION_CAP));
     &SECTIONS
 }
 
-/// The section a URI names.
 #[must_use]
 pub fn section(uri: &str) -> Option<&'static Section> {
     sections().iter().find(|section| section.uri == uri)
 }
 
-/// Split a markdown page into sections as the module doc describes.
 fn split(page: &str, cap: usize) -> Vec<Section> {
     let (title, body) = strip_front_matter(page);
     let chunks = chunks_at(body, "## ");
@@ -126,7 +105,6 @@ fn section_for(slugs: &[&str], title: &str, text: &str) -> Section {
     }
 }
 
-/// The page's `title:` and the body after its `---` front matter.
 fn strip_front_matter(page: &str) -> (Option<&str>, &str) {
     let Some(rest) = page.strip_prefix("---\n") else {
         return (None, page);
@@ -141,9 +119,6 @@ fn strip_front_matter(page: &str) -> (Option<&str>, &str) {
     (title, &rest[end + "\n---\n".len()..])
 }
 
-/// Cut `text` before every line that starts with `marker` outside a fenced
-/// code block. The first chunk has no heading; each later one carries its
-/// heading text and starts at its heading line.
 fn chunks_at<'a>(text: &'a str, marker: &str) -> Vec<(Option<&'a str>, &'a str)> {
     let mut chunks = Vec::new();
     let mut heading = None;
@@ -165,8 +140,6 @@ fn chunks_at<'a>(text: &'a str, marker: &str) -> Vec<(Option<&'a str>, &'a str)>
     chunks
 }
 
-/// A heading as a URI segment: ASCII alphanumerics lowercased, every other
-/// run of characters one `-`, none at either end.
 fn slugify(heading: &str) -> String {
     let mut slug = String::new();
     for c in heading.chars() {
@@ -253,8 +226,6 @@ mod tests {
         assert_eq!(slugify("Severity: `_severity`"), "severity-severity");
     }
 
-    /// The whole queries in [`ESSENTIALS`]: its indented example lines and
-    /// its single-backticked spans.
     fn essential_queries() -> Vec<&'static str> {
         let mut queries: Vec<&str> = ESSENTIALS
             .lines()
@@ -291,9 +262,6 @@ mod tests {
         assert!(ESSENTIALS.len() < 2048, "{}", ESSENTIALS.len());
     }
 
-    /// An agent reading only [`ESSENTIALS`] learns that a regex test is the
-    /// `matches` operator and that `replace` is literal. Whole words, so
-    /// another word that merely contains either one does not count.
     #[test]
     fn the_essentials_name_matches_and_literal_replace() {
         let words: Vec<&str> = ESSENTIALS

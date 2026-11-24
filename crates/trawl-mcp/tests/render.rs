@@ -2,9 +2,7 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The text contract (ADR-0058): the layout of a search result, hostile
-//! event text kept as data, the byte budget, abbreviation of long cells,
-//! refusals with caret excerpts, and a failed validation as a success.
+//! The text contract (ADR-0058).
 
 use proptest::prelude::*;
 use rmcp::model::CallToolResult;
@@ -33,8 +31,6 @@ fn text_of(result: &CallToolResult) -> &str {
     &result.content[0].as_text().expect("a text block").text
 }
 
-/// Bytes the result uses against its budget: the text block plus the
-/// mirror serialized compactly.
 fn used_bytes(result: &CallToolResult) -> usize {
     text_of(result).len()
         + result
@@ -56,7 +52,6 @@ fn presentation() -> Presentation {
     }
 }
 
-/// A search reply over `page`, its rows encoded as the tool encodes them.
 fn reply_over(page: &QueryResult, rows_captured: u64) -> SearchReply {
     let encoded = encode_page(page, &[], 0).expect("the page encodes");
     SearchReply {
@@ -106,8 +101,6 @@ fn arguments(value: Json) -> Map<String, Json> {
         _ => unreachable!("arguments are an object"),
     }
 }
-
-// -- layout -------------------------------------------------------------------
 
 #[test]
 fn a_search_result_follows_the_layout() {
@@ -231,8 +224,6 @@ fn an_abbreviated_cell_names_the_read_that_returns_it_whole() {
     assert_eq!(encoded.abbreviated[0].total_bytes, wire.len() as u64);
 }
 
-// -- hostile event text -----------------------------------------------------------
-
 #[test]
 fn hostile_raw_text_stays_inside_a_json_string() {
     let hostile = format!(
@@ -271,7 +262,6 @@ fn hostile_raw_text_stays_inside_a_json_string() {
     assert_eq!(parsed[0][1], Json::String(hostile));
     assert_eq!(parsed[1][1], Json::String(INSTRUCTION.to_owned()));
 
-    // The instruction appears only on row lines, and only inside strings.
     for line in text.lines().filter(|line| line.contains(INSTRUCTION)) {
         assert!(row_lines.contains(&line), "outside the rows: {line}");
         let row: Vec<Json> = serde_json::from_str(line).unwrap();
@@ -287,11 +277,6 @@ fn hostile_raw_text_stays_inside_a_json_string() {
     );
 }
 
-/// Bidi controls, zero-widths, the BOM and the soft hyphen in a cell print
-/// as `\uXXXX` escapes inside the row's JSON string, which decodes back to
-/// the cell, and as `\u{xxxx}` in a line the server writes. The mirror's
-/// strings carry the same `\uXXXX` escapes, the cell's being the very
-/// characters the row prints between its quotes.
 #[test]
 fn format_characters_print_escaped_in_a_row_and_a_written_line() {
     let format_chars = "\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}";
@@ -358,9 +343,6 @@ fn tool_written_lines_stay_on_one_line() {
     assert!(text.contains("hint: host \"a\\nb\" lags"), "{text}");
 }
 
-// -- the byte budget ----------------------------------------------------------------
-
-/// A page of `rows` rows of one 400-byte text column.
 fn wide_page(rows: usize) -> QueryResult {
     QueryResult {
         columns: vec![ApiColumn::new("message", ColumnType::String)],
@@ -391,7 +373,6 @@ fn rows_are_dropped_whole_from_the_end_to_fit_and_the_text_says_so() {
         )),
         "{text}"
     );
-    // Every printed row is whole: the first rows of the page, in order.
     for (i, row) in mirror["result"]["rows"]
         .as_array()
         .unwrap()
@@ -402,7 +383,6 @@ fn rows_are_dropped_whole_from_the_end_to_fit_and_the_text_says_so() {
     }
 }
 
-/// The proposed next calls of a fitted result, from its mirror.
 fn mirrored_actions(result: &CallToolResult) -> Vec<Json> {
     result.structured_content.as_ref().unwrap()["next_actions"]
         .as_array()
@@ -606,23 +586,13 @@ fn a_reply_that_cannot_fit_is_an_error_naming_the_result() {
     );
 }
 
-// -- wide results -------------------------------------------------------------------
-
 /// Columns of the page of [`sparse_page`]: a capture of 750 columns whose
 /// first trawld's projection left out, so page column `i` is captured
 /// column `i + 1`.
 const WIDE_COLUMNS: usize = 749;
-/// Rows the wide page read.
 const WIDE_ROWS: usize = 40;
-/// The page indices of the columns holding a value in some row, in stored
-/// order: the first holds one only in the last row, the second shares its
-/// name with [`DUPLICATE_OF_SECOND`], and the rest carry hostile names.
 const NON_NULL: [usize; 10] = [2, 9, 40, 41, 100, 230, 231, 400, 600, 748];
-/// A column null in every row, named as `NON_NULL[1]` is.
 const DUPLICATE_OF_SECOND: usize = 10;
-/// Name prefixes that must stay data: bidi and zero-width controls, a line
-/// break, a quote that would close the JSON string, an emoji, a combining
-/// mark, wide characters and a BOM.
 const HOSTILE: [&str; 8] = [
     "\u{202e}evil",
     "zero\u{200b}width",
@@ -634,7 +604,6 @@ const HOSTILE: [&str; 8] = [
     "\u{feff}bom",
 ];
 
-/// The name of wide page column `index`: long for every non-null column.
 fn wide_name(index: usize) -> String {
     let long = |prefix: &str| format!("{prefix}{}", "n".repeat(170));
     match NON_NULL.iter().position(|&non_null| non_null == index) {
@@ -646,9 +615,6 @@ fn wide_name(index: usize) -> String {
     }
 }
 
-/// The cell of wide page row `row` at column `index`: `NON_NULL[0]` holds a
-/// value only in the last row; each other non-null column holds one in
-/// every ninth row; every other cell is null.
 fn wide_cell(row: usize, index: usize) -> Value {
     let holds = match NON_NULL.iter().position(|&non_null| non_null == index) {
         Some(0) => row == WIDE_ROWS - 1,
@@ -662,8 +628,6 @@ fn wide_cell(row: usize, index: usize) -> Value {
     }
 }
 
-/// A sparse page of [`WIDE_COLUMNS`] string columns and [`WIDE_ROWS`] rows,
-/// with each cell `cell(row, index)` returns.
 fn sparse_page(cell: impl Fn(usize, usize) -> Value) -> QueryResult {
     QueryResult {
         columns: (0..WIDE_COLUMNS)
@@ -675,8 +639,6 @@ fn sparse_page(cell: impl Fn(usize, usize) -> Value) -> QueryResult {
     }
 }
 
-/// A search reply over the wide `page`, encoded at captured positions 1 to
-/// 749 with the one column trawld's projection left out counted.
 fn wide_reply(page: &QueryResult) -> SearchReply {
     let positions: Vec<usize> = (1..=page.columns.len()).collect();
     let encoded = encode_page(page, &positions, 0).expect("the page encodes");
@@ -689,11 +651,6 @@ fn wide_reply(page: &QueryResult) -> SearchReply {
     reply
 }
 
-/// The page indices of the columns the fitted `result` prints, in printed
-/// order, after checking each against the page: its captured position is
-/// its index plus one, its name and type are the page column's, every
-/// printed row is as long as the printed columns, and every printed cell
-/// is the page's cell at that captured position.
 fn printed_columns(result: &CallToolResult, page: &QueryResult) -> Vec<usize> {
     let view = &result.structured_content.as_ref().unwrap()["result"];
     let printed: Vec<usize> = view["columns"]
@@ -721,11 +678,6 @@ fn printed_columns(result: &CallToolResult, page: &QueryResult) -> Vec<usize> {
     printed
 }
 
-/// #373: a page of 749 columns, most of them null, prints rows at every
-/// budget. The null columns go first, decided over every row read; at
-/// 4096 bytes the ten that hold values still do not fit beside one row,
-/// so the reply keeps the longest prefix of them, in stored order, with
-/// which a row prints, and one more column would print none.
 #[test]
 fn wide_result_omits_null_columns_then_a_suffix() {
     let page = sparse_page(wide_cell);
@@ -749,8 +701,6 @@ fn wide_result_omits_null_columns_then_a_suffix() {
         let rows = view["rows"].as_array().unwrap().len();
         assert!(rows >= 1, "{label}: {}", text_of(&result));
         let printed = printed_columns(&result, &page);
-        // The printed columns are a prefix of the non-null ones: the
-        // duplicate name's null column is gone, its non-null twin is not.
         assert!(!printed.is_empty(), "{label}");
         assert_eq!(printed, NON_NULL[..printed.len()], "{label}");
         let omitted = 1 + WIDE_COLUMNS - printed.len();
@@ -764,8 +714,6 @@ fn wide_result_omits_null_columns_then_a_suffix() {
             json!(nulls),
             "{label}"
         );
-        // The column holding a value only in the last row stays printed
-        // where the budget dropped that row.
         assert_eq!(printed[0], NON_NULL[0], "{label}");
         if max_bytes < 32_768 {
             assert!(rows < WIDE_ROWS, "{label}: the last row is dropped");
@@ -778,7 +726,6 @@ fn wide_result_omits_null_columns_then_a_suffix() {
             )),
             "{label}: {text}"
         );
-        // Hostile names print escaped, as JSON strings, in the text block.
         assert!(
             !text
                 .chars()
@@ -829,10 +776,6 @@ fn wide_result_omits_null_columns_then_a_suffix() {
     );
 }
 
-/// #373: a page that read no row omits no column for being null: every
-/// column is null in zero rows, which says nothing of its cells. The reply
-/// drops its other parts to fit, and a page too wide to fit is refused
-/// rather than cut.
 #[test]
 fn an_empty_page_omits_no_null_column() {
     let page = QueryResult {
@@ -932,8 +875,6 @@ fn a_cell_range_prints_fewer_bytes_to_fit_and_says_where_the_rest_starts() {
     );
 }
 
-// -- refusals ---------------------------------------------------------------------
-
 #[test]
 fn a_rate_limited_search_names_the_code_request_id_and_wait() {
     let error = ClientError::Server {
@@ -959,8 +900,6 @@ fn a_rate_limited_search_names_the_code_request_id_and_wait() {
 
 #[test]
 fn a_cut_refusal_keeps_its_request_id_and_wait() {
-    // The parser echoes an unknown stage word in full, and this query is
-    // well under the 64 KiB query limit.
     let sent = format!("* | {}", "x".repeat(9000));
     let error = ClientError::Server {
         status: 429,
@@ -995,7 +934,6 @@ fn a_cut_refusal_keeps_its_request_id_and_wait() {
     );
 }
 
-/// The caret line's display columns before its first caret.
 fn caret_column(excerpt: &str) -> (usize, usize) {
     let (_, carets) = excerpt.split_once('\n').unwrap();
     let pad = carets.trim_end_matches('^');
@@ -1121,8 +1059,6 @@ fn line_and_paragraph_separators_never_reach_an_excerpt_raw() {
     }
 }
 
-/// The refusal text and the validation text for a parse error at `needle`
-/// in `sent`, each with the caret excerpt trawld's span asks for.
 fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
     let start = sent.find(needle).unwrap();
     let detail = ErrorDetail {
@@ -1169,8 +1105,6 @@ fn excerpt_texts(sent: &str, needle: &str) -> [String; 2] {
     [refused, validated]
 }
 
-/// The excerpt line and the caret line inside `text`: the line holding
-/// `needle` and the one after it.
 fn excerpt_lines<'a>(text: &'a str, needle: &str) -> (&'a str, &'a str) {
     let mut lines = text.lines();
     let line = lines
@@ -1290,8 +1224,6 @@ fn invalid_arguments_are_capped() {
     assert!(text.len() <= MAX_ERROR_BYTES);
 }
 
-// -- validation -------------------------------------------------------------------
-
 #[test]
 fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
     let sent = "level=error | sort -_time | haed 5";
@@ -1334,8 +1266,6 @@ fn a_failed_validation_is_a_successful_call_with_the_excerpt() {
     );
 }
 
-/// A valid query trawld would not format carries no text, says why, and
-/// mirrors the typed refusal (ADR-0061).
 #[test]
 fn validation_render_shows_the_format_error() {
     let response = ValidationResponse {
@@ -1372,13 +1302,9 @@ fn validation_render_shows_the_format_error() {
     assert_eq!(mirror["format_error"]["kind"], "too_long", "{mirror}");
 }
 
-// -- advice under the budget (ADR-0068, #460) ---------------------------------
-
 /// A text with one finding of each advice kind.
 const ADVISED: &str = "\"10.244.0.83\" -service=coredns service=trawld event_type in (a, b)";
 
-/// `reply` with the advice on [`ADVISED`] ahead of its hints, counted as
-/// the tool counts it.
 fn advised(reply: &SearchReply) -> SearchReply {
     let advice = trawl_mcp::hints::advice(ADVISED);
     assert_eq!(advice.len(), 2, "{advice:?}");
@@ -1389,8 +1315,7 @@ fn advised(reply: &SearchReply) -> SearchReply {
 }
 
 /// An execute reply whose ladder changes within the budgets a call may
-/// name: six 400-byte rows of 40 captured, three facets, a long link, a
-/// page continuation and a narrowing search, and one computed hint.
+/// name.
 fn execute_reply() -> SearchReply {
     let page = wide_page(6);
     let mut reply = reply_over(&page, 40);
@@ -1432,7 +1357,6 @@ fn execute_reply() -> SearchReply {
     reply
 }
 
-/// A valid verdict proposing the execution of a long text.
 fn validate_reply() -> SearchReply {
     let query = format!("service=trawld {}", "w".repeat(1500));
     let response = ValidationResponse {
@@ -1458,8 +1382,6 @@ fn validate_reply() -> SearchReply {
     }
 }
 
-/// What a fitted search reply kept, from its mirror, but its hints and the
-/// facts that say hints were dropped: the parts advice must never cost.
 fn kept_parts(result: &CallToolResult) -> Json {
     if result.is_error == Some(true) {
         return json!({"error": text_of(result)});
@@ -1479,24 +1401,17 @@ fn kept_parts(result: &CallToolResult) -> Json {
     kept
 }
 
-/// The hints a fitted reply printed, from its mirror; `None` for an error.
 fn printed_hints(result: &CallToolResult) -> Option<Vec<Json>> {
     let mirror = result.structured_content.as_ref()?;
     Some(mirror["hints"].as_array().unwrap().clone())
 }
 
-/// One budget of a sweep: the advised and the advice-free reply fitted.
 struct Fitted {
     budget: usize,
     advised: CallToolResult,
     plain: CallToolResult,
 }
 
-/// Fit `plain` and its [`advised`] counterpart under every budget a
-/// coarse pass over `lo..=hi` finds a change between, byte by byte, and
-/// every coarse budget besides: a change of what either reply keeps or of
-/// which hints the advised one prints. Returns every budget fitted, in
-/// increasing order.
 fn sweep(plain: &SearchReply, lo: usize, hi: usize) -> Vec<Fitted> {
     let advised_reply = advised(plain);
     let fit = |budget: usize| {
@@ -1533,16 +1448,10 @@ fn sweep(plain: &SearchReply, lo: usize, hi: usize) -> Vec<Fitted> {
     all
 }
 
-/// The smallest budget at which `reply` fits whole, by fitting it at the
-/// hard cap and measuring.
 fn whole_size(reply: &SearchReply) -> usize {
     used_bytes(&render::search(reply.clone(), Budget::HARD, ROWS))
 }
 
-/// Check every budget of `swept`: both replies stay within it; the
-/// advised one keeps exactly what the advice-free one keeps, next calls
-/// compared whole; and its hints are its advice and then the others, or
-/// the advice-free reply's hints with the hints-dropped fact said.
 fn assert_advice_costs_nothing(plain: &SearchReply, swept: &[Fitted]) {
     let advice = advised(plain).hints[..2].to_vec();
     for fitted in swept {
@@ -1586,18 +1495,12 @@ fn assert_advice_costs_nothing(plain: &SearchReply, swept: &[Fitted]) {
     }
 }
 
-/// A reply sized at any boundary has the same next calls, compared whole,
-/// and keeps the same rows, facets, link and verdict, with advice as
-/// without, in execute mode and in validate mode: every budget from the
-/// smallest a call may name to past the advised reply's whole size, byte by
-/// byte around every change of what either reply keeps.
 #[test]
 fn advice_never_costs_next_actions() {
     for plain in [execute_reply(), validate_reply()] {
         let hi = whole_size(&advised(&plain)) + 64;
         let swept = sweep(&plain, Budget::MIN.bytes(), hi.min(Budget::HARD.bytes()));
         assert_advice_costs_nothing(&plain, &swept);
-        // The sweep crossed the advice boundary and the next calls'.
         let actions = |result: &CallToolResult| {
             result
                 .structured_content
@@ -1627,9 +1530,6 @@ fn advice_never_costs_next_actions() {
     }
 }
 
-/// Advice goes before anything else: some budget prints every row, facet,
-/// next call, the link and the other hint, without the advice, and says
-/// the hints were dropped.
 #[test]
 fn advice_drops_before_rows_facets_and_other_hints() {
     let plain = execute_reply();
@@ -1672,9 +1572,6 @@ fn advice_drops_before_rows_facets_and_other_hints() {
     );
 }
 
-/// Without advice, the fitting gives up the same parts in the same order
-/// as before advice existed: the facets, then the next calls, then the
-/// link, then the hints, each only once no count of rows fits without it.
 #[test]
 fn non_advice_hint_drop_order_is_unchanged() {
     let mut plain = execute_reply();
@@ -1700,7 +1597,6 @@ fn non_advice_hint_drop_order_is_unchanged() {
         let link_gone = view["link"]["url"].is_null();
         let hints_gone = mirror["hints"] == json!([]);
         let order = [facets_gone, actions_gone, link_gone, hints_gone];
-        // A part is gone only when every part before it is.
         for (i, gone) in order.iter().enumerate() {
             if *gone {
                 assert!(order[..i].iter().all(|g| *g), "{budget}: {order:?}");
@@ -1713,9 +1609,6 @@ fn non_advice_hint_drop_order_is_unchanged() {
         );
         seen.insert(order);
     }
-    // Each part goes on a rung of its own: the sweep reaches every state
-    // where the parts before it are gone and the parts after it remain,
-    // so no rung gives up a later part early.
     for state in [
         [false, false, false, false],
         [true, false, false, false],
@@ -1727,10 +1620,6 @@ fn non_advice_hint_drop_order_is_unchanged() {
     }
 }
 
-// -- properties ---------------------------------------------------------------------
-
-/// Text cells: mostly short, sometimes long, with ASCII, accents, wide
-/// characters, emoji, combining marks, quotes and control characters.
 fn text_cell() -> impl Strategy<Value = String> {
     let piece = prop_oneof![
         Just("a".to_owned()),
@@ -1789,8 +1678,6 @@ fn page() -> impl Strategy<Value = QueryResult> {
     })
 }
 
-/// `value` as the mirror carries it: in each string, every unsafe display
-/// character is the escape text the text block prints for it.
 fn mirrored(value: Json) -> Json {
     match value {
         Json::String(text) => Json::String(
@@ -1832,9 +1719,6 @@ proptest! {
         let rows = mirror["result"]["rows"].as_array().unwrap();
         prop_assert!(rows.len() <= 200);
         let abbreviated = mirror["result"]["abbreviated"].as_array().unwrap();
-        // The printed columns keep their captured positions, in stored
-        // order. A column the fitting left out is null in every row read,
-        // or comes after the last printed column; the counts say so.
         let positions = mirror["result"]["columns"]
             .as_array()
             .unwrap()
@@ -1885,9 +1769,6 @@ proptest! {
                 }
             }
         }
-        // No proposed page repeats this call: one that reads from the
-        // page's own offset asks for a larger max_bytes. A reply that
-        // printed none of the rows it read says so in one line.
         for action in mirror["next_actions"].as_array().unwrap() {
             let arguments = &action["arguments"];
             if arguments["action"] == "page" && arguments["offset"] == 0 {
@@ -1903,7 +1784,6 @@ proptest! {
             text.lines().any(|l| l.starts_with("no row fits max_bytes ")),
             rows.is_empty() && !page.rows.is_empty()
         );
-        // Every row line of the text parses as a JSON array.
         if let Some(at) = text.lines().position(|l| l == "rows from captured row 0:") {
             prop_assert_eq!(text.lines().skip(at + 1).count(), rows.len());
             for line in text.lines().skip(at + 1) {

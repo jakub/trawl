@@ -3,19 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The fixed tool table and dispatch (ADR-0058).
-//!
-//! [`schema::tools`] is the table, in the order `tools/list` sends it:
-//! `orient`, `search`, `read`, `context`, `sightings`, `compare`, `fields`,
-//! `investigation`. [`dispatch`] routes one
-//! `tools/call` to its tool after decoding the arguments into the tool's
-//! input type. `context`, `sightings` and `compare` share
-//! [`correlation_read`], which sends the read, attached to an
-//! investigation as [`attach`] attaches `search`, reads the first page of
-//! the result it captured and renders it with its block. Each tool module
-//! has a `run` function that takes the backend, the session's
-//! investigation bookkeeping where the tool attaches, the decoded input
-//! and, where the tool needs it, the instant it treats as now, so a test
-//! can call it with a fixed clock.
 
 mod attach;
 pub mod compare;
@@ -60,13 +47,6 @@ use schema::{
     SightingsInput,
 };
 
-/// Run the tool `name` with `arguments` against `backend`, printing times
-/// in `display_zone` where a tool prints a display time and keeping the
-/// session's investigation bookkeeping in `seen`.
-///
-/// Arguments that do not decode into the tool's input are a tool error the
-/// model can read and correct, not a protocol error. An unknown tool name
-/// is a protocol error, `-32602`.
 pub async fn dispatch<B: Backend>(
     name: &str,
     arguments: Option<JsonObject>,
@@ -115,7 +95,6 @@ pub async fn dispatch<B: Backend>(
     }
 }
 
-/// Decode a call's arguments; absent arguments are an empty object.
 fn decode<I: DeserializeOwned>(
     name: &str,
     arguments: Option<JsonObject>,
@@ -151,19 +130,12 @@ pub(crate) fn failure_summary(error: &ClientError) -> String {
     }
 }
 
-/// The rows a page asks trawld for: the call's `rows`, held to the
-/// `[capture] page_max_rows` trawld's `capabilities` report, because trawld
-/// refuses a longer page. Every continuation the reply proposes asks for
-/// these rows too. When the capabilities could not be read, the call's
-/// `rows`, and trawld's answer stands.
 pub(crate) fn page_rows(rows: u64, capabilities: Option<&CapabilitiesResponse>) -> u64 {
     capabilities.map_or(rows, |capabilities| {
         rows.min(capabilities.bounds.page_max_rows)
     })
 }
 
-/// Whether the DSL itself sampled, limited or deduplicated, read from the
-/// executed text's pipe stages. A text that does not parse claims none.
 pub(crate) async fn dsl_effects(executed_query: &str) -> DslEffects {
     let executed_query = executed_query.to_owned();
     parse_work(move || {
@@ -187,8 +159,6 @@ pub(crate) async fn dsl_effects(executed_query: &str) -> DslEffects {
     .await
 }
 
-/// A captured result's page as a [`ResultView`], before the renderer
-/// counts what it prints.
 pub(crate) async fn result_view(
     result: &CapturedResult,
     offset: u64,
@@ -230,9 +200,6 @@ pub(crate) async fn result_view(
     }
 }
 
-/// At most two continuations of a page: the next page, when captured rows
-/// follow the rows read, and the first abbreviated cell whole.
-///
 /// The page continuation's `offset` is the end of the rows the view
 /// holds, the shape the renderer moves when its budget prints fewer, and
 /// it sends the `columns` the view's page was projected to.
@@ -306,18 +273,6 @@ pub(crate) async fn first_page<B: Backend>(
     Ok((page, offset, encoded))
 }
 
-/// A correlation read: `send` sends the request with the attachment it is
-/// given, and the answer is the first page of the result it captured, at
-/// most [`DEFAULT_ROWS`] rows held to `[capture] page_max_rows`, with the
-/// read's block, the page continuation and follow-ups, and the search URL
-/// under the origin trawld's capabilities report. The capabilities are
-/// read first, once.
-///
-/// Attached to `attachment`'s investigation, the read runs under the
-/// session's lock from before it is sent until its reply recorded what it
-/// printed ([`attach`]); unattached, it takes no lock. Once trawld
-/// accepted an attached read, every error after it opens with the
-/// acknowledgement. Nothing retries.
 pub(crate) async fn correlation_read<B, F, Fut>(
     backend: &B,
     seen: &Seen,
@@ -413,13 +368,6 @@ where
     attach::acknowledged(&acknowledgement, result)
 }
 
-/// A sightings read's follow-up queries as `search` calls over the
-/// result's own bounds, spliced into each query's search stage as AST;
-/// none for another read, and none for a result without bounds, a
-/// follow-up that does not parse, or one the checked formatter refuses
-/// (ADR-0061). A read attached to investigation
-/// `attached` proposes searches attached to it too, without the read's
-/// purpose, which was the read's own.
 pub(crate) async fn follow_ups(
     correlation: &Correlation,
     result: &CapturedResult,
@@ -446,7 +394,6 @@ pub(crate) async fn follow_ups(
     parse_work(move || follow_up_searches(&texts, &earliest, &latest, attached.as_ref())).await
 }
 
-/// [`follow_ups`] for its follow-up `texts`, over `earliest` to `latest`.
 fn follow_up_searches(
     texts: &[String],
     earliest: &str,
@@ -487,9 +434,6 @@ fn follow_up_searches(
         .collect()
 }
 
-/// A column's listed values as JSON values with their counts, at most
-/// [`MAX_FACET_VALUES`], most frequent first; `None` when a value does not
-/// encode under the column's type or is too long to print whole.
 pub(crate) fn listed_values(
     column: &ResultColumn,
     values: &[ValueCount],
@@ -508,8 +452,6 @@ pub(crate) fn listed_values(
         .collect()
 }
 
-/// The error for a page that came back with a cell its column type does
-/// not hold, naming the result so the caller can read it otherwise.
 pub(crate) fn unencodable(
     tool: &str,
     result_id: &str,
@@ -518,7 +460,6 @@ pub(crate) fn unencodable(
     crate::render::refusal::error_result(unencodable_text(tool, result_id, error))
 }
 
-/// The text of [`unencodable`], uncapped.
 pub(crate) fn unencodable_text(tool: &str, result_id: &str, error: &serde_json::Error) -> String {
     format!(
         "{tool} read result {} but a cell does not fit its column's type: {}",

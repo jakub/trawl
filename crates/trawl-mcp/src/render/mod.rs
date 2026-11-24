@@ -4,51 +4,9 @@
 
 //! The text contract: replies as one text block and its mirror (ADR-0058).
 //!
-//! Pure functions, no I/O: a tool fills a reply from [`crate::reply`], and
-//! [`search`] or [`read`] turns it into a `CallToolResult` whose one text
-//! block stands alone and whose `structuredContent` is the reply itself,
-//! its strings escaped as [`rows::mirror`] escapes them, both fitted under
-//! the call's [`Budget`].
-//!
-//! The text block of a result, top to bottom, each part omitted when it is
-//! empty:
-//!
-//! 1. the outcome line, then the result id and how long it stays readable;
-//! 2. the bounds, RFC 3339 with microseconds in UTC, and the executed text
-//!    as a JSON string;
-//! 3. four truncation facts, four sentences: the rows the execution
-//!    produced; the rows the capture kept and whether it truncated;
-//!    whether the DSL itself sampled, limited or deduplicated; and what
-//!    this response abbreviated, omitted or dropped to fit its budget;
-//! 4. facets over the captured rows, then the hints; for a correlation
-//!    read, its block instead ([`correlation`](mod@correlation));
-//! 5. at most two proposed next calls, each a tool name and its arguments
-//!    as a compact JSON object;
-//! 6. the search URL, or the sentence saying why there is none;
-//! 7. one columns line;
-//! 8. the rows, one JSON array per line, every cell one JSON value; when
-//!    the budget printed none of the rows read, one line saying so.
-//!
-//! Every value that came from stored events (a cell, a facet value, a
-//! column name) prints as JSON, so event text stays data. The free text a
-//! tool writes (the outcome, hints, reasons), trawld's messages and any
-//! trawld timestamp that does not parse print on one line each, with line
-//! breaks and control characters escaped. The mirror carries every string
-//! with the escape text a row prints for each such character, control
-//! characters included, because a client may show the model the mirror in
-//! place of the text block, or render its decoded strings.
-//!
-//! - [`rows`]: cells as JSON values and the abbreviation of long ones.
-//! - [`budget`]: the byte budget and the fitting.
-//! - [`refusal`]: refused calls as error text, and caret excerpts.
-//! - [`orient`](mod@orient): the `orient` reply's own layout.
-//! - [`fields`](mod@fields): the `fields` reply's own layout.
-//! - [`link`]: the search URL, built by the shared codec.
-//! - [`correlation`](mod@correlation): the block `context`, `sightings`
-//!   and `compare` print before their rows, and `read` on every page of
-//!   their results.
-//! - [`activity`]: investigations, their board, the activity an attached
-//!   call carries, and the `investigation` reply.
+//! The mirror carries every string with the escape text a row prints for
+//! line breaks and control characters, because a client may show the model
+//! the mirror in place of the text block, or render its decoded strings.
 
 pub mod activity;
 pub mod budget;
@@ -82,21 +40,12 @@ pub use fields::fields;
 pub use orient::orient;
 use rows::{columns_line, floor_char_boundary, json_string, json_text, row_line};
 
-/// The most facets a result prints.
 pub const MAX_FACETS: usize = 3;
-/// The most values one facet prints.
 pub const MAX_FACET_VALUES: usize = 5;
-/// The most proposed next calls a reply prints.
 pub const MAX_NEXT_ACTIONS: usize = 2;
 
-/// The `search` reply as a tool result fitted under `budget`.
-///
-/// The renderer owns the presentation facts: it caps the rows at the hard
-/// row limit, the facets and next calls at theirs, recounts the
-/// abbreviated cells and the rows left after the page, and writes the
-/// bounds as RFC 3339 with microseconds in UTC, in the text and the mirror
-/// alike. `page_rows` is the call's `rows` argument, which a page
-/// continuation the fitting creates asks for.
+/// `page_rows` is the call's `rows` argument, which a page continuation the
+/// fitting creates asks for.
 #[must_use]
 pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if let Some(view) = reply.result.as_mut() {
@@ -111,16 +60,6 @@ pub fn search(mut reply: SearchReply, budget: Budget, page_rows: u64) -> CallToo
     }
 }
 
-/// The `read` reply as a tool result fitted under `budget`.
-///
-/// A page is fitted as [`search`] fits a result, `page_rows` the call's
-/// `rows` argument, and its outcome line is the [`page_outcome`] of the
-/// rows it prints. A cell range is fitted by printing fewer of its bytes,
-/// cut on a character boundary, with its `length` and `next_offset` saying
-/// where the rest starts and a continuation proposed from there; when the
-/// column's name leaves no room for the range's first character, the name
-/// prints abbreviated ([`fit_cell`]). An investigation's entries are
-/// fitted as [`activity`] fits a board.
 #[must_use]
 pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolResult {
     if reply.entries.is_some() {
@@ -144,8 +83,6 @@ pub fn read(mut reply: ReadReply, budget: Budget, page_rows: u64) -> CallToolRes
     }
 }
 
-/// The text block of a `search` reply, unfitted. `budget` is the one the
-/// presentation facts name when the fitting dropped something.
 #[must_use]
 pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -166,8 +103,6 @@ pub fn search_text(reply: &SearchReply, budget: Budget) -> String {
     lines.join("\n")
 }
 
-/// The text block of a `read` reply, unfitted. `budget` is the one the
-/// presentation facts name when the fitting dropped something.
 #[must_use]
 pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     let mut lines = vec![one_line(&reply.outcome)];
@@ -196,9 +131,6 @@ pub fn read_text(reply: &ReadReply, budget: Budget) -> String {
     lines.join("\n")
 }
 
-/// The outcome line of a page `read` prints, from `view` as fitted: the
-/// captured rows it prints; or, when it prints none, whether none starts
-/// at its offset or the first one there does not fit the response.
 #[must_use]
 pub fn page_outcome(view: &ResultView) -> String {
     let id = json_string(&view.result_id);
@@ -221,8 +153,6 @@ pub fn page_outcome(view: &ResultView) -> String {
     }
 }
 
-/// The verdict of `search` in validate mode, with a caret excerpt cut from
-/// `sent`, the text that was validated, for each error with a usable span.
 #[must_use]
 pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationView {
     ValidationView {
@@ -241,8 +171,6 @@ pub fn validation_view(sent: &str, response: &ValidationResponse) -> ValidationV
     }
 }
 
-/// The outcome line of a validation verdict. A failed validation is a
-/// successful call whose outcome says the query did not validate.
 #[must_use]
 pub fn validation_outcome(view: &ValidationView) -> String {
     if view.valid {
@@ -288,11 +216,8 @@ impl Fit for SearchReply {
     }
     /// A reply that can carry advice, every reply but an invalid verdict,
     /// is charged as if it said its hints were dropped, whether or not it
-    /// has advice or hints. The reply with its advice dropped then costs
-    /// what the same reply without advice is charged, so dropping advice
-    /// changes nothing else the fitting keeps, at the exact boundary too.
-    /// The cost is the bytes of that one omission fact, which a reply
-    /// that drops no hint cannot spend on rows or other parts.
+    /// has advice or hints, so dropping advice changes nothing else the
+    /// fitting keeps, at the exact boundary too.
     fn charged(&self) -> Option<Self> {
         let flagged = match (&self.validation, &self.result) {
             (Some(validation), _) if !validation.valid => return None,
@@ -340,19 +265,15 @@ impl Fit for ReadReply {
     }
 }
 
-/// A successful result: one text block and its mirror.
 fn success(text: String, mirror: Json) -> CallToolResult {
     let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
     result.structured_content = Some(mirror);
     result
 }
 
-/// What the refusal of a reply that does not fit names, so the caller can
-/// still read the result: taken from the reply before the fitting
-/// consumes it.
+/// Taken from the reply before the fitting consumes it.
 #[derive(Debug, Clone)]
 pub(crate) struct Recovery {
-    /// The result's id.
     result_id: String,
     /// The captured row the page read first, and the page's first captured
     /// column position; `None` when the page read no row, or the call read
@@ -361,7 +282,6 @@ pub(crate) struct Recovery {
 }
 
 impl Recovery {
-    /// The recovery of the page `view`, recorded before it was fitted.
     pub(crate) fn of(view: &ResultView) -> Self {
         Self {
             result_id: view.result_id.clone(),
@@ -380,18 +300,8 @@ impl Recovery {
     }
 }
 
-/// The error a reply gets when it does not fit `budget` with every
-/// droppable part gone, naming the routes `recovery` leaves.
-///
-/// Below [`Budget::HARD`] a kept result is read with a larger
-/// `max_bytes`, or with `read action=page` and `columns`. At the hard cap
-/// no budget is larger: the error names `fields source=result`, which
-/// describes the columns, the `columns` route, and, when the page read a
-/// row, the `read action=cell` call for that row's cell at the page's
-/// first captured column, which prints neither the executed query nor the
-/// columns line, so no width or query length stops it. The cell call comes
-/// right after the fixed first sentence, where the error's cap at
-/// [`refusal::MAX_ERROR_BYTES`] cannot cut it.
+/// The cell call comes right after the fixed first sentence, where the
+/// error's cap at [`refusal::MAX_ERROR_BYTES`] cannot cut it.
 fn does_not_fit(tool: &str, recovery: Option<&Recovery>, budget: Budget) -> CallToolResult {
     let bytes = budget.bytes();
     let unfit = "even without rows, facets, hints, next calls or the search URL.";
@@ -436,10 +346,7 @@ fn does_not_fit(tool: &str, recovery: Option<&Recovery>, budget: Budget) -> Call
 
 /// Record in `view` what the call read, before the renderer caps or fits
 /// anything: which columns were null in every row read, by index (a
-/// column's name need not be unique), how many columns the page carried
-/// and trawld's projection left out, and the page's first captured
-/// position. A cell is null only when it is JSON `null`. The projection
-/// the tool recorded stays.
+/// column's name need not be unique).
 fn record_read(view: &mut ResultView) {
     let null_columns = if view.rows.is_empty() {
         Vec::new()
@@ -461,8 +368,6 @@ fn record_read(view: &mut ResultView) {
     };
 }
 
-/// Hold `view` to the limits the text contract states, and recount its
-/// presentation facts.
 fn normalize(view: &mut ResultView) {
     view.bounds.earliest = view.bounds.earliest.as_deref().map(utc_micros);
     view.bounds.latest = view.bounds.latest.as_deref().map(utc_micros);
@@ -476,8 +381,6 @@ fn normalize(view: &mut ResultView) {
     keep_rows(view, printed, printed);
 }
 
-/// An RFC 3339 instant as RFC 3339 with microseconds in UTC; text that
-/// does not parse is kept, on one line like any other untrusted string.
 fn utc_micros(text: &str) -> String {
     DateTime::parse_from_rfc3339(text).map_or_else(
         |_| one_line(text),
@@ -493,19 +396,8 @@ fn utc_micros(text: &str) -> String {
 /// string with its marker: the longest name a stored field may have.
 const ABBREVIATED_NAME_BYTES: usize = MAX_FIELD_NAME_BYTES;
 
-/// The reply for `cell`, the range `reply` holds, printing the most bytes
-/// of the range that fit `budget`, its continuation moved to, or created
-/// at, where the printed bytes end; `None` when no reply fits.
-///
 /// A cut that prints none of a non-empty range's bytes would propose the
-/// very call that made it, so it is never sent. The column's name prints
-/// whole when the range's first character fits beside it. When it does
-/// not, which a long name a query created can make happen, the name prints
-/// abbreviated, in the text and the mirror alike: cut on a character
-/// boundary to at most [`ABBREVIATED_NAME_BYTES`] as a JSON string, marker
-/// included, and when that still leaves no room, to the marker alone,
-/// when the marker prints shorter than the name. The row, the position,
-/// the type and the byte counts stay exact.
+/// very call that made it, so it is never sent.
 fn fit_cell(reply: &ReadReply, cell: &CellView, budget: Budget) -> Option<(String, Json)> {
     let whole = json_string(&cell.name).len();
     let mut names = vec![cell.name.clone()];
@@ -521,10 +413,6 @@ fn fit_cell(reply: &ReadReply, cell: &CellView, budget: Budget) -> Option<(Strin
         .find_map(|name| most_cell_bytes(reply, cell, name, budget))
 }
 
-/// The reply for `cell` printing the column's name as `name` and the most
-/// bytes of the range that fit `budget`: all of them, or at least the
-/// range's first character; `None` when not even that fits, or when an
-/// empty range does not.
 fn most_cell_bytes(
     reply: &ReadReply,
     cell: &CellView,
@@ -560,11 +448,8 @@ fn most_cell_bytes(
     Some(best)
 }
 
-/// `name` cut on a character boundary and ended with a marker saying so,
-/// printing as a JSON string of at most `bound` bytes; the marker alone
-/// when not one character fits beside it. A character's JSON escape does
-/// not depend on its neighbours, so the bound is met one character at a
-/// time.
+/// A character's JSON escape does not depend on its neighbours, so the
+/// bound is met one character at a time.
 fn abbreviated_name(name: &str, bound: usize) -> String {
     let marker = format!(
         "…[name cut from {} bytes to fit the response's byte budget]",
@@ -583,8 +468,6 @@ fn abbreviated_name(name: &str, bound: usize) -> String {
     format!("{}{marker}", &name[..end])
 }
 
-/// Keep at most `kept` bytes of the cell range's text, cut on a character
-/// boundary, and say where the rest starts.
 fn keep_cell_bytes(cell: &mut CellView, kept: usize) {
     let cut = floor_char_boundary(&cell.text, kept);
     if cut == cell.text.len() {
@@ -595,8 +478,6 @@ fn keep_cell_bytes(cell: &mut CellView, kept: usize) {
     cell.next_offset = Some(cell.offset.saturating_add(cell.length));
 }
 
-/// The validation verdict's lines, ending with how many diagnostics the
-/// fitting dropped under `budget`, if any.
 fn validation_lines(validation: &ValidationView, budget: Budget, lines: &mut Vec<String>) {
     if let Some(formatted) = &validation.formatted {
         lines.push(format!("formatted query: {}", json_string(formatted)));
@@ -621,8 +502,6 @@ fn validation_lines(validation: &ValidationView, budget: Budget, lines: &mut Vec
     }
 }
 
-/// Parts 1 to 4 of a result: its id, bounds, executed text, the four
-/// truncation facts and the facets.
 fn head_lines(view: &ResultView, budget: Budget, lines: &mut Vec<String>) {
     lines.push(match &view.expires_at {
         Some(at) => format!(
@@ -677,9 +556,6 @@ fn head_lines(view: &ResultView, budget: Budget, lines: &mut Vec<String>) {
     }
 }
 
-/// Parts 6 to 8 of a result: the link, the columns and the rows. When the
-/// fitting under `budget` printed none of the rows read, one line says so,
-/// and points at the next calls when the reply has `continued` them.
 fn tail_lines(view: &ResultView, budget: Budget, continued: bool, lines: &mut Vec<String>) {
     match (&view.link.url, &view.link.reason) {
         (Some(url), _) => lines.push(format!("search URL: {}", one_line(url))),
@@ -701,7 +577,6 @@ fn tail_lines(view: &ResultView, budget: Budget, continued: bool, lines: &mut Ve
     }
 }
 
-/// A cell range's head lines: which cell, and which bytes of it.
 fn cell_head_lines(cell: &CellView, lines: &mut Vec<String>) {
     lines.push(format!(
         "cell: row {}, column {} {} {}, of result {}",
@@ -725,12 +600,10 @@ fn cell_head_lines(cell: &CellView, lines: &mut Vec<String>) {
     lines.push(range);
 }
 
-/// The hints, one line each.
 fn hint_lines(hints: &[String], lines: &mut Vec<String>) {
     lines.extend(hints.iter().map(|hint| format!("hint: {}", one_line(hint))));
 }
 
-/// The proposed next calls, one line each.
 fn next_action_lines(actions: &[NextAction], lines: &mut Vec<String>) {
     for action in actions.iter().take(MAX_NEXT_ACTIONS) {
         let arguments = json_text(&action.arguments);
@@ -742,7 +615,6 @@ fn next_action_lines(actions: &[NextAction], lines: &mut Vec<String>) {
     }
 }
 
-/// Truncation fact 3: what the DSL itself did to the rows.
 fn dsl_fact(effects: DslEffects) -> String {
     let all = [
         (effects.sampled, "sampled", "sample"),
@@ -762,10 +634,6 @@ fn dsl_fact(effects: DslEffects) -> String {
     }
 }
 
-/// Truncation fact 4: what this response printed, abbreviated, omitted
-/// and dropped to fit its budget. When the fitting omitted columns of the
-/// page, it says how many of the omitted were null in every row read, and
-/// that `fields` describes the omitted columns.
 fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     let p = view.presentation;
     let printed = view.rows.len();
@@ -839,10 +707,6 @@ fn presentation_fact(view: &ResultView, budget: Budget) -> String {
     fact
 }
 
-/// `text` on one line and shown as it reads: line breaks, tabs and every
-/// other character [`is_unsafe_display_char`] names (controls, bidi
-/// controls, zero-widths and joiners, the BOM, the soft hyphen, and the
-/// Unicode line and paragraph separators) escaped.
 pub(crate) fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -859,12 +723,10 @@ pub(crate) fn one_line(text: &str) -> String {
     out
 }
 
-/// `a`, `a and b`, `a, b and c`.
 fn and_list(items: &[&str]) -> String {
     joined(items, "and")
 }
 
-/// `a`, `a or b`, `a, b or c`.
 fn or_list(items: &[&str]) -> String {
     joined(items, "or")
 }

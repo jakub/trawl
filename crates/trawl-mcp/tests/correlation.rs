@@ -3,10 +3,7 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `context`, `sightings` and `compare` over a recording backend
-//! (ADR-0058, #309): the block each prints before its rows, that the block
-//! survives the budget, that `read` carries it on every page, and how a
-//! refusal reads. trawld's own behaviour is the server tests'; these hold
-//! the MCP half of AC2 and AC3.
+//! (ADR-0058). trawld's own behaviour is the server tests'.
 
 mod support;
 
@@ -27,8 +24,6 @@ use trawl_mcp::tools::{compare, context, read, sightings};
 
 use support::*;
 
-/// The id of the result a correlation read captures; the focus row lives
-/// in [`RESULT_ID`].
 const CORRELATED_ID: &str = "fedcba9876543210fedcba9876543210";
 
 fn text_of(result: &CallToolResult) -> &str {
@@ -54,7 +49,6 @@ fn lines_starting<'a>(text: &'a str, prefix: &str) -> Vec<&'a str> {
         .collect()
 }
 
-/// The index of the first line equal to or starting with `prefix`.
 fn line_index(text: &str, prefix: &str) -> usize {
     text.lines()
         .position(|line| line.starts_with(prefix))
@@ -65,7 +59,6 @@ fn input<T: serde::de::DeserializeOwned>(arguments: Json) -> T {
     serde_json::from_value(arguments).expect("the arguments decode")
 }
 
-/// A capture of `kind` with `correlation`, as trawld returns it.
 fn correlated(
     kind: CaptureKind,
     correlation: &Correlation,
@@ -95,7 +88,6 @@ fn response(result: &trawl_client::CapturedResult) -> CorrelationResponse {
     }
 }
 
-/// The recorded request of `method`, as JSON.
 fn request_of(backend: &Fake, method: &str) -> Json {
     let call = backend
         .calls()
@@ -115,8 +107,6 @@ fn assert_valid_output(tool: &str, result: &CallToolResult) {
         .collect();
     assert!(errors.is_empty(), "{errors:?}");
 }
-
-// -- context ------------------------------------------------------------------
 
 const FOCUS_TIME: &str = "2026-03-14T03:30:00.000000Z";
 
@@ -152,8 +142,6 @@ fn context_columns() -> Vec<(&'static str, ColumnType)> {
     ]
 }
 
-/// Four rows: one earlier, two identical at the focus row's `_time`, one
-/// later.
 fn context_rows() -> Vec<Vec<Value>> {
     let row = |time: &str, message: &str| vec![s(time), s("prod"), s("web-1"), s(message)];
     vec![
@@ -236,7 +224,6 @@ async fn context_prints_equal_time_duplicates_as_two_rows_and_says_they_have_no_
                "host": "web-1"})
     );
 
-    // The block sits after the truncation facts and before the rows.
     assert!(line_index(text, "This response prints") < line_index(text, "scope used:"));
     assert!(line_index(text, NO_ORDER) < line_index(text, "columns (position name type):"));
     assert_eq!(
@@ -261,7 +248,6 @@ async fn context_prints_equal_time_duplicates_as_two_rows_and_says_they_have_no_
 /// BOM and a soft hyphen.
 const FORMAT_CHARS: &str = "\u{202e}\u{2066}\u{200b}\u{200d}\u{feff}\u{00ad}";
 
-/// [`FORMAT_CHARS`] as the text block prints them inside a JSON string.
 const FORMAT_ESCAPED: &str = r"\u202e\u2066\u200b\u200d\ufeff\u00ad";
 
 fn assert_no_raw_format_char(text: &str) {
@@ -274,9 +260,6 @@ fn assert_no_raw_format_char(text: &str) {
     }
 }
 
-/// An event-controlled host with bidi and zero-width characters prints
-/// escaped in the scope line, the focus line and the row, so it cannot
-/// reorder or hide the text an agent reads; the mirror keeps the value.
 #[tokio::test]
 async fn context_escapes_format_characters_in_the_focus_host() {
     let host = format!("web{FORMAT_CHARS}-1");
@@ -333,8 +316,6 @@ async fn context_escapes_format_characters_in_the_focus_host() {
     let row: Vec<Json> = serde_json::from_str(row_line).expect("the row is JSON");
     assert_eq!(row[2], json!(host));
 
-    // The mirror carries the escape text the rows print, never the raw
-    // characters (`render::rows`'s mirror).
     let mirror = mirror(&result);
     let mirrored = json!(format!("web{FORMAT_ESCAPED}-1"));
     assert_eq!(mirror["correlation"]["context"]["focus"]["host"], mirrored);
@@ -342,8 +323,6 @@ async fn context_escapes_format_characters_in_the_focus_host() {
     assert_valid_output("context", &result);
 }
 
-/// A correlation route that answers without `result.correlation` broke its
-/// contract: the tool says so in prose and reads no page.
 #[tokio::test]
 async fn a_correlation_answer_without_its_facts_is_refused_in_prose() {
     let mut bare = response(&correlated(
@@ -393,8 +372,6 @@ async fn context_sends_the_scope_and_sizes_the_call_names() {
                "before": 0, "after": 50})
     );
 }
-
-// -- refusals -----------------------------------------------------------------
 
 fn refused_with_wait(status: u16, code: ErrorCode, message: &str) -> trawl_client::ClientError {
     trawl_client::ClientError::Server {
@@ -482,14 +459,10 @@ async fn a_refused_correlation_read_names_the_code_message_request_id_and_wait()
     );
 }
 
-// -- sightings ----------------------------------------------------------------
-
 const LITERAL: &str = "10.0.4.17";
 const EARLIEST: &str = "2026-03-14T03:00:00.250000Z";
 const LATEST: &str = "2026-03-14T04:00:00.750000Z";
 
-/// The literal under two field names in two services, and one `_raw`-only
-/// match; `fields` says which fields attribution held.
 fn sightings_facts(fields: Vec<FieldSightings>) -> Correlation {
     Correlation::Sightings(SightingsFacts {
         literal: LITERAL.to_owned(),
@@ -533,8 +506,6 @@ fn sightings_facts(fields: Vec<FieldSightings>) -> Correlation {
     })
 }
 
-/// [`sightings_facts`] as trawld freezes them for a call that restricted
-/// attribution to `attributed`, in request order.
 fn restricted_sightings_facts(attributed: &[&str], fields: Vec<FieldSightings>) -> Correlation {
     let Correlation::Sightings(mut facts) = sightings_facts(fields) else {
         unreachable!()
@@ -647,13 +618,9 @@ async fn sightings_names_both_denominators_and_sums_the_groups() {
     assert_valid_output("sightings", &result);
 }
 
-/// A literal carrying bidi and zero-width characters is echoed escaped,
-/// in the outcome and the denominators line, never raw; the mirror keeps
-/// the literal.
 #[tokio::test]
 async fn sightings_escapes_format_characters_in_the_literal() {
     let literal = format!("10.0.4.17{FORMAT_CHARS}");
-    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -690,11 +657,8 @@ async fn sightings_escapes_format_characters_in_the_literal() {
     assert_valid_output("sightings", &result);
 }
 
-/// Fields trawld did not list are counted after the list, with the way to
-/// attribute them.
 #[tokio::test]
 async fn sightings_counts_the_fields_trawld_did_not_list() {
-    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -756,8 +720,6 @@ async fn sightings_proposes_its_follow_ups_over_the_same_bounds() {
 
 #[tokio::test]
 async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
-    // trawld attributes to the named field only; the population is the
-    // same, so the totals and the captured matches do not move.
     let restricted = restricted_sightings_facts(
         &["client_ip"],
         vec![FieldSightings {
@@ -821,9 +783,7 @@ async fn fields_restrict_attribution_and_leave_the_counted_matches_alone() {
     assert!(lines_starting(text_of(&without), "attribution restricted").is_empty());
 }
 
-/// Fifty (env, service) groups with distinct services.
 fn fifty_groups() -> Correlation {
-    // One group and one field: a block that fits beside a cut row.
     let Correlation::Sightings(mut facts) = sightings_facts(both_fields()) else {
         unreachable!()
     };
@@ -888,7 +848,6 @@ async fn a_sightings_block_too_wide_for_the_budget_says_what_it_left_off() {
     assert!(dropped > 0, "{block}");
     let printed = block["groups"].as_array().unwrap().len();
     assert!(printed < 400, "{printed}");
-    // The busiest groups are the ones kept.
     assert_eq!(block["groups"][0][1], json!("service-000"));
     let text = text_of(&result);
     assert!(text.contains(DENOMINATORS), "{text}");
@@ -901,8 +860,6 @@ async fn a_sightings_block_too_wide_for_the_budget_says_what_it_left_off() {
         "{text}"
     );
 }
-
-// -- compare ------------------------------------------------------------------
 
 fn compare_facts(rows_ranked: u64) -> Correlation {
     Correlation::Compare(CompareFacts {
@@ -1100,8 +1057,6 @@ async fn compare_sends_an_explicit_baseline_and_min_count() {
     );
 }
 
-// -- read of a correlation result ---------------------------------------------
-
 #[tokio::test]
 async fn read_prints_the_block_and_warnings_on_every_page() {
     let result = correlated(
@@ -1180,9 +1135,6 @@ async fn read_of_a_sightings_result_keeps_its_denominators() {
     );
 }
 
-/// The follow-up `search` calls a later page of a sightings result
-/// proposes to a key holding `permissions` (`None`: `whoami` fails): the
-/// read of its last captured row, so no continuation leads.
 async fn later_page_follow_ups(kept_for: Option<&str>, permissions: Option<&[&str]>) -> Vec<Json> {
     let mut result = correlated(
         CaptureKind::Sightings,
@@ -1224,9 +1176,6 @@ async fn later_page_follow_ups(kept_for: Option<&str>, permissions: Option<&[&st
     searches
 }
 
-/// A kept sightings result is evidence of one investigation: the sightings
-/// reply attached its follow-ups there, and every later page does too for
-/// a key that may write to it.
 #[tokio::test]
 async fn a_later_page_of_a_kept_sightings_result_suggests_follow_ups_in_its_investigation() {
     let writer: &[&str] = &["query", "investigation_read", "investigation_write"];
@@ -1240,8 +1189,6 @@ async fn a_later_page_of_a_kept_sightings_result_suggests_follow_ups_in_its_inve
     }
 }
 
-/// A temporary sightings result belongs to no investigation, so its later
-/// pages propose follow-ups that attach to none.
 #[tokio::test]
 async fn a_later_page_of_a_temporary_sightings_result_suggests_follow_ups_in_no_investigation() {
     for search in later_page_follow_ups(None, None).await {
@@ -1252,10 +1199,6 @@ async fn a_later_page_of_a_temporary_sightings_result_suggests_follow_ups_in_no_
     }
 }
 
-/// A key that reads the investigation but may not write to it reads its
-/// evidence too. An attached search would be refused 403, so its later
-/// pages propose the searches it can run: attached to nothing. So does a
-/// page whose `whoami` fails, since nothing says the key may write.
 #[tokio::test]
 async fn a_later_page_of_kept_evidence_proposes_plain_searches_to_a_key_that_cannot_write() {
     let reader: &[&str] = &["query", "investigation_read"];
@@ -1269,9 +1212,6 @@ async fn a_later_page_of_kept_evidence_proposes_plain_searches_to_a_key_that_can
     }
 }
 
-/// A page whose continuations already fill both next-action slots has no
-/// room for a follow-up search, so it does not ask `whoami` whether the
-/// key may attach one: the fake answers no `whoami`.
 #[tokio::test]
 async fn a_kept_sightings_page_with_no_room_for_follow_ups_does_not_ask_whoami() {
     let mut result = correlated(
@@ -1322,9 +1262,6 @@ async fn a_kept_sightings_page_with_no_room_for_follow_ups_does_not_ask_whoami()
     );
 }
 
-/// The restriction is part of the frozen facts: a later page of a
-/// restricted capture states it, and a requested field with no matches
-/// (absent from `fields`) is still named, never read as "every field".
 #[tokio::test]
 async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
     for (attributed, fields, holding) in [
@@ -1336,8 +1273,6 @@ async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
             }],
             r#"["client_ip",3999]"#,
         ),
-        // Both requested fields matched nothing: `fields` is empty, and the
-        // restriction can only come from the facts.
         (vec!["peer", "client_ip"], vec![], "none"),
     ] {
         let backend = sightings_backend(&restricted_sightings_facts(&attributed, fields));
@@ -1384,15 +1319,11 @@ async fn a_later_page_states_the_attribution_restriction_of_the_capture() {
     }
 }
 
-// -- continuation progress ----------------------------------------------------
-
 /// What a `context` answer over one row printed and proposed, in the
 /// order a growing fixed part moves it through.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum OneRowAnswer {
-    /// It printed the row.
     Printed,
-    /// It printed no row and proposed calls that read on.
     Advanced,
     /// It printed no row and proposed no call, or did not fit at all.
     Stuck,
@@ -1404,10 +1335,7 @@ fn wide_cell() -> String {
     "w".repeat(500)
 }
 
-/// The backend and the `context` answer, at the default budget, over a
-/// one-row capture of one column holding [`wide_cell`] whose executed
-/// query ends in a comment of `comment` bytes. The query prints in the
-/// text and the mirror, and no fitting gives it up.
+/// The query prints in the text and the mirror, and no fitting gives it up.
 async fn wide_context(comment: usize) -> (Fake, CallToolResult) {
     let columns = [("message", ColumnType::String)];
     let mut result = correlated(CaptureKind::Context, &context_facts(), &columns, 1, 1);
@@ -1428,9 +1356,6 @@ async fn wide_context(comment: usize) -> (Fake, CallToolResult) {
     (backend, answer)
 }
 
-/// Check that `answer`, which printed none of its one row at the default
-/// budget, proposes that row alone at the hard cap, and that following the
-/// call prints the row beside the block there.
 async fn proposes_the_correlation_row_at_the_hard_cap(backend: &Fake, answer: &CallToolResult) {
     let text = text_of(answer);
     assert_eq!(mirror(answer)["result"]["rows"], json!([]));
@@ -1471,12 +1396,6 @@ async fn proposes_the_correlation_row_at_the_hard_cap(backend: &Fake, answer: &C
 
 #[tokio::test]
 async fn a_correlation_row_the_budget_cannot_print_is_proposed_alone_at_the_hard_cap() {
-    // The result's only row, beside a block that is never dropped and a
-    // long executed query: the default budget has room for an answer that
-    // prints no row, and none for the row. The continuation reads it alone
-    // at the hard cap, and that read prints it beside the block. As the
-    // query grows, the answers go from printing the row, through proposing
-    // it, to neither.
     let mut answers = Vec::new();
     for comment in (3_000..8_600).step_by(20) {
         let (backend, answer) = wide_context(comment).await;
@@ -1553,12 +1472,7 @@ async fn the_correlation_tools_dispatch_by_name() {
     assert!(text_of(&refused).starts_with("invalid arguments for sightings:"));
 }
 
-// -- a wide sightings result (#373) -------------------------------------------
-
-/// The columns null in every row before each of [`WIDE_NAMED`]'s.
 const WIDE_GAP: usize = 40;
-/// The long-named columns of [`wide_sightings_columns`] holding a value
-/// in every row.
 const WIDE_NAMED: usize = 9;
 /// The named column, counted from 0, that holds [`wide_payload`].
 const WIDE_PAYLOAD: usize = 4;
@@ -1568,9 +1482,6 @@ const WIDE_PAYLOAD: usize = 4;
 /// proposed calls.
 const WIDE_MAX_BYTES: usize = 6912;
 
-/// `_time`, `service`, then [`WIDE_NAMED`] times: [`WIDE_GAP`] columns
-/// null in every row, then one column whose name is 250 bytes long. The
-/// union of columns a sightings read over many services captures.
 fn wide_sightings_columns() -> Vec<(String, ColumnType)> {
     let mut columns = vec![
         ("_time".to_owned(), ColumnType::Timestamp),
@@ -1600,13 +1511,10 @@ fn wide_payload(row: u64) -> String {
     format!("{row}{}", "p".repeat(900))
 }
 
-/// The captured position of the named column [`WIDE_PAYLOAD`].
 fn wide_payload_column() -> usize {
     2 + WIDE_PAYLOAD * (WIDE_GAP + 1) + WIDE_GAP
 }
 
-/// Captured row `row` of the wide sightings result: a short value in every
-/// named column but [`WIDE_PAYLOAD`]'s, which holds [`wide_payload`].
 fn wide_sightings_row(row: u64, columns: usize) -> Vec<Value> {
     (0..columns)
         .map(|index| match index {
@@ -1619,8 +1527,6 @@ fn wide_sightings_row(row: u64, columns: usize) -> Vec<Value> {
         .collect()
 }
 
-/// The captured positions `answer`'s mirror prints, after checking that
-/// every printed row holds one cell per printed column.
 fn printed_positions(answer: &CallToolResult) -> Vec<u64> {
     let view = &mirror(answer)["result"];
     let positions: Vec<u64> = view["columns"]
@@ -1637,7 +1543,6 @@ fn printed_positions(answer: &CallToolResult) -> Vec<u64> {
     positions
 }
 
-/// The lines of a sightings block, which state its population facts.
 fn population_lines(text: &str) -> Vec<&str> {
     [
         "sightings of",
@@ -1654,8 +1559,7 @@ fn population_lines(text: &str) -> Vec<&str> {
 
 /// A backend holding the wide sightings capture: the `sightings` answer,
 /// its first page and a later one of two rows each, then the zero-row page
-/// a cell read takes its metadata from, and `wire`, the whole wire text of
-/// [`WIDE_PAYLOAD`]'s cell in row 0.
+/// a cell read takes its metadata from.
 fn wide_sightings_backend(wire: &str) -> Fake {
     let named = wide_sightings_columns();
     let columns: Vec<(&str, ColumnType)> = named
@@ -1696,10 +1600,6 @@ fn wide_sightings_backend(wire: &str) -> Fake {
     }
 }
 
-/// Check that `tool`'s `answer`, a page of the wide sightings capture,
-/// fits [`WIDE_MAX_BYTES`] and prints rows of `_time`, `service` and the
-/// named columns before [`WIDE_PAYLOAD`]'s, at their captured positions,
-/// counting every other column omitted and the null ones apart.
 fn assert_wide_page(tool: &str, answer: &CallToolResult) {
     let width = wide_sightings_columns().len();
     let nulls = (0..width).filter(|&index| !wide_named(index)).count();
@@ -1711,8 +1611,6 @@ fn assert_wide_page(tool: &str, answer: &CallToolResult) {
         used_bytes(answer)
     );
     assert_valid_output(tool, answer);
-    // The null columns go, then a suffix of the named ones: what prints is
-    // a prefix of the named columns, at their captured positions.
     let named: Vec<u64> = (0..width)
         .filter(|&index| wide_named(index))
         .map(|index| u64::try_from(index).unwrap())
@@ -1735,12 +1633,6 @@ fn assert_wide_page(tool: &str, answer: &CallToolResult) {
     );
 }
 
-/// #373: a `sightings` result over hundreds of columns, most null in every
-/// row and a few with long names, prints rows on its first page and on a
-/// later one. Each page omits its null columns, then a suffix of the rest,
-/// and keeps the block's population facts whole. The abbreviated cell the
-/// tool proposes stays proposed when the fit cuts its column, and following
-/// that call reads the cell without a new capture (ruling R10).
 #[tokio::test]
 async fn wide_sightings_stays_readable() {
     let named = wide_sightings_columns();
@@ -1781,8 +1673,6 @@ async fn wide_sightings_stays_readable() {
     assert_eq!(block, population_lines(text_of(&later)));
     assert!(text_of(&first).contains(DENOMINATORS));
 
-    // The tool proposed the abbreviated payload cell whole; the fit cut its
-    // column from print and kept the call.
     let proposed = mirror(&first)["next_actions"]
         .as_array()
         .unwrap()
