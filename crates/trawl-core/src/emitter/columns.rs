@@ -5,12 +5,6 @@
 //! What a query's input carries, known before any SQL is written
 //! (ADR-0062).
 //!
-//! A field the input does not carry reads as NULL. Which fields those are
-//! is a fact about the sources one query selected: the cold reader the
-//! executor resolved, and the hot snapshot it took. The catalog cannot
-//! answer it, because a pin proves a type, not presence. This module holds
-//! that fact for the emitter.
-//!
 //! Every name here is folded through [`catalog_key`], `DuckDB`'s ASCII
 //! identifier fold, so `Status` in a query and `status` in a file are one
 //! column, as they are to `DuckDB`.
@@ -19,35 +13,22 @@ use std::collections::BTreeSet;
 
 use crate::schema::catalog_key;
 
-/// The columns the sources one query selected carry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InputColumns {
-    /// The cold side: the resolved parquet reader, an embedded source, or
-    /// a saved run's reader.
     pub cold: ColdColumns,
-    /// The hot snapshot's keys, on a lane that reads one.
     pub hot: Option<HotColumns>,
 }
 
-/// What the cold side of a read carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ColdColumns {
-    /// Nobody asked, so every name binds. That is the SQL the emitter
-    /// writes for a query whose reads need no answer, and for the callers
-    /// with no source to ask ([`super::emit`]).
+    /// Nobody asked, so every name binds.
     Unprobed,
-    /// The cold source reaches no file, so it carries no column.
     NoFiles,
-    /// The reader's columns as `DESCRIBE` reports them, in its order: each
-    /// name folded through [`catalog_key`], with its `DuckDB` type text.
+    /// Each name folded through [`catalog_key`], with its `DuckDB` type text.
     /// Build it with [`ColdColumns::described`], which folds.
     Described(Vec<(String, String)>),
 }
 
-/// The keys of one hot snapshot, folded through [`catalog_key`].
-///
-/// `null_only` holds the keys whose every value in the snapshot was JSON
-/// `null`. Each of them is also a key.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct HotColumns {
     keys: BTreeSet<String>,
@@ -55,10 +36,6 @@ pub struct HotColumns {
 }
 
 impl InputColumns {
-    /// No description of either side: every name binds.
-    ///
-    /// The emitter then writes exactly the SQL it wrote before it could
-    /// know what the input carries.
     #[must_use]
     pub fn unprobed() -> Self {
         Self {
@@ -67,17 +44,11 @@ impl InputColumns {
         }
     }
 
-    /// Whether every name binds because the cold side was never described.
     #[must_use]
     pub fn is_unprobed(&self) -> bool {
         matches!(self.cold, ColdColumns::Unprobed)
     }
 
-    /// The same input read without its cold side, for the lane that reads
-    /// the hot snapshot alone.
-    ///
-    /// An unprobed input stays unprobed: there is no description to
-    /// narrow, so every name still binds.
     #[must_use]
     pub fn hot_only(&self) -> Self {
         let cold = match self.cold {
@@ -90,14 +61,11 @@ impl InputColumns {
         }
     }
 
-    /// Whether either side carries `name`. Always true while unprobed.
     #[must_use]
     pub fn carries(&self, name: &str) -> bool {
         self.cold.carries(name) || self.hot.as_ref().is_some_and(|hot| hot.contains(name))
     }
 
-    /// The `DuckDB` type the cold side stores `name` as, when it was
-    /// described and carries it.
     #[must_use]
     pub fn cold_type(&self, name: &str) -> Option<&str> {
         self.cold.type_of(name)
@@ -105,8 +73,6 @@ impl InputColumns {
 }
 
 impl ColdColumns {
-    /// A description from `(name, type)` pairs in the reader's order, each
-    /// name folded through [`catalog_key`].
     pub fn described<N, T>(columns: impl IntoIterator<Item = (N, T)>) -> Self
     where
         N: AsRef<str>,
@@ -120,8 +86,6 @@ impl ColdColumns {
         )
     }
 
-    /// Whether this side carries `name`. Always true while unprobed, never
-    /// with no files.
     #[must_use]
     pub fn carries(&self, name: &str) -> bool {
         match self {
@@ -131,10 +95,6 @@ impl ColdColumns {
         }
     }
 
-    /// The `DuckDB` type text `name` is stored as, when described.
-    ///
-    /// The comparison is `DuckDB`'s ASCII fold on both sides, so a
-    /// description built without [`Self::described`] answers the same.
     #[must_use]
     pub fn type_of(&self, name: &str) -> Option<&str> {
         match self {
@@ -148,9 +108,6 @@ impl ColdColumns {
 }
 
 impl HotColumns {
-    /// A snapshot's keys and, among them, the ones that held only JSON
-    /// `null`. A name in `null_only` is a key whether or not `keys` lists
-    /// it.
     pub fn new(
         keys: impl IntoIterator<Item = impl AsRef<str>>,
         null_only: impl IntoIterator<Item = impl AsRef<str>>,
@@ -167,30 +124,24 @@ impl HotColumns {
         Self { keys, null_only }
     }
 
-    /// A snapshot's keys, with no evidence that any of them held only
-    /// `null`.
     pub fn keys_only(keys: impl IntoIterator<Item = impl AsRef<str>>) -> Self {
         Self::new(keys, std::iter::empty::<&str>())
     }
 
-    /// Whether the snapshot carries `name`.
     #[must_use]
     pub fn contains(&self, name: &str) -> bool {
         self.keys.contains(&catalog_key(name))
     }
 
-    /// Whether every value the snapshot holds under `name` is `null`.
     #[must_use]
     pub fn is_null_only(&self, name: &str) -> bool {
         self.null_only.contains(&catalog_key(name))
     }
 
-    /// The keys, folded, in sorted order.
     pub fn keys(&self) -> impl Iterator<Item = &str> {
         self.keys.iter().map(String::as_str)
     }
 
-    /// The null-only keys, folded, in sorted order.
     pub fn null_only(&self) -> impl Iterator<Item = &str> {
         self.null_only.iter().map(String::as_str)
     }
@@ -303,8 +254,6 @@ mod tests {
         assert!(!narrowed.carries("status"));
         assert!(narrowed.carries("host"));
 
-        // Unprobed stays unprobed: no description to narrow, so every name
-        // still binds.
         let unprobed = InputColumns {
             cold: ColdColumns::Unprobed,
             hot: Some(hot.clone()),

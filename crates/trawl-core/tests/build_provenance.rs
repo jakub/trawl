@@ -1,4 +1,3 @@
-//! Exercise the production build script through Cargo in disposable Git trees.
 use std::path::Path;
 use std::process::Command;
 

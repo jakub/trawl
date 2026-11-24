@@ -7,114 +7,16 @@
 //!
 //! One rule table, two doors: [`compare_form`] takes a search-stage
 //! literal, [`compare_form_bound`] takes a parsed AST literal from
-//! `| where` / `| let`. The resolved forms are rendered to SQL by
-//! [`crate::emitter`] and evaluated against JSON events by
-//! `crate::pin_match` (behind [`crate::filter::CompiledFilter`] and
-//! [`crate::eval`]) — batch/live parity is part of the contract, so the
-//! decision of *how* a comparison binds under a catalog pin lives here and
-//! nowhere else.
-//!
-//! The rules:
-//!
-//! | pinned type | operation | form |
-//! |---|---|---|
-//! | unpinned | all | [`CompareForm::Native`] — literal-driven |
-//! | VARCHAR | `=` / `!=` / IN element, non-numeric literal | [`CompareForm::Text`] — compare as text (`'accepted'`) |
-//! | VARCHAR | `=` / `!=` / IN element, numeric literal | [`CompareForm::TextOrNumeric`] — the text OR both sides' [`crate::conform::DECIMAL_COMPARISON_SPACE`] reading |
-//! | VARCHAR | ordered + numeric literal | [`CompareForm::NumericOnText`] — the same DECIMAL reading, both sides; a text without one NULLs out |
-//! | VARCHAR | ordered + non-numeric literal | [`CompareForm::Native`] — lexical |
-//! | VARCHAR | glob / regex | [`PatternForm::Native`] — the column itself |
-//! | `TIMESTAMP` | glob / regex | [`PatternForm::Rfc3339Text`] — the canonical RFC 3339 UTC-microsecond text |
-//! | `DOUBLE` | glob / regex | [`PatternForm::DoubleText`] — `DuckDB`'s DOUBLE rendering (`200.0`, `1e-07`) |
-//! | `BIGINT` | glob / regex | [`PatternForm::BigIntText`] — the conformed integer's decimal text (`"0404"` globs as `404`) |
-//! | `BOOLEAN` | glob / regex | [`PatternForm::BooleanText`] — `true`/`false` (`"TRUE"` globs as `true`) |
-//! | `SEVERITY` | glob / regex | [`PatternForm::SeverityText`] — the canonical `OTel` short name |
-//! | `SEVERITY` | `=` / `!=` / IN element, band token | [`CompareForm::SeverityBand`] — the whole band |
-//! | `SEVERITY` | integer, exact `OTel` name, or ordered band token | [`CompareForm::SeverityExact`] — one number, unclamped |
-//! | typed pin, not `SEVERITY` | everything else | [`CompareForm::Conformed`] — native literal; the live mirror conforms first |
-//!
-//! A `SEVERITY` literal off that vocabulary is a [`CompareError`], never a
-//! filter that quietly matches nothing.
+//! `| where` / `| let`.
 //!
 //! "Numeric literal" is decided by content (the same i64-then-f64 ladder as
 //! [`coerce_filter_value`]): the AST discards quote provenance, so
 //! `status>"400"` is indistinguishable from `status>400`.
 //!
-//! ## Why the equality rung carries a numeric reading
-//!
-//! A VARCHAR pin does not mean the stored text is the text the wire
-//! carried. Both conform lanes read the column through
-//! [`crate::conform::untyped_text`] over whatever `read_json` inferred for
-//! it, so a wire `200` sitting in a batch that also carries `200.5` infers
-//! DOUBLE and stores `"200.0"`, in parquet, durably (probed in
-//! `trawl-core/tests/filter_parity.rs`). The live matcher only ever sees
-//! the wire JSON, so an exact-text equality is unmirrorable: `status=200`
-//! would be a batch miss and a live hit — the silent divergence
-//! [`crate::filter`]'s invariant forbids.
-//!
-//! The numeric reading is the inference-independent half: every rendering
-//! `DuckDB` can produce for a number (`200`, `200.0`, `2e2`) reads back to
-//! that same value, and the wire value's own reading equals it. So an
-//! equality against a numeric literal matches on either — the exact text
-//! (`"200"`, the enum-shaped case ADR-0011 is about) or the numeric reading
-//! (`"200.0"`, the same value spelled by `read_json`'s inference). `!=` is
-//! its complement (text differs AND the reading differs, `COALESCE`d TRUE
-//! so `status!=200` still returns `"accepted"`), and both sides evaluate
-//! the identical rule.
-//!
-//! Residual: `read_json` also infers TIMESTAMP for date-shaped strings,
-//! and conformance then stores `DuckDB`'s space-separated rendering, so an
-//! equality against a timestamp-shaped literal can differ from the wire
-//! text. That is a write-path fidelity question, not a comparison rule.
-//!
-//! ## One comparison space: `DECIMAL(38,6)`
-//!
-//! Both numeric rungs — the equality arm and the ordered one — read the
-//! column and the literal through the same
-//! [`crate::conform::decimal_reading`], which is the space the conform
-//! guard already compares in (ADR-0011 ruling #6). The literal binds as
-//! its own text and is cast by the identical expression the column is, so
-//! it never round-trips through `f64` and neither side can read one string
-//! differently from the other.
-//!
-//! That is a correctness property, not tidiness. A DOUBLE comparison
-//! collapses every integer above 2^53 onto the nearest representable
-//! neighbour — in both engines alike, so parity testing cannot see it:
-//! `id=1737000000123456789` would match three distinct stored ids, and
-//! `id!=9007199254740993` would silently suppress the genuinely different
-//! `9007199254740992`. Snowflake ids and nanosecond epochs sit in
-//! VARCHAR-pinned fields in exactly that shape. `DECIMAL(38,6)` is exact
-//! for every `i64` and out to 10^32.
-//!
-//! Never `BIGINT`, for the reason that rules it out of the conform ladder
-//! too: `TRY_CAST('1.5' AS BIGINT)` rounds to 2 (pinned by
-//! `trawl-engine/tests/duckdb_probe.rs`), so an integer space would make
-//! `dur>1` and `dur>1.5` disagree about a stored `"1.5"`.
-//!
-//! Two costs, and both are paid by the two engines together — they narrow
-//! what matches, never what agrees:
-//!
-//! 1. **fractions quantize at 10^-6**, rounded half away from zero, so
-//!    `"0.0000005"` reads as `0.000001` and two values a nanosecond apart
-//!    compare equal. Sub-microsecond ordering is not something a
-//!    VARCHAR-pinned field can express;
-//! 2. **`nan`, `inf` and magnitudes at or above 10^32 have no reading at
-//!    all**, which is a NULL — UNKNOWN, never a false match, and `NOT`
-//!    cannot invert it into one. A stored `"nan"` therefore matches
-//!    nothing, where DOUBLE's total ordering sorts it above every number
-//!    and lets `dur>1` return it.
-//!
 //! The domain is `DuckDB`'s cast domain, not Rust's number parser:
-//! [`decimal_micros`] is its live mirror — ASCII whitespace trimmed, `_`
-//! separators between digits, `"0404"`, `"1e3"` and `".5"` read, radix
-//! prefixes refused, and the cast's own laxness reproduced down to
-//! `'- '` reading zero — executed side by side in
-//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] is the DOUBLE
-//! pin's own cast, not the VARCHAR comparison space: it reads what a
-//! DOUBLE-pinned column stores, for the pin's pattern text
-//! ([`PatternForm::DoubleText`]), for a DOUBLE-pinned live value before
-//! `pin_match` compares it in DOUBLE's total order, and for `tonumber()`
-//! in streaming eval (`crate::eval`).
+//! [`decimal_micros`] is its live mirror, executed side by side in
+//! `trawl-engine/tests/duckdb_probe.rs`. [`try_cast_double`] is the
+//! DOUBLE pin's own cast, not the VARCHAR comparison space.
 
 use crate::ast::{FilterOp, LiteralValue};
 use crate::emitter::SqlValue;
@@ -130,14 +32,6 @@ pub enum CompareForm {
     /// the SQL is byte-identical, because the column on disk already is
     /// the pinned type — but the live matcher has to conform the wire
     /// value before comparing it.
-    ///
-    /// Batch compares what conformance stored, and the wire value is only
-    /// the same thing when it already reads as its pin. Without that step
-    /// every value the round-trip guard nulls out answers differently: a
-    /// wire `1.5` under a BIGINT pin is NULL in both batch lanes, so
-    /// `duration>1` is UNKNOWN there and true live, and a `"TRUE"` under a
-    /// BOOLEAN pin makes `NOT flag=true` fire on a stream while `/query`
-    /// returns nothing.
     Conformed {
         pin: CanonicalType,
         literal: SqlValue,
@@ -146,15 +40,9 @@ pub enum CompareForm {
     Text(String),
     /// The VARCHAR-pinned equality form for a NUMERIC literal: the value
     /// matches when its stored TEXT is the literal **or** the two
-    /// [`crate::conform::DECIMAL_COMPARISON_SPACE`] readings agree.
-    ///
-    /// The text half is ADR-0011's rule; the numeric half is what makes it
-    /// mirrorable, because the stored text of a number is `read_json`'s
-    /// inference rendered, not the wire spelling (see the module doc).
-    ///
-    /// One string, carried once: the numeric arm casts the same literal
-    /// text the text arm compares, so the two arms cannot disagree about
-    /// what the literal is.
+    /// [`crate::conform::DECIMAL_COMPARISON_SPACE`] readings agree. The
+    /// numeric half is what makes it mirrorable, because the stored text of
+    /// a number is `read_json`'s inference rendered, not the wire spelling.
     TextOrNumeric(String),
     /// Ordered numeric comparison over a VARCHAR column: both sides read
     /// through [`crate::conform::decimal_reading`], so a stored text
@@ -206,36 +94,10 @@ impl std::error::Error for CompareError {}
 /// How one glob/regex pattern binds its column.
 ///
 /// A pattern needs ONE text per pinned type, or batch and live disagree:
-/// the SQL side matches the CONFORMED value's rendering (the column is
-/// conformed to its pin on the hot branch by [`crate::conform`] and
-/// already typed on disk) while the live matcher only ever sees the wire
-/// JSON. Stringifying the wire value is that same text only when the value
-/// already reads as its pin — a JSON int under a BIGINT pin, a JSON bool
-/// under a BOOLEAN pin. For every other shape the two diverge, so each
-/// typed pin renders the value's own conformed reading:
-///
-/// - `"0404"` conforms to the BIGINT `404`, so `status=0*` matches the
-///   wire text and misses the column, while `"accepted"` and `"1.5"`
-///   conform to NULL where the wire text matches `a*` and `1*`.
-///   [`Self::BigIntText`] renders [`conformed_bigint`] instead.
-/// - `"true"` conforms to the BOOLEAN `true` and `"TRUE"` conforms to
-///   NULL — the cast reads both, the round-trip guard keeps only the
-///   spelling `DuckDB` writes back. [`Self::BooleanText`] renders
-///   [`conformed_boolean`].
-/// - `DuckDB` renders a TIMESTAMP space-separated and zoneless
-///   (`2026-01-15 09:00:00`) where the event carries RFC 3339
-///   (`2026-01-15T09:00:00.000000Z`), so `_time=/T09:/` would match live
-///   and miss in batch. [`Self::Rfc3339Text`] pins both sides to the wire
-///   form (see [`TIMESTAMP_PATTERN_SQL_FORMAT`] and
-///   [`canonical_timestamp_text`]).
-/// - `DuckDB` renders a DOUBLE with a mandatory fraction and a signed,
-///   two-digit exponent (`200.0`, `0.0`, `1e-07`,
-///   `1.2345678901234568e+17`) where the same wire value stringifies as
-///   `200` / `0` / `1e-7` / `123456789012345680` — the conformed column
-///   is DOUBLE whatever the wire number looked like, so `dur=/^200$/`
-///   would match live and miss in batch. [`Self::DoubleText`] renders the
-///   value's DOUBLE reading on the live side too (see
-///   [`canonical_double_text`]).
+/// the SQL side matches the CONFORMED value's rendering while the live
+/// matcher only ever sees the wire JSON. Stringifying the wire value is
+/// that same text only when the value already reads as its pin, so each
+/// typed pin renders the value's own conformed reading.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PatternForm {
     /// Match against the column directly (unpinned or VARCHAR pin).
@@ -328,17 +190,9 @@ pub enum Instant {
 impl Instant {
     /// This instant as `CAST(ts AS VARCHAR)` renders it — the SCALAR
     /// text, which is what `tostring()`, a `concat()` argument and a
-    /// projected cell show.
-    ///
-    /// Deliberately NOT [`Self::pattern_text`]: that one is the TIMESTAMP
-    /// pin's RFC 3339 `Z` form, the target a glob matches against a
-    /// stored column. The two differ for every finite instant (`T` and a
-    /// `Z` against a space and none), so a caller that reached for the
-    /// wrong one would print a string `DuckDB` never prints. Both
-    /// renderings are probed —
-    /// `a_timestamp_casts_to_the_text_duckdb_prints` for this one — and
-    /// the finite arm delegates to the renderer that already byte-matches
-    /// the engine, exactly as [`canonical_double_text`] delegates.
+    /// projected cell show. Deliberately NOT [`Self::pattern_text`], the
+    /// TIMESTAMP pin's RFC 3339 `Z` form: the two differ for every finite
+    /// instant.
     #[must_use]
     pub fn cast_text(self) -> String {
         match self {
@@ -349,18 +203,11 @@ impl Instant {
     }
 
     /// The seconds-since-1970 `date_part('epoch', ts)` reads — this
-    /// instant's whole MICROSECOND count, divided ONCE.
+    /// instant's whole MICROSECOND count, divided ONCE. Summing `timestamp()`
+    /// and `subsec_micros() / 1e6` separately rounds twice, and the two
+    /// disagree the moment the seconds exceed the mantissa.
     ///
-    /// One division, one rounding. Summing `timestamp()` and
-    /// `subsec_micros() / 1e6` separately rounds twice, and the two
-    /// disagree the moment the seconds exceed the mantissa: at the year
-    /// 9999 one f64 ulp spans 32 microseconds, so the engine's answer
-    /// has NO fraction left and the summed form invents one
-    /// (`…799.00003`). Probed bit-for-bit across the whole range in
-    /// `the_epoch_reading_is_the_micro_count_divided_once`.
-    ///
-    /// `None` for an infinity, which is what `date_part` answers for one
-    /// — every unit, `epoch` included.
+    /// `None` for an infinity, which is what `date_part` answers for one.
     #[must_use]
     #[allow(clippy::cast_precision_loss)]
     pub fn epoch_seconds(self) -> Option<f64> {
@@ -409,14 +256,8 @@ pub fn conformed_timestamp(text: &str) -> Option<Instant> {
 ///
 /// Deliberately not [`conformed_timestamp`]: the emitter binds the literal
 /// as a string and leaves the cast to `DuckDB`, whose implicit
-/// VARCHAR → TIMESTAMP conversion is the wall-clock parse. The two agree
-/// on every zoneless text — which is every literal that does not spell an
-/// offset out — and the SQL side is what decides, so the mirror follows it
-/// rather than the reading it would prefer.
-///
-/// It also resolves a NARROWER set of zone names: exactly `UTC`, where the
-/// conform's ICU-backed cast takes every name in `pg_timezone_names()`.
-/// Probed, both ways.
+/// VARCHAR → TIMESTAMP conversion is the wall-clock parse. It also
+/// resolves a NARROWER set of zone names: exactly `UTC`.
 #[must_use]
 pub fn literal_timestamp(text: &str) -> Option<Instant> {
     parse_instant(text, ZoneRule::Ignore)
@@ -448,63 +289,16 @@ pub fn bound_instant(text: &str) -> Option<Instant> {
 /// NULL for it, and `strftime` of NULL is NULL — UNKNOWN, never a false
 /// pattern miss that `NOT` could invert.
 ///
-/// # The reading is `TRY_CAST(text AS TIMESTAMPTZ)` under a UTC session
-///
-/// Not the plain `TRY_CAST(… AS TIMESTAMP)` wall-clock parse: an offset in
-/// the text is APPLIED (ADR-0011 ruling #1), which is also the only way
-/// the mirror can agree with a corpus `read_json` typed for itself. Every
-/// rule below is established by execution in
-/// `trawl-engine/tests/duckdb_probe.rs`, never from a specification —
-/// and that matrix is the CONTRACT: an input where this function and the
-/// engine disagree is a bug here, to be added to the matrix and fixed,
-/// not a tolerance to be absorbed at the call site:
-///
-/// - **keywords**: `epoch` and `-epoch` → 1970-01-01, `infinity`/`inf`
-///   and `-infinity`/`-inf` → the infinite instants, all
-///   case-insensitive. The leading `-` is consumed before the keyword is
-///   read, which is why `-epoch` IS epoch and `+infinity` is nothing.
-///   Trailing whitespace is allowed after the FULL spellings only:
-///   `'epoch '` and `'-infinity\t'` parse, `'inf '` does not;
-/// - **date**: `[-]Y+{sep}M{1,2}{sep}D{1,2}` with `{sep}` either `-` or
-///   `/` *and the same both times*. The year is any run of digits
-///   (`02026` is 2026), month and day are one or two — a third digit is a
-///   different shape, refused, never truncated. A date alone is midnight,
-///   and then the text must END: `2026-01-15 ` is not a date;
-/// - **separator**: one `T` or one ASCII space (then any run of further
-///   whitespace), and a TIME is then mandatory;
-/// - **time**: `H+:M{1,2}[:S{1,2}[.f*]]`. Hour ≤ 24, minute and second
-///   ≤ 59; hour 24 is midnight of the NEXT day and only when everything
-///   below it is zero. The fraction TRUNCATES to microseconds
-///   (`.9999999` → `.999999`) and may be empty (`09:00:00.` parses);
-/// - **zone, only when SECONDS are present**: `Z` (uppercase),
-///   `±HH`, `±HHMM`, `±HH:MM`, `±HH:MM:SS` — each component EXACTLY two
-///   digits, unvalidated in range (`+99:99` is a real offset) — or one
-///   space and a zone name. A SPACE is the only whitespace that can close
-///   a zoneless time, because it is where a zone name would start:
-///   `09:00:00 ` and `09:00:00 \t` parse where `09:00:00\t` is NULL,
-///   while past a zone any trailing whitespace goes (`09:00:00Z\t`).
-///   Without seconds the text must end where the time does: `09:00Z`,
-///   `09:00 UTC` and even `09:00 ` are all refused, since reading one
-///   would be a live match the batch query does not have;
-/// - **whitespace**: ASCII only (` \t\n\r\x0b\x0c`, never `\u{a0}`),
-///   skipped before the value and after a complete time.
-///
 /// # Two residuals, both in the safe direction
 ///
 /// Both make the mirror answer `None` where `DuckDB` has a reading, so a
-/// live tail UNDER-matches; neither can invent a match the batch query
-/// does not have. They are pinned as expected divergences in the probe
-/// matrix rather than left to be rediscovered:
+/// live tail UNDER-matches:
 ///
-/// 1. **zone names other than the [`UTC_ZONE_NAMES`]**. `DuckDB` links ICU
-///    and resolves all 638 of `pg_timezone_names()`, with DST rules and
-///    pre-1970 local-mean-time offsets. Mirroring that means shipping a
-///    zone database inside `trawl-core` — which compiles to wasm for the
-///    SPA — and two tzdata versions that drift apart would be a *silent*
-///    divergence in place of this loud one;
-/// 2. **years outside chrono's calendar** (before `-262143-01-01` or
-///    after `+262142-12-31`, its `NaiveDate` bounds in this build), where
-///    `DuckDB`'s microsecond range reaches ±~290 000.
+/// 1. **zone names other than the [`UTC_ZONE_NAMES`]**. Mirroring them
+///    means shipping a zone database inside `trawl-core`, which compiles
+///    to wasm for the SPA;
+/// 2. **years outside chrono's calendar**, where `DuckDB`'s microsecond
+///    range reaches ±~290 000.
 #[must_use]
 pub fn canonical_timestamp_text(value: &str) -> Option<String> {
     conformed_timestamp(value).map(Instant::pattern_text)
@@ -536,20 +330,15 @@ fn render_pattern_text(at: chrono::NaiveDateTime) -> String {
     )
 }
 
-/// The instant `DuckDB` reads out of this text, or `None`.
 fn parse_instant(value: &str, zone: ZoneRule) -> Option<Instant> {
     let text = &value[leading_space(value.as_bytes(), 0)..];
     keyword_instant(text).or_else(|| parse_datetime(text, zone).map(Instant::At))
 }
 
-/// The keyword instants, case-insensitive.
-///
 /// The leading `-` is consumed before the keyword is matched, so `-epoch`
-/// is epoch (only `infinity` reads the sign as a sign), and trailing
-/// whitespace is tolerated after the full spellings only: `'epoch '` and
-/// `'-infinity\t'` parse where `'inf '` and `'-inf '` are NULL. Both rules
-/// are the cast's, established by execution: reading `'inf '` here would
-/// match live against a corpus that holds NULL.
+/// is epoch, and trailing whitespace is tolerated after the full
+/// spellings only: `'epoch '` and `'-infinity\t'` parse where `'inf '`
+/// and `'-inf '` are NULL.
 fn keyword_instant(text: &str) -> Option<Instant> {
     let token = text.trim_end_matches(is_c_space);
     if token.eq_ignore_ascii_case("epoch") || token.eq_ignore_ascii_case("-epoch") {
@@ -582,7 +371,6 @@ struct TimeOfDay {
     has_seconds: bool,
 }
 
-/// The calendar form: a date, optionally a time, optionally a zone.
 fn parse_datetime(text: &str, zone: ZoneRule) -> Option<chrono::NaiveDateTime> {
     let bytes = text.as_bytes();
     let mut pos = 0;
@@ -731,15 +519,7 @@ fn parse_zone_offset(text: &str, pos: &mut usize, zone: ZoneRule) -> Option<i64>
         // arms above already allow.
         Some(b' ') => {
             // The name runs to the end of the text, and only one space
-            // introduces it (`  UTC` is refused by the recursion into
-            // this same arm).
-            //
-            // The two casts resolve different sets: the conform's
-            // `TIMESTAMPTZ` rung reaches ICU and takes every name, of
-            // which the mirror keeps the definitionally-UTC ones
-            // ([`UTC_ZONE_NAMES`]); the wall-clock cast a bound literal
-            // gets takes exactly one, `UTC`, and NULLs even `GMT` and
-            // `Etc/UTC` (probed).
+            // introduces it.
             let name = text[*pos + 1..].trim_end_matches(is_c_space);
             let accepted: &[&str] = match zone {
                 ZoneRule::Apply => &UTC_ZONE_NAMES,
@@ -758,8 +538,6 @@ fn parse_zone_offset(text: &str, pos: &mut usize, zone: ZoneRule) -> Option<i64>
     }
 }
 
-/// The index of the first byte at or after `from` that is not ASCII
-/// whitespace.
 fn leading_space(bytes: &[u8], from: usize) -> usize {
     let mut pos = from;
     while bytes.get(pos).is_some_and(|&c| is_c_space(c as char)) {
@@ -768,8 +546,6 @@ fn leading_space(bytes: &[u8], from: usize) -> usize {
     pos
 }
 
-/// Read a run of ASCII digits of length `min..=max`.
-///
 /// The run must END inside the bound: a longer one is a different shape
 /// and is refused, never silently truncated (`2026-011-15` is not a date).
 fn take_digits(bytes: &[u8], pos: &mut usize, min: usize, max: usize) -> Option<i64> {
@@ -832,23 +608,10 @@ pub fn compare_form(
 /// `None` for [`LiteralValue::Null`]: `== null` is not a comparison this
 /// table binds, and the caller takes the generic path.
 ///
-/// Quote provenance is discarded, deliberately: the VARCHAR-pin rules read
-/// the literal's CONTENT, and a string literal binds through the same
-/// content coercion the search stage applies — so `where status == "400"`
+/// Quote provenance is discarded, deliberately: `where status == "400"`
 /// is `status == 400`, exactly as `status="400"` is `status=400` in the
-/// search stage (the two are one AST there). Honouring the AST's quoting
-/// would make adjacent stages of one query disagree about the same
-/// comparison.
-///
-/// That promise is why the literal's text comes from the AST and not from
-/// re-rendering a parsed number: a float literal carries its source token
-/// ([`crate::ast::FloatLiteral::text`]), so `where id > 9007199254740993.0` binds the
-/// digits the user wrote instead of the `f64`-rounded `…992` — which would
-/// match the ADJACENT identifier, and disagree with the quoted spelling of
-/// the same literal. `i64` and the wire text are already exact.
-///
-/// A non-string literal binds unchanged under a typed pin (`flag == true`
-/// stays `Bool(true)`, byte-identical SQL); only the live mirror conforms.
+/// search stage. Honouring the AST's quoting would make adjacent stages
+/// of one query disagree about the same comparison.
 ///
 /// # Errors
 ///
@@ -908,24 +671,7 @@ fn form_over(
 }
 
 /// The SEVERITY pin's rung (ADR-0013 §6), resolved in ONE order so every
-/// lane reads the same answer:
-///
-/// 1. an INTEGER binds exactly, unclamped — `_severity>0` is "carries a
-///    severity at all" and `_severity=99` honestly matches nothing (the
-///    conform rung means no stored value is outside 1-24);
-/// 2. a BAND token ([`crate::severity::number_for_token`], the ADR-0009
-///    table with its aliases) is the band under `=`/`!=`/IN and the
-///    token's own number under an ordered operator — `_severity=error`
-///    is the band 17-20, `_severity>=warn` is `>= 13`;
-/// 3. an `OTel` EXACT short name ([`crate::severity::number_for_exact`])
-///    is that exact number, whatever the operator — `error2` is 18. The
-///    band table is consulted first, so the bare base names (`error`,
-///    `warn`) keep their band meaning;
-/// 4. anything else — a word outside the vocabulary, a float, a boolean —
-///    is an error naming the vocabulary, never a filter that quietly
-///    matches nothing.
-///
-/// Glob and regex resolve through [`pattern_form`] instead.
+/// lane reads the same answer.
 fn severity_form(op: FilterOp, text: &str) -> Result<CompareForm, CompareError> {
     if let Ok(n) = text.trim().parse::<i64>() {
         return Ok(CompareForm::SeverityExact(n));
@@ -965,25 +711,12 @@ pub fn pattern_form(pin: Option<CanonicalType>) -> PatternForm {
 }
 
 /// The band→points expansion: the ladder points a set of `SEVERITY`-pinned
-/// equality forms accepts, as one sorted, deduplicated list.
+/// equality forms accepts, as one sorted, deduplicated list. Anything
+/// else (a mixed list, an empty one) is `None`.
 ///
-/// `Some(points)` exactly when the slice is non-empty and every form is a
-/// severity equality form — a [`CompareForm::SeverityBand`] contributing
-/// its inclusive `lo..=hi`, or a [`CompareForm::SeverityExact`]
-/// contributing its number unclamped. Anything else (a mixed list, an
-/// empty one) is `None` and the caller keeps its per-element shape.
-///
-/// Unclamped is the point: `_severity=99` stays an honest matches-nothing
-/// and a negative literal stays negative, because the exact rung binds
-/// integers without consulting the ladder ([`compare_form`]'s rung 1).
-/// The set is what lets a whole severity list render as one merged range
-/// set ([`severity_ranges`]) instead of once per band — a `sev()` subject
-/// is over a kilobyte of SQL, so repeating it per band multiplies the
-/// emitted text 4-6x on natural queries.
-///
+/// Unclamped is the point: `_severity=99` stays an honest matches-nothing.
 /// The points are `i64` because the exact rung is: `u8` would have to
-/// clamp, and clamping is exactly the silent meaning change this must not
-/// make.
+/// clamp.
 #[must_use]
 pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
     if forms.is_empty() {
@@ -1005,62 +738,16 @@ pub fn severity_points(forms: &[CompareForm]) -> Option<Vec<i64>> {
 }
 
 /// Collapse sorted, deduplicated ladder points into minimal contiguous
-/// ranges — the shape a severity predicate renders.
+/// ranges — the shape a severity predicate renders. Ranges rather than
+/// the point set itself, because the range is what `DuckDB` executes
+/// cheaply (`trawl-engine/tests/severity_set_bench.rs`).
 ///
-/// Points in, inclusive `(lo, hi)` runs out, in ascending order: a run of
-/// one point is `(p, p)`, and two points are one run exactly when they are
-/// adjacent integers. The whole error band is therefore one run, the six
-/// base bands together are one run (1-24), and a genuinely disjoint
-/// selection like `warn,fatal` is two.
-///
-/// Ranges rather than the point set itself, because the set is what the
-/// comparison means while the range is what `DuckDB` executes cheaply: a
-/// probe over 1M rows (`trawl-engine/tests/severity_set_bench.rs`) puts a
-/// repeated-subject `BETWEEN` at ~6 ms against ~392 ms for the equivalent
-/// `IN` over the same points — the engine takes an `IN` list over a
-/// computed left-hand side off its fast path, and a `sev()` subject is
-/// exactly that. Merging serves both goals: the natural queries (a band, a
-/// contiguous run of bands) collapse to a single range, so the expensive
-/// subject is written once and the predicate keeps the shape the engine
-/// likes.
-///
-/// # Out-of-ladder points collapse to one representative
-///
-/// Every non-adjacent point is its own run, and every run repeats the
-/// subject — so an unbounded run count is an unbounded SQL amplifier. A
-/// query is capped at 64 KB of TEXT, but `sev(level) in (1, 3, 5, …)`
-/// turns each cheap literal into a fresh ~1.2 KB copy of the subject, so
-/// the cap does not bound the SQL. The in-ladder points cannot amplify
-/// (1-24 admits at most 12 non-adjacent points, hence ≤12 runs), but the
-/// out-of-ladder ones are drawn from all of `i64`.
-///
-/// They are also all interchangeable, which is what makes the collapse
-/// sound. A `SEVERITY`-typed subject evaluates to 1-24 or NULL and
-/// nothing else — the conform rung guards a stored `_severity` or
-/// SEVERITY-pinned column into that range
-/// ([`crate::conform::guarded_cast`]'s ladder `CASE`), and the `sev()`
-/// kernel's declared result has the same domain
-/// ([`crate::severity::reading_text`]). So for any point `p` outside
-/// 1-24, `subject = p` is FALSE for every non-NULL subject and UNKNOWN
-/// for a NULL one — a contribution that depends on nothing but `p` being
-/// unmatchable, and therefore identical for every such `p`. Keeping the
-/// smallest one (deterministic, so snapshots are stable) preserves the
-/// predicate's three-valued answer exactly while bounding the render at
-/// **≤13 runs**.
-///
-/// Dropping them entirely would not be equivalent: with no in-ladder
-/// points left there would be no predicate at all, and the NULL subject
-/// must still answer UNKNOWN rather than FALSE. The representative is
-/// what carries that.
-///
-/// This is a rendering equivalence only — [`severity_points`] keeps the
-/// exact semantic union, and the drift guard checks membership against
-/// it over the ladder domain.
-///
-/// The input should come from [`severity_points`]; duplicates and unsorted
-/// input are tolerated defensively, and a run's bounds are `i64` for the
-/// same reason the points are — an out-of-ladder literal keeps its own
-/// value.
+/// Out-of-ladder points collapse to one representative, the smallest. A
+/// `SEVERITY`-typed subject evaluates to 1-24 or NULL, so for any point
+/// `p` outside 1-24, `subject = p` is FALSE or UNKNOWN, identical for
+/// every such `p`; the collapse bounds the render at **≤13 runs**.
+/// Dropping them entirely would not be equivalent: the NULL subject must
+/// still answer UNKNOWN rather than FALSE.
 #[must_use]
 pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
     let mut kept: Vec<i64> = Vec::with_capacity(points.len());
@@ -1094,12 +781,8 @@ pub fn severity_ranges(points: &[i64]) -> Vec<(i64, i64)> {
 
 /// The `SeverityNumber` a SEVERITY-pinned column CONFORMS a stored text to
 /// — the live mirror of [`crate::conform::guarded_cast`]'s SEVERITY rung.
-///
-/// A one-line delegate to the one reader (ADR-0013 slice 2, ruling 9):
-/// the rung and this mirror are the same kernel, so `"error"` reads 17 on
-/// both engines and a text off the ladder — or off the vocabulary
-/// entirely — has no reading at all, leaving the column NULL and the
-/// value in `_raw`.
+/// The rung and this mirror are the same kernel (ADR-0013 slice 2,
+/// ruling 9).
 #[must_use]
 pub fn conformed_severity(text: &str) -> Option<u8> {
     crate::severity::reading_text(text, crate::severity::Dialect::Otel)
@@ -1109,31 +792,9 @@ pub fn conformed_severity(text: &str) -> Option<u8> {
 /// mirror of [`crate::conform::guarded_cast`]'s BIGINT rung, which is
 /// `TRY_CAST` under a `DECIMAL(38,6)` round-trip guard.
 ///
-/// Derived from [`decimal_micros`] alone, because the guard leaves nothing
-/// else to decide: it keeps the cast only where
-/// `dec(text) = dec(TRY_CAST(text AS BIGINT))`, `dec` of a BIGINT is
-/// exact, and so the guard passes exactly when the text's own DECIMAL
-/// reading is a whole number of microsteps naming an integer `BIGINT` can
-/// hold. Mirroring the cast through `f64` instead could only disagree with
-/// `DuckDB`'s exact decimal rounding above 2^53:
-/// `'1.7356896001234568e+18'` and `'9007199254740993.0'` conform in both
-/// batch lanes and would read as nothing here.
-///
-/// Spelling drift is fine — `'0404'`, `'4.0'`, `'1e3'`, `' 200'`,
-/// `'200_000'` all conform to the integer they denote — while a value the
-/// cast would alter (`'1.5'`, `'2.5'`) conforms to NULL and is findable in
-/// `_raw` instead.
-///
-/// `'0x10'` is the instructive rejection: `TRY_CAST` reads it as 16, and
-/// the guard refuses it because `DECIMAL` does not read hex at all. That
-/// is the guard working as specified — `16` is a value `DuckDB` would
-/// never render back as `0x10` — not a mirror artefact; the SQL writes
-/// NULL for it too.
-///
-/// Residual tolerance, shared with the SQL guard rather than added here: a
-/// fraction below `DECIMAL(38,6)`'s half-microstep (`'4.0000001'`)
-/// quantizes to the integer and conforms; `'4.0000005'` rounds away and is
-/// refused.
+/// Derived from [`decimal_micros`] alone: mirroring the cast through
+/// `f64` instead could only disagree with `DuckDB`'s exact decimal
+/// rounding above 2^53.
 #[must_use]
 pub fn conformed_bigint(text: &str) -> Option<i64> {
     let micros = decimal_micros(text)?;
@@ -1146,10 +807,8 @@ pub fn conformed_bigint(text: &str) -> Option<i64> {
 /// carried as whole microsteps.
 const MICROS_PER_UNIT: i128 = 1_000_000;
 
-/// `DECIMAL(38,6)`'s width — the total number of digits it holds.
 const DECIMAL_DIGITS: usize = 38;
 
-/// `DECIMAL(38,6)`'s scale, as a shift.
 const DECIMAL_SCALE: i64 = 6;
 
 /// The `DECIMAL(38,6)` reading `DuckDB` takes from a text, scaled by 10^6
@@ -1159,38 +818,16 @@ const DECIMAL_SCALE: i64 = 6;
 /// comparison rungs ([`CompareForm::TextOrNumeric`],
 /// [`CompareForm::NumericOnText`]).
 ///
-/// Exact by construction (digit strings and `i128`, never `f64`): that is
-/// the point of the DECIMAL space, which stays exact across the whole
-/// BIGINT range and out to 10^32, where a DOUBLE comparison goes blind
-/// above 2^53.
-///
 /// `None` is the NULL the cast writes — UNKNOWN on both engines, never a
 /// false match.
 ///
-/// The accepted syntax is the numeric-cast domain — C `isspace` trimmed
-/// off both ends, `_` separators strictly between ASCII digits, optional
-/// sign, digits with an optional fraction, optional `e`/`E` exponent —
-/// minus the radix prefixes (`'0x10'` is NULL here and 16 to the BIGINT
-/// cast) and minus `nan`/`inf`. Digits below the sixth decimal are
-/// ROUNDED, half away from zero (`'4.0000005'` → `4.000001`,
-/// `'4.0000001'` → `4.000000` — the documented tolerance that lets a
-/// sub-microstep fraction conform as its integer), and a magnitude at or
-/// above 10^32 overflows the type and reads NULL.
-///
 /// Three of the cast's own quirks are REPRODUCED rather than corrected,
-/// because the SQL side has them and a tidier mirror is a divergence — all
-/// three established by execution in `trawl-engine/tests/duckdb_probe.rs`:
-///
-/// 1. **a scan cut short by whitespace is forgiven** in states an
-///    end-of-text refuses ([`terminated_scan`]): `'- '` reads 0 and
-///    `'1e '` reads 1 where `'-'` and `'1e'` are NULL;
-/// 2. **a negative exponent rounds on the leading SIGNIFICANT digit** when
-///    its shift drops every digit the mantissa has ([`shift_digits`]), so
-///    `'5e-8'` is one microstep while the same value spelled
-///    `'0.00000005'` is zero;
-/// 3. **the literal exponent is bounded** by the type's integer digits
-///    plus the mantissa's own excessive decimals, so `'0.01e33'` is NULL
-///    even though the 10^31 it denotes fits comfortably.
+/// because the SQL side has them and a tidier mirror is a divergence: a
+/// scan cut short by whitespace is forgiven ([`terminated_scan`]), a
+/// negative exponent rounds on the leading SIGNIFICANT digit
+/// ([`shift_digits`]), and the literal exponent is bounded by the type's
+/// integer digits plus the mantissa's own excessive decimals, so
+/// `'0.01e33'` is NULL.
 #[must_use]
 pub fn decimal_micros(text: &str) -> Option<i128> {
     let parsed = NumericText::parse(text)?;
@@ -1412,11 +1049,8 @@ fn increment_digits(digits: &str) -> String {
 /// live mirror of [`crate::conform::guarded_cast`]'s BOOLEAN rung.
 ///
 /// Exactly two texts, lowercase, untrimmed. The CAST itself takes a wide
-/// case-insensitive vocabulary (`'TRUE'`, `'t'`, `'yes'`, `'1'`, `'0'`,
-/// `'no'`, …), and the round-trip guard — `CAST(cast AS VARCHAR) = text` —
-/// keeps only the two spellings `DuckDB` writes back. Everything else
-/// conforms to NULL and stays findable in `_raw`, which is what makes a
-/// BOOLEAN pin mean the column holds booleans rather than a synonym table.
+/// case-insensitive vocabulary, and the round-trip guard keeps only the
+/// two spellings `DuckDB` writes back.
 #[must_use]
 pub fn conformed_boolean(text: &str) -> Option<bool> {
     match text {
@@ -1429,18 +1063,10 @@ pub fn conformed_boolean(text: &str) -> Option<bool> {
 /// The BOOLEAN `DuckDB` reads out of a text it CASTS — the wide
 /// vocabulary, which is what a query LITERAL gets when it is compared
 /// against a BOOLEAN column (`flag=TRUE` and `flag=yes` both match a
-/// stored `true`, probed).
+/// stored `true`, probed). Not what a pinned COLUMN holds
+/// ([`conformed_boolean`]).
 ///
-/// Not what a pinned COLUMN holds: there the round-trip guard keeps only
-/// the two spellings `DuckDB` writes back ([`conformed_boolean`]). The
-/// asymmetry is deliberate — a stored `'yes'` is data the corpus must not
-/// silently restate as `true`, while a literal is the user's own token and
-/// `DuckDB` reads it generously.
-///
-/// A closed, case-insensitive vocabulary with NO whitespace trimming
-/// (`' true '` is NULL, unlike the numeric casts) and no numeric texts
-/// beyond `1`/`0` (`'2'`, `'1.0'` and `'on'`/`'off'` are all NULL) — every
-/// member and every rejection probed by execution.
+/// NO whitespace trimming (`' true '` is NULL, unlike the numeric casts).
 #[must_use]
 pub fn try_cast_boolean(text: &str) -> Option<bool> {
     const TRUE_WORDS: [&str; 5] = ["true", "t", "yes", "y", "1"];
@@ -1457,33 +1083,16 @@ pub fn try_cast_boolean(text: &str) -> Option<bool> {
 /// Compare two DOUBLEs in `DuckDB`'s order — the ONE owner of that
 /// domain, read by every lane that compares a double.
 ///
-/// `DuckDB` orders DOUBLE TOTALLY, and in two places Rust's IEEE
-/// operators do not:
-///
-/// - **every NaN is EQUAL to every other NaN**, whatever its sign bit,
-///   and GREATER than every real value — above `inf`, and last before
-///   SQL NULL in a sort. Rust answers `false` to `NaN == NaN` and `None`
-///   to `partial_cmp`, so an IEEE mirror answers "no match" where the
-///   batch query returns the row.
-/// - `-0.0` TIES `0.0`, which Rust's `partial_cmp` already gets right.
-///
-/// Probed against the engine both ways round — two bound values
-/// (`double_comparison_orders_nan_greatest_and_ties_the_two_zeros`) and a
-/// stored parquet column against a bound literal
-/// (`a_stored_double_column_compares_in_that_same_total_order`), because
-/// a scalar answer can be constant-folded and a column read cannot.
-///
-/// NaN is ordinary reachable data: `0 / 0` in a pipeline expression, a
-/// wire `"nan"` under a DOUBLE pin (the conform's round-trip guard keeps
-/// both spellings), and `metric=nan` as a filter literal.
+/// `DuckDB` orders DOUBLE TOTALLY: every NaN is EQUAL to every other NaN,
+/// whatever its sign bit, and GREATER than every real value. Rust answers
+/// `false` to `NaN == NaN` and `None` to `partial_cmp`. `-0.0` TIES
+/// `0.0`, which Rust's `partial_cmp` already gets right.
 #[must_use]
 pub fn double_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => std::cmp::Ordering::Equal,
         (true, false) => std::cmp::Ordering::Greater,
         (false, true) => std::cmp::Ordering::Less,
-        // Neither side is NaN, so `partial_cmp` is total here — and it
-        // already ties the two zeros.
         (false, false) => a
             .partial_cmp(&b)
             .expect("partial_cmp is total when neither operand is NaN"),
@@ -1494,11 +1103,6 @@ pub fn double_total_cmp(a: f64, b: f64) -> std::cmp::Ordering {
 /// produces — the live mirror of the DOUBLE pin's pattern target, and the
 /// same renderer `tostring()` uses in streaming eval (one renderer, so
 /// `dur=/^200$/` and `tostring(dur)` cannot disagree about `200.0`).
-///
-/// The rendering rules (shortest round-trip digits, a mandatory `.0` on
-/// integral values, sign-stripped zero, signed two-digit exponents,
-/// lowercase `inf`/`nan`) are documented on the renderer itself and
-/// executed against `DuckDB` in `trawl-engine/tests/duckdb_probe.rs`.
 #[must_use]
 pub fn canonical_double_text(x: f64) -> String {
     crate::eval::duckdb_double_to_string(x)
@@ -1506,34 +1110,20 @@ pub fn canonical_double_text(x: f64) -> String {
 
 /// The DOUBLE `DuckDB` reads out of a stored text under
 /// `TRY_CAST(col AS DOUBLE)` — the live mirror of the DOUBLE pin's own
-/// cast, and deliberately NOT `str::parse::<f64>`.
-///
-/// Three callers, one cast domain: the DOUBLE pin's PATTERN text
-/// ([`PatternForm::DoubleText`]) — what the conformed column holds, to be
-/// rendered and globbed — `pin_match`'s reading of a DOUBLE-pinned live
-/// value before it compares in DOUBLE's total order ([`double_total_cmp`]),
-/// and `crate::eval`'s `tonumber()` scalar, whose SQL counterpart is the
-/// same `TRY_CAST(… AS DOUBLE)`. A VARCHAR pin's numeric comparison never
-/// comes through here: that is [`decimal_micros`]' job (ADR-0011 ruling #6).
+/// cast, and deliberately NOT `str::parse::<f64>`. A VARCHAR pin's numeric
+/// comparison never comes through here: that is [`decimal_micros`]' job
+/// (ADR-0011 ruling #6).
 ///
 /// `DuckDB`'s cast domain is strictly wider than Rust's float parser in
-/// two ways (both executed in `trawl-engine/tests/duckdb_probe.rs`), and
-/// both widen it in the direction that costs live matches: batch returns
-/// the row, the stream drops it.
+/// two ways:
 ///
-/// - ASCII whitespace is trimmed off BOTH ends — space, `\t`, `\n`,
-///   `\r`, `\x0b`, `\x0c` (C `isspace`, so `\x0b` too, which
-///   [`char::is_ascii_whitespace`] excludes), and never a non-ASCII
-///   space like U+00A0. `' 200'` is 200 to `DuckDB`.
-/// - `_` digit separators are accepted strictly BETWEEN ASCII digits:
-///   `'200_000'` is 200000 and `'1e1_0'` is 1e10, while `'_200'`,
-///   `'200_'`, `'1__0'`, `'1._5'` and `'1_e3'` are NULL.
+/// - ASCII whitespace is trimmed off BOTH ends (C `isspace`, so `\x0b`
+///   too, which [`char::is_ascii_whitespace`] excludes), and never a
+///   non-ASCII space like U+00A0.
+/// - `_` digit separators are accepted strictly BETWEEN ASCII digits.
 ///
-/// Everything else the two engines already agree on, so the normalized
-/// text goes to Rust's parser verbatim: `nan`/`inf`/`infinity` in any
-/// case and sign, `+5`, `1.`, `.5`, `1e3`, `00200`, and out-of-range
-/// exponents saturating to ±inf / ±0. `None` is the NULL `TRY_CAST`
-/// writes — UNKNOWN, never a false FALSE that `NOT` could invert.
+/// `None` is the NULL `TRY_CAST` writes — UNKNOWN, never a false FALSE
+/// that `NOT` could invert.
 #[must_use]
 pub fn try_cast_double(text: &str) -> Option<f64> {
     let trimmed = text.trim_matches(is_c_space);
@@ -1571,16 +1161,12 @@ fn strip_digit_separators(text: &str) -> Option<String> {
 }
 
 /// Whether the literal's content is a number, over exactly the set
-/// [`coerce_filter_value`]'s i64-then-f64 ladder answers numerically — so
-/// the pinned and unpinned paths agree on what counts as one. (Every
-/// i64-shaped text parses as `f64` too, so the ladder's two rungs are one
-/// membership question here; they differ only in what they bind.)
+/// [`coerce_filter_value`]'s i64-then-f64 ladder answers numerically.
 ///
 /// It stays Rust's parser rather than the DECIMAL domain the readings use,
 /// because this decides which RULE applies, not what the literal is worth.
-/// `dur>1e40` is a numeric comparison whose answer happens to be UNKNOWN
-/// for every row; routing it to the lexical rule instead would silently
-/// turn it into a string comparison against `"1e40"` and return rows.
+/// Routing `dur>1e40` to the lexical rule would silently turn it into a
+/// string comparison against `"1e40"` and return rows.
 fn is_numeric_literal(s: &str) -> bool {
     s.parse::<f64>().is_ok()
 }
@@ -1589,9 +1175,6 @@ fn is_numeric_literal(s: &str) -> bool {
 mod tests {
     use super::*;
 
-    /// The two doors, unwrapped: every case in this module binds a
-    /// literal the rule table accepts, so the fallible signature is noise
-    /// here. The refusal path has its own tests below.
     fn compare_form(pin: Option<CanonicalType>, op: FilterOp, literal: &str) -> CompareForm {
         super::compare_form(pin, op, literal).expect("literal binds under the pin")
     }
@@ -1635,8 +1218,6 @@ mod tests {
         matches!(native, SqlValue::Int(_) | SqlValue::Float(_))
     }
 
-    // ── unpinned: everything stays literal-driven ─────────────────────
-
     #[test]
     fn unpinned_is_native_for_every_op_and_literal() {
         for (lit, native) in literal_shapes() {
@@ -1651,13 +1232,10 @@ mod tests {
         assert_eq!(pattern_form(None), PatternForm::Native);
     }
 
-    // ── the bound door (ADR-0011 slice A′) ────────────────────────────
-
     fn lit_str(s: &str) -> LiteralValue {
         LiteralValue::String(s.to_owned())
     }
 
-    /// A float literal as the parser builds it: value plus source token.
     fn lit_float(text: &str) -> LiteralValue {
         LiteralValue::Float(crate::ast::FloatLiteral::new(
             text.parse::<f64>().expect("test literal parses"),
@@ -1665,8 +1243,6 @@ mod tests {
         ))
     }
 
-    /// `== null` binds no comparison form — the caller falls through to
-    /// the generic, pin-blind path.
     #[test]
     fn bound_null_literal_has_no_form() {
         for pin in [None, Some(CanonicalType::Varchar)]
@@ -1683,9 +1259,6 @@ mod tests {
         }
     }
 
-    /// A typed pin binds the AST's own literal unchanged — the SQL the
-    /// pipeline lane emits for `flag == true` is byte-identical to the
-    /// pin-blind emission; only the live mirror conforms.
     #[test]
     fn bound_typed_pin_binds_the_ast_literal_unchanged() {
         for pin in TYPED_PINS {
@@ -1722,10 +1295,6 @@ mod tests {
         );
     }
 
-    /// Quote provenance is discarded: `where status == "400"` binds
-    /// exactly as `status == 400` does, under every pin — content
-    /// decides, matching the search stage where every literal arrives as
-    /// text (`status="400"` and `status=400` are one AST).
     #[test]
     fn bound_string_literal_with_numeric_content_binds_like_the_number() {
         for pin in [None, Some(CanonicalType::Varchar)]
@@ -1742,15 +1311,9 @@ mod tests {
         }
     }
 
-    /// Quote-insensitivity holds ABOVE 2^53, where `f64` stops being able
-    /// to name the number: a float literal binds its SOURCE TOKEN, so the
-    /// unquoted spelling resolves to the same form the quoted one does.
-    /// Re-rendering the parsed double would bind `…992` and answer for the
-    /// ADJACENT identifier (ADR-0011 ruling #6).
     #[test]
     fn bound_float_literal_above_2_53_binds_its_source_token() {
         const HUGE: &str = "9007199254740993.0";
-        // The premise: the parsed double cannot express this literal.
         assert_eq!(
             HUGE.parse::<f64>().unwrap().to_string(),
             "9007199254740992",
@@ -1774,8 +1337,6 @@ mod tests {
         );
     }
 
-    /// The bound door and the text door agree on every VARCHAR-pin rule:
-    /// one rule table, however the literal arrives.
     #[test]
     fn bound_varchar_rules_mirror_compare_form() {
         let cases: &[(LiteralValue, &str)] = &[
@@ -1814,7 +1375,6 @@ mod tests {
             ),
             Some(CompareForm::Native(SqlValue::Bool(true)))
         );
-        // The specific shapes, pinned:
         assert_eq!(
             compare_form_bound(
                 Some(CanonicalType::Varchar),
@@ -1849,14 +1409,9 @@ mod tests {
         );
     }
 
-    // ── VARCHAR pin ───────────────────────────────────────────────────
-
     #[test]
     fn varchar_eq_class_binds_text_for_every_literal() {
         for (lit, native) in literal_shapes() {
-            // A numeric literal additionally carries its reading — the
-            // stored text of a number is `read_json`'s inference rendered,
-            // so exact text alone is unmirrorable live (see the module doc).
             let expected = if is_numeric(&native) {
                 CompareForm::TextOrNumeric(lit.to_owned())
             } else {
@@ -1872,10 +1427,6 @@ mod tests {
         }
     }
 
-    /// The equality rung's numeric half is decided by the SAME ladder the
-    /// ordered rung uses: one literal is either a number to both or to
-    /// neither, so `status=200` and `status>=200` cannot disagree about
-    /// what `200` is.
     #[test]
     fn varchar_eq_and_ordered_agree_on_what_is_numeric() {
         for (lit, _) in literal_shapes()
@@ -1894,10 +1445,6 @@ mod tests {
         }
     }
 
-    /// The ordered rung carries the literal's own TEXT, never a parsed
-    /// number: the SQL binds that string and casts it with the same
-    /// expression it casts the column with, so the literal never
-    /// round-trips through `f64` (ADR-0011 ruling #6).
     #[test]
     fn varchar_ordered_numeric_literal_carries_the_literal_text() {
         for (lit, native) in literal_shapes() {
@@ -1945,12 +1492,6 @@ mod tests {
         );
     }
 
-    // ── typed pins ────────────────────────────────────────────────────
-
-    /// A typed pin binds the literal exactly as the unpinned path does —
-    /// the emitted SQL stays byte-identical, since the column on disk IS
-    /// the pinned type — and carries the pin so the LIVE matcher can
-    /// conform the wire value before comparing.
     #[test]
     fn typed_pins_bind_natively_and_carry_the_pin() {
         for pin in TYPED_PINS {
@@ -1969,10 +1510,6 @@ mod tests {
         }
     }
 
-    // --- the SEVERITY pin (ADR-0013) ---
-
-    /// The equality class takes the band, ordered operators take the
-    /// token's own number — bound by the pin, never by the field's name.
     #[test]
     fn severity_band_tokens_bind_bands_for_equality_and_numbers_for_ordering() {
         let sev = Some(CanonicalType::Severity);
@@ -2001,9 +1538,6 @@ mod tests {
         }
     }
 
-    /// The `OTel` exact short names name ONE number, under every
-    /// operator — the band table is consulted first, so the bare base
-    /// names keep their band meaning.
     #[test]
     fn severity_exact_names_and_integers_bind_exactly() {
         let sev = Some(CanonicalType::Severity);
@@ -2019,8 +1553,6 @@ mod tests {
                 "{op:?}"
             );
         }
-        // Unclamped: `_severity>0` is "carries a severity at all", and an
-        // out-of-ladder equality honestly matches nothing.
         assert_eq!(
             compare_form(sev, FilterOp::Gt, "0"),
             CompareForm::SeverityExact(0)
@@ -2031,15 +1563,6 @@ mod tests {
         );
     }
 
-    /// The drift guard for [`severity_points`]: expanding a form to ladder
-    /// points must accept exactly the numbers the form's own rule accepts,
-    /// for every literal the SEVERITY rung binds.
-    ///
-    /// Exhaustive and pure — every band token, every `OTel` exact short
-    /// name, and the integers around the ladder's edges, each checked
-    /// against every point on it. If the rule table ever grows a rung
-    /// whose membership is not `lo..=hi` or `== n`, this fails rather
-    /// than letting the `IN (…)` rendering quietly mean something else.
     #[test]
     fn severity_points_expands_exactly_the_forms_own_membership() {
         let sev = Some(CanonicalType::Severity);
@@ -2061,9 +1584,6 @@ mod tests {
                 points.windows(2).all(|w| w[0] < w[1]),
                 "{literal}: {points:?}"
             );
-            // The ranges the renderer emits must accept exactly the
-            // numbers the points do: merging is a rendering choice, never
-            // a meaning change.
             let ranges = severity_ranges(&points);
             assert!(
                 ranges.iter().all(|(lo, hi)| lo <= hi),
@@ -2091,17 +1611,12 @@ mod tests {
                     "{literal} at {n} through the merged ranges {ranges:?}"
                 );
             }
-            // Unclamped: an out-of-ladder integer keeps its own value, so
-            // `_severity=99` renders `= 99` and honestly matches nothing.
             if let CompareForm::SeverityExact(exact) = form {
                 assert_eq!(points, vec![exact]);
             }
         }
     }
 
-    /// `severity_points` is the SEVERITY set door and nothing else: a
-    /// non-severity form, or no forms at all, keeps the caller on its
-    /// per-element shape.
     #[test]
     fn severity_points_refuses_mixed_and_empty_form_sets() {
         assert_eq!(severity_points(&[]), None);
@@ -2116,7 +1631,6 @@ mod tests {
             severity_points(&[CompareForm::TextOrNumeric("200".to_owned())]),
             None
         );
-        // Overlapping bands and duplicated points collapse to one set.
         assert_eq!(
             severity_points(&[
                 CompareForm::SeverityBand { lo: 17, hi: 20 },
@@ -2127,26 +1641,18 @@ mod tests {
         );
     }
 
-    /// The merge itself: maximal runs, in order, and adjacency is what
-    /// joins them.
     #[test]
     fn severity_ranges_merges_adjacent_points_into_maximal_runs() {
-        // One band is one run; the six base bands together are one run,
-        // which is the case the merge exists for.
         assert_eq!(severity_ranges(&[17, 18, 19, 20]), vec![(17, 20)]);
         assert_eq!(
             severity_ranges(&(1..=24).collect::<Vec<_>>()),
             vec![(1, 24)]
         );
-        // A genuinely disjoint selection stays two runs…
         assert_eq!(
             severity_ranges(&[13, 14, 15, 16, 21, 22, 23, 24]),
             vec![(13, 16), (21, 24)]
         );
-        // …and a point adjacent to a band extends it rather than splitting
-        // (`warn,17` is the contiguous 13-17).
         assert_eq!(severity_ranges(&[13, 14, 15, 16, 17]), vec![(13, 17)]);
-        // Singletons stay singletons.
         assert_eq!(severity_ranges(&[18]), vec![(18, 18)]);
         assert_eq!(
             severity_ranges(&[13, 14, 15, 16, 99]),
@@ -2155,14 +1661,10 @@ mod tests {
         assert_eq!(severity_ranges(&[]), vec![]);
     }
 
-    /// Out-of-ladder points are interchangeable, so exactly one survives
-    /// the render — the amplification bound.
     #[test]
     fn severity_ranges_collapse_out_of_ladder_points_to_one_representative() {
-        // All out of ladder: one representative, the smallest.
         assert_eq!(severity_ranges(&[-5, 99, 101]), vec![(-5, -5)]);
         assert_eq!(severity_ranges(&[25, 26, 4000]), vec![(25, 25)]);
-        // Mixed: the in-ladder runs stand, plus the one representative.
         assert_eq!(
             severity_ranges(&[-5, 13, 14, 15, 16, 99, 101]),
             vec![(-5, -5), (13, 16)]
@@ -2177,8 +1679,6 @@ mod tests {
             severity_ranges(&[i64::MIN, i64::MAX]),
             vec![(i64::MIN, i64::MIN)]
         );
-        // The bound: the ladder admits at most 12 non-adjacent points, so
-        // no input can render more than 13 runs however long it is.
         let adversarial: Vec<i64> = (1..=24)
             .step_by(2)
             .chain((100..2000).map(|n| n * 2))
@@ -2191,8 +1691,6 @@ mod tests {
         assert_eq!(severity_ranges(&adversarial).len(), 13);
     }
 
-    /// Anything outside the vocabulary is an ERROR naming it — never a
-    /// filter that quietly matches nothing.
     #[test]
     fn severity_refuses_literals_outside_the_ladder_vocabulary() {
         let sev = Some(CanonicalType::Severity);
@@ -2231,8 +1729,6 @@ mod tests {
         );
     }
 
-    /// Both doors agree, literal for literal — the property that keeps
-    /// `_severity=error` and `| where _severity == "error"` one rule.
     #[test]
     fn severity_doors_agree() {
         let sev = Some(CanonicalType::Severity);
@@ -2245,7 +1741,6 @@ mod tests {
                 assert_eq!(compare_form(sev, op, literal), bound, "{literal} {op:?}");
             }
         }
-        // An integer literal binds identically whichever door spelled it.
         assert_eq!(
             super::compare_form_bound(sev, FilterOp::Gte, &LiteralValue::Int(13))
                 .unwrap()
@@ -2254,10 +1749,6 @@ mod tests {
         );
     }
 
-    /// Every typed pin gets its OWN pattern text — none of them can share
-    /// "stringify the wire value", because each conforms values the wire
-    /// spells differently (`"0404"` → 404, `"TRUE"` → true, `200` → 200.0,
-    /// `…T09:00:00Z` → the six-digit RFC 3339 form).
     #[test]
     fn typed_pins_each_take_their_own_pattern_text() {
         for pin in TYPED_PINS {
@@ -2273,10 +1764,6 @@ mod tests {
         }
     }
 
-    /// The DOUBLE pin's pattern text is `DuckDB`'s DOUBLE rendering, NOT
-    /// the wire number's stringification — every expectation here is the
-    /// string `CAST(v AS VARCHAR)` returns over a DOUBLE column (executed
-    /// side by side in `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
     fn canonical_double_text_mirrors_duckdb_rendering() {
         let cases = [
@@ -2304,20 +1791,12 @@ mod tests {
         }
     }
 
-    // ── the TIMESTAMP pin's canonical pattern text ────────────────────
-
-    /// The shapes that HAVE a reading, each with the ONE canonical text —
-    /// `T` separator, six fractional digits, `Z`.
-    ///
     /// Every expectation is the string `DuckDB` returns for `strftime`
-    /// over the same input under [`crate::conform::guarded_cast`]'s
-    /// TIMESTAMP rung, executed side by side in
-    /// `trawl-engine/tests/duckdb_probe.rs`, which is the CONTRACT: a case
-    /// that disagrees there is a bug in this function, never a tolerance.
+    /// over the same input, executed side by side in
+    /// `trawl-engine/tests/duckdb_probe.rs`.
     const TIMESTAMP_RENDERINGS: &[(&str, &str)] = &[
         // The wire form ingest canonicalizes _time into.
         ("2026-01-15T09:00:00.000000Z", "2026-01-15T09:00:00.000000Z"),
-        // Separator and whitespace variants of the same instant.
         ("2026-01-15T09:00:00Z", "2026-01-15T09:00:00.000000Z"),
         ("2026-01-15 09:00:00", "2026-01-15T09:00:00.000000Z"),
         ("2026-01-15T09:00", "2026-01-15T09:00:00.000000Z"),
@@ -2372,7 +1851,6 @@ mod tests {
         ),
         ("2026-01-15T09:00:00.Z", "2026-01-15T09:00:00.000000Z"),
         ("2026-01-15T09:00:00.-08:00", "2026-01-15T17:00:00.000000Z"),
-        // Date-only, slash dates, and unpadded/overpadded components.
         ("2026-01-15", "2026-01-15T00:00:00.000000Z"),
         ("  2026-01-15", "2026-01-15T00:00:00.000000Z"),
         ("2026/01/15", "2026-01-15T00:00:00.000000Z"),
@@ -2392,7 +1870,6 @@ mod tests {
         ("2026-01-15 24:00:00 UTC", "2026-01-16T00:00:00.000000Z"),
         ("2026-01-15 24:00:00+05:30", "2026-01-15T18:30:00.000000Z"),
         ("2026-12-31 24:00:00", "2027-01-01T00:00:00.000000Z"),
-        // Keyword instants, case-insensitive, whitespace-tolerant.
         ("epoch", "1970-01-01T00:00:00.000000Z"),
         ("EpOcH", "1970-01-01T00:00:00.000000Z"),
         (" epoch ", "1970-01-01T00:00:00.000000Z"),
@@ -2478,13 +1955,8 @@ mod tests {
         }
     }
 
-    /// No reading → `None`, the UNKNOWN that mirrors the NULL the conform
-    /// wrote for the same value. Epoch numerals are not timestamps to
-    /// `DuckDB` and must not become one here.
-    ///
-    /// The `HH:MM` rows are the false-positive direction: a seconds-less
-    /// time takes no zone and no trailing anything, so `09:00Z` would fire
-    /// live and NULL in batch unless the mirror refuses it too.
+    /// Epoch numerals are not timestamps to `DuckDB` and must not become one
+    /// here.
     #[test]
     fn canonical_timestamp_text_is_none_without_a_reading() {
         for input in [
@@ -2513,7 +1985,6 @@ mod tests {
             "2026-01-15 09",
             "2026-01-15Z",
             "2026-01-15+05:30",
-            // A seconds-less time must END the text.
             "2026-01-15T09:00Z",
             "2026-01-15T09:00+05:30",
             "2026-01-15T09:00 UTC",
@@ -2606,14 +2077,9 @@ mod tests {
         }
     }
 
-    /// The two shapes the mirror deliberately does NOT read, asserted here
-    /// so a later change to either has to say so out loud.
-    ///
     /// `DuckDB` has a reading for all of them, so each is a live tail that
-    /// UNDER-matches a batch query — never the reverse. The reasons are on
-    /// [`canonical_timestamp_text`]; the divergence itself is pinned
-    /// against the engine in `trawl-engine/tests/duckdb_probe.rs`, so it
-    /// stays a known cost rather than becoming a rediscovery.
+    /// UNDER-matches a batch query. The reasons are on
+    /// [`canonical_timestamp_text`].
     #[test]
     fn canonical_timestamp_text_declines_the_documented_residuals() {
         for input in [
@@ -2631,12 +2097,6 @@ mod tests {
         }
     }
 
-    /// A search bound is what [`literal_timestamp`] reads AND what its
-    /// [`Instant::cast_text`] reads back as. Chrono's `%Y` writes a finite
-    /// year above 9999 with a leading `+`, which neither the mirror nor
-    /// `DuckDB` reads, so such a year cannot reach the SQL lane and is
-    /// refused. A year `DuckDB` prints as BC keeps its reading. The
-    /// engine side of both claims is `a_bound_instant_reads_back_through_duckdb`.
     #[test]
     fn bound_instant_refuses_unprintable_years() {
         let at = |text: &str| literal_timestamp(text).expect("the mirror reads the text");
@@ -2665,11 +2125,6 @@ mod tests {
         }
     }
 
-    // ── the stored-value cast domain mirrors DuckDB ───────────────────
-
-    /// Every expectation here is the value `DuckDB`'s
-    /// `TRY_CAST(v AS DOUBLE)` returns for the same text (executed side
-    /// by side in `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
     fn try_cast_double_mirrors_duckdb_cast_domain() {
         // ASCII whitespace is trimmed off both ends, `\x0b` included.
@@ -2700,7 +2155,6 @@ mod tests {
         ] {
             assert_eq!(try_cast_double(text), None, "{text:?}");
         }
-        // Shapes both engines already agree on, unchanged.
         assert_eq!(try_cast_double("+5"), Some(5.0));
         assert_eq!(try_cast_double("1."), Some(1.0));
         assert_eq!(try_cast_double(".5"), Some(0.5));
@@ -2715,11 +2169,6 @@ mod tests {
         }
     }
 
-    /// The BIGINT reading is DERIVED from the comparison space, so the
-    /// guard's algebra is the test: a text conforms exactly when its
-    /// DECIMAL reading is a whole number of microsteps that `BIGINT` can
-    /// hold. Every pairing is executed against the guard SQL in
-    /// `trawl-engine/tests/duckdb_probe.rs`.
     #[test]
     fn conformed_bigint_is_the_whole_microsteps_of_the_decimal_reading() {
         for text in [
@@ -2745,8 +2194,6 @@ mod tests {
             });
             assert_eq!(conformed_bigint(text), expected, "{text:?}");
         }
-        // An `f64` cast rung goes blind above 2^53: both batch lanes hold
-        // these integers exactly, so the mirror has to as well.
         assert_eq!(
             conformed_bigint("1.7356896001234568e+18"),
             Some(1_735_689_600_123_456_800)
@@ -2757,13 +2204,8 @@ mod tests {
         );
     }
 
-    /// The conformed BIGINT reading keeps every SPELLING drift and refuses
-    /// every VALUE change — the round-trip guard, mirrored (each
-    /// expectation executed against the guard SQL in
-    /// `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
     fn conformed_bigint_preserves_value_not_spelling() {
-        // Spelling drift: same value, different text.
         for (text, value) in [
             ("404", 404),
             ("0404", 404),
@@ -2784,15 +2226,12 @@ mod tests {
             // integer, the documented residual tolerance.
             ("4.0000001", 4),
             ("4.0000004999", 4),
-            // Above 2^53, where an `f64` cast rung reads nothing and both
-            // batch lanes hold the integer.
             ("1.7356896001234568e+18", 1_735_689_600_123_456_800),
             ("1735689600123456800.0", 1_735_689_600_123_456_800),
             ("9007199254740993.0", 9_007_199_254_740_993),
         ] {
             assert_eq!(conformed_bigint(text), Some(value), "{text:?}");
         }
-        // Value changes the cast would have made silently.
         for text in [
             "1.5",
             "1.4",
@@ -2815,7 +2254,6 @@ mod tests {
         for text in ["0x10", "0B101", "-0x10", " 0x10 "] {
             assert_eq!(conformed_bigint(text), None, "{text:?}");
         }
-        // No reading at all, and out of BIGINT range.
         for text in [
             "accepted",
             "",
@@ -2833,8 +2271,6 @@ mod tests {
         }
     }
 
-    /// The guard's comparison space, exact by construction: `DuckDB`'s
-    /// `TRY_CAST(v AS DECIMAL(38,6))` scaled by 10^6 (probe-pinned).
     #[test]
     fn decimal_micros_mirrors_duckdb_decimal_domain() {
         for (text, micros) in [
@@ -2931,9 +2367,6 @@ mod tests {
         );
     }
 
-    /// Exactly two conformed texts, lowercase and untrimmed: the CAST's
-    /// vocabulary is wide, and the round-trip guard keeps only what
-    /// `DuckDB` renders back (probe-pinned).
     #[test]
     fn conformed_boolean_keeps_only_the_rendered_spellings() {
         assert_eq!(conformed_boolean("true"), Some(true));
@@ -2947,10 +2380,6 @@ mod tests {
         }
     }
 
-    /// The comparison space is exact where a DOUBLE one collapses:
-    /// adjacent snowflake ids read as three distinct values, and
-    /// `2^53 ± 1` are distinguishable at all (executed against `DuckDB`
-    /// in `trawl-engine/tests/duckdb_probe.rs`).
     #[test]
     fn decimal_micros_separates_ids_a_double_would_equate() {
         let ids = [
@@ -2980,14 +2409,10 @@ mod tests {
         assert_eq!(decimal_micros("200"), decimal_micros("200.0"));
     }
 
-    // ── the numeric-literal ladder mirrors coerce_filter_value ────────
-
     #[test]
     fn numeric_detection_follows_the_coercion_ladder() {
-        // i64 rung.
         assert!(is_numeric_literal("42"));
         assert!(is_numeric_literal("-7"));
-        // f64 rung (i64 overflow, fractions).
         assert!(is_numeric_literal("1.5"));
         assert!(is_numeric_literal("9999999999999999999"));
         // Numeric to the ladder, unreadable in the comparison space: the
@@ -2997,7 +2422,6 @@ mod tests {
             assert!(is_numeric_literal(lit), "{lit:?}");
             assert_eq!(decimal_micros(lit), None, "{lit:?}");
         }
-        // Non-numeric.
         assert!(!is_numeric_literal("accepted"));
         assert!(!is_numeric_literal(""));
         assert!(!is_numeric_literal("1.5s"));

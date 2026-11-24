@@ -2,8 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Build-time version metadata.
-
 use std::sync::LazyLock;
 
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -18,7 +16,6 @@ static LONG_VERSION: LazyLock<String> = LazyLock::new(|| {
     format!("{PKG_VERSION} ({GIT_SHA}{dirty} {GIT_DATE}, rustc {RUSTC_VERSION}, {TARGET_TRIPLE})")
 });
 
-/// Returns the long version string for clap's `long_version` attribute.
 pub fn long_version() -> &'static str {
     &LONG_VERSION
 }

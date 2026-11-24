@@ -3,12 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! A query's cooperative stop (ADR-0063).
-//!
-//! Neither regex engine can be interrupted inside one call, so work that
-//! may be cancelled reads a [`Stop`] between its steps: a parse between
-//! its phases and its pattern builds, a preparation between translation
-//! and compiles. Whoever owns the work requests the stop, and the work
-//! ends at its next check with [`Cancelled`], never with a diagnostic.
 
 use std::fmt;
 use std::sync::Arc;
@@ -16,8 +10,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 /// A flag that work reads between its steps. Clones share it, so a
 /// request through any clone reaches every reader.
-///
-/// The default is [`Stop::never`].
 #[derive(Debug, Clone, Default)]
 pub struct Stop(Option<Arc<AtomicBool>>);
 
@@ -50,7 +42,6 @@ impl Stop {
         }
     }
 
-    /// Whether the stop has been requested.
     #[must_use]
     pub fn requested(&self) -> bool {
         self.0
@@ -58,7 +49,6 @@ impl Stop {
             .is_some_and(|flag| flag.load(Ordering::SeqCst))
     }
 
-    /// One cancellation point: [`Cancelled`] once the stop is requested.
     pub fn check(&self) -> Result<(), Cancelled> {
         if self.requested() {
             Err(Cancelled)
@@ -85,7 +75,6 @@ impl std::error::Error for Cancelled {}
 mod tests {
     use super::*;
 
-    /// A never stop ignores a request, and so does its default.
     #[test]
     fn a_never_stop_is_never_requested() {
         for stop in [Stop::never(), Stop::default()] {
@@ -95,8 +84,6 @@ mod tests {
         }
     }
 
-    /// A request through one clone reaches every clone, and through the
-    /// flag a stop was made from.
     #[test]
     fn a_request_reaches_every_clone() {
         let stop = Stop::new();

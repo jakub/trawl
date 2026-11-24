@@ -4,118 +4,17 @@
 
 //! The bind-time expansion budget (ADR-0024).
 //!
-//! `DuckDB` binds a SELECT list left to right, and an output that names an
-//! EARLIER output of the same list is bound by copying that earlier
-//! expression in and binding it again. The DSL text grows by one name; the
-//! bound tree doubles. Chained, that is exponential preparation work for a
-//! query that fits on one line, and the permit stays held for all of it.
+//! [`profile`] states, per rendering, how many copies of each child the
+//! emitter writes; the drift tests in `tests/complexity_emission_bounds.rs`
+//! hold those numbers against the real emitter. A profile may overcount
+//! fixed overhead. It may never omit a child copy.
 //!
-//! This module is the admission check both validation doors run
-//! ([`crate::emitter::validate_pipeline`] and
-//! [`crate::stream::compile_stream_plan`]). It is pure and
-//! corpus-independent: it reads the AST and a table of numeric RENDERING
-//! PROFILES, and it never emits SQL, parses SQL, consults the catalog or
-//! opens a database. Corpus-independence is the point — the same DSL text
-//! has to be admitted or refused identically at every door, including the
-//! one that validates a saved query nobody has run yet.
-//!
-//! # The measure
-//!
-//! Every expression carries two numbers ([`Weight`]):
-//!
-//! - `w`, the EXPANDED node count — what the bound tree costs once every
-//!   same-stage alias inside it has been substituted;
-//! - `d`, the ADDITIONAL substitution that expansion caused — the part
-//!   that would not exist if the query named no earlier output.
-//!
-//! A field or a literal is `w = 1, d = 0`. A reference to an earlier
-//! output `T` of the SAME stage is `w = W(T), d = W(T) - 1`: the whole
-//! target arrives in place of the one name that was written. A rendering
-//! with fixed node overhead `c` and per-child copy counts `mᵢ` gives
-//! `w = c + Σ mᵢ·wᵢ` and `d = Σ mᵢ·dᵢ`.
-//!
-//! `d` is PROPAGATED, never derived by subtracting one maximized total
-//! from another: where a construct's shape depends on the field's catalog
-//! pin, the check takes the componentwise maximum of `(w, d)` over every
-//! supported pin, and two maxima can come from two different renderings.
-//!
-//! The per-stage sum of assignment `d`s, accumulated across the pipeline,
-//! is what [`MAX_LATERAL_EXPANSION`] bounds. Arithmetic saturates, and a
-//! saturated total is over the limit by construction — nothing subtracts
-//! saturated numbers.
-//!
-//! # What the profiles are for
-//!
-//! Counting DSL nodes alone undercounts, because SQL translation multiplies
-//! operands the DSL wrote once. `sev(x) in (1,3,5,…,23)` renders its
-//! subject once per disjoint ladder range — twelve copies for that list —
-//! so a chain of such assignments compounds twelve-fold per link while the
-//! DSL grows linearly. [`profile`] states, per rendering, how many copies
-//! of each child the emitter writes; the drift tests in
-//! `tests/complexity_emission_bounds.rs` hold those numbers against the
-//! real emitter. A profile may overcount fixed overhead. It may never omit
-//! a child copy.
-//!
-//! # The parser multiplies too
-//!
-//! Emitted TEXT is not the last word on how many times a child is
-//! written. `DuckDB`'s parser rewrites a SIMPLE `CASE` — one with a
-//! subject at its head — into one equality predicate per `WHEN` arm, and
-//! it does that at PARSE time, before the binder ever sees a lateral
-//! alias. `CASE x WHEN 1 THEN 'a' WHEN 2 THEN 'b' END` reaches the binder
-//! as `CASE WHEN x = 1 THEN 'a' WHEN x = 2 THEN 'b' END`, with two copies
-//! of `x`. A SEARCHED `CASE` (`CASE WHEN cond THEN …`) has no subject and
-//! is not rewritten at all.
-//!
-//! That is why [`simple_case`] exists and why the severity kernels are
-//! priced the way they are: `conform::severity_token_text_sql` writes its
-//! subject once in text and twenty-four times in the parsed tree, and
-//! `conform::severity_reading_sql` writes it five times in text and
-//! seventy-nine times parsed. Text-level drift tests count the wrong side
-//! of the parser, so the copy counts here are held against the PARSED
-//! tree by `trawl-engine/tests/duckdb_probe.rs`, which serializes the
-//! renderer-shaped SQL through `json_serialize_sql` and counts a marker
-//! subject in the result.
-//!
-//! # Regex copies
-//!
-//! A lateral copy is a whole bound expression, so a regex parameter
-//! inside one binds again with it: `let a = message matches "x", b = a`
-//! writes one `?` and makes `DuckDB` bind two `regexp_matches` calls, each
-//! compiling its own RE2 (probed in `trawl-engine/tests/integration.rs`).
-//! The parser's `CASE` rewrite copies a `?` the same way. So every
-//! [`Weight`] also carries its regex patterns ([`RegexLoad`]): the ones
-//! the emitter writes, and the further copies `DuckDB` binds, propagated
-//! through the same profiles and substitutions as `w` and `d`.
-//! [`stage_regex_copies`] sums the further copies of one stage, and the
-//! emitter charges them to its regex parameter counter beside the
-//! patterns it writes.
-//!
-//! A `pivot` copies its aggregate once per pivot value, up to
-//! [`PIVOT_FILTER_THRESHOLD`] values, and the values come from the data.
-//! So [`stage_regex_copies`] charges a pivot aggregate's patterns at that
-//! worst case. A dynamic pivot that a later stage reads past its keys
-//! also renders a fill (ADR-0062), which binds the aggregate once more.
-//! Only a later stage's read decides whether the fill renders, so the
-//! emitter charges that copy ([`pivot_aggregate_regex`]) when the fill
-//! takes its first name.
-//!
-//! # Field lists
-//!
-//! A `sort` or `dedup` stage has no output sequence, but the kv tail keys
-//! and compares one slot per field it names, so [`MAX_STAGE_FIELDS`] caps
-//! how many names one such stage may write.
-//!
-//! # What it does not bound
-//!
-//! Multiplication that no alias reference feeds — `x in (1,…,1000)` over an
-//! ordinary column — has `d = 0`. The query length limit bounds its size
-//! instead, and the parser's two depth limits bound its depth: the
-//! nesting of parentheses, calls and `in` lists (`MAX_EXPR_DEPTH`), and
-//! the levels of the whole tree (`MAX_TREE_DEPTH`). Corpus width, file
-//! discovery and pivot cardinality are database planning costs and sit
-//! outside the node measure entirely; only the regex count above prices
-//! a pivot's copies.
+//! `DuckDB`'s parser rewrites a SIMPLE `CASE` — one with a subject at its
+//! head — into one equality predicate per `WHEN` arm, at PARSE time, before
+//! the binder ever sees a lateral alias. A SEARCHED `CASE` is not
+//! rewritten. Text-level drift tests count the wrong side of the parser, so
+//! the copy counts here are held against the PARSED tree by
+//! `trawl-engine/tests/duckdb_probe.rs`.
 
 use std::borrow::Cow;
 use std::collections::HashMap;
@@ -132,47 +31,21 @@ use crate::projection::agg_output_name;
 use crate::schema::{CanonicalType, catalog_key};
 use crate::severity::Dialect;
 
-// ---------------------------------------------------------------------------
-// The limits
-// ---------------------------------------------------------------------------
-
 /// The most additional substitution one query may describe (ADR-0024).
-///
-/// Not configurable, deliberately: an operator cannot know what a number
-/// here costs the binder, and a per-install limit would make one DSL text
-/// admitted on one node and refused on another.
 pub const MAX_LATERAL_EXPANSION: u64 = 512;
 
 /// The most pipeline stages one query may carry (ADR-0024).
-///
-/// Counted over the WHOLE pipeline, including `from saved` and the stages
-/// the executor later peels off to run in Rust — the search stage is not a
-/// pipeline stage and carries no same-stage aliases.
 pub const MAX_PIPELINE_STAGES: usize = 128;
 
 /// The most fields one `sort` or `dedup` stage may name (ADR-0024,
 /// Amendment 2026-11-09).
-///
-/// Every written name counts, repeats included: the kv tail's exact dedup
-/// keeps one key slot per written field for each distinct key, and its
-/// sort compares every written field, so a repeated name costs what a new
-/// one does. A bare `dedup` names none.
 pub const MAX_STAGE_FIELDS: usize = 64;
 
-/// The most times `DuckDB` binds a `pivot`'s aggregate for its values:
-/// `DuckDB`'s default `pivot_filter_threshold`, which trawl never sets. A
-/// pivot whose fill renders binds it once more
-/// ([`pivot_aggregate_regex`]).
-///
+/// `DuckDB`'s default `pivot_filter_threshold`, which trawl never sets.
 /// With at most this many pivot values, `DuckDB`'s binder writes one
-/// filtered aggregate per value (`pivot_values.size() <=
-/// pivot_filter_threshold` in `bind_pivot.cpp`), each a whole copy of the
-/// aggregate, regex patterns and all. With more, it computes the
-/// aggregate once in a `GROUP BY` and lists the results, which binds it
-/// twice. The values come from the data, so the emitter cannot know which
-/// side a query lands on, and [`stage_regex_copies`] charges this many.
-/// `trawl-engine/tests/integration.rs` holds this value against the
-/// setting the engine's connections run with.
+/// filtered aggregate per value, each a whole copy of the aggregate, regex
+/// patterns and all. `trawl-engine/tests/integration.rs` holds this value
+/// against the setting the engine's connections run with.
 pub const PIVOT_FILTER_THRESHOLD: u64 = 20;
 
 /// The most contiguous ranges a `SEVERITY` set can render
@@ -181,34 +54,21 @@ pub const PIVOT_FILTER_THRESHOLD: u64 = 20;
 /// collapses onto.
 const MAX_SEVERITY_RUNS: usize = 13;
 
-/// The node the `OVER (…)` wrapper adds to an `eventstats` output, before
-/// its partition keys.
 const EVENTSTATS_OVER_FIXED: u64 = 1;
 
-// ---------------------------------------------------------------------------
-// Weights and profiles
-// ---------------------------------------------------------------------------
-
-/// Regex patterns bound as `DuckDB` `regexp_*` arguments (ADR-0063): how
-/// many pattern copies, and how many pattern bytes over all of them.
-///
-/// Both halves saturate.
+/// Regex patterns bound as `DuckDB` `regexp_*` arguments (ADR-0063).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexLoad {
-    /// Bound pattern copies.
     pub copies: u64,
-    /// Pattern bytes, summed over the copies.
     pub bytes: u64,
 }
 
 impl RegexLoad {
-    /// No pattern at all.
     pub const NONE: Self = Self {
         copies: 0,
         bytes: 0,
     };
 
-    /// One copy of `pattern`.
     #[must_use]
     pub fn of(pattern: &str) -> Self {
         Self {
@@ -217,7 +77,6 @@ impl RegexLoad {
         }
     }
 
-    /// Both loads together.
     #[must_use]
     pub fn plus(self, other: Self) -> Self {
         Self {
@@ -226,7 +85,6 @@ impl RegexLoad {
         }
     }
 
-    /// `times` copies of this load.
     #[must_use]
     pub fn times(self, times: u64) -> Self {
         Self {
@@ -235,8 +93,6 @@ impl RegexLoad {
         }
     }
 
-    /// The componentwise maximum, as [`Weight::max_with`] combines two
-    /// renderings.
     #[must_use]
     fn max_with(self, other: Self) -> Self {
         Self {
@@ -246,16 +102,9 @@ impl RegexLoad {
     }
 }
 
-/// One expression's expanded weight and the additional substitution that
-/// expansion caused, and the regex patterns it binds.
-///
-/// Every half saturates. A saturated `d` is over [`MAX_LATERAL_EXPANSION`]
-/// on its own, so saturation needs no separate signal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Weight {
-    /// The expanded node count.
     pub w: u64,
-    /// The additional substitution, propagated from the children.
     pub d: u64,
     /// The regex patterns the emitter writes for the expression, one bound
     /// parameter each.
@@ -267,8 +116,6 @@ pub struct Weight {
 }
 
 impl Weight {
-    /// A field reference the stage does not define, a literal, a bound
-    /// parameter: one node, nothing substituted.
     pub const LEAF: Self = Self {
         w: 1,
         d: 0,
@@ -276,9 +123,6 @@ impl Weight {
         regex_copies: RegexLoad::NONE,
     };
 
-    /// A reference to an earlier output of the SAME stage, whose expanded
-    /// weight is `target`: the target arrives whole in place of the name,
-    /// and every pattern in it binds once more.
     #[must_use]
     pub fn substituted(target: Self) -> Self {
         Self {
@@ -289,13 +133,6 @@ impl Weight {
         }
     }
 
-    /// The componentwise maximum — how the check combines two pin
-    /// interpretations of one construct.
-    ///
-    /// Componentwise, and `d` carried rather than recomputed: the two
-    /// maxima may describe different renderings, so any arithmetic across
-    /// them (`w_max - w_unexpanded_max`) could name a rendering that does
-    /// not exist and undercount the real one.
     #[must_use]
     pub fn max_with(self, other: Self) -> Self {
         Self {
@@ -306,8 +143,6 @@ impl Weight {
         }
     }
 
-    /// This weight with `pattern` written into it: a `matches` operand's
-    /// own parameter.
     #[must_use]
     fn writing(self, pattern: RegexLoad) -> Self {
         Self {
@@ -317,11 +152,6 @@ impl Weight {
     }
 }
 
-/// How one rendering multiplies its children.
-///
-/// `fixed` is the node overhead translation adds on its own — calls,
-/// casts, `CASE` scaffolding, inlined literals. `copies[i]` is how many
-/// times child `i` lands in the emitted expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RenderProfile {
     /// Nodes the rendering contributes regardless of its children.
@@ -335,21 +165,14 @@ impl RenderProfile {
         Self { fixed, copies }
     }
 
-    /// `fixed` nodes over `n` children, each written once.
     fn uniform(fixed: u64, n: usize) -> Self {
         Self::new(fixed, vec![1; n])
     }
 
-    /// Apply the profile to its children's weights.
-    ///
     /// Total by construction: a child list shorter or longer than `copies`
     /// stops at the shorter of the two rather than indexing past either,
     /// because scoring must reach the emitter's own semantic refusal for a
     /// malformed call instead of panicking ahead of it.
-    ///
-    /// A child's written patterns stay written once: the emitter pushes a
-    /// child's parameters once however often the rendering repeats it, and
-    /// each copy past the first is one more that `DuckDB` binds.
     #[must_use]
     pub fn apply(&self, children: &[Weight]) -> Weight {
         let mut out = Weight {
@@ -371,9 +194,6 @@ impl RenderProfile {
     }
 }
 
-/// The shape of a rendering that has exactly ONE child — every link in
-/// the severity kernel, and every `CASE` head this module prices.
-///
 /// A distinct type rather than a [`RenderProfile`] with one entry so the
 /// composition below can read the copy count without an `Option`: a
 /// defaulted `None` there would be a silently omitted child copy, which is
@@ -393,7 +213,6 @@ impl OneChild {
         RenderProfile::new(self.fixed, vec![self.copies])
     }
 
-    /// This shape wrapped in `extra` nodes that do not repeat it.
     fn wrapped(self, extra: u64) -> Self {
         Self {
             fixed: self.fixed.saturating_add(extra),
@@ -403,15 +222,9 @@ impl OneChild {
 }
 
 /// A simple `CASE <this shape> WHEN v THEN r … END` over `arms` arms, as
-/// `DuckDB`'s PARSER leaves it.
-///
-/// The rewrite is `CASE WHEN subject = v THEN r …`, so each arm costs one
-/// equality node, the arm's value, the arm's result, and a WHOLE further
-/// copy of the subject expression. Two more nodes cover the `CASE` itself
-/// and the fallthrough result `DuckDB` supplies when the query wrote no
-/// `ELSE` — an explicit `ELSE` is added by the caller on top, which
-/// overcounts by exactly that one node and is left there rather than
-/// special-cased.
+/// `DuckDB`'s PARSER leaves it: `CASE WHEN subject = v THEN r …`, so each
+/// arm costs one equality node, the arm's value, the arm's result, and a
+/// WHOLE further copy of the subject expression.
 fn simple_case(subject: OneChild, arms: u64) -> OneChild {
     OneChild {
         fixed: 2u64
@@ -420,10 +233,6 @@ fn simple_case(subject: OneChild, arms: u64) -> OneChild {
         copies: arms.saturating_mul(subject.copies),
     }
 }
-
-// ---------------------------------------------------------------------------
-// The rendering inventory
-// ---------------------------------------------------------------------------
 
 /// One comparison clause's emitted shape
 /// (`crate::emitter::compare::comparison_sql`).
@@ -439,18 +248,13 @@ pub enum CompareKind {
     /// VARCHAR pin's equality against a numeric literal, which names its
     /// subject twice.
     TextOrNumeric,
-    /// A `SEVERITY` band reached through a MIXED `IN` list, where the
-    /// per-element arm renders the band's own ranges. No single pin can
+    /// A `SEVERITY` band reached through a MIXED `IN` list. No single pin can
     /// produce that mixture, so this arm is defensive and takes the widest
     /// set the ladder can render.
     SeverityBand,
 }
 
 /// One DSL function's emitted shape, at the arity it was called with.
-///
-/// The variants are emission shapes, not names: everything that translates
-/// to one wrapper node over each argument written once is [`Self::Plain`],
-/// and a variant exists only where the emitter does something else.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FunctionShape {
     /// One wrapper node over `n` arguments, each written once —
@@ -463,9 +267,6 @@ pub enum FunctionShape {
     /// and `DuckDB`'s parser fills in `ELSE NULL` before the binder ever
     /// sees the tree, so the node is there either way
     /// (`duckdb_probe::an_else_less_case_still_binds_an_else_node`).
-    /// Pricing both parities alike understated the even one by exactly
-    /// one node, which is the difference between refusing and admitting a
-    /// query sitting on the cap.
     Case(usize),
     /// `COUNT(*)` — the row counter, whose star is a node of its own.
     CountStar,
@@ -493,14 +294,10 @@ pub enum FunctionShape {
     Sev { dialect: Dialect, argc: usize },
 }
 
-/// One `crate::conform` expression helper.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConformShape {
-    /// [`crate::conform::untyped_text`].
     UntypedText,
-    /// [`crate::conform::decimal_reading`].
     DecimalReading,
-    /// [`crate::conform::guarded_cast_in`] for one pin.
     GuardedCast(CanonicalType, Dialect),
     /// [`crate::conform::severity_reading_sql`] — the repeated-subject
     /// shape the conform rung emits.
@@ -508,12 +305,9 @@ pub enum ConformShape {
     /// [`crate::conform::severity_reading_sql_bind_once`] — the shape
     /// `sev()` emits, whose subject may carry bound parameters.
     SeverityReadingBindOnce(Dialect),
-    /// [`crate::conform::severity_token_text_sql`].
     SeverityTokenText,
 }
 
-/// Every construct whose emitted shape the check has to price.
-///
 /// [`profile`] is exhaustive over this enum with no wildcard arm, so a new
 /// rendering fails to compile until it states its cost.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -552,8 +346,6 @@ pub enum Rendering {
     Conform(ConformShape),
 }
 
-/// The node overhead and child-copy counts one rendering contributes.
-///
 /// Exhaustive, with no wildcard arm and no generic function fallback: a
 /// rendering that has not stated its cost must fail to compile rather than
 /// score as something cheaper.
@@ -727,17 +519,13 @@ fn conform_profile(shape: ConformShape) -> RenderProfile {
 /// whitespace trim both severity readings wrap their subject in.
 const TRIMMED_FIXED: u64 = 6;
 
-/// `crate::conform`'s reading `CASE`, over its ALREADY-TRIMMED subject.
-///
 /// The arm count is read off the severity tables rather than frozen, so a
 /// token added there widens the profile instead of silently escaping it.
 ///
 /// The shape is a SIMPLE `CASE` whose head is itself an expression naming
 /// the subject twice, so the parser's rewrite dominates everything else
 /// here: thirty-eight arms times two writings is seventy-six copies of the
-/// subject before the numeric fallthrough adds its own. Text-level
-/// counting sees five (`OTel`) or four (syslog) and is wrong by more than
-/// an order of magnitude.
+/// subject before the numeric fallthrough adds its own.
 fn reading_case(dialect: Dialect) -> OneChild {
     // `(CASE WHEN regexp_full_match(t, '[A-Za-z0-9]+') THEN lower(t) END)`
     // — the `CASE`, its NULL fallthrough, the match call, its pattern and
@@ -775,9 +563,6 @@ fn reading_numeric_arm(dialect: Dialect) -> OneChild {
     )
 }
 
-/// The arms `crate::conform`'s reading `CASE` generates: every band token,
-/// plus each `OTel` exact short name the token table does not already
-/// carry.
 fn severity_case_arms() -> usize {
     static ARMS: std::sync::LazyLock<usize> = std::sync::LazyLock::new(|| {
         let table: Vec<&str> = crate::severity::token_entries().map(|(t, _)| t).collect();
@@ -796,14 +581,8 @@ fn severity_token_text() -> OneChild {
     simple_case(OneChild::new(0, 1), 24)
 }
 
-// ---------------------------------------------------------------------------
-// The refusal
-// ---------------------------------------------------------------------------
-
-/// Which limit a refusal names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Limit {
-    /// [`MAX_LATERAL_EXPANSION`].
     Lateral,
     /// [`MAX_PIPELINE_STAGES`], with the stage count the query carried.
     Stages(usize),
@@ -811,31 +590,19 @@ pub enum Limit {
     Fields(usize),
 }
 
-/// A query the expansion budget refuses, and the one sentence that says so.
-///
-/// One `Display` owner for both doors: the SQL lane carries it as
-/// `EmitError::UnsupportedOperation` (which prefixes its own
-/// `unsupported operation: `), the stream lane as
-/// `StreamPlanError::TooComplex`, verbatim. The sentence names the stage
-/// and the budget and no measured database node count — the profiles are
-/// deliberately conservative, so a number here would be a claim the check
-/// cannot make.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ComplexityRefusal {
     /// Zero-based index of the offending stage in the pipeline.
     pub stage_index: usize,
-    /// The keyword the query spelled that stage with.
     pub stage: &'static str,
     /// The output whose scoring crossed the budget, rendered as DSL text.
     /// `None` where the stage has no output sequence, or where the name
     /// cannot be spelled in the DSL at all.
     pub target: Option<String>,
-    /// Which limit was crossed.
     pub limit: Limit,
 }
 
 impl ComplexityRefusal {
-    /// The advice that fits the stage that overflowed.
     fn remedy(&self) -> &'static str {
         match self.stage {
             "let" | "eval" => {
@@ -895,19 +662,11 @@ impl fmt::Display for ComplexityRefusal {
 
 impl std::error::Error for ComplexityRefusal {}
 
-/// A name as it appears inside a refusal: its DSL spelling, sanitised,
-/// always visually quoted.
-///
 /// [`quote_dsl_field`] declines a name the field grammar cannot spell
 /// (empty, or carrying a control or invisible display character), and a
 /// declined name is simply omitted — the stage alone still says where to
 /// look, and a refusal an operator reads in a terminal must never carry
 /// text the query author chose to hide a line with.
-///
-/// A name the bare production can spell is wrapped here so the message's
-/// quoting is uniform, and a name that is ALREADY backticked is left as
-/// the DSL must spell it rather than double-wrapped — the same rule
-/// [`crate::projection`]'s collision messages use.
 fn refusal_name(name: &str) -> Option<String> {
     let dsl = crate::sanitize::sanitize_display_text(&quote_dsl_field(name)?);
     Some(if dsl.starts_with('`') {
@@ -917,45 +676,27 @@ fn refusal_name(name: &str) -> Option<String> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// The check
-// ---------------------------------------------------------------------------
-
 /// What one check visited — the evidence that the walk is linear in source
 /// size rather than in expanded weight.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct CheckStats {
     /// AST nodes entered, plus one per pin interpretation priced.
     pub visited_nodes: u64,
-    /// Pipeline stages counted, against [`MAX_PIPELINE_STAGES`].
     pub stages: usize,
-    /// The summed assignment delta, against [`MAX_LATERAL_EXPANSION`] —
-    /// the headroom a query actually left, which is what the
-    /// documentation fixtures record.
+    /// The summed assignment delta, against [`MAX_LATERAL_EXPANSION`].
     pub lateral_delta: u64,
 }
 
 /// Admit a pipeline under the bind-time expansion budget (ADR-0024).
-///
-/// # Errors
-///
-/// [`ComplexityRefusal`] when the pipeline carries more than
-/// [`MAX_PIPELINE_STAGES`] stages, when one `sort` or `dedup` stage names
-/// more than [`MAX_STAGE_FIELDS`] fields, or when its assignment deltas
-/// sum past [`MAX_LATERAL_EXPANSION`]. After the stage cap, the first
-/// offending stage decides which.
 pub fn check_pipeline_complexity(stages: &[Spanned<PipeStage>]) -> Result<(), ComplexityRefusal> {
     check_pipeline_complexity_with_stats(stages).0
 }
 
-/// [`check_pipeline_complexity`], with the walk's own accounting.
 pub fn check_pipeline_complexity_with_stats(
     stages: &[Spanned<PipeStage>],
 ) -> (Result<(), ComplexityRefusal>, CheckStats) {
     let mut stats = CheckStats::default();
 
-    // The stage cap first: a pipeline over it is refused for its length,
-    // whatever its expressions cost.
     if stages.len() > MAX_PIPELINE_STAGES {
         return (
             Err(ComplexityRefusal {
@@ -984,15 +725,8 @@ pub fn check_pipeline_complexity_with_stats(
 
 /// The per-stage alias table: an output's name, folded through
 /// [`catalog_key`], against its expanded weight.
-///
-/// Cleared at every stage, because a name defined in an earlier stage is
-/// an incoming COLUMN by the time the next SELECT reads it, not a lateral
-/// alias — one node, nothing substituted.
 type Memo = HashMap<String, Weight>;
 
-/// Walk one stage's ordered outputs, charging each one's delta, and
-/// hold a `sort` or `dedup` field list to [`MAX_STAGE_FIELDS`].
-///
 /// The match is exhaustive with no wildcard arm: a new stage variant must
 /// state whether it has a recursive output-alias sequence before it can
 /// compile, rather than defaulting to free.
@@ -1020,31 +754,20 @@ fn score_stage(
             score_aggregations(index, keyword, &t.aggregations, 0, total, stats)?;
         }
         PipeStage::EventStats(es) => {
-            // Every output carries a mandatory `OVER (…)` wrapper.
-            // `DuckDB` 1.5.5 happens to refuse a substituted nested window
-            // before it binds the children, but validity here does not
-            // depend on that refusal order staying put, so the outputs are
-            // walked and charged like any other sequence.
             let window = EVENTSTATS_OVER_FIXED.saturating_add(n_u64(es.group_by.len()));
             score_aggregations(index, keyword, &es.aggregations, window, total, stats)?;
         }
         PipeStage::Pivot(p) => {
-            // One USING expression and no output-alias sequence: its
-            // delta is charged, and nothing in the stage can name it.
             let weight = score_agg(&p.aggregation, &Memo::new(), 0, stats);
             charge(index, keyword, None, weight.d, total)?;
         }
         PipeStage::Rename(r) => {
-            // A rename substitutes a leaf, so its target carries one node
-            // and no delta. Recorded all the same: the stage's own outputs
-            // are what a same-stage reference would find.
+            // Recorded all the same: the stage's own outputs are what a
+            // same-stage reference would find.
             for (_, new) in &r.renames {
                 memo.insert(catalog_key(new), Weight::LEAF);
             }
         }
-        // No recursive output-alias sequence. Each arm is spelled out
-        // rather than folded into a wildcard, so a stage that grows one
-        // has to say so here.
         // Both arms are spelled out, and their bodies are identical on
         // purpose: neither extraction mode has a recursive output-alias
         // sequence, and merging them would let a third mode inherit that
@@ -1055,8 +778,6 @@ fn score_stage(
             // One fixed source for the whole stage.
             ExtractMode::KeyValue { .. } => {}
         },
-        // No output sequence, but a field list the kv tail keys and
-        // compares once per written name.
         PipeStage::Sort(s) => check_field_list(index, keyword, s.fields.len())?,
         PipeStage::Dedup(d) => check_field_list(index, keyword, d.fields.len())?,
         PipeStage::Where(_)
@@ -1072,8 +793,6 @@ fn score_stage(
     Ok(())
 }
 
-/// Refuse a `sort` or `dedup` stage that names more than
-/// [`MAX_STAGE_FIELDS`] fields.
 fn check_field_list(
     index: usize,
     keyword: &'static str,
@@ -1109,18 +828,7 @@ fn score_aggregations(
 }
 
 /// The regex pattern copies `DuckDB` binds for one stage beyond the
-/// patterns the emitter writes for it (ADR-0063): every pattern inside a
-/// same-stage alias the stage substitutes, each extra copy a rendering
-/// makes of a written pattern, and a pivot aggregate's copies at
-/// [`PIVOT_FILTER_THRESHOLD`].
-///
-/// The emitter charges this to its regex parameter counter before it
-/// emits the stage, and counts the written patterns as it pushes them, so
-/// the two together are every pattern the stage binds. A pivot's fill is
-/// the one copy left out: a later stage decides whether it renders, and
-/// the emitter charges it then ([`pivot_aggregate_regex`]). The stages scored
-/// here are the ones that hold expressions; the match is exhaustive for
-/// the reason [`score_stage`]'s is.
+/// patterns the emitter writes for it (ADR-0063).
 #[must_use]
 #[allow(clippy::match_same_arms)]
 pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
@@ -1142,8 +850,7 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
         // The aggregate binds whole once per pivot value, up to
         // [`PIVOT_FILTER_THRESHOLD`] values: each written pattern for every
         // copy past the one the emitter counts, and each further copy
-        // inside the aggregate for every copy. A fill's copy is charged
-        // apart, when the fill renders ([`pivot_aggregate_regex`]).
+        // inside the aggregate for every copy.
         PipeStage::Pivot(p) => {
             let weight = score_agg(&p.aggregation, &Memo::new(), 0, &mut stats);
             weight
@@ -1170,15 +877,6 @@ pub fn stage_regex_copies(stage: &PipeStage) -> RegexLoad {
     }
 }
 
-/// The regex patterns one bound copy of a pivot's aggregate holds, priced
-/// as [`stage_regex_copies`] prices each of the pivot's
-/// [`PIVOT_FILTER_THRESHOLD`] copies: the patterns the emitter writes for
-/// it and any further copies a rendering inside it makes.
-///
-/// A dynamic pivot that a later stage pads renders a fill (ADR-0062), a
-/// zero-row select of the aggregate, and `DuckDB` binds this much once
-/// more for it. The emitter charges it when the fill takes its first
-/// name.
 #[must_use]
 pub fn pivot_aggregate_regex(pivot: &PivotStage) -> RegexLoad {
     let weight = score_agg(
@@ -1190,7 +888,6 @@ pub fn pivot_aggregate_regex(pivot: &PivotStage) -> RegexLoad {
     weight.regex.plus(weight.regex_copies)
 }
 
-/// [`stage_regex_copies`] over an aggregation's output sequence.
 fn aggregation_regex_copies(aggregations: &[AggExpr], stats: &mut CheckStats) -> RegexLoad {
     let mut memo = Memo::new();
     let mut copies = RegexLoad::NONE;
@@ -1224,8 +921,6 @@ fn charge(
     Ok(())
 }
 
-/// The keyword a stage was written with — the spelling the query used,
-/// where the AST kept it.
 fn stage_keyword(stage: &PipeStage) -> &'static str {
     match stage {
         PipeStage::Let(l) => l.keyword,
@@ -1248,10 +943,6 @@ fn stage_keyword(stage: &PipeStage) -> &'static str {
         PipeStage::FromSaved(_) => "from saved",
     }
 }
-
-// ---------------------------------------------------------------------------
-// Expression scoring
-// ---------------------------------------------------------------------------
 
 fn score_agg(agg: &AggExpr, memo: &Memo, wrapper: u64, stats: &mut CheckStats) -> Weight {
     let children: Vec<Weight> = agg
@@ -1284,11 +975,6 @@ fn score_expr(expr: &Spanned<Expr>, memo: &Memo, stats: &mut CheckStats) -> Weig
     }
 }
 
-/// Which rendering a call takes, at the arity it was written with.
-///
-/// A name outside the inventory takes [`Rendering::UnknownCall`], which is
-/// benign by construction: the emitter and the stream compiler both refuse
-/// an unknown function, and this walk only has to reach them.
 fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
     let arity = args.len();
     let Some(known) = crate::parser::suggest::KNOWN_FUNCTIONS
@@ -1326,8 +1012,6 @@ fn call_rendering(name: &str, args: &[Spanned<Expr>]) -> Rendering {
     })
 }
 
-/// The dialect a `sev()` call reads its numerals in.
-///
 /// Absent argument means `OTel`. An argument the emitter would refuse
 /// (non-literal, or a token outside the vocabulary) takes the dialect with
 /// the LARGER rendering, so an unreadable call is never priced below the
@@ -1344,18 +1028,13 @@ fn sev_dialect(args: &[Spanned<Expr>]) -> Dialect {
     }
 }
 
-/// What a pin-aware comparison is comparing, as far as a corpus-blind
-/// check can tell.
-///
 /// The classifier mirrors [`crate::pin_scope::PinScope::subject_pin`]'s
 /// two admitted SHAPES without its catalog: a bare field reference is a
 /// subject under EVERY pin (the check does not know which one applies, so
 /// it prices them all), and a pin-declaring call carries its own answer.
 #[derive(Debug, Clone, Copy)]
 enum SubjectKind {
-    /// A bare field reference: score under every supported pin.
     Bare,
-    /// A call whose result type the function declares — `sev(level)`.
     Declared(CanonicalType),
 }
 
@@ -1380,7 +1059,6 @@ fn subject_kind(expr: &Spanned<Expr>) -> Option<SubjectKind> {
     }
 }
 
-/// The pins one subject has to be priced under.
 fn candidate_pins(kind: SubjectKind) -> Vec<Option<CanonicalType>> {
     match kind {
         SubjectKind::Declared(pin) => vec![Some(pin)],
@@ -1390,9 +1068,6 @@ fn candidate_pins(kind: SubjectKind) -> Vec<Option<CanonicalType>> {
     }
 }
 
-/// A bare literal operand, as [`compare::compare_form_bound`]'s door wants
-/// it.
-///
 /// Mirrors the emitter's own fold of a negative numeric literal
 /// (`crate::emitter::expr`'s `bare_literal`), which the parser leaves as
 /// `Unary{Neg, Literal}`: the sign belongs to the literal the rule table
@@ -1460,8 +1135,6 @@ fn score_binary(
             (PatternKind::Regex, Expr::Literal(LiteralValue::String(text))) => RegexLoad::of(text),
             _ => RegexLoad::NONE,
         };
-        // Only the LEFT operand of a pattern operator is a subject; the
-        // right one is the pattern.
         let Some(kind) = subject_kind(lhs) else {
             return generic.writing(pattern);
         };
@@ -1508,7 +1181,6 @@ fn score_binary(
     best
 }
 
-/// The weight one resolved comparison form renders to over its subject.
 fn compare_weight(form: Option<&CompareForm>, op: FilterOp, subject: Weight) -> Weight {
     match form {
         // `== null`, and the forms the rule table leaves literal-driven:
@@ -1592,8 +1264,6 @@ fn score_in_list(
 fn in_list_weight(forms: &[CompareForm], subject: Weight) -> Weight {
     let runs = severity_run_count(forms);
     if runs > 0 {
-        // An all-severity list is one merged range set: the subject once
-        // per run.
         return profile(&Rendering::SeverityRanges {
             runs,
             negated: false,
@@ -1624,10 +1294,6 @@ fn element_kind(form: &CompareForm) -> CompareKind {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -1647,12 +1313,6 @@ mod tests {
         check(dsl).expect_err("this query must be refused")
     }
 
-    // ── the numeric boundary ──────────────────────────────────────────
-
-    /// The exact 512/513 boundary, and the proof that the cap is on the
-    /// LATERAL DELTA rather than on the total expanded weight: at 512
-    /// references the delta is exactly the budget while `W` is more than
-    /// twice it, and the query is admitted.
     #[test]
     fn the_boundary_is_the_delta_not_the_weight() {
         let coalesce = |n: usize| {
@@ -1684,20 +1344,12 @@ mod tests {
         assert_eq!(refused.target.as_deref(), Some("`z`"));
     }
 
-    /// A `case()` with no fallback is bound with one: `DuckDB`'s parser
-    /// fills in `ELSE NULL` before the binder sees the tree. Pricing the
-    /// two parities alike understated the even one by a node, and one node
-    /// per reference is the whole cap once a target is read 256 times.
     #[test]
     fn an_else_less_case_is_priced_for_the_else_the_parser_adds() {
-        // Two arguments: one WHEN/THEN pair, no written fallback, and the
-        // `CASE` node plus the parser's `ELSE`.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Case(2))),
             RenderProfile::new(2, vec![1, 1])
         );
-        // Three: the fallback is written, so it is an operand and the
-        // `CASE` node is the only fixed one.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Case(3))),
             RenderProfile::new(1, vec![1, 1, 1])
@@ -1712,18 +1364,12 @@ mod tests {
         let refused = refusal(&reads(256));
         assert_eq!(refused.limit, Limit::Lateral);
         assert_eq!(refused.target.as_deref(), Some("`z`"));
-        // The old price was the plain two-argument call: three nodes, so
-        // two a copy, which put this exact query at 512 and admitted it
-        // one node under what the binder walks.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Plain(2))),
             RenderProfile::new(1, vec![1, 1])
         );
     }
 
-    /// The same boundary written as DSL an operator could type, through
-    /// `eval` rather than `let`, with the alias reached by a different
-    /// case spelling.
     #[test]
     fn a_constructible_boundary_case_refuses_one_reference_late() {
         let chain = |n: usize| {
@@ -1736,10 +1382,6 @@ mod tests {
         assert_eq!(refused.target.as_deref(), Some("`z`"));
     }
 
-    // ── the severity chain (ADR-0024's worked example) ─────────────────
-
-    /// The chain the ADR records: a doubling seed, then eight assignments
-    /// that each read the previous one through `sev(…) in (…)`.
     fn severity_chain(links: usize) -> String {
         use std::fmt::Write as _;
         let points = (0..12).map(|i| (i * 2 + 1).to_string()).collect::<Vec<_>>();
@@ -1822,9 +1464,6 @@ mod tests {
         const { assert!(408 < MAX_LATERAL_EXPANSION) }
     }
 
-    /// The reason ADR-0024 replaced that measure: the emitter writes
-    /// twelve copies of the subject per assignment, so the chain is
-    /// refused — at the SECOND link, long before the eighth.
     #[test]
     fn severity_chain_is_refused() {
         let refused = refusal(&severity_chain(8));
@@ -1836,8 +1475,6 @@ mod tests {
         assert!(text.contains("`let`"), "{text}");
     }
 
-    /// A twelve-point severity set writes its subject twelve times, read
-    /// off the real range expansion rather than a frozen number.
     #[test]
     fn a_disjoint_severity_set_renders_twelve_runs() {
         let forms: Vec<CompareForm> = (0..12)
@@ -1851,10 +1488,6 @@ mod tests {
         assert_eq!(p.copies, vec![12]);
     }
 
-    /// A deep chain is refused by traversing the SOURCE, never by building
-    /// the expansion: the walk visits a bounded number of nodes, nothing
-    /// overflows, and a debug build (where arithmetic overflow panics)
-    /// finishes.
     #[test]
     fn a_deep_chain_is_refused_without_expanding() {
         use std::fmt::Write as _;
@@ -1867,10 +1500,6 @@ mod tests {
         let refused = result.expect_err("a 90-link doubling chain is refused");
         assert_eq!(refused.limit, Limit::Lateral);
 
-        // Every visit is either an AST node or one pin interpretation of a
-        // construct, so the walk is linear in source size with a fixed
-        // number of pin cases — not in the expanded weight, which is
-        // astronomically larger.
         let source_nodes = count_ast_nodes(&stages);
         let cases = 1 + CanonicalType::ALL.len();
         assert!(
@@ -1912,8 +1541,6 @@ mod tests {
         total
     }
 
-    /// Saturation is over-limit, and nothing panics reaching it: a chain
-    /// long enough to saturate `u64` is refused like any other.
     #[test]
     fn saturated_weights_are_over_limit() {
         let full = RegexLoad {
@@ -1934,8 +1561,6 @@ mod tests {
         assert_eq!(combined.regex_copies, full);
     }
 
-    // ── the stage cap ─────────────────────────────────────────────────
-
     #[test]
     fn stage_cap() {
         let stages = |n: usize| format!("*{}", " | head 1".repeat(n));
@@ -1947,8 +1572,6 @@ mod tests {
         assert!(text.contains("128"), "{text}");
     }
 
-    /// The stage cap is checked BEFORE any expression, so a pipeline that
-    /// is both too long and too expensive is refused for its length.
     #[test]
     fn the_stage_cap_wins_over_the_expansion_budget() {
         let mut dsl = severity_chain(8);
@@ -1956,17 +1579,12 @@ mod tests {
         assert!(matches!(refusal(&dsl).limit, Limit::Stages(_)));
     }
 
-    /// `from saved` counts like every other stage, so slicing it off
-    /// later cannot buy a query one more stage.
     #[test]
     fn from_saved_counts_toward_the_stage_cap() {
         let dsl = format!("| from saved daily{}", " | head 1".repeat(128));
         assert!(matches!(refusal(&dsl).limit, Limit::Stages(129)));
     }
 
-    // ── the field-list width ──────────────────────────────────────────
-
-    /// `count` written field names, distinct or all one name.
     fn field_list(count: usize, distinct: bool) -> String {
         (0..count)
             .map(|i| {
@@ -1980,7 +1598,6 @@ mod tests {
             .join(", ")
     }
 
-    /// The SQL door's refusal text, without the emitter's own prefix.
     fn sql_door(dsl: &str) -> Result<(), String> {
         crate::emitter::validate_pipeline(&pipeline(dsl)).map_err(|e| {
             e.to_string()
@@ -1999,10 +1616,6 @@ mod tests {
         .map(|_| ())
     }
 
-    /// One `sort` or `dedup` stage names at most [`MAX_STAGE_FIELDS`]
-    /// fields, every written name counted, and both doors carry the one
-    /// sentence. The stream door refuses every `sort` for being a sort,
-    /// so an admitted wide sort there gets that refusal, never this one.
     #[test]
     fn field_list_width_is_shared_admission() {
         use crate::stream::StreamPlanError;
@@ -2046,16 +1659,13 @@ mod tests {
             }
         }
 
-        // A bare dedup names no field.
         check("* | dedup").expect("bare dedup is admitted");
         sql_door("* | dedup").expect("bare dedup is admitted by the SQL door");
         stream_door("* | dedup").expect("bare dedup streams");
 
         let wide = format!("* | dedup {}", field_list(65, true));
-        // The stage cap wins over a wide first stage.
         let long = format!("{wide}{}", " | head 1".repeat(MAX_PIPELINE_STAGES));
         assert!(matches!(refusal(&long).limit, Limit::Stages(129)));
-        // Otherwise the first offending stage wins, whichever limit it is.
         let lateral = format!(
             "* | let x = abs(y), z = coalesce({})",
             vec!["x"; 513].join(", ")
@@ -2066,11 +1676,6 @@ mod tests {
         assert_eq!(refusal(&wide_first).limit, Limit::Fields(65));
     }
 
-    // ── the alias table ───────────────────────────────────────────────
-
-    /// The table resets at every stage: a name defined in one stage is an
-    /// incoming COLUMN in the next, so reading it twice costs two leaves,
-    /// not two expansions.
     #[test]
     fn the_alias_table_resets_between_stages() {
         let args = vec!["y"; 300].join(", ");
@@ -2081,8 +1686,6 @@ mod tests {
         check(&split).expect("a split pipeline reads a finished column");
     }
 
-    /// Names fold the way the catalog folds them, so a differently-cased
-    /// reference is still the same output.
     #[test]
     fn alias_names_fold_ascii_case() {
         let args = vec!["a"; 513].join(", ");
@@ -2094,19 +1697,12 @@ mod tests {
         assert_eq!(refused.target.as_deref(), Some("`z`"));
     }
 
-    /// A forward or self reference does not resolve through the table —
-    /// it is a plain leaf, and the existing semantic refusal still owns
-    /// that query.
     #[test]
     fn forward_and_self_references_score_as_leaves() {
         check("* | let a = b + b, b = 1").expect("a forward reference costs nothing here");
         check("* | let a = a + a").expect("a self reference costs nothing here");
     }
 
-    // ── zero-delta shapes ─────────────────────────────────────────────
-
-    /// An expression naming no earlier output contributes nothing, however
-    /// large — a flat list, an independent assignment, a wide `stats`.
     #[test]
     fn independent_expressions_and_flat_lists_have_no_delta() {
         let list = (0..2000)
@@ -2128,8 +1724,6 @@ mod tests {
         check(&format!("* | stats {aggs}")).expect("independent aggregates are free");
     }
 
-    /// Stages with no output-alias sequence charge nothing, whatever their
-    /// expressions look like.
     #[test]
     fn stages_without_an_output_sequence_charge_nothing() {
         for dsl in [
@@ -2145,11 +1739,6 @@ mod tests {
         }
     }
 
-    // ── the aggregating stages ────────────────────────────────────────
-
-    /// `stats` and `timechart` accept scalar heads, so they can express
-    /// the same chains `let` can — under the names
-    /// `projection::agg_output_name` derives, explicit or inferred.
     #[test]
     fn aggregating_stages_carry_their_own_alias_sequence() {
         let args = vec!["abs_y"; 513].join(", ");
@@ -2157,8 +1746,6 @@ mod tests {
         assert_eq!(refused.stage, "stats");
         assert_eq!(refused.target.as_deref(), Some("`z`"));
 
-        // The inferred name is the derivation every lane reads, so an
-        // un-aliased head is reachable by the name it projects.
         let args = vec!["abs_y"; 513].join(", ");
         let refused = refusal(&format!(
             "* | timechart span=1h abs(y), coalesce({args}) as z"
@@ -2172,8 +1759,6 @@ mod tests {
         assert_eq!(refused.stage, "eventstats");
     }
 
-    /// The `eventstats` window wrapper is charged conservatively, so its
-    /// outputs weigh at least as much as the plain `stats` ones.
     #[test]
     fn eventstats_outputs_carry_their_window_wrapper() {
         let mut stats = CheckStats::default();
@@ -2193,8 +1778,6 @@ mod tests {
         assert!(over.w > bare.w, "{over:?} vs {bare:?}");
     }
 
-    // ── hand-calculated profiles ──────────────────────────────────────
-
     #[test]
     fn hand_calculated_profiles() {
         assert_eq!(profile(&Rendering::Leaf), RenderProfile::new(1, vec![]));
@@ -2203,19 +1786,14 @@ mod tests {
             RenderProfile::new(1, vec![1, 1])
         );
         assert_eq!(profile(&Rendering::Unary), RenderProfile::new(1, vec![1]));
-        // `(x IN (a, b, c))`: the `IN` node, the subject and three
-        // elements.
         assert_eq!(
             profile(&Rendering::InListPlain(3)),
             RenderProfile::new(1, vec![1, 1, 1, 1])
         );
-        // `x IN (?, ?, ?)`: the `IN` node and three parameters over one
-        // writing of the subject.
         assert_eq!(
             profile(&Rendering::InListBound(3)),
             RenderProfile::new(4, vec![1])
         );
-        // The VARCHAR pin's numeric equality names its subject twice.
         assert_eq!(
             profile(&Rendering::Compare(CompareKind::TextOrNumeric)),
             RenderProfile::new(9, vec![2])
@@ -2238,12 +1816,10 @@ mod tests {
             }),
             RenderProfile::new(15, vec![3])
         );
-        // `COUNT(*)` has no operands at all.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::CountStar)),
             RenderProfile::new(2, vec![])
         );
-        // `(a IS NULL)` and `(a IS NOT NULL)`.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::IsNull)),
             RenderProfile::new(2, vec![1])
@@ -2252,33 +1828,26 @@ mod tests {
             profile(&Rendering::Function(FunctionShape::IsNotNull)),
             RenderProfile::new(3, vec![1])
         );
-        // `ABS(a)`.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Plain(1))),
             RenderProfile::new(1, vec![1])
         );
-        // `ROUND(a, 2)`: the precision literal is inlined, never copied.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::RoundPrecision)),
             RenderProfile::new(2, vec![1, 0])
         );
-        // `STRING_SPLIT(a, b)[i + 1]`.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Split)),
             RenderProfile::new(3, vec![1, 1, 0])
         );
-        // `CAST(? AS TIMESTAMP)` — no operands at all.
         assert_eq!(
             profile(&Rendering::Function(FunctionShape::Now)),
             RenderProfile::new(2, vec![])
         );
-        // `json_extract_string(to_json(x), '$')`.
         assert_eq!(
             profile(&Rendering::Conform(ConformShape::UntypedText)),
             RenderProfile::new(3, vec![1])
         );
-        // The BIGINT rung names its text three times. It is a SEARCHED
-        // `CASE`, so the parser leaves the count alone.
         assert_eq!(
             profile(&Rendering::Conform(ConformShape::GuardedCast(
                 CanonicalType::BigInt,
@@ -2286,7 +1855,6 @@ mod tests {
             ))),
             RenderProfile::new(7, vec![3])
         );
-        // The VARCHAR rung IS the text.
         assert_eq!(
             profile(&Rendering::Conform(ConformShape::GuardedCast(
                 CanonicalType::Varchar,
@@ -2304,12 +1872,6 @@ mod tests {
         );
     }
 
-    /// The twenty-four-arm token kernel, hand-computed against
-    /// `DuckDB`'s simple-`CASE` rewrite, and the two renderings that carry
-    /// it.
-    ///
-    /// `CASE x WHEN 1 THEN 'trace' … WHEN 24 THEN 'fatal4' END` parses as
-    /// twenty-four `x = n` predicates, so `x` lands twenty-four times.
     /// The nodes: one `CASE`, one fallthrough result, and three per arm
     /// (the equality, the ladder number, the token string) — 74, plus the
     /// 24 subject copies, which is exactly the 98-node tree
@@ -2322,13 +1884,9 @@ mod tests {
         assert_eq!(kernel.copies, vec![24]);
         assert_eq!(kernel.fixed + kernel.copies[0], 98);
 
-        // A pattern operator over a SEVERITY pin renders through that
-        // kernel, so it inherits all twenty-four copies plus the operator
-        // and its bound pattern.
         let pattern = profile(&Rendering::Pattern(compare::PatternForm::SeverityText));
         assert_eq!(pattern, RenderProfile::new(76, vec![24]));
 
-        // Every other pattern target writes its subject once.
         for form in [
             compare::PatternForm::Native,
             compare::PatternForm::BigIntText,
@@ -2344,14 +1902,6 @@ mod tests {
         }
     }
 
-    /// The reviewer's counterexample against the pre-repricing table: two
-    /// chained `sev(…) like` assignments, admitted at a delta of 166 when
-    /// the token kernel was priced at one subject copy, refused now that
-    /// it is priced at twenty-four.
-    ///
-    /// The arithmetic: `b` is the kernel over `sev(a)`, so it weighs about
-    /// 24 × the reading; `c` names `b` and pays 24 × that substitution,
-    /// which is six figures of bound tree for three lines of DSL.
     #[test]
     fn severity_pattern_chain_is_refused() {
         let dsl = r#"* | let a = abs(_severity), b = sev(a) like "e%", c = sev(b) like "e%""#;
@@ -2366,20 +1916,10 @@ mod tests {
             stats.lateral_delta
         );
 
-        // Its two prefixes stay admitted: nothing about the repricing
-        // refuses a single pattern over a severity reading.
         check(r#"* | let a = abs(_severity), b = sev(a) like "e%""#)
             .expect("one link is well inside the budget");
     }
 
-    /// The reading `CASE` writes its subject five times in TEXT under
-    /// `OTel` and four under syslog — and seventy-nine / eighty-five times
-    /// once the parser has rewritten the two simple `CASE`s inside it.
-    /// Those are the numbers the profile carries, executed against the
-    /// bundled `DuckDB` in `trawl-engine/tests/duckdb_probe.rs`.
-    ///
-    /// Seventy-six of the seventy-nine come from one place: the outer
-    /// `CASE` has thirty-eight arms and its head names the subject twice.
     #[test]
     fn the_severity_reading_profiles_match_their_documented_shapes() {
         let repeated = profile(&Rendering::Conform(ConformShape::SeverityReading(
@@ -2392,10 +1932,6 @@ mod tests {
             Dialect::Syslog,
         )));
         assert_eq!(syslog.copies, vec![85]);
-        // The bind-once shape still names its subject exactly once — the
-        // rewrite multiplies the LAMBDA-LOCAL variable, which is why
-        // `sev()` can carry bound parameters. Its fixed weight absorbs
-        // every one of those copies instead.
         let once = profile(&Rendering::Conform(ConformShape::SeverityReadingBindOnce(
             Dialect::Otel,
         )));
@@ -2406,9 +1942,6 @@ mod tests {
         assert_eq!(severity_case_arms(), 38);
     }
 
-    /// The severity set can never render more runs than the ladder admits
-    /// non-adjacent points, plus the one representative every out-of-ladder
-    /// point collapses onto.
     #[test]
     fn the_severity_run_ceiling_is_thirteen() {
         let mut points: Vec<i64> = (1..=24).step_by(2).collect();
@@ -2417,11 +1950,6 @@ mod tests {
         assert_eq!(compare::severity_ranges(&points).len(), MAX_SEVERITY_RUNS);
     }
 
-    // ── the function inventory ────────────────────────────────────────
-
-    /// Every function the DSL knows has a profile. A new entry in
-    /// `KNOWN_FUNCTIONS` without one lands on the placeholder, and this
-    /// test is what makes that loud.
     #[test]
     fn every_known_function_has_a_profile() {
         for &name in crate::parser::suggest::KNOWN_FUNCTIONS {
@@ -2435,9 +1963,6 @@ mod tests {
         }
     }
 
-    /// A name outside the inventory scores structurally and hands the
-    /// query on: this check never pre-empts the emitter's own
-    /// unknown-function refusal.
     #[test]
     fn an_unknown_call_scores_structurally() {
         let args = vec![Spanned::new(Expr::FieldRef("x".to_string()), 0..0)];
@@ -2445,18 +1970,11 @@ mod tests {
         check("* | let a = nosuchfn(x)").expect("the emitter owns that refusal");
     }
 
-    /// A severity token the rule table refuses is skipped as an
-    /// interpretation, not turned into a complexity refusal — the lanes
-    /// own that sentence.
     #[test]
     fn an_unknown_severity_token_is_not_a_complexity_refusal() {
         check(r#"* | where _severity == "wat""#).expect("the lanes own the vocabulary error");
     }
 
-    // ── the message ───────────────────────────────────────────────────
-
-    /// The sentence names the stage and the budget, offers the remedy that
-    /// fits the stage, and claims no measured database node count.
     #[test]
     fn the_refusal_sentence_names_the_stage_the_budget_and_a_remedy() {
         let args = vec!["x"; 513].join(", ");
@@ -2465,7 +1983,6 @@ mod tests {
         assert!(text.contains("512"), "{text}");
         assert!(text.contains("`z`"), "{text}");
         assert!(text.contains("separate `| let` stages"), "{text}");
-        // Not the parser's depth sentence, and no count of database nodes.
         assert!(!text.contains("nests deeper"), "{text}");
         assert!(!text.contains("nodes"), "{text}");
 
@@ -2474,8 +1991,6 @@ mod tests {
         assert!(text.contains("expression of its own"), "{text}");
     }
 
-    /// A name the field grammar cannot spell is omitted; the stage still
-    /// says where to look.
     #[test]
     fn an_unquotable_name_is_omitted_from_the_sentence() {
         assert_eq!(refusal_name("dur"), Some("`dur`".to_string()));
@@ -2496,39 +2011,14 @@ mod tests {
         assert!(text.contains("512"), "{text}");
     }
 
-    // ── the documented queries ────────────────────────────────────────
-
     /// Every query trawl DOCUMENTS stays inside the budget (ADR-0024).
-    ///
-    /// The caps are numbers picked against a binder's behaviour, not
-    /// against the DSL's expressiveness, so the obligation runs the other
-    /// way: a limit that refused an example the reference tells operators
-    /// to type would be the wrong limit. This walks the fenced code in the
-    /// DSL and CLI references, parses what parses, and admits it.
-    ///
-    /// What it skips, and why:
-    ///
-    /// - **fences in another language.** A `toml` block is configuration
-    ///   and a `bash` block is shell; the DSL inside a `bash` block is
-    ///   recovered from the quoted argument of `trawl query` /
-    ///   `trawl validate`, which is where the CLI reference keeps it.
-    /// - **lines the prose labels as errors.** The reference shows what a
-    ///   refused query looks like. Those mostly fail to parse and drop out
-    ///   on their own; the ones that parse are semantic refusals, not
-    ///   budget ones, and stay in.
-    /// - **anything that does not parse.** Placeholders
-    ///   (`[search stage] | …`), sample output and prose fragments are not
-    ///   queries.
     const DOCS: &[&str] = &[
         "docs/src/content/docs/reference/dsl.md",
         "docs/src/content/docs/reference/cli.md",
     ];
 
-    /// The reference deliberately shows refused text. A line the prose marks
-    /// that way is not a fixture.
     const NEGATIVE_MARKERS: &[&str] = &["error at the"];
 
-    /// Pull every candidate query out of one markdown file's fenced blocks.
     fn candidates(markdown: &str) -> Vec<String> {
         let mut out = Vec::new();
         let mut block: Vec<&str> = Vec::new();
@@ -2566,11 +2056,9 @@ mod tests {
         }
 
         if lang.eq_ignore_ascii_case("bash") {
-            // The CLI reference carries its DSL inside a quoted argument.
             return lines.iter().filter_map(|l| quoted_argument(l)).collect();
         }
         if !lang.is_empty() {
-            // toml, json and friends are not queries.
             return Vec::new();
         }
 
@@ -2584,8 +2072,6 @@ mod tests {
         lines.iter().map(|l| (*l).to_string()).collect()
     }
 
-    /// The first double-quoted argument on a shell line, if the command is one
-    /// that takes DSL.
     fn quoted_argument(line: &str) -> Option<String> {
         if !line.contains("trawl query") && !line.contains("trawl validate") {
             return None;
@@ -2641,15 +2127,6 @@ mod tests {
             "only {admitted} documented queries were parsed — the extraction broke"
         );
 
-        // Observed maxima at the time of writing, on the two reference pages:
-        //   documented queries admitted: 63
-        //   longest pipeline:            5 stages   (of 128)
-        //   largest lateral delta:       0          (of 512)
-        //
-        // Zero is not an accident. No documented example names an earlier
-        // output of the same stage — the pattern the budget exists for does
-        // not appear in the reference at all, which is why the caps can be
-        // this low without touching anything trawl tells people to write.
         assert!(max_stages <= MAX_PIPELINE_STAGES / 4, "{max_stages} stages");
         assert!(
             max_delta <= MAX_LATERAL_EXPANSION / 4,
@@ -2657,8 +2134,6 @@ mod tests {
         );
     }
 
-    /// A backticked name comes back out of the message exactly as the
-    /// DSL has to spell it.
     #[test]
     fn a_quoted_target_renders_as_dsl_text() {
         let args = vec!["`a b`"; 513].join(", ");
@@ -2668,8 +2143,6 @@ mod tests {
             .expect("the name the message prints parses back");
     }
 
-    // ── regex copies (ADR-0063) ────────────────────────────────────────
-
     fn regex_copies(dsl: &str) -> Vec<RegexLoad> {
         pipeline(dsl)
             .iter()
@@ -2677,9 +2150,6 @@ mod tests {
             .collect()
     }
 
-    /// A same-stage reference binds the whole expression it names again,
-    /// pattern included: `b = a` copies `a`'s pattern, and `c = b`
-    /// copies it again through `b`. Doubling references double.
     #[test]
     fn a_lateral_reference_copies_the_pattern_it_names() {
         assert_eq!(
@@ -2697,7 +2167,6 @@ mod tests {
                 bytes: 6
             }]
         );
-        // The aggregation sequence is a lateral sequence too.
         assert_eq!(
             regex_copies(r#"* | stats count(if(message matches "x", 1, null)) as n, max(n) as m"#),
             vec![RegexLoad {
@@ -2707,9 +2176,6 @@ mod tests {
         );
     }
 
-    /// What binds no further copy: a name from an earlier stage, which is
-    /// a column by then; a `like` pattern, which never reaches RE2; and a
-    /// pattern written once.
     #[test]
     fn a_column_or_a_like_copies_no_regex() {
         assert_eq!(
@@ -2726,9 +2192,6 @@ mod tests {
         );
     }
 
-    /// A rendering that writes its subject more than once copies every
-    /// alias inside it: `sev(a) in (…)` writes `sev(a)` once per disjoint
-    /// severity run, and each writing of `a` binds `a`'s pattern again.
     #[test]
     fn a_rendering_that_repeats_its_subject_copies_the_pattern() {
         let points = (0..12).map(|i| (i * 2 + 1).to_string()).collect::<Vec<_>>();
@@ -2750,10 +2213,6 @@ mod tests {
         );
     }
 
-    /// A pivot's aggregate is bound once per pivot value, up to
-    /// [`PIVOT_FILTER_THRESHOLD`] values, and the count of values comes
-    /// from the data. So every written pattern in the aggregate is charged
-    /// for the copies past the one the emitter counts.
     #[test]
     fn a_pivot_aggregate_copies_its_patterns_per_filtered_value() {
         let worst = PIVOT_FILTER_THRESHOLD;
@@ -2764,7 +2223,6 @@ mod tests {
                 bytes: 2 * (worst - 1)
             }]
         );
-        // Two patterns in the one aggregate: each is copied.
         assert_eq!(
             regex_copies(
                 r#"* | pivot count(coalesce(if(host matches "a", 1, null), if(host matches "b", 1, null))) on service by host"#
@@ -2774,7 +2232,6 @@ mod tests {
                 bytes: 2 * (worst - 1)
             }]
         );
-        // A `like` never reaches RE2, so a pivot over one copies nothing.
         assert_eq!(
             regex_copies(r#"* | pivot count(if(host like "x%", 1, null)) on service by host"#),
             vec![RegexLoad::NONE]

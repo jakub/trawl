@@ -1,8 +1,5 @@
 //! Pins the regex-automata 0.4.16 memory facts that the regex budget relies
-//! on (ADR-0063). Each test is one fact about the library itself, measured
-//! with a counting global allocator, checked against the accounting in
-//! `trawl_core::pattern::charge`. The last also measures a pattern built
-//! through trawl's own `Preparer` against the charge it carries.
+//! on (ADR-0063).
 //!
 //! The heap counters are process-wide. Run the binary single-threaded so the
 //! test harness cannot interleave allocations with a measurement:
@@ -10,9 +7,6 @@
 //! ```text
 //! cargo test -p trawl-core --test regex_memory -- --test-threads=1 --nocapture
 //! ```
-//!
-//! Every test also takes [`serial`], so a parallel run cannot mix two
-//! measurements.
 //!
 //! `peak_alloc` grows a block with a fresh allocation and frees the old one
 //! after the copy, so a measured peak counts both. Measured peaks therefore
@@ -49,7 +43,6 @@ fn serial() -> MutexGuard<'static, ()> {
 const KIB: usize = 1 << 10;
 const MIB: usize = 1 << 20;
 
-/// Part 1's compiled-size limit, `MAX_REGEX_COMPILED_BYTES`.
 const NFA_SIZE_LIMIT: usize = trawl_core::pattern::MAX_REGEX_COMPILED_BYTES;
 
 /// A body within the repeat budget whose program is over the 1 MiB limit,
@@ -59,8 +52,6 @@ const OVER_LIMIT: &str = r"[\pL\pN]{64}";
 /// The DFA blowup family: `2^17` lazy states over `a` and `b`.
 const BLOWUP: &str = r"(a|b)*a(a|b){16}";
 
-/// The calibration corpus and Unicode table the charge is calibrated
-/// over, then a body over the size limit.
 fn every_body() -> impl Iterator<Item = &'static str> {
     charge::LOG_REGEXES
         .iter()
@@ -69,9 +60,6 @@ fn every_body() -> impl Iterator<Item = &'static str> {
         .chain([OVER_LIMIT])
 }
 
-// --- Heap window ---------------------------------------------------------
-
-/// Live bytes and the peak since [`Window::open`].
 struct Window {
     base: usize,
 }
@@ -92,7 +80,6 @@ impl Window {
         HEAP.peak_usage().saturating_sub(self.base)
     }
 
-    /// Restarts the peak at the current live bytes, keeping the base.
     fn restart_peak() {
         HEAP.reset_peak_usage();
     }
@@ -107,14 +94,11 @@ fn mib(bytes: usize) -> f64 {
     ratio(bytes, MIB)
 }
 
-// --- The program meta builds ---------------------------------------------
-
 /// The regex crate's syntax config (regex-1.13.1 builders.rs:81).
 fn parse(body: &str) -> Hir {
     syntax::parse_with(body, &syntax::Config::new().utf8(true)).expect("the body parses")
 }
 
-/// The plan's R1 meta config at lazy-DFA capacity `cap`.
 fn meta_config(cap: usize) -> meta::Config {
     meta::Config::new()
         .match_kind(MatchKind::LeftmostFirst)
@@ -125,7 +109,6 @@ fn meta_config(cap: usize) -> meta::Config {
         .backtrack(false)
 }
 
-/// `None` over the 1 MiB size limit, the only way these bodies fail.
 fn build(hir: &Hir, config: meta::Config) -> Option<meta::Regex> {
     meta::Builder::new()
         .configure(config)
@@ -217,8 +200,6 @@ fn flatten(hir: &Hir) -> Hir {
     }
 }
 
-/// The profile the charge reads from a pattern's forward NFA, plus the
-/// minimum of every other lazy DFA meta can build for it.
 #[derive(Debug, Clone, Copy)]
 struct Profile {
     charged: charge::Profile,
@@ -232,8 +213,6 @@ struct Profile {
 }
 
 impl Profile {
-    /// `None` when an NFA meta needs is over 1 MiB, so meta refuses the
-    /// body too.
     fn of(hir: &Hir) -> Option<Self> {
         let config = meta_config(CACHE_MAX);
         let forward = forward_nfa(hir, &config)?;
@@ -270,18 +249,14 @@ impl Profile {
             .max(self.min_inner.unwrap_or(0))
     }
 
-    /// The capacity the charge sets: `clamp(K_R × minF, CACHE_FLOOR,
-    /// CACHE_MAX)`.
     fn capacity(&self) -> usize {
         self.charged.capacity()
     }
 
-    /// The charge's Pike VM scratch ([`charge::Profile::pike`]).
     fn pike(&self) -> usize {
         self.charged.pike()
     }
 
-    /// What the charge sets for a program `re` built at [`Self::capacity`].
     fn charge(&self, re: &meta::Regex) -> Charge {
         Charge::new(&self.charged, re.memory_usage())
     }
@@ -323,9 +298,6 @@ impl Engines {
     }
 }
 
-// --- Inputs --------------------------------------------------------------
-
-/// xorshift64, so every run searches the same bytes.
 struct Rng(u64);
 
 impl Rng {
@@ -341,8 +313,6 @@ impl Rng {
     }
 }
 
-/// Words, digits, punctuation, Latin-1, Greek, Cyrillic, CJK, Deseret and
-/// emoji, with spaces and newlines.
 const MIXED: &[char] = &[
     'a', 'b', 'c', 'x', 'y', 'z', 'E', 'R', 'O', '_', '0', '1', '2', '9', ':', '.', '-', '@', '=',
     '"', '[', ']', 'é', 'ß', 'ø', 'ñ', 'α', 'β', 'Ω', 'Ж', '漢', '字', '文', 'ア', '𐐀', '𐐁', '😀',
@@ -396,8 +366,6 @@ const LOG_LINES: &[&str] = &[
     "mac 00:1a:2B:3c:4D:5e uuid 123e4567-e89b-12d3-a456-426614174000 mail a.b+c@d-e.fg timeout",
 ];
 
-/// Varied Unicode and ASCII text that drives each lazy DFA through many
-/// states.
 fn saturating_inputs() -> Vec<String> {
     let mut inputs: Vec<String> = (0..24).map(|seed| text(seed, 4096, MIXED)).collect();
     inputs.extend((300..316).map(|seed| wide(seed, 4096)));
@@ -418,21 +386,18 @@ fn saturate(re: &meta::Regex, cache: &mut meta::Cache, inputs: &[String]) {
     }
 }
 
-// --- Facts ---------------------------------------------------------------
-
 /// Below its minimum capacity a lazy DFA does not build, and meta builds the
 /// regex anyway with the lazy DFA off: `HybridEngine::new` suppresses the
 /// build error (wrappers.rs:569-614, `skip_cache_capacity_check(false)` at
 /// :583). The forward and reverse DFAs build as one engine, so a capacity
 /// that fits the forward minimum but not the reverse one turns both off.
 ///
-/// Detection for `lazy_dfa_stays_enabled` (CP3): build the same Hir with
+/// Detection for `lazy_dfa_stays_enabled`: build the same Hir with
 /// `hybrid(false)` and compare `create_cache().memory_usage()`. `Cache`
 /// sums every engine's cache (meta/regex.rs:2426-2434), a missing lazy DFA
 /// adds zero, and a built one adds its fresh sentinel and start states. So
 /// the lazy DFA is on exactly when the fresh cache is larger than its
-/// `hybrid(false)` twin. The `Debug` reading in [`Engines`] agrees and also
-/// tells `ReverseInner`'s prefix DFA apart.
+/// `hybrid(false)` twin.
 #[test]
 fn hybrid_below_minimum_is_silently_disabled() {
     let _serial = serial();
@@ -464,10 +429,6 @@ fn hybrid_below_minimum_is_silently_disabled() {
     assert!(at_engines.core_lazy);
 }
 
-/// Every lazy DFA meta can build for a pattern has a minimum within
-/// `K_R × minF`, so R3's capacity keeps them on. Checked for the forward
-/// and reverse DFAs and every `ReverseInner` prefix split, and confirmed by
-/// building each pattern at its capacity.
 #[test]
 fn every_lazy_dfa_minimum_fits_k_r() {
     let _serial = serial();
@@ -622,7 +583,6 @@ fn forward_clears(hir: &Hir, capacity: usize, inputs: &[String]) -> Option<usize
     Some(cache.clear_count())
 }
 
-/// The `PikeVM`'s cache stays within R3's `pike` formula.
 #[test]
 fn pikevm_scratch_matches_formula() {
     let _serial = serial();
@@ -667,9 +627,6 @@ fn pikevm_scratch_matches_formula() {
     );
 }
 
-/// One build's transient heap, the peak during parse, profile and meta
-/// build minus what the regex keeps, stays within `BUILD_TRANSIENT` for the
-/// largest bodies part 1 admits.
 #[test]
 fn build_transient_fits_t() {
     let _serial = serial();
@@ -710,7 +667,6 @@ fn build_transient_fits_t() {
     assert!(worst <= BUILD_TRANSIENT, "a build's transient is over T");
 }
 
-/// `atom{N}` for the largest `N <= 64` that compiles under 1 MiB.
 fn largest_repeat(atom: &str) -> String {
     let fits =
         |n: usize| build(&parse(&format!("{atom}{{{n}}}")), meta_config(CACHE_MAX)).is_some();
@@ -729,8 +685,6 @@ fn largest_repeat(atom: &str) -> String {
     format!("{atom}{{{lo}}}")
 }
 
-/// Returns the peak heap from parse through meta build and the heap the
-/// built regex keeps.
 fn build_window(body: &str) -> (usize, usize) {
     let window = Window::open();
     let hir = parse(body);
@@ -742,10 +696,6 @@ fn build_window(body: &str) -> (usize, usize) {
     (peak, retained)
 }
 
-/// R3's charge covers the heap a pattern holds while it matches: the
-/// program, one cache saturated by `is_match` and `captures`, and one
-/// `Captures`. The build's own transient is T's, so the charge plus T
-/// covers the peak across the build, too.
 #[test]
 fn charge_formula_covers_measured_peak() {
     let _serial = serial();
@@ -795,11 +745,6 @@ fn charge_formula_covers_measured_peak() {
     );
 }
 
-/// A pattern built through trawl's own `Preparer` holds no more heap than
-/// the charge it carries while it matches, through `is_match` and
-/// `captures`, and its build no more than that charge and one
-/// `BUILD_TRANSIENT`: the parse, the profile, the program, a regex body's
-/// batch view and the pattern's cache together.
 #[test]
 fn a_prepared_pattern_stays_within_its_charge() {
     let _serial = serial();

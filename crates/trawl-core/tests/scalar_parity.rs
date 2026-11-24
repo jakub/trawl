@@ -4,19 +4,6 @@
 
 //! Property test: scalar `let` expressions must produce the same result
 //! through `eval_scalar_fn` (streaming path) and `DuckDB` SQL (batch path).
-//!
-//! Generates random scalar DSL expressions (`let x = <expr>`), evaluates
-//! them against a fixed event via both paths, and asserts type-aware
-//! normalized equality.
-//!
-//! `now()` is generated like any other call. Neither lane reads a clock
-//! during evaluation, so a case is deterministic once the harness hands
-//! both lanes the same [`EvalContext`]: the streaming side takes it as its
-//! evaluation context, the batch side as the emit call's anchor, which
-//! rides into the SQL as a bound TIMESTAMP parameter (ADR-0017 §3). One
-//! anchor per case, [`now_anchor`], never a second capture.
-//!
-//! Modelled on `tests/filter_parity.rs`.
 
 use std::io::Write;
 
@@ -29,8 +16,6 @@ use trawl_core::emitter::{self, DATE_PART_UNITS, DATE_UNITS, SqlValue};
 use trawl_core::eval::{EvalValue, PatternTable, eval_expr};
 use trawl_core::parser;
 use trawl_core::pattern::Preparer;
-
-// ── Deterministic RNG (splitmix64, different seed from filter_parity) ─
 
 struct Rng {
     state: u64,
@@ -63,16 +48,9 @@ impl Rng {
     }
 }
 
-// ── The `now()` anchor ────────────────────────────────────────────────
-
-/// The instant every case in this harness reads `now()` at.
-///
 /// The microseconds are nonzero on purpose: a whole-second anchor would
 /// pass `strftime(now(), "…%f")` even if the anchor lost its sub-second
-/// precision on the way into either lane. The date is arbitrary; what
-/// matters is that one value reaches both lanes, the streaming evaluator
-/// as its [`EvalContext`] and `DuckDB` as the bound TIMESTAMP parameter
-/// the emit call's anchor produces.
+/// precision on the way into either lane.
 const NOW_ANCHOR_TEXT: &str = "2026-02-03T03:04:05.123456Z";
 
 /// The anchor as `DuckDB` renders it (`CAST(TIMESTAMP AS VARCHAR)`): a
@@ -87,8 +65,6 @@ fn now_anchor() -> EvalContext {
     )
 }
 
-// ── Timestamp fixtures ────────────────────────────────────────────────
-
 const TS_VALS: &[&str] = &[
     "2026-01-15 10:20:30",
     "2026-06-01 00:00:00",
@@ -97,11 +73,6 @@ const TS_VALS: &[&str] = &[
     "2024-03-15 08:45:00",
     "2023-11-07 17:30:45",
 ];
-
-// Date/time unit allowlists are imported from the emitter (see `use` above) so
-// the generator can never silently drift from the real allowlist: if the
-// emitter grows a unit, this test exercises it automatically, `date_part`'s
-// `epoch` included.
 
 // Include non-ASCII values so the parity harness exercises byte-vs-character
 // divergence in scalar fns like length() (DuckDB LENGTH counts characters).
@@ -117,10 +88,8 @@ const STRING_VALS: &[&str] = &[
 ];
 
 // Partial strptime formats whose component fill (from the `1900-01-01 00:00:00`
-// base) the streaming evaluator and DuckDB's STRPTIME agree on. Shared by the
-// generative property test so each filled case is checked against real DuckDB
-// every run — mirrors the deterministic `strptime_partial_formats_match_duckdb`
-// table. Only formats with exact streaming/batch parity belong here.
+// base) the streaming evaluator and DuckDB's STRPTIME agree on. Only formats
+// with exact streaming/batch parity belong here.
 const STRPTIME_PARTIALS: &[(&str, &str)] = &[
     ("2023", "%Y"),                   // year-only -> 2023-01-01 00:00:00
     ("2023-11", "%Y-%m"),             // year-month -> 2023-11-01 00:00:00
@@ -134,7 +103,7 @@ const INT_VALS: &[i64] = &[0, 1, 42, 100, -5, 200, 500];
 // rules: integer-valued (.0 suffix), plain decimals, magnitudes that flip into
 // sci-notation on render (the value decides, so the literal stays plain: the
 // DSL float grammar requires `digits.digits`, no `e` notation), negatives,
-// and zero. Drives the tostring/concat float-text parity.
+// and zero. Drives the tostring float-text parity.
 const FLOAT_LITS: &[&str] = &[
     "0.0",
     "1.0",
@@ -153,28 +122,10 @@ const FLOAT_LITS: &[&str] = &[
     "0.0000000001", // 1e-10 -> renders "1e-10"
 ];
 
-// ── Random-generator completeness surface ─────────────────────────────
-//
-// A deleted generator arm is a skip moved to generation time, which ADR-0017 §5
-// outlaws, and nothing else in the suite goes red when one disappears: that is
-// how `ceil`/`floor` once fell out of `random_numeric_fn` unnoticed. Three
-// mechanical guards, all asserted by `random_generator_surface_is_complete`:
-//
-//  1. every selector's arm count is a named constant checked against a required
-//     value, the cheap first line, so narrowing one cannot be an invisible
-//     literal edit;
-//  2. every generator arm carries a stable label, the labels drawn over a
-//     deterministic sweep are checked for set equality against
-//     [`REQUIRED_GENERATOR_ARMS`], and that set is made of branch identity, not
-//     of the head symbol of the emitted text. Two arms can share a head symbol
-//     (`strptime` over a full vs. a partial format, `tostring` over an int vs. a
-//     float) and are distinct coverage classes: deleting either one leaves the
-//     function-name set below completely unchanged; and
-//  3. the set of scalar function names the generator actually emits is observed
-//     from the generated text and checked for set equality too. A label is the
-//     generator's self-report and could lie about what its arm emits; this third
-//     projection reads the expression itself, so it catches an arm rewritten to
-//     emit something else under the same label.
+// A deleted generator arm is a skip moved to generation time, which ADR-0017
+// §5 outlaws. Two arms can share a head symbol (`strptime` over a full vs. a
+// partial format, `tostring` over an int vs. a float) and are distinct
+// coverage classes, so the guard checks arm labels as well as function names.
 
 const SCALAR_FAMILY_ARMS: usize = 16;
 const STRING_FN_ARMS: usize = 8;
@@ -202,13 +153,6 @@ const REQUIRED_SELECTOR_ARMS: &[(&str, usize, usize)] = &[
     ("random_now shape", NOW_SHAPE_ARMS, 4),
 ];
 
-/// A generated expression together with the generator arms that produced it.
-///
-/// `arms` is the guard's unit of identity. Most arms contribute exactly one
-/// label; an arm that composes independent sub-choices contributes one per
-/// choice (`sev` picks an argument shape and a dialect; `concat` picks a kind
-/// per argument), so deleting either axis is visible on its own. Duplicates are
-/// fine, since the guard compares sets.
 struct Generated {
     arms: Vec<&'static str>,
     expression: String,
@@ -222,16 +166,12 @@ impl Generated {
         }
     }
 
-    /// Record a second, independent choice this arm made.
     fn and(mut self, arm: &'static str) -> Self {
         self.arms.push(arm);
         self
     }
 }
 
-/// Every coverage class the random generator can draw. One label per branch,
-/// so a deleted arm is a missing label even when its neighbours keep emitting
-/// the same function name.
 const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "coalesce",
     "concat/arg_int",
@@ -285,9 +225,6 @@ const REQUIRED_GENERATOR_ARMS: &[&str] = &[
     "typeof/arg_string",
 ];
 
-/// Every scalar function `random_scalar_expr` can put at the head of a
-/// generated expression: the third projection, read off the emitted text
-/// rather than off an arm's self-reported label.
 const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "abs",
     "ceil",
@@ -317,8 +254,6 @@ const REQUIRED_RANDOM_CALL_NAMES: &[&str] = &[
     "upper",
 ];
 
-/// The function name at the head of a generated expression: every `random_*`
-/// arm emits a `name(...)` call, so the text before the first `(` names it.
 fn leading_call_name(expression: &str) -> &str {
     let (name, _) = expression
         .split_once('(')
@@ -326,14 +261,8 @@ fn leading_call_name(expression: &str) -> &str {
     name
 }
 
-// ── DSL expression generation ─────────────────────────────────────────
-
 /// Generate a scalar DSL expression (no field refs that could be absent
 /// from the fixed event), labelled with the arms that produced it.
-///
-/// `now()` is generated: both lanes read the one anchor
-/// [`assert_parity_case`] hands them, so a `now()` draw is as
-/// deterministic as any other (ADR-0017 §3).
 fn random_scalar_expr(rng: &mut Rng) -> Option<Generated> {
     match rng.range(SCALAR_FAMILY_ARMS) {
         0 => Some(random_string_fn(rng)),
@@ -399,15 +328,6 @@ fn random_string_fn(rng: &mut Rng) -> Generated {
     }
 }
 
-/// Arm count of `random_numeric_fn`'s selector.
-///
-/// All four are generated, over both argument kinds: eval follows `DuckDB`'s
-/// argument-driven return type
-/// (`ceil_floor_and_round_split_their_return_type_on_the_argument_type` in
-/// `trawl-engine/tests/duckdb_probe.rs`), where `ceil`/`floor` widen a BIGINT
-/// to DOUBLE and `round` keeps it integral. The argument kind is an independent
-/// draw with its own label, so dropping float or integer coverage from any of
-/// the four has to be visible on its own.
 const NUMERIC_FN_ARMS: usize = 4;
 
 fn random_numeric_fn(rng: &mut Rng) -> Generated {
@@ -438,8 +358,6 @@ fn random_conditional(rng: &mut Rng) -> Generated {
 }
 
 fn random_date_part(rng: &mut Rng) -> Generated {
-    // Every unit in the emitter allowlist, `epoch` included, so a
-    // newly-added unit flows in here without a test edit.
     let unit = rng.pick(DATE_PART_UNITS);
     let ts = ts_lit(rng);
     Generated::new("date_part", format!("date_part(\"{unit}\", {ts})"))
@@ -470,20 +388,12 @@ fn random_strftime(rng: &mut Rng) -> Generated {
 
 fn random_strptime(rng: &mut Rng) -> Generated {
     if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
-        // Unparseable input against a valid format: batch (TRY_STRPTIME) and
-        // streaming both yield NULL, so the two paths agree on a data-parse
-        // failure (TRY_STRPTIME nulls instead of erroring the whole query).
         return Generated::new(
             "strptime/unparseable",
             "strptime(\"not-a-date\", \"%Y-%m-%d %H:%M:%S\")".to_string(),
         );
     }
     if rng.range(STRPTIME_SHAPE_ARMS) == 0 {
-        // Partial format: streaming fills omitted components from the
-        // 1900-01-01 00:00:00 base exactly like DuckDB. Render through strftime
-        // so the filled timestamp is compared as a string. Its head symbol is
-        // `strftime`, exactly like the full-format arm below, which is why the
-        // completeness guard tracks this label and not that name.
         let (input, fmt) = rng.pick(STRPTIME_PARTIALS);
         return Generated::new(
             "strptime/partial_format",
@@ -491,7 +401,6 @@ fn random_strptime(rng: &mut Rng) -> Generated {
         );
     }
     let ts = rng.pick(TS_VALS);
-    // strptime returns a Timestamp — wrap it in strftime to get a string for comparison
     Generated::new(
         "strptime/full_format",
         format!("strftime(strptime(\"{ts}\", \"%Y-%m-%d %H:%M:%S\"), \"%Y-%m-%d %H:%M:%S\")"),
@@ -500,26 +409,18 @@ fn random_strptime(rng: &mut Rng) -> Generated {
 
 fn random_tonumber(rng: &mut Rng) -> Generated {
     if rng.bool() {
-        // Digit-separator strings: `1_000`/`1_0.0_5` parse to a value in BOTH
-        // paths; `_1000` is unparseable in both (DuckDB returns NULL -> skipped).
-        // Proves the underscore-strip rule stays in DuckDB TRY_CAST parity.
         let s = rng.pick(&["1_000", "1_0.0_5", "_1000"]);
         Generated::new(
             "tonumber/digit_separator_text",
             format!("tonumber(\"{s}\")"),
         )
     } else {
-        // Use integer string literals so the result is exact
         let n = rng.pick(INT_VALS).unsigned_abs();
         Generated::new("tonumber/integer_text", format!("tonumber(\"{n}\")"))
     }
 }
 
 fn random_tostring(rng: &mut Rng) -> Generated {
-    // Mix ints and floats: float text rendering (1.0 -> "1.0", 1e16 -> "1e+16")
-    // is the divergence this exercises. The String arm of values_match does
-    // an exact compare, so DuckDB CAST(DOUBLE AS VARCHAR) must byte-match eval.
-    // Both arms emit a `tostring` call, so only their labels tell them apart.
     if rng.bool() {
         Generated::new("tostring/int", format!("tostring({})", int_lit(rng)))
     } else {
@@ -527,10 +428,6 @@ fn random_tostring(rng: &mut Rng) -> Generated {
     }
 }
 
-/// `substr(s, start [, len])` with negative/zero starts and out-of-range
-/// lengths: start in -8..=8, optional len in -8..=8 (incl. 0), so `DuckDB`'s
-/// from-end and leftward-window behaviour is compared against the streaming
-/// evaluator rather than assumed.
 fn random_substr(rng: &mut Rng) -> Generated {
     let s = str_lit(rng);
     #[allow(clippy::cast_possible_wrap)]
@@ -547,11 +444,6 @@ fn random_substr(rng: &mut Rng) -> Generated {
     }
 }
 
-/// Severity texts spanning the reading kernel's rungs: band tokens with
-/// their case and whitespace variants, an exact `OTel` short name, the
-/// numeric strings both dialects read differently, the spellings
-/// `TRY_CAST` reads and the kernel does not (`1.5`, `1e1`, `0x10`), and
-/// values with no reading at all.
 const SEV_TEXTS: &[&str] = &[
     "error",
     "ERR",
@@ -587,9 +479,6 @@ const SEV_TEXTS: &[&str] = &[
 /// SQL lane reads the column's text form while eval reads the wire JSON, so
 /// a field arm is the one that proves the two readings agree.
 fn random_sev(rng: &mut Rng) -> Generated {
-    // Argument shape and dialect are independent choices, so each contributes
-    // its own label: dropping `syslog`, or dropping the `level` column arm,
-    // has to be visible on its own rather than masked by the other axis.
     let (arg_arm, arg) = match rng.range(SEV_ARG_ARMS) {
         0 => (
             "sev/arg_text_literal",
@@ -613,8 +502,6 @@ fn random_sev(rng: &mut Rng) -> Generated {
     Generated::new(arg_arm, expression).and(dialect_arm)
 }
 
-/// `typeof(x)` over every literal shape the emitter binds.
-///
 /// Eval spells a value by the type its bound literal arrives as, so every
 /// shape here agrees. The two that diverge, the NULL type and a list, are not
 /// bound literals and are pinned by
@@ -630,10 +517,6 @@ fn random_typeof(rng: &mut Rng) -> Generated {
         ),
         _ => unreachable!(),
     };
-    // The branch keeps its original label and the argument kind is a
-    // second, independent one (`sev` and `concat`'s idiom): the manifest
-    // only ever grows, so a reader can tell "this arm was deleted" from
-    // "this arm gained an axis" by looking at it.
     Generated::new("typeof", format!("typeof({argument})")).and(arg_arm)
 }
 
@@ -643,15 +526,8 @@ fn random_coalesce(rng: &mut Rng) -> Generated {
     Generated::new("coalesce", format!("coalesce({a}, {b})"))
 }
 
-/// 2–4 concat args, each a string/int literal or a bare `null`. Exercises
-/// `DuckDB`'s CONCAT NULL-skipping and CAST-to-VARCHAR join against the
-/// streaming evaluator.
-/// (Floats omitted: `DuckDB` float→text rendering differs from Rust's.)
 fn random_concat(rng: &mut Rng) -> Generated {
-    let n = 2 + rng.range(3); // 2..=4 args
-    // Labelled per argument kind, so dropping the `null` argument arm, the
-    // whole point of the family, cannot hide behind the surviving string/int
-    // arguments of the same `concat(...)` call.
+    let n = 2 + rng.range(3);
     let mut arms = Vec::new();
     let args: Vec<String> = (0..n)
         .map(|_| match rng.range(CONCAT_ARG_ARMS) {
@@ -676,15 +552,6 @@ fn random_concat(rng: &mut Rng) -> Generated {
     }
 }
 
-/// `now()`, bare and composed.
-///
-/// `now/bare` and `now/self_equality` both emit the head symbol `now`, so
-/// the function-name projection cannot see either one disappear; the arm
-/// labels can, which is what the completeness guard is made of. The
-/// composed arms matter on their own: the batch lane reaches `now()` as a
-/// bound `CAST(? AS TIMESTAMP)`, so a wrapper is where a parameter-ordering
-/// or result-type mistake would show up, and `now() == now()` is the
-/// one-instant rule itself (ADR-0017 §3).
 fn random_now(rng: &mut Rng) -> Generated {
     match rng.range(NOW_SHAPE_ARMS) {
         0 => Generated::new("now/bare", "now()".to_string()),
@@ -697,8 +564,6 @@ fn random_now(rng: &mut Rng) -> Generated {
         _ => unreachable!(),
     }
 }
-
-// ── Event fixture (all fields present to avoid binder errors) ─────────
 
 fn fixed_event() -> Map<String, Value> {
     let mut m = Map::new();
@@ -714,14 +579,10 @@ fn fixed_event() -> Map<String, Value> {
         "event_ts_far".into(),
         Value::String("9999-12-31 23:59:59.000016".into()),
     );
-    // A severity-bearing pair, one word and one numeral, so `sev()` reads
-    // a real column in both shapes.
     m.insert("sev_num".into(), Value::Number(3.into()));
     m.insert("sev_word".into(), Value::String("warn".into()));
     m
 }
-
-// ── SQL execution ──────────────────────────────────────────────────────
 
 fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
     params
@@ -741,19 +602,10 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
-/// Outcome of running a `let x = <expr>` query through the batch (`DuckDB`) path.
 #[derive(Debug, PartialEq)]
 enum SqlOutcome {
-    /// `DuckDB` produced a value for `x`, with its declared logical type.
     Value(SqlCell),
-    /// `DuckDB` raised an error (prepare/query failed), carrying the error text.
-    /// The streaming evaluator cannot error, so its contract is to yield `Null`
-    /// wherever batch errors, and the property loop asserts that rather than
-    /// silently skipping. The text is carried for two reasons: a mismatch prints
-    /// the reason, and a pinned divergence test can assert which error it
-    /// pinned, so a different error cannot keep the pin green.
     Errored(String),
-    /// The only value shapes the harness deliberately cannot read faithfully.
     Skip(SkipCategory),
 }
 
@@ -810,11 +662,6 @@ fn eval_scalar(dsl: &str, event: &Map<String, Value>, anchor: EvalContext) -> Ev
         .unwrap_or_else(|error| panic!("{dsl:?}: {error}"))
 }
 
-/// Run a `let x = <expr>` query and return the outcome of the computed `x`
-/// column. A `DuckDB` error is surfaced as [`SqlOutcome::Errored`], never as a
-/// skip, at prepare, at query and at fetch alike, so a batch error cannot hide.
-/// Only genuinely impossible states (no row, no `x` column, unreadable text)
-/// panic as infrastructure failures.
 fn sql_scalar_result(
     conn: &Connection,
     dsl: &str,
@@ -843,8 +690,6 @@ fn sql_scalar_result(
     let params = bind_params(&emitted.params);
     let param_refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
 
-    // A prepare/query failure is a real DuckDB error, not a skip, and the
-    // message is kept so a pin cannot pass for the wrong reason.
     let mut stmt = match conn.prepare(&emitted.sql) {
         Ok(stmt) => stmt,
         Err(error) => return SqlOutcome::Errored(error.to_string()),
@@ -854,14 +699,9 @@ fn sql_scalar_result(
         Err(error) => return SqlOutcome::Errored(error.to_string()),
     };
     // A fetch-time `Err` is a real DuckDB execution error and classifies as
-    // one, exactly like the prepare/query failures above: collapsing it into
-    // the empty-result panic would make an overflow pin panic with the wrong
-    // reason instead of returning `Errored`. Against duckdb-rs 1.10505.0,
-    // `query()` materializes the result and every runtime error surfaces there
-    // (probed: an `error('boom')` guarded by a row predicate 2M rows in still
-    // errors at `query()`), so this arm is unreachable today. That is a fact
-    // about this DuckDB, not a licence to launder a future streaming error
-    // into the wrong outcome.
+    // one, exactly like the prepare/query failures above. Against duckdb-rs
+    // 1.10505.0, `query()` materializes the result and every runtime error
+    // surfaces there, so this arm is unreachable today.
     let row = match rows.next() {
         Ok(Some(row)) => row,
         Err(error) => return SqlOutcome::Errored(error.to_string()),
@@ -901,8 +741,6 @@ fn sql_scalar_result(
     panic!("query infrastructure failure: generated scalar query has no x column: {dsl:?}")
 }
 
-// ── Value comparison ──────────────────────────────────────────────────
-
 /// Explicitly permitted representation widenings between streaming and batch.
 /// There is deliberately no string/numeric coercion and no timestamp/text arm.
 ///
@@ -929,10 +767,6 @@ fn logical_type_matches(eval: &EvalValue, sql: &Type) -> bool {
                 | Type::UInt
                 | Type::UBigInt
         ),
-        // A cell above `i64::MAX`. No generated scalar produces one —
-        // the fixture carries no such field and no expression mints one —
-        // but the match is total by design, and the shapes DuckDB would
-        // answer with are the unsigned ones.
         EvalValue::UInt(_) => matches!(sql, Type::UBigInt | Type::HugeInt),
         EvalValue::Float(_) => matches!(sql, Type::Float | Type::Double),
         EvalValue::Str(_) => matches!(sql, Type::Text),
@@ -1011,10 +845,6 @@ fn assert_parity_case(
     expression: &str,
 ) -> Option<SkipCategory> {
     let dsl = format!("* | let x = {expression}");
-    // One anchor, both lanes: the streaming evaluator reads it as its
-    // evaluation context and the emitter binds the same instant as the
-    // statement's TIMESTAMP parameter, so a generated `now()` is an
-    // ordinary deterministic case rather than a race between two clocks.
     let anchor = now_anchor();
     let eval_result = eval_scalar(&dsl, event, anchor);
     match sql_scalar_result(conn, &dsl, event, anchor) {
@@ -1070,9 +900,6 @@ struct GeneratedCase {
     expression: &'static str,
 }
 
-/// Per-family case counts, the only thing standing between this table and a
-/// silent deletion. Equal `BTreeMap`s imply equal key sets, so this subsumes a
-/// separate family-name manifest; there is deliberately not one.
 const REQUIRED_FAMILY_CASE_COUNTS: &[(&str, usize)] = &[
     ("operators", 27),
     ("numeric", 7),
@@ -1243,37 +1070,21 @@ fn generated_cases() -> Vec<GeneratedCase> {
     add(
         "now",
         &[
-            // The anchor itself, and the one-instant rule.
             "now()",
             "now() == now()",
-            // Its type and its text. `typeof` is here as a VARCHAR case on
-            // purpose: `logical_type_matches` reads duckdb-rs's `Type`,
-            // which erases the TIMESTAMP/TIMESTAMPTZ split (see the caveat
-            // on that function), so only the spelling can see it. The
-            // rendered forms carry six fractional digits, which is what
-            // makes a lost microsecond visible.
             "typeof(now())",
             "tostring(now())",
             r#"strftime(now(), "%Y-%m-%d %H:%M:%S.%f")"#,
-            // Timestamp semantics through composition — the anchor arrives
-            // as a bound `CAST(? AS TIMESTAMP)`, so each wrapper is a place
-            // a parameter-ordering or result-type mistake would surface.
             r#"date_diff("second", now(), now())"#,
             r#"date_part("year", now())"#,
             r#"date_trunc("second", now())"#,
             "if(true, now(), now())",
             "coalesce(now(), now())",
-            // The ladder function over a bound TIMESTAMP: NULL in both
-            // lanes. Agreement is all this arm claims; that the batch lane
-            // does not error is a stronger claim, pinned by
-            // `sev_over_the_now_anchor_is_null_never_a_binder_error`.
             "sev(now())",
         ],
     );
     cases
 }
-
-// ── Property test ──────────────────────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "forced infrastructure failure")]
@@ -1313,8 +1124,6 @@ fn timestamp_comparison_is_microsecond_exact() {
     );
 }
 
-/// The random generator's own completeness guard — see the
-/// "Random-generator completeness surface" block above.
 #[test]
 fn random_generator_surface_is_complete() {
     use std::collections::BTreeSet;
@@ -1414,9 +1223,6 @@ fn generated_scalar_families_are_complete_and_match() {
 
 #[test]
 fn a_malformed_offset_has_no_timestamp_reading() {
-    // A malformed offset has no reading: `compare::literal_timestamp` (the
-    // TRY_CAST a bound string gets) rejects it rather than stripping it, so
-    // the batch lane errors and the streaming answer is NULL.
     let conn = utc_connection();
     let event = fixed_event();
     for offset in ["+ab:cd", "+5:30"] {
@@ -1444,11 +1250,6 @@ fn a_malformed_offset_has_no_timestamp_reading() {
 
 #[test]
 fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
-    // Comparing an instant against a text with no reading is UNKNOWN in
-    // both operand orders (ADR-0017 §2), which is what the batch error
-    // implies. A lexical string fallback would be an order DuckDB does not
-    // have: it inverts under `NOT` and depends on whether the other operand
-    // happened to parse.
     let conn = utc_connection();
     let event = fixed_event();
     for expression in [
@@ -1456,9 +1257,6 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
         r#""zzz" > strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S")"#,
         r#"strptime("2026-01-15 10:20:30", "%Y-%m-%d %H:%M:%S") == "zzz""#,
     ] {
-        // Same reason as the sibling above: the errored/null shape is
-        // asserted directly, because [`assert_parity_case`] cannot tell
-        // it from two lanes AGREEING on an answer.
         let dsl = format!("* | let x = {expression}");
         assert_eq!(
             eval_scalar(&dsl, &event, now_anchor()),
@@ -1473,18 +1271,10 @@ fn a_failed_timestamp_coercion_is_null_in_both_operand_orders() {
     }
 }
 
-/// ADR-0017 §3: `now()` is one instant per unit of output.
-///
-/// Deterministic in one pass, with no retry loop and no dependence on the
-/// platform clock ticking between two reads: neither lane reads a clock
-/// during evaluation. The batch lane binds the statement's anchor at both
-/// call sites, and `eval` reads the evaluation context it was handed.
 #[test]
 fn now_is_one_instant_per_unit_of_output() {
     let conn = utc_connection();
     let event = fixed_event();
-    // One context, both lanes: the eval side reads it directly, the SQL
-    // side binds it as the emit call's anchor.
     let anchor = now_anchor();
     let dsl = "* | let x = now() == now()";
     assert_eq!(
@@ -1501,9 +1291,6 @@ fn now_is_one_instant_per_unit_of_output() {
     );
 }
 
-/// The anchor is the value both lanes answer with, not merely the same
-/// value as each other.
-///
 /// `assert_parity_case` proves the two lanes agree; it cannot prove they
 /// agree on the instant the caller handed them, and a bug that dropped the
 /// anchor's microseconds in the emitter and in `eval` alike would still
@@ -1518,9 +1305,6 @@ fn now_reads_the_statements_anchor_in_both_lanes() {
     let event = fixed_event();
     let anchor = now_anchor();
     let micros = anchor.now_utc().timestamp_micros();
-    // The same instant with its fractional second dropped — the answer
-    // `date_trunc("second", ...)` owes, written from the fixture rather
-    // than from either lane.
     let whole_second_micros = micros - i64::from(anchor.now_utc().timestamp_subsec_micros());
     let whole_second = chrono::DateTime::from_timestamp_micros(whole_second_micros)
         .expect("fixture infrastructure failure: the anchor is not a representable instant")
@@ -1546,8 +1330,6 @@ fn now_reads_the_statements_anchor_in_both_lanes() {
     };
 
     for (expression, eval_want, sql_want) in [
-        // The anchor undecorated, through two pass-through wrappers, and
-        // truncated to the second.
         ("now()", anchor.now_value(), instant(micros)),
         (
             "if(true, now(), now())",
@@ -1574,7 +1356,6 @@ fn now_reads_the_statements_anchor_in_both_lanes() {
             EvalValue::Str("TIMESTAMP".to_string()),
             text("TIMESTAMP"),
         ),
-        // The text, byte for byte, with the fixture's microseconds in it.
         (
             "tostring(now())",
             EvalValue::Str(NOW_ANCHOR_RENDERED.to_string()),
@@ -1585,8 +1366,6 @@ fn now_reads_the_statements_anchor_in_both_lanes() {
             EvalValue::Str(NOW_ANCHOR_RENDERED.to_string()),
             text(NOW_ANCHOR_RENDERED),
         ),
-        // Two reads of the anchor, differenced: zero, because there is
-        // only one instant to difference.
         (
             r#"date_diff("second", now(), now())"#,
             EvalValue::Int(0),
@@ -1612,14 +1391,11 @@ fn now_reads_the_statements_anchor_in_both_lanes() {
     }
 }
 
-/// `sev(now())` is NULL, and specifically not a `DuckDB` error.
-///
-/// The distinction is the point: the ladder reads its argument through
-/// `to_json(...)`, so a bound TIMESTAMP parameter has to stay typeable
-/// there. If it stopped being, the batch lane would error and the
-/// null-where-batch-errors rule would keep every parity assertion green
-/// while `sev()` over any timestamp-valued expression failed for real
-/// users. That is why this is not left to the family's `sev(now())` arm.
+/// The ladder reads its argument through `to_json(...)`, so a bound
+/// TIMESTAMP parameter has to stay typeable there. If it stopped being, the
+/// batch lane would error and the null-where-batch-errors rule would keep
+/// every parity assertion green while `sev()` over any timestamp-valued
+/// expression failed for real users.
 #[test]
 fn sev_over_the_now_anchor_is_null_never_a_binder_error() {
     let conn = utc_connection();
@@ -1640,9 +1416,6 @@ fn sev_over_the_now_anchor_is_null_never_a_binder_error() {
 
 #[test]
 fn tonumber_reads_a_boolean_the_way_try_cast_double_does() {
-    // A boolean has a DOUBLE reading, probed by
-    // `a_boolean_casts_to_double_as_one_and_zero` in
-    // `trawl-engine/tests/duckdb_probe.rs`, so both lanes answer 1 and 0.
     let conn = utc_connection();
     let event = fixed_event();
     for expression in ["tonumber(true)", "tonumber(false)"] {
@@ -1655,10 +1428,6 @@ fn tonumber_reads_a_boolean_the_way_try_cast_double_does() {
 
 #[test]
 fn integer_division_is_true_division_like_duckdb() {
-    // `/` has no integer form: both operands go through DOUBLE, so the last
-    // row, a dividend above 2^53, comes back rounded in both lanes rather
-    // than exact in one of them
-    // (`integer_division_is_true_division_through_double`).
     let conn = utc_connection();
     let event = fixed_event();
     for expression in [
@@ -1677,11 +1446,6 @@ fn integer_division_is_true_division_like_duckdb() {
 
 #[test]
 fn integer_overflow_nulls_where_duckdb_errors() {
-    // The errored/null shape, not an agreement: DuckDB raises
-    // `Out of Range Error` (probed:
-    // `integer_arithmetic_overflow_is_an_error_never_a_wrap`) and a streaming
-    // lane cannot raise a per-event error, so eval nulls instead, in every
-    // build profile.
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, duckdb_error) in [
@@ -1719,32 +1483,21 @@ fn integer_overflow_nulls_where_duckdb_errors() {
 
 #[test]
 fn an_if_or_case_condition_takes_duckdbs_boolean_domain() {
-    // A condition is a boolean CAST, not truthiness (probed by
-    // `an_if_condition_is_a_boolean_cast_not_truthiness`): a readable
-    // condition picks the same branch in both lanes, and an unreadable one,
-    // where DuckDB raises a Conversion error, nulls in streaming instead of
-    // silently taking a branch.
     let conn = utc_connection();
     let event = fixed_event();
     for function in ["if", "case"] {
         for condition in [
-            // The readable vocabulary.
             r#""true""#,
             r#""TRUE""#,
             r#""t""#,
             r#""yes""#,
             r#""1""#,
-            // Read as false, where truthiness would take the THEN branch.
             r#""0""#,
             r#""no""#,
-            // No boolean reading at all: batch errors, streaming nulls.
             r#""nonempty""#,
             r#"" true ""#,
             r#""""#,
             r#""2""#,
-            // Non-string conditions, including the columns the fixture
-            // carries: `service` is a VARCHAR holding 'nginx' (no reading),
-            // `status` a BIGINT (non-zero, so true).
             "0",
             "1",
             "-1",
@@ -1769,8 +1522,6 @@ fn an_if_or_case_condition_takes_duckdbs_boolean_domain() {
         }
     }
 
-    // Arm ORDER: an unreadable condition is not "this arm does not match",
-    // and an earlier match means it is never read.
     for expression in [
         r#"case(true, 1, "nonempty", 2, 3)"#,
         r#"case(false, 1, "nonempty", 2, 3)"#,
@@ -1803,7 +1554,6 @@ fn agreed_value(
     eval_scalar(&dsl, event, now_anchor())
 }
 
-/// Three-valued (Kleene) logic, the expected answer for a truth-table row.
 fn kleene_and(a: Option<bool>, b: Option<bool>) -> Option<bool> {
     match (a, b) {
         (Some(false), _) | (_, Some(false)) => Some(false),
@@ -1826,11 +1576,6 @@ fn kleene_value(value: Option<bool>) -> EvalValue {
 
 #[test]
 fn boolean_case_lane_parity() {
-    // `and`, `or` and `not` read the same in lowercase and in capitals, in
-    // both lanes, for true, false and NULL operands, with `not` binding
-    // tighter than `and` and `and` tighter than `or`. Each row is written
-    // all lowercase, all capitals, and with each operator's spelling
-    // chosen on its own.
     let conn = utc_connection();
     let event = fixed_event();
     let operands = [("true", Some(true)), ("false", Some(false)), ("null", None)];
@@ -1863,7 +1608,6 @@ fn boolean_case_lane_parity() {
             }
         }
     }
-    // Over the fixture's fields: `status` is 200 and `service` is "nginx".
     rows.push((
         r#"{not} status == 200 {or} service == "nginx" {and} null"#.to_string(),
         EvalValue::Null,
@@ -1878,8 +1622,6 @@ fn boolean_case_lane_parity() {
     ));
 
     for (index, (template, expected)) in rows.iter().enumerate() {
-        // All lowercase, all capitals, then one mixed choice per row that
-        // walks every combination of the three operators across the rows.
         let choices = [
             [false; 3],
             [true; 3],
@@ -1901,11 +1643,6 @@ fn boolean_case_lane_parity() {
 
 #[test]
 fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
-    // `CEIL`/`FLOOR` widen a BIGINT argument to DOUBLE while `ROUND` keeps it
-    // integral. The asymmetry is DuckDB's, probed by
-    // `ceil_floor_and_round_split_their_return_type_on_the_argument_type`. The
-    // random generator draws all four over both argument kinds
-    // (NUMERIC_FN_ARMS); this test holds the shapes that draw does not name.
     let conn = utc_connection();
     let event = fixed_event();
     for expression in [
@@ -1914,7 +1651,6 @@ fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
         "ceil(0.0)",
         "floor(0.0)",
         "round(-1.5)",
-        // INTEGER arguments — the asymmetric half.
         "ceil(5)",
         "ceil(-5)",
         "floor(5)",
@@ -1935,16 +1671,12 @@ fn ceil_floor_and_round_return_duckdbs_argument_driven_shapes() {
 
 #[test]
 fn division_by_zero_matches_duckdbs_ieee_answer() {
-    // Both lanes answer the IEEE special DuckDB does, while integer `%` 0 is
-    // NULL on both sides.
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, want) in [
         ("* | let x = 1 / 0", "inf"),
         ("* | let x = -1 / 0", "-inf"),
         ("* | let x = 0 / 0", "NaN"),
-        // A DOUBLE operand takes the IEEE path under `%` too — only the
-        // all-integer shape below is NULL.
         ("* | let x = 5 % 0.0", "NaN"),
         ("* | let x = 5.0 % 0", "NaN"),
     ] {
@@ -1965,8 +1697,6 @@ fn division_by_zero_matches_duckdbs_ieee_answer() {
         }
     }
 
-    // Integer `%` 0 is NULL on both sides (a BIGINT column holding NULL),
-    // the one shape that is not an IEEE special.
     let modulo = "* | let x = 5 % 0";
     assert_eq!(eval_scalar(modulo, &event, now_anchor()), EvalValue::Null);
     assert_eq!(
@@ -2036,12 +1766,6 @@ fn typeof_spells_a_value_the_way_the_bound_literal_arrives() {
 
 #[test]
 fn current_typeof_null_and_list_spellings_are_pinned() {
-    // A known residual awaiting a ruling, recorded because an unpinned
-    // divergence is what this harness exists to prevent: `DuckDB` spells the
-    // NULL type with quotes and a list by its element type, where eval has one
-    // word for each. Neither is a bound literal, so neither is reachable from
-    // the generator surface; both are cheap to fix once somebody decides they
-    // should be.
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, eval, sql) in [
@@ -2068,9 +1792,6 @@ fn current_typeof_null_and_list_spellings_are_pinned() {
 
 #[test]
 fn the_hostile_timestamp_corpus_agrees_in_both_lanes() {
-    // Hostile offset and zone texts, all read through the one probe-pinned
-    // reader, so the whole corpus agrees.
-    //
     // `+99:99` is accepted on both sides: it is syntactically a complete
     // offset and the wall-clock cast throws it away without range-checking
     // it, a documented property of the reader rather than a gap here.
@@ -2085,8 +1806,6 @@ fn the_hostile_timestamp_corpus_agrees_in_both_lanes() {
             None
         );
     }
-    // The keyword instants: `epoch` is 1970-01-01, and an infinity equals
-    // no calendar date.
     for (base, text) in [
         ("1970-01-01 00:00:00", "epoch"),
         ("2026-01-15 10:20:30", "infinity"),
@@ -2112,10 +1831,7 @@ fn percent_f_is_microseconds_in_both_lanes() {
     for expression in [
         r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%f")"#,
         r#"strftime(strptime("2024-12-30 23:05:07.123456", "%Y-%m-%d %H:%M:%S.%f"), "%Y-%m-%d %H:%M:%S.%f")"#,
-        // A zero fraction still fills six digits.
         r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%f")"#,
-        // An escaped percent is a literal, and the translation leaves it
-        // alone in both lanes.
         r#"strftime(strptime("2024-12-30 23:05:07", "%Y-%m-%d %H:%M:%S"), "%%f")"#,
     ] {
         assert_eq!(
@@ -2178,17 +1894,11 @@ fn accepted_locale_percent_c_residual_is_pinned() {
 
 #[test]
 fn json_extract_returns_json_text_in_both_lanes() {
-    // `json_extract` yields JSON text, not a decoded scalar: `{"a":1}` reads
-    // as the text `1` and an array as `[1,2]`, in both lanes, through the one
-    // renderer (`json_extract_returns_the_values_json_text` asserts it against
-    // the engine value by value).
     let conn = utc_connection();
     let event = fixed_event();
     for expression in [
         r#"json_extract("{\"a\":1}", "$.a")"#,
         r#"json_extract("{\"a\":1.5}", "$.a")"#,
-        // A string keeps its quotes; `json_extract_string` is the
-        // unquoting door.
         r#"json_extract("{\"a\":\"x\"}", "$.a")"#,
         r#"json_extract_string("{\"a\":\"x\"}", "$.a")"#,
         r#"json_extract("{\"a\":true}", "$.a")"#,
@@ -2197,7 +1907,6 @@ fn json_extract_returns_json_text_in_both_lanes() {
         r#"json_extract("[1,2]", "$")"#,
         r#"tostring(json_extract("[1,2]", "$"))"#,
         r#"tostring(json_extract("{\"a\":1}", "$.a"))"#,
-        // The value a JSON number reads as, arriving as text.
         r#"tonumber(json_extract("{\"a\":1.5}", "$.a"))"#,
     ] {
         assert_eq!(
@@ -2271,23 +1980,16 @@ fn scalar_eval_matches_sql_parity() {
     assert_eq!(blob_skips, 0, "Blob skip ceiling exceeded");
 }
 
-/// The harness must surface a `DuckDB` error as [`SqlOutcome::Errored`] (not a
-/// silent skip), and the streaming contract is that eval yields `Null` wherever
-/// batch errors. These type-mismatch expressions error in the `DuckDB` binder
-/// while permissive eval nulls, so both halves are asserted here.
 #[test]
 fn batch_errors_imply_streaming_null() {
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, duckdb_error) in [
-        // wrong-type replace arg
         (
             r#"* | let x = replace("abc", "a", 5)"#,
             "'replace(STRING_LITERAL, STRING_LITERAL, BIGINT)'",
         ),
-        // varchar + int
         ("* | let x = service + 1", "'+(VARCHAR, UNKNOWN)'"),
-        // round of varchar
         (
             r#"* | let x = round("abc")"#,
             r#"the function call "round(STRING_LITERAL)""#,
@@ -2298,10 +2000,6 @@ fn batch_errors_imply_streaming_null() {
             duckdb_error,
             dsl,
         );
-        // `EvalValue::Null`, never the `serde_json::Value` form compared to
-        // `Value::Null`: that conversion maps `Float(NaN)`/`Float(inf)` onto
-        // `Value::Null` too, so the weaker form would accept a non-null eval
-        // here.
         assert_eq!(
             eval_scalar(dsl, &event, now_anchor()),
             EvalValue::Null,
@@ -2310,21 +2008,12 @@ fn batch_errors_imply_streaming_null() {
     }
 }
 
-/// `strftime` over a nested `strptime` with literal args.
-///
-/// Both args carry bound params, so the emitter must emit them in DSL order to
-/// keep the `?` placeholders aligned with `emit_expr`'s param push (swapping
-/// the argument text misbinds them and batch nulls or errors). Both paths must
-/// produce `"2023"`.
 #[test]
 fn strftime_over_strptime_binds_params_in_order() {
     let conn = utc_connection();
     let event = fixed_event();
-    // Full datetime so chrono's NaiveDateTime::parse_from_str succeeds (date-only
-    // formats are a separate chrono-vs-DuckDB divergence, not the param bug here).
     let dsl = r#"* | let x = strftime(strptime("2023-11-07 17:30:45", "%Y-%m-%d %H:%M:%S"), "%Y")"#;
 
-    // Batch path (real DuckDB).
     assert_eq!(
         sql_scalar_result(&conn, dsl, &event, now_anchor()),
         SqlOutcome::Value(SqlCell {
@@ -2345,44 +2034,32 @@ fn strftime_over_strptime_binds_params_in_order() {
     );
 }
 
-/// `strptime` with a partial format must fill components the same way `DuckDB`
-/// does: a date-only format yields `00:00:00`, a time-only format yields the
-/// `1900-01-01` base. Chrono's `NaiveDateTime::parse_from_str` needs a full
-/// datetime and rejects both, which is why `eval_strptime` cascades. Each case
-/// is rendered back through `strftime` so the filled value is what gets
-/// compared against real `DuckDB`.
 #[test]
 fn strptime_partial_formats_match_duckdb() {
     let conn = utc_connection();
     let event = fixed_event();
     for (dsl, want) in [
         (
-            // date-only -> midnight
             r#"* | let x = strftime(strptime("2023-11-07", "%Y-%m-%d"), "%Y-%m-%d %H:%M:%S")"#,
             "2023-11-07 00:00:00",
         ),
         (
-            // time-only -> 1900-01-01 base
             r#"* | let x = strftime(strptime("14:30:00", "%H:%M:%S"), "%Y-%m-%d %H:%M:%S")"#,
             "1900-01-01 14:30:00",
         ),
         (
-            // year-only -> month/day fill to 1, time to midnight
             r#"* | let x = strftime(strptime("2023", "%Y"), "%Y-%m-%d %H:%M:%S")"#,
             "2023-01-01 00:00:00",
         ),
         (
-            // year-month -> day fills to 1
             r#"* | let x = strftime(strptime("2023-11", "%Y-%m"), "%Y-%m-%d %H:%M:%S")"#,
             "2023-11-01 00:00:00",
         ),
         (
-            // bare month-day -> year fills to the 1900 base
             r#"* | let x = strftime(strptime("11-07", "%m-%d"), "%Y-%m-%d %H:%M:%S")"#,
             "1900-11-07 00:00:00",
         ),
         (
-            // date + INCOMPLETE time -> minute/second fill to 0 (not dropped)
             r#"* | let x = strftime(strptime("2023-11-07 14", "%Y-%m-%d %H"), "%Y-%m-%d %H:%M:%S")"#,
             "2023-11-07 14:00:00",
         ),
@@ -2418,7 +2095,7 @@ fn keys(names: &[&str]) -> EvalValue {
 /// `json_keys(doc)` and `json_array_length(doc)`).
 type JsonDocumentCase = (&'static str, &'static str, [EvalValue; 6]);
 
-#[allow(clippy::too_many_lines)] // one table, kept in one place to stay readable
+#[allow(clippy::too_many_lines)]
 fn json_document_cases() -> Vec<JsonDocumentCase> {
     let null = EvalValue::Null;
     vec![
@@ -2544,10 +2221,6 @@ fn json_document_cases() -> Vec<JsonDocumentCase> {
     ]
 }
 
-/// A document that is not JSON is null in both lanes, and a valid document
-/// of each shape reads the same in both (ADR-0017, amendment of
-/// 2026-11-13). `agreed_value` fails on a batch error, so the
-/// errored-equals-null rule cannot pass a `Malformed JSON` raise here.
 #[test]
 fn a_document_that_is_not_json_is_null_in_both_lanes() {
     let conn = utc_connection();
@@ -2574,19 +2247,11 @@ fn a_document_that_is_not_json_is_null_in_both_lanes() {
     }
 }
 
-/// An error raised while computing the document still raises in batch.
-///
-/// Guards against a regression from `TRY_CAST(<document> AS JSON)` to
-/// `TRY(…)`, which would swallow these errors along with the bad document
-/// (ADR-0017, amendment of 2026-11-13). The evaluator cannot raise per
-/// event, so it nulls, as for any other batch error.
 #[test]
 fn an_error_inside_the_json_document_still_raises() {
     let conn = utc_connection();
     let event = fixed_event();
     let overflow = "tostring(9223372036854775807 + 1)";
-    // A condition with no boolean reading is a Conversion error in DuckDB
-    // (`an_if_or_case_condition_takes_duckdbs_boolean_domain`).
     let conversion = r#"if("nonempty", "{}", "[]")"#;
     for (document, duckdb_error) in [
         (overflow, "Overflow in addition of INT64"),
@@ -2614,7 +2279,6 @@ fn an_error_inside_the_json_document_still_raises() {
     }
 }
 
-/// The value batch gives `expression`, asserted to be a value.
 fn batch_value(conn: &Connection, event: &Map<String, Value>, expression: &str) -> DuckValue {
     let dsl = format!("* | let x = {expression}");
     match sql_scalar_result(conn, &dsl, event, now_anchor()) {
@@ -2631,8 +2295,6 @@ fn eval_value(event: &Map<String, Value>, expression: &str) -> EvalValue {
     eval_scalar(&format!("* | let x = {expression}"), event, now_anchor())
 }
 
-/// Residual: object key order. `DuckDB` lists `json_keys` in document order;
-/// the evaluator's `serde_json` map sorts them.
 #[test]
 fn current_json_keys_order_residual_is_pinned() {
     let conn = utc_connection();
@@ -2645,8 +2307,6 @@ fn current_json_keys_order_residual_is_pinned() {
     assert_eq!(eval_value(&event, expression), keys(&["a", "b"]));
 }
 
-/// Residual: duplicate keys. `DuckDB` reads the first `a` and lists both;
-/// `serde_json` keeps the last and lists one.
 #[test]
 fn current_json_duplicate_key_residual_is_pinned() {
     let conn = utc_connection();
@@ -2663,9 +2323,6 @@ fn current_json_duplicate_key_residual_is_pinned() {
     assert_eq!(eval_value(&event, &listed), keys(&["a"]));
 }
 
-/// Residual: parser leniency. `DuckDB` accepts a trailing comma, `NaN` and
-/// `1e999` as JSON; `serde_json` refuses all three, so the evaluator reads
-/// each document as not JSON and answers null.
 #[test]
 fn current_lenient_json_document_residual_is_pinned() {
     let conn = utc_connection();
@@ -2688,9 +2345,6 @@ fn current_lenient_json_document_residual_is_pinned() {
     assert_eq!(eval_value(&event, nan), EvalValue::Null);
 }
 
-/// Residual: a document that is not text. Batch casts the number 42 to the
-/// JSON `42`; the evaluator reads only a string as a document and answers
-/// null.
 #[test]
 fn current_non_text_json_document_residual_is_pinned() {
     let conn = utc_connection();
@@ -2703,8 +2357,6 @@ fn current_non_text_json_document_residual_is_pinned() {
     assert_eq!(eval_value(&event, listed), EvalValue::Null);
 }
 
-/// `text` as a DSL string literal: `\` and `"` escaped, every other
-/// character as written.
 fn dsl_string(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
 }
@@ -2721,10 +2373,8 @@ type JsonPathCase = (
 );
 
 const JSON_PATH_CASES: &[JsonPathCase] = &[
-    // the root
     (r#"{"k":1}"#, "$", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
     (r#"{"k":1}"#, "", Some(r#"{"k":1}"#), Some(r#"{"k":1}"#)),
-    // members
     (r#"{"k":"v"}"#, "$.k", Some("v"), Some(r#""v""#)),
     (r#"{"a":{"b":2}}"#, "$.a.b", Some("2"), Some("2")),
     (
@@ -2735,7 +2385,6 @@ const JSON_PATH_CASES: &[JsonPathCase] = &[
     ),
     (r#"{"@t":"x"}"#, "$.@t", Some("x"), Some(r#""x""#)),
     (r#"{"é":1}"#, "$.é", Some("1"), Some("1")),
-    // quoted members
     (
         r#"{"a.b":1,"a":{"b":2}}"#,
         r#"$."a.b""#,
@@ -2749,34 +2398,27 @@ const JSON_PATH_CASES: &[JsonPathCase] = &[
         Some("true"),
         Some("true"),
     ),
-    // indexes
     ("[7,8]", "$[0]", Some("7"), Some("7")),
     ("[7,8]", "$[01]", Some("8"), Some("8")),
     ("[7,8,9]", "$[-1]", Some("9"), Some("9")),
     ("[7,8,9]", "$[#-2]", Some("8"), Some("8")),
     (r#"{"m":[[1,2]]}"#, "$.m[0][1]", Some("2"), Some("2")),
-    // the longest accepted spelling: 19 digits, value 1
     ("[7,8]", "$[0000000000000000001]", Some("8"), Some("8")),
     ("[7,8]", "$[-0000000000000000001]", Some("8"), Some("8")),
     ("[7,8]", "$[#-0000000000000000001]", Some("8"), Some("8")),
-    // an index misses on an object, and past the end
     (r#"{"0":1}"#, "$[0]", None, None),
     ("[7,8]", "$[2]", None, None),
     ("[7,8]", "$[-3]", None, None),
-    // pointers
     (r#"{"k":[1]}"#, "/k", Some("[1]"), Some("[1]")),
     (r#"{"m":[[1,2]]}"#, "/m/0/1", Some("2"), Some("2")),
     (r#"{"a/b":1}"#, "/a~1b", Some("1"), Some("1")),
     (r#"{"a~b":1}"#, "/a~0b", Some("1"), Some("1")),
-    // `/` reads the empty key, not the root
     (r#"{"":1}"#, "/", Some("1"), Some("1")),
     (r#"{"k":1}"#, "/", None, None),
     (r#"{"*":1}"#, "/*", Some("1"), Some("1")),
-    // `/0` reads a key on an object and an element on an array
     (r#"{"0":"o"}"#, "/0", Some("o"), Some(r#""o""#)),
     ("[5,6]", "/0", Some("5"), Some("5")),
     ("[5,6]", "/01", None, None),
-    // bare keys
     (
         r#"{"level":"info"}"#,
         "level",
@@ -2789,14 +2431,9 @@ const JSON_PATH_CASES: &[JsonPathCase] = &[
         Some("curl"),
         Some(r#""curl""#),
     ),
-    // a JSON null target
     (r#"{"k":null}"#, "$.k", None, Some("null")),
 ];
 
-/// Every path form the grammar accepts selects the same value in both
-/// lanes, and the value the table writes out (#457, ADR-0017's amendment
-/// of 2026-11-13). `agreed_value` fails on a batch error, so a path
-/// `DuckDB` refuses cannot pass as null here.
 #[test]
 fn every_accepted_json_path_selects_the_same_value_in_both_lanes() {
     let conn = utc_connection();

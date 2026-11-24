@@ -3,16 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! DSL parser for trawl's query language.
-//!
-//! Transforms a query string like `service=nginx _severity=error last=2h | stats count() by host`
-//! into a structured AST representation.
-//!
-//! The parser is built in layers:
-//! 1. **Primitives** — numbers, strings, identifiers, operators, durations
-//! 2. **Search tokens** — field filters, text search, time filters, quoted phrases
-//! 3. **Search stage** — whitespace-separated tokens (implicit AND)
-//! 4. **Expressions** — recursive expression parser with operator precedence
-//! 5. **Pipe stages** — stats, where, sort, limit, table
 
 pub(crate) mod comment;
 mod depth;
@@ -33,13 +23,11 @@ pub(crate) use depth::fixtures as depth_fixtures;
 use primitives::{ParserExtra, ParserInput};
 pub use primitives::{RegexCut, first_cut};
 
-/// An error produced by the parser, with source location and context.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ParseError {
     pub message: String,
     pub span: std::ops::Range<usize>,
     pub label: Option<String>,
-    /// Optional contextual suggestion (e.g. "did you mean 'stats'?").
     pub hint: Option<String>,
 }
 
@@ -60,94 +48,34 @@ impl std::fmt::Display for ParseError {
     }
 }
 
-/// Maximum query length in bytes. Prevents denial-of-service via pathological parser input.
-///
 /// `GET /api/v1/capabilities` advertises it as `max_query_bytes`.
 pub const MAX_QUERY_LEN: usize = 65_536;
 
 /// How many levels deep one expression, or a query's search, may be: the
 /// most levels on any path from its root down to a leaf, as `context.md`'s
-/// **Tree depth** counts them.
-///
-/// Each binary operator, `not`, minus sign, function call and `in` list
-/// adds a level, and so does each search `NOT` and each pair of search
-/// brackets. Fields, values, search words and filters, and time clauses
-/// add none, and neither do expression parentheses, the top-level `OR`
-/// between search filters, or an aggregation's call: each of its
-/// arguments is a root of its own. An `or` of 64 comparisons is 64 deep.
-///
-/// [`MAX_QUERY_LEN`] alone admits tens of thousands of levels, because
-/// the grammar folds a flat chain into a tree as deep as the chain is
-/// long, and most walks of a parsed query recurse once a level. 64 keeps
-/// each of them within a quarter of a 2 MiB worker stack in a debug build
-/// (ADR-0024's amendment of 2026-11-11). It is not the nesting bound
+/// **Tree depth** counts them (ADR-0024). It is not the nesting bound
 /// `expr::MAX_EXPR_DEPTH`, which counts only parentheses, call arguments
 /// and `in` lists while the grammar runs.
 pub const MAX_TREE_DEPTH: usize = 64;
 
 /// How many levels the search grammar may recurse through, as a count of
-/// the raw text, before the grammar reads the text at all. Past it, the
-/// query gets the search's [`MAX_TREE_DEPTH`] error and is never parsed.
-///
-/// The search grammar recurses once for each bracket and each `NOT`, and
-/// the tree depth check refuses a deep search only after the grammar has
-/// built it. A native build grows its stack while the grammar recurses,
-/// but wasm32 cannot: in the browser, a search about 1 500 brackets deep
-/// overflowed the tab's stack before the check ran. 512 is about a third
-/// of the depth the release build survived. The count may exceed a
-/// search's real depth, never fall short of it (`depth::prescan` says
-/// where), so text it admits recurses at most 512 levels.
+/// the raw text, before the grammar reads the text at all. The count may
+/// exceed a search's real depth, never fall short of it (`depth::prescan`
+/// says where).
 pub const MAX_SEARCH_PRESCAN: usize = 512;
 
-/// The most globs and regexes one query may hold, summed over every filter
-/// and list element and every `matches`, `like` and `ilike` pattern. Exact
-/// values do not count. An `extract` charges one for each named group it
-/// binds, and at least one (ADR-0063). The batch lane binds an extract's
-/// body once whatever its group count, so this charge counts the groups,
-/// not the regexes `DuckDB` compiles.
-///
-/// `MAX_QUERY_LEN` does not bound this: `f=/a/,/b/,…` spends four bytes a
-/// regex, so 64 KiB of list compiles thousands of patterns in each lane.
-/// The parser builds a query's patterns only once the query is under it.
 pub const MAX_QUERY_PATTERNS: usize = 256;
 
-/// The most diagnostics one parse reports, however many the grammar
-/// emitted.
-///
-/// A single query can carry unboundedly many independent violations
-/// (`f=#a,#b,#c,…` emits one per element) and every one of them renders a
-/// hint quoting text from the input, so the reported bytes grow as the
-/// product of the two. The cap is applied before rendering, so the
-/// quadratic work is never done rather than merely never returned; the
-/// server serializes every detail it is handed, so this is the bound the
-/// wire sees too.
-///
-/// Eight, not one: a parse error list is a work list, and chumsky orders
-/// it by position, so the first few are the ones a user reads.
-///
-/// The cap is not a plain truncation, because the list is not purely
-/// positional: the emitted diagnostics come first, and the failure that
-/// ended the parse is appended last. Plain truncation drops that one, and
-/// it is the error the query cannot succeed without fixing (an
-/// eight-element `f=#a,…` list would hide `unknown command 'bogus'`). So
-/// the report is the first `MAX_REPORTED_ERRORS - 1` plus that final one,
-/// whose message is annotated with how many were left out
-/// ([`omitted_suffix`]).
+/// The most diagnostics one parse reports. The cap is not a plain
+/// truncation: the failure that ended the parse is appended last, and the
+/// report is the first `MAX_REPORTED_ERRORS - 1` plus that final one.
 const MAX_REPORTED_ERRORS: usize = 8;
 
-/// How the annotation on the last reported error reads, so the count the
-/// cap swallowed is never silent. `{n}` diagnostics between the reported
-/// prefix and the terminal error were not rendered.
 fn omitted_suffix(n: usize) -> String {
     let plural = if n == 1 { "error" } else { "errors" };
     format!(" ({n} earlier {plural} omitted)")
 }
 
-/// Parse a trawl DSL query string into a structured AST.
-///
-/// # Errors
-///
-/// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
     parse_cancellable(input, &Stop::never())
         .unwrap_or_else(|Cancelled| unreachable!("a stop nobody can request never cancels"))
@@ -159,32 +87,14 @@ pub fn parse(input: &str) -> Result<Query, Vec<ParseError>> {
 /// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`], or a regex body's
 /// batch-engine view past [`crate::pattern::MAX_BATCH_COMPILED_BYTES`]:
 /// only a build measures either.
-///
-/// For a caller that reads what a query means and runs nothing, so has no
-/// use for a built pattern: the formatter's check that its text reads back
-/// as the query, and hints for a query that is not run.
-///
-/// # Errors
-///
-/// Returns a list of parse errors if the input is not valid trawl DSL.
 pub fn parse_unbuilt(input: &str) -> Result<Query, Vec<ParseError>> {
     parse_unbuilt_cancellable(input, &Stop::never())
         .unwrap_or_else(|Cancelled| unreachable!("a stop nobody can request never cancels"))
 }
 
-/// [`parse`], reading `stop` between its steps (ADR-0063): before the
-/// grammar and after it, after the pattern cap, after the translation
-/// budget, before each pattern it builds and once the last build is done.
-/// A build reads it too, between translation and compiles
-/// ([`Preparer::with_stop`]).
-///
-/// A parse whose stop is requested ends with [`Cancelled`] at its next
-/// check, never with `Ok` and never with a diagnostic: the work that
-/// asked for it has ended, and the query was not judged.
-///
-/// # Errors
-///
-/// [`Cancelled`] once `stop` is requested. Inside, as [`parse`].
+/// [`parse`], reading `stop` between its steps (ADR-0063). A parse whose
+/// stop is requested ends with [`Cancelled`] at its next check, never with
+/// `Ok` and never with a diagnostic.
 pub fn parse_cancellable(
     input: &str,
     stop: &Stop,
@@ -207,13 +117,6 @@ pub fn parse_cancellable(
     Ok(parsed)
 }
 
-/// [`parse_unbuilt`], reading `stop` as [`parse_cancellable`] does before
-/// it builds. It builds nothing, so its last check follows the
-/// translation budget.
-///
-/// # Errors
-///
-/// [`Cancelled`] once `stop` is requested. Inside, as [`parse_unbuilt`].
 pub fn parse_unbuilt_cancellable(
     input: &str,
     stop: &Stop,
@@ -223,7 +126,6 @@ pub fn parse_unbuilt_cancellable(
     Ok(admit(input, stop)?.map(|(query, _)| query))
 }
 
-/// One cancellation point of a parse.
 fn checkpoint(stop: &Stop) -> Result<(), Cancelled> {
     #[cfg(test)]
     tests::pass_point(stop);
@@ -232,23 +134,18 @@ fn checkpoint(stop: &Stop) -> Result<(), Cancelled> {
 
 #[cfg(any(test, feature = "test-support"))]
 thread_local! {
-    /// How many queries [`parse`] and [`parse_unbuilt`], or their
-    /// cancellable doors, have read on this thread.
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
-/// Count a parse that begins reading `input` through `kind`'s door, on
-/// this thread and in every [`ParseLog`] watching it.
 #[cfg(any(test, feature = "test-support"))]
 fn count_read(input: &str, kind: ParseKind) {
     PARSES.with(|n| n.set(n.get() + 1));
     watch::record(input, kind);
 }
 
-/// How many queries [`parse`] and [`parse_unbuilt`], or their cancellable
-/// doors, have read on this thread, so a test can show that some work
-/// parsed a query once. Take the difference across the work: other work
-/// on the same thread counts too.
+/// How many queries [`parse`] and [`parse_unbuilt`] have read on this
+/// thread. Take the difference across the work: other work on the same
+/// thread counts too.
 #[cfg(any(test, feature = "test-support"))]
 #[must_use]
 pub fn thread_parses() -> usize {
@@ -258,24 +155,17 @@ pub fn thread_parses() -> usize {
 #[cfg(any(test, feature = "test-support"))]
 pub use watch::{ParseKind, ParseLog};
 
-/// Which parses read a test's query, and on which threads.
 #[cfg(any(test, feature = "test-support"))]
 mod watch {
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::ThreadId;
 
-    /// Which door read a query.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum ParseKind {
-        /// [`super::parse`] or [`super::parse_cancellable`], which build
-        /// the query's patterns.
         Built,
-        /// [`super::parse_unbuilt`] or
-        /// [`super::parse_unbuilt_cancellable`], which build none.
         Unbuilt,
     }
 
-    /// Every live log, the ones a parse records into.
     static LOGS: Mutex<Vec<Arc<Watched>>> = Mutex::new(Vec::new());
 
     #[derive(Debug)]
@@ -284,21 +174,12 @@ mod watch {
         parses: Mutex<Vec<(ThreadId, ParseKind)>>,
     }
 
-    /// A test's record of the parses whose input holds its marker: for
-    /// each, the thread that ran it and the door that read it, so a test
-    /// can show where some work parsed its query. Each test watches a
-    /// marker of its own, so tests that run in parallel never see each
-    /// other's parses. It records until it drops.
+    /// Each test watches a marker of its own, so tests that run in parallel
+    /// never see each other's parses. It records until it drops.
     #[derive(Debug)]
     pub struct ParseLog(Arc<Watched>);
 
     impl ParseLog {
-        /// Record every parse, from now until the log drops, whose input
-        /// holds `marker`.
-        ///
-        /// # Panics
-        ///
-        /// When `marker` is empty, because every input holds it.
         #[must_use]
         pub fn watch(marker: &str) -> Self {
             assert!(!marker.is_empty(), "a parse log watches a marker");
@@ -310,7 +191,6 @@ mod watch {
             Self(watched)
         }
 
-        /// The parses recorded so far, in the order they began.
         #[must_use]
         pub fn parses(&self) -> Vec<(ThreadId, ParseKind)> {
             self.0
@@ -331,8 +211,6 @@ mod watch {
         LOGS.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Record a parse that begins reading `input` through `kind`'s door in
-    /// every log whose marker `input` holds.
     pub(super) fn record(input: &str, kind: ParseKind) {
         let thread = std::thread::current().id();
         for log in logs().iter().filter(|log| input.contains(&log.marker)) {
@@ -344,15 +222,8 @@ mod watch {
     }
 }
 
-/// What [`admit`] answers: the query and its pattern sites, or why the
-/// query was refused, unless the parse was cancelled first.
 type Admitted = Result<Result<(Query, Vec<primitives::RegexSite>), Vec<ParseError>>, Cancelled>;
 
-/// The steps [`parse`] and [`parse_unbuilt`] share: the length cap, the
-/// search pre-scan, the grammar, the tree depth limit, the pattern cap
-/// and the translation budget, with a cancellation point before the
-/// grammar, after it and after each of the last two steps. It returns the
-/// query and the patterns the grammar recorded, built by no one yet.
 fn admit(input: &str, stop: &Stop) -> Admitted {
     checkpoint(stop)?;
     if input.len() > MAX_QUERY_LEN {
@@ -371,17 +242,11 @@ fn admit(input: &str, stop: &Stop) -> Admitted {
         return Ok(Err(vec![error]));
     }
 
-    // Comments are a grammar production (ADR-0014), so the raw input goes
-    // straight to the parser and error spans index the real text.
     let parser = query_parser();
     let mut regexes = primitives::RegexSites::default();
     let result = parser.parse_with_state(input, &mut regexes);
     checkpoint(stop)?;
 
-    // The grammar checks each pattern and builds nothing. Building waits
-    // for a clean parse under the pattern cap and the translation budget,
-    // so neither a long list nor a parse that already failed spends any
-    // build work.
     let query = match result.into_result() {
         Ok(query) => query,
         Err(errors) => {
@@ -407,16 +272,9 @@ fn admit(input: &str, stop: &Stop) -> Admitted {
 }
 
 /// Name each `/…/` run a pipe stage cut out of a search value, beside the
-/// first reported error that falls inside it (ADR-0061 ruling 1).
-///
-/// The run was a regex under the earlier rule, so `msg=/err | warn/`
-/// fails as an unknown command `warn` whose real cause is the `|` the
-/// author meant as alternation. The diagnostic goes beside that error,
-/// never in place of it: an unrelated mistake can sit inside the run too
-/// (`path=/tmp* | wher x / 2`), and its own error is the one to fix. A run
-/// no error falls inside belongs to a query that failed for some other
-/// reason, so it adds nothing. A name never pushes the report past
-/// [`MAX_REPORTED_ERRORS`]: a report already at the cap stays as it is.
+/// first reported error that falls inside it (ADR-0061 ruling 1), never in
+/// place of it: an unrelated mistake can sit inside the run too
+/// (`path=/tmp* | wher x / 2`), and its own error is the one to fix.
 fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usize>]) {
     let mut named: Vec<&std::ops::Range<usize>> = Vec::new();
     for run in runs {
@@ -443,15 +301,6 @@ fn name_pipe_cut_runs(errors: &mut Vec<ParseError>, runs: &[std::ops::Range<usiz
     }
 }
 
-/// The translation budget (ADR-0063): what translating the query's
-/// patterns costs, summed over every site in text order, may not pass
-/// [`price::MAX_TRANSLATION_UNITS`]. A pattern written twice is charged
-/// twice. The error covers the first site that takes the sum past the
-/// budget and states the whole query's cost.
-///
-/// It reads the charges the grammar recorded, so finding it translates
-/// and builds nothing, and it runs before [`regex_compile_errors`] builds
-/// anything.
 fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseError> {
     let limit = price::MAX_TRANSLATION_UNITS;
     let mut units: u64 = 0;
@@ -471,24 +320,11 @@ fn translation_budget_error(sites: &[primitives::RegexSite]) -> Option<ParseErro
     })
 }
 
-/// Build the patterns a clean parse recognised, in text order, and report
-/// those that do not build, capped as [`report_errors`] caps a parse's
-/// list. It runs after [`pattern_cap_error`], so it builds at most
-/// [`MAX_QUERY_PATTERNS`] patterns, each bounded by
-/// [`crate::pattern::MAX_REGEX_COMPILED_BYTES`] and, for a regex body, its
-/// view by [`crate::pattern::MAX_BATCH_COMPILED_BYTES`].
-///
 /// One ledger serves every site, so a pattern written twice builds once
 /// and both sites report its error. After the first pattern that compiles
 /// too large the ledger builds nothing new, and a site it did not build
 /// reports nothing: the query is refused either way, and the work stays
 /// one failed build.
-///
-/// The ledger checks ([`Preparer::check`]): it keeps no program and
-/// meters no regex budget. A query is charged where it is prepared to
-/// match.
-///
-/// It reads `stop` before each build, and the ledger reads it inside one.
 fn regex_compile_errors(
     sites: &[primitives::RegexSite],
     stop: &Stop,
@@ -520,12 +356,6 @@ fn regex_compile_errors(
     Ok(errors)
 }
 
-/// The [`MAX_QUERY_PATTERNS`] check, over a query that already parsed.
-///
-/// It reads the AST, so no grammar alternative can fail and fall through
-/// to another reading. The span is the token, pattern operand or
-/// `extract` stage that holds the first charge past the cap, walked in
-/// text order.
 fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     use crate::ast::{ExtractMode, PipeStage};
 
@@ -568,28 +398,18 @@ fn pattern_cap_error(query: &Query) -> Option<ParseError> {
     })
 }
 
-/// What an `extract` body charges toward [`MAX_QUERY_PATTERNS`]: one for
-/// each named group, and one for a body that names none (ADR-0063).
-/// Unnamed groups bind nothing.
 fn extract_charge(body: &str) -> usize {
     // The grammar refused a body that is not regex syntax, so this one
     // parses; reading its groups builds nothing.
     crate::pattern::price::captures(body).map_or(1, |groups| groups.len().max(1))
 }
 
-/// One node the [`PatternTally`] has still to visit.
 enum Visit<'q> {
     Token(&'q crate::ast::Spanned<crate::ast::SearchToken>),
     Expr(&'q crate::ast::Spanned<crate::ast::Expr>),
-    /// A `matches`, `like` or `ilike` pattern, counted when the walk
-    /// reaches it.
     Pattern(&'q std::ops::Range<usize>),
 }
 
-/// The pattern count, walked with an explicit stack rather than by
-/// recursion. `MAX_EXPR_DEPTH` bounds nesting, not tree depth: `1+1+…`
-/// folds to a left-leaning tree as deep as the chain is long, and a
-/// recursive walk of a 64 KiB chain overflows a tokio worker's stack.
 #[derive(Default)]
 struct PatternTally<'q> {
     count: usize,
@@ -607,7 +427,6 @@ impl<'q> PatternTally<'q> {
         }
     }
 
-    /// Count `root` and everything under it, in text order.
     fn walk(&mut self, root: Visit<'q>) {
         self.pending.push(root);
         while let Some(visit) = self.pending.pop() {
@@ -675,10 +494,6 @@ impl<'q> PatternTally<'q> {
     }
 }
 
-/// Render at most [`MAX_REPORTED_ERRORS`] diagnostics from one parse,
-/// keeping the terminal failure whatever the emitted list does to the
-/// budget. Rendering is done only for the errors reported, so a
-/// pathological query costs a constant amount of work, not a product.
 fn report_errors(errors: &[Rich<'_, char>], input: &str) -> Vec<ParseError> {
     if errors.len() <= MAX_REPORTED_ERRORS {
         return errors
@@ -702,18 +517,13 @@ fn report_errors(errors: &[Rich<'_, char>], input: &str) -> Vec<ParseError> {
     reported
 }
 
-/// Convert a chumsky `Rich` error into our `ParseError` with a human-friendly message.
 fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     use chumsky::error::RichReason;
 
     let span = e.span();
     let label = e.contexts().next().map(|(l, _)| l.to_string());
 
-    // custom errors (e.g. overflow, invalid regex) carry their own message
     if let RichReason::Custom(raw) = e.reason() {
-        // A comment diagnostic carries the exact token its production
-        // held, past the message it renders (`comment::payload`); every
-        // other custom error is its message and nothing else.
         let (msg, exact) = comment::split_payload(raw);
         return ParseError {
             message: comment::message_for(msg, exact),
@@ -770,23 +580,15 @@ fn rich_to_parse_error(e: &Rich<'_, char>, input: &str) -> ParseError {
     }
 }
 
-/// Find the pipe-command word around the error offset, if the error is in
-/// a position that looks like a pipe stage command (i.e. the word follows a `|`).
-///
-/// Returns `Some(word)` if the word is not a known pipe stage (i.e. it's a typo),
-/// or `None` if the error isn't in a pipe-command position or the word is valid.
 fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
-    // Guard against byte offsets that land inside a multi-byte character.
     if !input.is_char_boundary(offset) {
         return None;
     }
 
-    // Find the start of the word containing `offset` by scanning backward.
     let before = &input[..offset];
     let word_start = before
         .rfind(|c: char| !c.is_alphanumeric() && c != '_')
         .map_or(0, |pos| {
-            // Advance past the matched character (which may be multi-byte).
             let c = input[pos..].chars().next().unwrap_or(' ');
             pos + c.len_utf8()
         });
@@ -812,16 +614,10 @@ fn find_pipe_command_word(input: &str, offset: usize) -> Option<String> {
     Some(candidate)
 }
 
-/// Whether `offset` sits at the start of the input or directly after an
-/// ASCII whitespace character — the two positions the grammar admits a
-/// comment at, asked of the one predicate that owns the question
-/// ([`comment::opens_comment_after`], which [`comment::ws`] and
-/// [`scan`] also go through).
 fn preceded_by_whitespace(input: &str, offset: usize) -> bool {
     comment::opens_comment_after(input[..offset].chars().next_back())
 }
 
-/// A comment diagnostic, with the span of the byte the user must change.
 struct CommentDiagnostic {
     message: String,
     hint: Option<String>,
@@ -841,18 +637,12 @@ impl CommentDiagnostic {
     }
 }
 
-/// The generic net for a comment opener the grammar could not admit, at
-/// every position the two validators (the bare value and the search-stage
-/// bare word) do not cover — a stage name, an expression, a sort key. It
-/// exists so a `#` never surfaces as "found '#', expected …".
 fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
     if offset >= input.len() {
         return None;
     }
     let rest = &input[offset..];
 
-    // A `#` right where the parser died, and not at a boundary the
-    // grammar would have admitted a comment at (ADR-0014 ruling 2).
     if rest.starts_with(comment::OPENER) && !preceded_by_whitespace(input, offset) {
         return Some(CommentDiagnostic::new(
             comment::MSG_OPENER_IN_TOKEN,
@@ -861,10 +651,6 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
         ));
     }
 
-    // …and the same net for `//`, which is not a comment opener, at the
-    // one place it could have been one: a token boundary (ADR-0014
-    // ruling 3). The span covers both slashes, since underlining one of
-    // the two points at nothing the user can act on.
     if comment::starts_with_slashes(rest) && preceded_by_whitespace(input, offset) {
         return Some(CommentDiagnostic::new(
             comment::MSG_SLASHES_NOT_A_COMMENT,
@@ -885,7 +671,6 @@ fn comment_diagnostic(input: &str, offset: usize) -> Option<CommentDiagnostic> {
     ))
 }
 
-/// Produce an enriched (message, hint) pair based on error context.
 fn enrich_error(
     input: &str,
     offset: usize,
@@ -937,7 +722,6 @@ fn enrich_error(
     (message, None)
 }
 
-/// Build the top-level query parser: search stage, then pipeline, then EOF.
 fn query_parser<'src>() -> impl Parser<'src, ParserInput<'src>, Query, ParserExtra<'src>> {
     comment::leading_ws()
         .ignore_then(search::search_stage())
@@ -952,8 +736,6 @@ fn query_parser<'src>() -> impl Parser<'src, ParserInput<'src>, Query, ParserExt
 mod tests {
     use super::*;
 
-    /// Naming pipe-cut runs never pushes a report past the cap: a full
-    /// report keeps its errors as they are, and a short one gains the name.
     #[test]
     fn pipe_cut_names_stay_within_the_error_cap() {
         let error = |at: usize| ParseError {
@@ -992,7 +774,6 @@ mod tests {
     #[test]
     fn test_multi_token_search() {
         let query = parse("service=nginx _severity=error last=2h").unwrap();
-        // Time filter hoisted, 2 tokens remain in group.
         assert_eq!(query.search.groups[0].len(), 2);
         assert!(query.search.time_filter.is_some());
     }
@@ -1025,7 +806,6 @@ mod tests {
     #[test]
     fn test_search_with_stats() {
         let query = parse("service=nginx last=1h | stats count() by host").unwrap();
-        // Time filter hoisted, 1 token remains in group.
         assert_eq!(query.search.groups[0].len(), 1);
         assert!(query.search.time_filter.is_some());
         assert_eq!(query.pipeline.len(), 1);
@@ -1072,7 +852,6 @@ mod tests {
         let query =
             parse("status>=400 last=24h | stats count() by host, uri | sort -count | limit 20")
                 .unwrap();
-        // Time filter hoisted, 1 token remains in group.
         assert_eq!(query.search.groups[0].len(), 1);
         assert!(query.search.time_filter.is_some());
         assert_eq!(query.pipeline.len(), 3);
@@ -1093,8 +872,6 @@ mod tests {
         assert!(query.search.groups.is_empty());
         assert_eq!(query.pipeline.len(), 0);
     }
-
-    // --- error case tests ---
 
     #[test]
     fn test_error_invalid_pipe_stage() {
@@ -1134,7 +911,6 @@ mod tests {
 
     #[test]
     fn test_error_integer_overflow_no_panic() {
-        // overflowing integers must produce a parse error, not a panic
         let result = parse("x | where count > 99999999999999999999999");
         assert!(result.is_err());
     }
@@ -1167,12 +943,9 @@ mod tests {
         let result = parse("| badstage");
         let errors = result.unwrap_err();
         let msg = errors[0].to_string();
-        // should contain span info and the error description
         assert!(msg.contains('['));
         assert!(msg.contains(']'));
     }
-
-    // --- enriched error message tests ---
 
     #[test]
     fn test_error_unknown_command_with_suggestion() {
@@ -1257,18 +1030,12 @@ mod tests {
         assert_eq!(errors[0].hint.as_deref(), Some("did you mean 'where'?"));
     }
 
-    // --- comment tests ---
-
     #[test]
     fn test_hash_comment_at_start_of_input() {
         let query = parse("# this is a comment\nservice=nginx").unwrap();
         assert_eq!(query.search.groups[0].len(), 1);
     }
 
-    /// `//` is not a comment opener (ADR-0014 ruling 3), and the refusal
-    /// is loud at the one place it could have been one: a bare term at a
-    /// token boundary. Silently reading it as two AND-ed text terms would
-    /// narrow the match set to nothing.
     #[test]
     fn test_double_slash_is_no_longer_a_comment() {
         let errors = parse("service=nginx // filter by service\n| stats count()").unwrap_err();
@@ -1289,8 +1056,6 @@ mod tests {
         );
     }
 
-    /// A `//` in a value is ordinary data and needs no quoting, the
-    /// everyday half of ADR-0014 ruling 3.
     #[test]
     fn test_double_slash_in_a_value_is_data() {
         for (dsl, field, value) in [
@@ -1310,7 +1075,6 @@ mod tests {
                 "{dsl}"
             );
         }
-        // …and a sibling filter on the same line survives.
         let query = parse("referrer=https://a.b/c status=200").expect("both filters");
         assert_eq!(query.search.groups[0].len(), 2);
     }
@@ -1359,7 +1123,6 @@ mod tests {
 
     #[test]
     fn test_comment_error_spans_match_original() {
-        // error should point to the original input position
         let result = parse("# comment\n| badstage");
         assert!(result.is_err());
         let errors = result.unwrap_err();
@@ -1370,11 +1133,6 @@ mod tests {
         );
     }
 
-    // ── backtick escape (ADR-0013 ruling 7) ─────────────────────────────
-
-    /// A backticked name is a quoted context, so a `#` or `//` inside it
-    /// is part of the name: the comment production is unreachable from
-    /// inside [`primitives::quoted_name`].
     #[test]
     fn backticked_names_carry_comment_openers_verbatim() {
         for (dsl, want) in [("| table `a#b`", "a#b"), ("| table `a//b`", "a//b")] {
@@ -1391,13 +1149,11 @@ mod tests {
             }
             other => panic!("expected Table, got {other:?}"),
         }
-        // …and the name reaches the AST intact.
         let query = parse("| table `a#b`").expect("parses");
         match &query.pipeline[0].node {
             PipeStage::Table(t) => assert_eq!(t.fields, vec!["a#b".to_string()]),
             other => panic!("expected Table, got {other:?}"),
         }
-        // A comment after a closed backtick is still a comment.
         let query = parse("`a b`=x # trailing").expect("parses");
         assert_eq!(query.search.groups[0].len(), 1);
         match &query.search.groups[0][0].node {
@@ -1406,11 +1162,6 @@ mod tests {
         }
     }
 
-    /// A stray backtick inside a regex literal must not protect a later
-    /// comment: the comment's own words would parse as extra AND-ed
-    /// text-search terms and silently narrow the match set. A regex body
-    /// is a production, not a scanner state, so a partner backtick later
-    /// on cannot open a pseudo-name across the comment either.
     #[test]
     fn stray_backtick_does_not_shield_later_comments() {
         let query = parse("message=/back`tick/ # comment").expect("parses");
@@ -1426,15 +1177,9 @@ mod tests {
             "{input:?}: only the two filters, never the comment's words"
         );
 
-        // The glob shape reaches the same invariant from the other side:
-        // a bare value cannot absorb a tick, so the query is a loud parse
-        // error rather than a comment quietly read as part of a value.
         assert!(parse("cmd=*`* # secret note\n`req id`=1").is_err());
     }
 
-    /// No unquoted position absorbs a backtick (ADR-0013 ruling 7), so a
-    /// value that runs into one is a loud parse error rather than a
-    /// quietly different query.
     #[test]
     fn a_value_never_absorbs_a_backtick_shielded_comment() {
         for dsl in [
@@ -1451,8 +1196,6 @@ mod tests {
             assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
         }
 
-        // A value that genuinely contains a tick is double-quoted, and the
-        // comment beside it is still a comment.
         let query = parse(r#"host="a+`b" # outside"#).expect("the quoted form parses");
         assert_eq!(query.search.groups[0].len(), 1);
         assert_eq!(
@@ -1465,14 +1208,8 @@ mod tests {
         );
     }
 
-    /// A backticked name is a field reference in every field position,
-    /// including directly after an operator — a descending sort key or
-    /// arithmetic. It carries comment openers verbatim, because a quoted
-    /// name has no whitespace-skip site inside it for the comment
-    /// production to reach.
     #[test]
     fn a_backtick_after_an_operator_opens_a_name() {
-        // the descending sort key, precisely: the name arrives whole
         for (dsl, want) in [
             ("* | sort -`a#b`", "a#b"),
             ("* | sort -`http://x`", "http://x"),
@@ -1487,7 +1224,6 @@ mod tests {
             }
         }
 
-        // …and every other operator an expression can put in front of one
         for dsl in [
             "* | let x = 1+`a#b`",
             "* | let x = 2*`http://x`",
@@ -1499,8 +1235,6 @@ mod tests {
             assert!(parse(dsl).is_ok(), "{dsl} must parse");
         }
 
-        // …and a tick inside a regex is ordinary body content, with the
-        // trailing comment still a comment.
         let query = parse("host=/a+b`c/ # | bad_stage").expect("the comment is a comment");
         assert_eq!(
             query.pipeline.len(),
@@ -1510,23 +1244,17 @@ mod tests {
         assert_eq!(query.search.groups[0].len(), 1);
     }
 
-    /// A negated quoted name has no production in the search grammar, so
-    /// it is a loud parse error. Reading it as text would search for the
-    /// literal ticks (matching nothing), and dropping the `-` to a term of
-    /// its own would silently discard the negation.
     #[test]
     fn a_negated_backtick_is_a_parse_error() {
         for dsl in ["-`http-status`=500", "-`a b`", "error -`x", "-`"] {
             assert!(parse(dsl).is_err(), "{dsl} must be a loud parse error");
         }
-        // `NOT` is the spelling that negates a field filter, and it works.
         let query = parse("NOT `http-status`=500").expect("NOT negates a quoted name");
         assert_eq!(query.search.groups[0].len(), 1);
         assert!(matches!(
             &query.search.groups[0][0].node,
             SearchToken::Not(_)
         ));
-        // An ordinary negated term is untouched.
         let query = parse("-debug").expect("parses");
         assert_eq!(
             query.search.groups[0][0].node,
@@ -1537,9 +1265,6 @@ mod tests {
         );
     }
 
-    /// An adversarial backtick run stays cheap: no pass over the text
-    /// re-scans to end of input from a backtick byte, so these shapes
-    /// terminate with an answer instead of going quadratic.
     #[test]
     fn a_backtick_run_parses_without_blowing_up() {
         let n = 65_536;
@@ -1552,26 +1277,12 @@ mod tests {
         }
     }
 
-    /// The pathological corpus parses inside a 2 MiB stack, the size of a
-    /// tokio worker thread, which is where trawld runs the parser.
-    ///
     /// `cargo test`'s own threads get 8 MiB by default, so a suite that
     /// merely calls `parse` would keep passing while the server
-    /// overflowed. A frame is not cheap either: every padding site is a
-    /// project-owned combinator ([`comment::Spaced::spaced`]), which
-    /// deepens the parser's nested type and with it the per-frame stack
-    /// cost. So the corpus runs in a thread sized like the one that
+    /// overflowed. So the corpus runs in a thread sized like the one that
     /// matters, and the test asserts it finishes rather than dies.
-    ///
-    /// Nesting is in the corpus at both sides of the grammar's depth
-    /// bound: the deepest expression the DSL accepts must fit this stack
-    /// (that is the bound's whole claim), and one far past it must reach
-    /// a parse error rather than a recursion. What a level costs varies
-    /// by orders of magnitude between builds, so it is the bound rather
-    /// than any measurement that makes the claim true everywhere.
     #[test]
     fn the_pathological_corpus_parses_within_a_tokio_workers_stack() {
-        /// A tokio worker thread's default stack.
         const TOKIO_WORKER_STACK: usize = 2 * 1024 * 1024;
 
         let deepest_legal = crate::parser::expr::MAX_EXPR_DEPTH;
@@ -1611,15 +1322,6 @@ mod tests {
             .expect("the parser must not overflow a 2 MiB stack");
     }
 
-    /// Expression nesting is bounded by the grammar, and the refusal is
-    /// a parse error that names the bound — never a truncated query and
-    /// never a stack overflow: the depth of a `where` clause is
-    /// client-chosen, and `MAX_QUERY_LEN` alone lets `a(a(a(…` spell
-    /// twenty thousand levels inside 64 KiB.
-    ///
-    /// All three recursion sites are covered — parentheses, a function
-    /// call's arguments, an `in (…)` list — because each is one descent
-    /// through the whole precedence chain.
     #[test]
     fn expression_nesting_past_the_bound_is_a_loud_parse_error() {
         let n = crate::parser::expr::MAX_EXPR_DEPTH;
@@ -1661,11 +1363,6 @@ mod tests {
         }
     }
 
-    /// A backtracked nesting level is given back: the depth counter is
-    /// restored however chumsky leaves the level, so a query that tries
-    /// (and abandons) many nested alternatives still parses its own
-    /// legal nesting afterwards. A leak here would refuse valid queries
-    /// only after a long enough prefix — the worst kind of bug to find.
     #[test]
     fn abandoned_nesting_does_not_spend_the_depth_budget() {
         let n = crate::parser::expr::MAX_EXPR_DEPTH;
@@ -1702,7 +1399,6 @@ mod tests {
         );
     }
 
-    /// What the grammar builds from `dsl`, before any check after it.
     fn grammar_tree(dsl: &str) -> Query {
         let mut regexes = primitives::RegexSites::default();
         query_parser()
@@ -1711,9 +1407,6 @@ mod tests {
             .unwrap_or_else(|errors| panic!("{dsl:.80}: the grammar refused it: {errors:?}"))
     }
 
-    /// The deepest root in `query`, counted as `context.md`'s **Tree
-    /// depth** counts, by plain recursion: a second count beside the
-    /// parser's, for trees shallow enough to recurse over.
     fn true_depth(query: &Query) -> usize {
         use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
 
@@ -1773,7 +1466,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// The two refusals, word for word as #447 states them.
     fn depth_refusal(kind: depth_fixtures::Kind) -> (&'static str, &'static str) {
         match kind {
             depth_fixtures::Kind::Search => (
@@ -1787,10 +1479,6 @@ mod tests {
         }
     }
 
-    /// Every shape #447 names parses at [`MAX_TREE_DEPTH`] and is refused
-    /// one level deeper with exactly one error: the sentence, the hint and
-    /// the span of the deep root. Each fixture's depth is counted, so a
-    /// shape that is not as deep as its name says fails here.
     #[test]
     fn tree_depth_limit_admits_64_and_refuses_65() {
         assert_eq!(MAX_TREE_DEPTH, 64);
@@ -1825,12 +1513,6 @@ mod tests {
         }
     }
 
-    /// `parse`, `parse_unbuilt` and both cancellable doors refuse a deep
-    /// search and a deep expression with the same one error. The check
-    /// runs after the grammar's checkpoint, adds none of its own, and
-    /// comes before the pattern cap and the translation budget; a grammar
-    /// error wins over it. Of two deep roots, the first in the text is
-    /// the one refused, and the search comes before every stage.
     #[test]
     fn every_parse_door_enforces_tree_depth() {
         use depth_fixtures::{Kind, chain, comparisons};
@@ -1879,10 +1561,6 @@ mod tests {
         assert_eq!(&two[error.span], chain(66));
     }
 
-    /// Depth counts levels, not width or text: a 5 000-element `in` list
-    /// and a call with 5 000 arguments parse, and brackets, `not` and
-    /// `NOT` inside quoted values, backticked names, comments and regex
-    /// bodies add no level.
     #[test]
     fn tree_depth_is_not_width_or_text() {
         let over = MAX_TREE_DEPTH + 1;
@@ -1921,10 +1599,6 @@ mod tests {
         }
     }
 
-    /// A parse cancelled at the checkpoint after its grammar ends with
-    /// `Cancelled`, and drops the deep tree the grammar built on a tokio
-    /// worker's 2 MiB stack: a search as deep as the pre-scan lets the
-    /// grammar read, and an expression as deep as `MAX_QUERY_LEN` spells.
     /// The count of cancellation points is thread-local, so the doors are
     /// tripped on the small thread itself.
     #[test]
@@ -1963,21 +1637,12 @@ mod tests {
             .expect("a cancelled parse must drop its tree on a 2 MiB stack");
     }
 
-    /// The search pre-scan's count of `text`, with no bound to pass.
     fn prescan_count(text: &str) -> usize {
         depth::prescan(text, usize::MAX).expect("no bound to pass")
     }
 
-    /// A search whose raw nesting is [`MAX_SEARCH_PRESCAN`] reaches the
-    /// grammar, which builds it and refuses it for its tree depth. One
-    /// level more is refused before the grammar runs, with the same
-    /// sentence and hint, over the one bracket or `NOT` that passed the
-    /// bound. That holds for a bracket nest, a `NOT` run and alternating
-    /// `NOT (`. A parse the pre-scan refuses passes no cancellation point
-    /// after the start, as one over the length cap does.
     #[test]
     fn the_search_prescan_admits_512_and_refuses_513() {
-        /// A search `n` levels deep.
         type Nest = fn(usize) -> String;
 
         assert_eq!(MAX_SEARCH_PRESCAN, 512);
@@ -2035,9 +1700,6 @@ mod tests {
         }
     }
 
-    /// A search the pre-scan refuses never reaches the grammar, however
-    /// long: 30 000 brackets pass the same cancellation points as a query
-    /// over the length cap, none after the start, so no tree is built.
     #[test]
     fn a_search_the_prescan_refuses_builds_no_tree() {
         let deep = format!("{}a=1{}", "(".repeat(30_000), ")".repeat(30_000));
@@ -2054,13 +1716,6 @@ mod tests {
         }
     }
 
-    /// The pre-scan never counts fewer levels than the search nests. A
-    /// `)` in a quoted value, in a value after a stray quote, in a
-    /// backticked name, a regex body or a comment ends no level the
-    /// grammar opened, and a comment between a `NOT` and its bracket
-    /// keeps the `NOT` open, even when the comment holds a whole group.
-    /// Each unit nests one or two levels; a text of
-    /// more units than the bound is refused before the grammar runs.
     #[test]
     fn the_prescan_counts_at_least_what_the_search_nests() {
         let units = [
@@ -2092,8 +1747,6 @@ mod tests {
         }
     }
 
-    /// How the pre-scan counts, rule by rule: what ends a level, and what
-    /// it counts that the search does not nest.
     #[test]
     fn the_prescan_counts_by_its_rules() {
         for (text, count) in [
@@ -2137,8 +1790,6 @@ mod tests {
         }
     }
 
-    /// `n` patterns spread over separate filters, list elements, globs and
-    /// regexes, so every way of writing one counts toward the same total.
     fn mixed_patterns(n: usize) -> String {
         let mut tokens = Vec::new();
         let mut left = n;
@@ -2168,12 +1819,6 @@ mod tests {
         tokens.join(" ")
     }
 
-    /// The pattern count walks a query in a 2 MiB stack, the size of the
-    /// tokio worker that parses it, however deep its tree. The parser now
-    /// refuses a tree past [`MAX_TREE_DEPTH`] before the count runs, so the
-    /// deep trees are built in code, as deep as the longest chain
-    /// `MAX_QUERY_LEN` spells, in every position the walk enters an
-    /// expression from.
     #[test]
     fn the_pattern_count_walks_a_deep_tree_within_a_tokio_workers_stack() {
         use depth_fixtures::{flat_chain, spliced};
@@ -2201,10 +1846,8 @@ mod tests {
         assert_eq!(counted, [None, None, None, None]);
     }
 
-    /// The walk counts in text order inside a chain, so the span is the
-    /// first `matches` pattern past the cap. The chains are 50 terms long,
-    /// under [`MAX_TREE_DEPTH`], so the pattern that passes the cap sits
-    /// in the middle of the sixth.
+    /// The chains are 50 terms long, under [`MAX_TREE_DEPTH`], so the pattern
+    /// that passes the cap sits in the middle of the sixth.
     #[test]
     fn pattern_cap_spans_the_first_pattern_past_it_in_a_chain() {
         let terms: Vec<String> = (0..MAX_QUERY_PATTERNS + 5)
@@ -2230,7 +1873,6 @@ mod tests {
                 MAX_QUERY_PATTERNS + 1
             )
         );
-        // The span is the token holding the first pattern past the cap.
         let last = over.rsplit(' ').next().unwrap();
         assert_eq!(&over[error.span.clone()], last);
     }
@@ -2241,8 +1883,6 @@ mod tests {
         let one_list = format!("f={}", list.join(","));
         assert!(parse(&one_list).is_ok());
         assert!(pattern_cap_refusal(&format!("{one_list},z*")).is_some());
-        // One more pattern in a separate filter, grouped and negated, still
-        // counts toward the same total.
         assert!(pattern_cap_refusal(&format!("{one_list} (a OR NOT g=z*)")).is_some());
     }
 
@@ -2280,21 +1920,16 @@ mod tests {
             let error = pattern_cap_refusal(&over).expect(tail);
             assert_eq!(&over[error.span], "/b/", "{tail}");
         }
-        // A field after `matches` is refused for what it is, never
-        // counted against the cap.
         let errors =
             parse(&format!("{one_short} f2=z* | where a matches b")).expect_err("computed");
         assert_eq!(errors.len(), 1, "{errors:?}");
         assert_eq!(errors[0].message, crate::pattern::MSG_PATTERN_NOT_LITERAL);
     }
 
-    /// Write `body` as a quoted string decodes it back, for a site that
-    /// takes a quoted `matches` operand.
     fn quoted(body: &str) -> String {
         body.replace('\\', r"\\").replace('"', "\\\"")
     }
 
-    /// The text `span` covers in `dsl`, for an assertion message.
     fn at(dsl: &str, span: &std::ops::Range<usize>) -> String {
         let text = &dsl[span.clone()];
         if text.len() > 40 {
@@ -2304,20 +1939,12 @@ mod tests {
         }
     }
 
-    /// Every regex body and every pattern operand gets the checks a
-    /// `/body/` regex gets, in its order (ADR-0063): syntax, then the
-    /// 1024-byte limit on the text as the query decodes it, then the
-    /// compile once the query has parsed. Each is the query's one error,
-    /// over the body as written.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn every_regex_body_is_validated() {
         use crate::pattern::{MAX_REGEX_LEN, MSG_REGEX_TOO_LARGE};
-        /// An operand site: the query that writes `t`, and the text its
-        /// error covers.
         type Operand = fn(&str) -> (String, String);
 
-        // Each regex site, as (query, the text its error covers).
         type Site = fn(&str) -> (String, String);
         let regex_sites: [(&str, Site); 5] = [
             ("search value", |b| (format!("msg=/{b}/"), format!("/{b}/"))),
@@ -2436,9 +2063,6 @@ mod tests {
         }
     }
 
-    /// The right side of `matches`, `like` and `ilike` is literal text
-    /// (ADR-0063). Anything else is one error over the operand, with a
-    /// hint that names both literal spellings.
     #[test]
     fn a_computed_pattern_operand_is_refused_with_a_hint() {
         for (dsl, operand) in [
@@ -2477,17 +2101,14 @@ mod tests {
         }
     }
 
-    /// Parse `input` and count the regexes the parse compiled.
     fn parse_counting_builds(input: &str) -> (Result<Query, Vec<ParseError>>, usize) {
         let before = crate::pattern::thread_builds();
         let result = parse(input);
         (result, crate::pattern::thread_builds() - before)
     }
 
-    /// `parse_unbuilt` makes every refusal `parse` makes before it builds,
-    /// with the same errors, and builds nothing. Only a build's own
-    /// refusal is `parse`'s alone: `\w{64}` compiles past the size limit,
-    /// and `\B(?:\pL?){15}\PL` past the batch engine's.
+    /// `\w{64}` compiles past the size limit, and `\B(?:\pL?){15}\PL` past
+    /// the batch engine's.
     #[test]
     fn parse_unbuilt_refuses_what_parse_refuses_before_it_builds() {
         let unbuilt = |input: &str| {
@@ -2529,8 +2150,6 @@ mod tests {
         }
     }
 
-    /// The test-support parse counter counts each query `parse` or
-    /// `parse_unbuilt` reads, refused or not, once.
     #[test]
     fn thread_parses_counts_each_query_read_once() {
         let before = thread_parses();
@@ -2542,15 +2161,12 @@ mod tests {
     }
 
     thread_local! {
-        /// The cancellation points the parses on this thread have passed.
         static POINTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
         /// The point, counted from 0, at which a parse on this thread
         /// requests its own stop.
         static TRIP_AT: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
     }
 
-    /// A parse's side of [`tripped`]: count the point, and request the
-    /// stop if this is the one to trip at.
     pub(super) fn pass_point(stop: &Stop) {
         let point = POINTS.get();
         POINTS.set(point + 1);
@@ -2569,10 +2185,6 @@ mod tests {
         (out, POINTS.get())
     }
 
-    /// A query for every way a parse ends: clean with and without
-    /// patterns, refused by the length cap, the search pre-scan, the
-    /// grammar, the pattern cap, the translation budget, a build and the
-    /// tree depth limit.
     fn every_ending() -> Vec<String> {
         let too_costly = format!("(?i){}", r"[\x00-\x{10FFFF}]".repeat(15));
         vec![
@@ -2591,11 +2203,6 @@ mod tests {
         ]
     }
 
-    /// A cancelled parse is never `Ok` and never a diagnostic, however the
-    /// parse would have ended and wherever the stop lands: before it
-    /// begins, or at any one of its cancellation points. A stop never
-    /// requested changes nothing, and `parse` is the cancellable parse
-    /// under a stop nobody requests.
     #[test]
     fn a_cancelled_parse_is_never_ok_and_never_a_diagnostic() {
         let ends = every_ending();
@@ -2643,10 +2250,6 @@ mod tests {
         }
     }
 
-    /// A parse reads its stop after the grammar, after the pattern cap,
-    /// after the translation budget, before each pattern it builds and
-    /// once the last build is done. Tripped at each point in turn, it
-    /// builds every pattern before that point and none after it.
     #[test]
     fn a_parse_stops_between_its_pattern_builds() {
         let input = r"f=/a/ g=/b/ | where m matches /c/";
@@ -2676,10 +2279,6 @@ mod tests {
         }
     }
 
-    /// A parse log records each parse whose input holds its marker, with
-    /// the thread that ran it and the door that read it, refused and
-    /// cancelled parses too. A parse without the marker is not recorded,
-    /// and another log's marker is not this one's.
     #[test]
     fn a_parse_log_records_the_thread_and_kind_of_each_marked_parse() {
         let marker = "parselog_a1f3";
@@ -2714,9 +2313,6 @@ mod tests {
         assert!(other.parses().is_empty());
     }
 
-    /// No regex compiles before the pattern cap passes: a list of
-    /// thousands of four-byte regexes, or of a few hundred that each
-    /// compile large, is refused having compiled none.
     #[test]
     fn a_query_over_the_pattern_cap_compiles_no_regex() {
         for (label, element, n) in [
@@ -2735,9 +2331,6 @@ mod tests {
         }
     }
 
-    /// A parse that already failed compiles nothing, however many regexes
-    /// it read, whether the grammar stopped it or emitted an error and
-    /// went on.
     #[test]
     fn a_parse_that_failed_compiles_no_regex() {
         let list = vec![r"/\w{64}/"; 300].join(",");
@@ -2752,11 +2345,6 @@ mod tests {
         }
     }
 
-    /// A query under the cap compiles each regex once, in a filter and
-    /// after `matches`, and reports those that do not compile as any
-    /// parse reports its errors: in text order, capped, the count it
-    /// left out annotated on the last. A body written at every site
-    /// compiles once, and every site reports it.
     #[test]
     fn a_query_under_the_cap_compiles_each_regex_once() {
         let (result, builds) = parse_counting_builds("f=/a/,b,/c/ g=/d/ | where m matches /e/");
@@ -2783,9 +2371,6 @@ mod tests {
         assert_eq!(last.span.end, input.len());
     }
 
-    /// A well-formed body that does not compile is refused after the
-    /// parse, over its `/…/`: an unknown Unicode class is not a syntax
-    /// error, so the grammar lets it through to the compile.
     #[test]
     fn a_well_formed_regex_that_does_not_compile_is_a_parse_error() {
         let errors = parse(r"msg=/\p{Nope}/").expect_err("unknown class");
@@ -2797,9 +2382,6 @@ mod tests {
         assert_eq!(errors[0].span, 4..14);
     }
 
-    /// A regex over the compiled-size limit is a parse error over the
-    /// whole `/…/`, in a filter and after `matches` alike, with a hint
-    /// naming the usual cause.
     #[test]
     fn a_regex_too_large_once_compiled_is_a_parse_error() {
         for (dsl, span) in [
@@ -2825,9 +2407,7 @@ mod tests {
         }
     }
 
-    /// The five admission errors of ADR-0061 (rulings 1-5), each with the
-    /// span of the text to change and the hint its ruling names. Spans
-    /// are bytes, so a multibyte prefix moves them by its length.
+    /// Spans are bytes, so a multibyte prefix moves them by its length.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn new_admission_errors_carry_span_and_hint() {
@@ -2994,10 +2574,6 @@ mod tests {
             assert_eq!(errors[0].hint.as_deref(), Some(hint), "{dsl:?}");
         }
 
-        // A `|` after whitespace in a value is a new pipe stage, so the
-        // run reads as a value and a stage. When the query then fails, the
-        // run is named beside the error that falls inside it, never in
-        // its place.
         for (dsl, span, natural) in [
             ("msg=/err | warn/", 4..16, "unknown command 'warn'"),
             ("msg=/a\nb | c/", 4..13, "unknown command 'c'"),
@@ -3019,7 +2595,7 @@ mod tests {
         }
 
         // Without a backtick after the `-`, layout after `NOT` still
-        // separates it from a negated term, as it did before the guard.
+        // separates it from a negated term.
         let not_dash_x = parse("NOT\u{a0}-x=1").expect("NOT nbsp -x=1");
         assert!(
             matches!(
@@ -3042,7 +2618,6 @@ mod tests {
         );
     }
 
-    /// The legal neighbours of the five errors keep their readings.
     #[test]
     fn the_admission_errors_leave_their_neighbours_alone() {
         // a pipe stage after a slash-opening glob, on one line or two
@@ -3091,12 +2666,6 @@ mod tests {
         assert!(parse("NOT-x").is_ok());
     }
 
-    /// A leading backtick that fails the quoted production is a loud
-    /// parse error, never a quiet slide into text search: unterminated,
-    /// empty, or holding a character that cannot render as itself. That
-    /// covers control characters and the bidi and zero-width format
-    /// characters `sanitize` neutralises, since a name that parses is
-    /// echoed verbatim into notices and error messages.
     #[test]
     fn leading_backtick_that_is_not_a_name_is_a_parse_error() {
         for input in [

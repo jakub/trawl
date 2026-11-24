@@ -4,10 +4,6 @@
 
 //! The emitter's half of ADR-0062: a field the input does not carry reads
 //! as NULL, checked by running the emitted SQL on a real `DuckDB`.
-//!
-//! Every fixture is one parquet file of three events, none of which
-//! carries `f` or `g`. The descriptor is built the way the executor builds
-//! it: `DESCRIBE SELECT * FROM <the emitter's own reader>`.
 
 use duckdb::Connection;
 
@@ -35,7 +31,6 @@ fn pins(entries: &[(&str, CT)]) -> FieldTypes {
     ft
 }
 
-/// One parquet file, and the connection that reads it.
 struct Fixture {
     _dir: tempfile::TempDir,
     dir: std::path::PathBuf,
@@ -43,7 +38,6 @@ struct Fixture {
     conn: Connection,
 }
 
-/// The three events every test reads. `n` is NULL on event 3.
 const EVENTS: &str = "SELECT CAST(id AS BIGINT) AS id, \
      _time, _time AS _ingested, host, service, CAST(n AS BIGINT) AS n, message, _raw \
      FROM (VALUES \
@@ -73,7 +67,6 @@ fn fixture() -> Fixture {
     fixture_from(EVENTS)
 }
 
-/// `DESCRIBE` as (name, type) pairs.
 fn describe(conn: &Connection, relation: &str) -> Vec<(String, String)> {
     let mut stmt = conn
         .prepare(&format!("DESCRIBE {relation}"))
@@ -84,7 +77,6 @@ fn describe(conn: &Connection, relation: &str) -> Vec<(String, String)> {
         .expect("describe rows")
 }
 
-/// The descriptor the executor's probe builds for `source`.
 fn described(conn: &Connection, source: &str) -> InputColumns {
     let reader = source_reader(source).expect("a valid source");
     InputColumns {
@@ -126,8 +118,6 @@ fn bind(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
-/// A statement's answer: its columns with their stored types, and its
-/// rows as text, in result order.
 #[derive(Debug)]
 struct Answer {
     columns: Vec<(String, String)>,
@@ -157,7 +147,6 @@ impl Answer {
         self.rows.iter().map(|row| row[at].as_deref()).collect()
     }
 
-    /// The `id` column, sorted.
     fn ids(&self) -> Vec<i64> {
         let mut ids: Vec<i64> = self
             .column("id")
@@ -169,9 +158,6 @@ impl Answer {
     }
 }
 
-/// Run the statement as the query lane does, and read its result columns
-/// with their logical types, and its rows as `DuckDB`'s own text, in
-/// result order.
 fn run(conn: &Connection, emitted: &EmittedQuery) -> Result<Answer, duckdb::Error> {
     let params = bind(&emitted.params);
     let refs: Vec<&dyn duckdb::ToSql> = params.iter().map(AsRef::as_ref).collect();
@@ -212,8 +198,6 @@ fn ids(dsl: &str, fx: &Fixture) -> Vec<i64> {
     answer(dsl, fx).ids()
 }
 
-/// No absent read leaves an identifier for `DuckDB` to bind: the SQL
-/// never names `f` or `g`.
 fn assert_never_names_f(dsl: &str, fx: &Fixture) {
     let sql = emit_ok(dsl, fx).sql;
     for name in ["\"f\"", "\"g\""] {
@@ -224,14 +208,6 @@ fn assert_never_names_f(dsl: &str, fx: &Fixture) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// absent operands
-// ---------------------------------------------------------------------------
-
-/// Every search operator over an absent field answers as over a NULL:
-/// `!=` and the negated patterns and lists match (ADR-0011, ADR-0060),
-/// everything positive is unknown, `NOT` keeps three-valued logic, and an
-/// absent field never removes a sibling branch's matches.
 #[test]
 fn absent_search_operands_read_null() {
     let fx = fixture();
@@ -261,8 +237,6 @@ fn absent_search_operands_read_null() {
     }
 }
 
-/// `where` stays strict over an absent field, and functions take it as
-/// NULL.
 #[test]
 fn absent_expression_operands_read_null() {
     let fx = fixture();
@@ -282,8 +256,6 @@ fn absent_expression_operands_read_null() {
     }
 }
 
-/// Aggregate arguments over an absent field: `count` and `dc` are 0, the
-/// numeric reductions are NULL.
 #[test]
 fn absent_aggregate_arguments_read_null() {
     let fx = fixture();
@@ -302,12 +274,6 @@ fn absent_aggregate_arguments_read_null() {
     assert_eq!(by_host.column("s"), [None, None]);
 }
 
-// ---------------------------------------------------------------------------
-// absent output columns
-// ---------------------------------------------------------------------------
-
-/// `table` and `fields` materialize an absent requested name, in order,
-/// as an all-null column that a result stores as VARCHAR.
 #[test]
 fn table_materializes_absent_names_in_order() {
     let fx = fixture();
@@ -320,8 +286,6 @@ fn table_materializes_absent_names_in_order() {
     }
 }
 
-/// `let y = f`, `rename f as q` and `stats … by f` write their target as
-/// NULL; a direct NULL of an unpinned absent field is VARCHAR.
 #[test]
 fn absent_sources_write_null_targets() {
     let fx = fixture();
@@ -361,8 +325,6 @@ fn absent_sources_write_null_targets() {
     assert_eq!(charted.type_of("f"), "VARCHAR");
 }
 
-/// A grouping over an absent key keeps SQL's empty-input answer: no
-/// input, no group.
 #[test]
 fn an_absent_group_key_over_no_rows_is_no_group() {
     let fx = fixture();
@@ -370,8 +332,6 @@ fn an_absent_group_key_over_no_rows_is_no_group() {
     assert!(got.rows.is_empty(), "{:?}", got.rows);
 }
 
-/// `dedup`, `eventstats` and `sort` over an absent field: one null group,
-/// a constant key that changes no order.
 #[test]
 fn absent_partitions_and_sort_keys_read_null() {
     let fx = fixture();
@@ -387,12 +347,6 @@ fn absent_partitions_and_sort_keys_read_null() {
     assert_eq!(trailing.column("id"), [Some("1"), Some("2"), Some("3")]);
 }
 
-// ---------------------------------------------------------------------------
-// pins
-// ---------------------------------------------------------------------------
-
-/// A pinned absent field reads as a NULL of its pin's storage type, as an
-/// operand and as an output column.
 #[test]
 fn a_pinned_absent_field_reads_as_its_pin_type() {
     let fx = fixture();
@@ -427,10 +381,6 @@ fn a_pinned_absent_field_reads_as_its_pin_type() {
     );
 }
 
-/// Where an untyped NULL leaves `DuckDB` no single overload, an absent
-/// argument is a NULL of the type the function reads a field as, and a
-/// pin still decides the type when there is one. A present argument is
-/// read by name, untouched.
 #[test]
 fn an_overloaded_argument_reads_a_typed_null() {
     let fx = fixture();
@@ -472,12 +422,6 @@ fn an_overloaded_argument_reads_a_typed_null() {
     assert!(!present.sql.contains("CAST(NULL"), "{}", present.sql);
 }
 
-// ---------------------------------------------------------------------------
-// lateral `let`
-// ---------------------------------------------------------------------------
-
-/// `let` binds an input column first, then an earlier assignment of the
-/// same stage, then NULL — `stream::apply_let`'s order (plan R5).
 #[test]
 fn let_reads_the_input_then_a_lateral_alias_then_null() {
     let fx = fixture();
@@ -505,9 +449,6 @@ fn let_reads_the_input_then_a_lateral_alias_then_null() {
     assert_eq!(none.type_of("b"), "VARCHAR");
 }
 
-/// The documented exception to "absent equals explicit null" (plan R5): a
-/// read that binds a same-stage alias. `let a = 1, b = a` is 1 when the
-/// input lacks `a`, and NULL when the input carries an all-null `a`.
 #[test]
 fn a_lateral_read_is_the_absent_equals_null_exception() {
     let carrying = fixture_from(&format!(
@@ -523,12 +464,6 @@ fn a_lateral_read_is_the_absent_equals_null_exception() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// reads after a projection
-// ---------------------------------------------------------------------------
-
-/// A stage that removed a field leaves it absent: later reads are NULL,
-/// and the output gains no column.
 #[test]
 fn post_projection_reads_are_null() {
     let fx = fixture();
@@ -562,9 +497,6 @@ fn post_projection_reads_are_null() {
     assert_eq!(stats.rows.len(), 2);
 }
 
-/// A column that is a direct NULL for an absent field reads as the NULL
-/// literal downstream, never by name: an INTEGER-typed NULL column would
-/// throw against a VARCHAR parameter and refuse `sum` over VARCHAR.
 #[test]
 fn a_direct_null_column_is_read_as_the_literal_downstream() {
     let fx = fixture();
@@ -588,8 +520,6 @@ fn a_direct_null_column_is_read_as_the_literal_downstream() {
     }
 }
 
-/// The VARCHAR cast is for the final result only. A computed expression
-/// over an absent field keeps the type `DuckDB` gives it.
 #[test]
 fn only_surviving_direct_nulls_are_cast_to_varchar() {
     let fx = fixture();
@@ -609,12 +539,6 @@ fn only_surviving_direct_nulls_are_cast_to_varchar() {
     assert_eq!(present.type_of("id"), "BIGINT");
 }
 
-// ---------------------------------------------------------------------------
-// targets and alias capture
-// ---------------------------------------------------------------------------
-
-/// `rename`, regex `extract` and `eventstats` write their targets, NULL
-/// when the source is absent, overwriting a stale target.
 #[test]
 fn targets_overwrite_a_stale_column_with_null() {
     let fx = fixture();
@@ -629,8 +553,6 @@ fn targets_overwrite_a_stale_column_with_null() {
     assert_eq!(windowed.column("host"), [None, None, None]);
 }
 
-/// The alias-capture defect (ADR-0062): with `f` absent, a search `!=`
-/// must not bind a same-SELECT alias named `f`.
 #[test]
 fn alias_capture_cannot_happen() {
     let fx = fixture();
@@ -640,12 +562,6 @@ fn alias_capture_cannot_happen() {
     assert_eq!(stats.column("f"), [Some("3")]);
 }
 
-// ---------------------------------------------------------------------------
-// text search
-// ---------------------------------------------------------------------------
-
-/// Text search reads `message` and `_raw` through the resolver: a source
-/// without either answers positive, negated and `OR` searches.
 #[test]
 fn text_search_over_a_source_without_message_or_raw() {
     let bare = fixture_from(&format!(
@@ -664,12 +580,6 @@ fn text_search_over_a_source_without_message_or_raw() {
     assert_eq!(ids("boom", &no_message), [1, 3], "_raw alone still matches");
 }
 
-// ---------------------------------------------------------------------------
-// the envelope timestamps
-// ---------------------------------------------------------------------------
-
-/// A source without `_time` or `_ingested` is foreign or broken: a read
-/// of either is refused loudly, never answered as NULL.
 #[test]
 fn an_envelope_timestamp_absent_from_the_source_is_refused() {
     let no_time = fixture_from(&format!("SELECT * EXCLUDE (_time) FROM ({EVENTS})"));
@@ -696,15 +606,12 @@ fn an_envelope_timestamp_absent_from_the_source_is_refused() {
     .expect_err("a read of _ingested is refused");
     assert!(err.to_string().contains("_ingested"), "{err}");
 
-    // A query that never reads the timestamp is answered.
     assert_eq!(
         answer("* | stats count() as c", &no_time).column("c"),
         [Some("3")]
     );
 }
 
-/// A stage that removed `_time` leaves it absent like any other field;
-/// only the source's lack of it is refused.
 #[test]
 fn a_timestamp_a_stage_removed_reads_null() {
     let fx = fixture();
@@ -712,11 +619,6 @@ fn a_timestamp_a_stage_removed_reads_null() {
     assert_eq!(got.rows.len(), 2);
 }
 
-/// The refusal covers a read that reaches the source's missing column,
-/// and nothing after a stage that replaced the column set: from there the
-/// read follows the relation, as it would over a source that carries
-/// `_time`. A `timechart` writes its own `_time`, the only stage that can:
-/// every name a stage mints refuses the `_` namespace (ADR-0013 §5).
 #[test]
 fn a_timestamp_after_a_replacing_stage_is_not_the_sources() {
     let no_time = fixture_from(&format!("SELECT * EXCLUDE (_time) FROM ({EVENTS})"));
@@ -738,14 +640,6 @@ fn a_timestamp_after_a_replacing_stage_is_not_the_sources() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// pivot
-// ---------------------------------------------------------------------------
-
-/// A read after a dynamic pivot that misses the group-by keys is padded
-/// onto the pivot with a zero-row fill: it answers as an all-null column
-/// of the type a produced one has when no event produced it, and keeps a
-/// produced column's values.
 #[test]
 fn a_pivot_miss_is_padded_with_a_null_fill() {
     let fx = fixture();
@@ -784,7 +678,6 @@ fn a_pivot_miss_is_padded_with_a_null_fill() {
     );
 }
 
-/// No read misses, no fill: the SQL is today's.
 #[test]
 fn a_pivot_without_a_miss_takes_no_fill() {
     let fx = fixture();
@@ -799,9 +692,6 @@ fn a_pivot_without_a_miss_takes_no_fill() {
     }
 }
 
-/// A read of a name the `let` already assigned, which no earlier read of
-/// the same `let` padded, binds the alias when the pivot made no column of
-/// that name.
 #[test]
 fn a_post_pivot_let_reads_its_own_alias() {
     let fx = fixture();
@@ -812,9 +702,6 @@ fn a_post_pivot_let_reads_its_own_alias() {
     assert_eq!(got.column("b"), [Some("1"), Some("1")]);
 }
 
-/// After a pivot, a `let` that reads a name both at or before its
-/// assignment and after it is refused at emission, so every batch lane
-/// meets the refusal. Without the pivot, or split in two, it emits.
 #[test]
 fn a_post_pivot_let_reading_a_name_on_both_sides_of_its_assignment_is_refused() {
     let fx = fixture();
@@ -852,7 +739,6 @@ fn a_post_pivot_let_reading_a_name_on_both_sides_of_its_assignment_is_refused() 
     }
 }
 
-/// Once a stage resets the relation, a miss is a plain NULL again.
 #[test]
 fn a_reset_after_a_pivot_reads_plain_null() {
     let fx = fixture();
@@ -864,7 +750,6 @@ fn a_reset_after_a_pivot_reads_plain_null() {
     assert_eq!(got.rows.len(), 2);
 }
 
-/// Absent pivot inputs read as NULL columns in the narrowing.
 #[test]
 fn a_pivot_over_absent_inputs_binds() {
     let fx = fixture();
@@ -873,13 +758,6 @@ fn a_pivot_over_absent_inputs_binds() {
     assert_eq!(got.type_of("g"), "VARCHAR");
 }
 
-// ---------------------------------------------------------------------------
-// timechart on
-// ---------------------------------------------------------------------------
-
-/// `timechart on` an absent unpinned field keeps the refusal: its probe
-/// reports an untyped NULL, not a timestamp. A TIMESTAMP pin passes and
-/// buckets everything as NULL.
 #[test]
 fn timechart_on_an_absent_field_probes_its_null() {
     let fx = fixture();
@@ -920,13 +798,6 @@ fn timechart_on_an_absent_field_probes_its_null() {
     assert_eq!(got.column("c"), [Some("3")]);
 }
 
-// ---------------------------------------------------------------------------
-// saved sources
-// ---------------------------------------------------------------------------
-
-/// A saved run that recorded no schema reads through a dummy-column
-/// source. The dummy column is hidden: `table n` is zero rows and one
-/// VARCHAR column `n`.
 #[test]
 fn the_zero_column_source_hides_its_dummy_column() {
     let conn = Connection::open_in_memory().expect("duckdb");
@@ -948,12 +819,6 @@ fn the_zero_column_source_hides_its_dummy_column() {
     assert_eq!(run(&conn, &emitted).expect("runs").column("c"), [Some("0")]);
 }
 
-// ---------------------------------------------------------------------------
-// hot null-only keys
-// ---------------------------------------------------------------------------
-
-/// A hot snapshot beside the fixture: two events, `k` only ever JSON
-/// `null`, `host` real.
 fn hot_file(fx: &Fixture) -> String {
     let path = fx.dir.join("hot.ndjson");
     std::fs::write(
@@ -969,9 +834,6 @@ fn hot_columns() -> HotColumns {
     HotColumns::new(["id", "_time", "_ingested", "host"], ["k"])
 }
 
-/// R7: an unpinned null-only hot key with a cold carrier of type T reads
-/// as `CAST(NULL AS T)`; with no carrier it is excluded and reads absent;
-/// a pinned one keeps the guarded conform.
 #[test]
 fn hot_null_only_keys_conform_to_a_typed_null_or_vanish() {
     let carrier = fixture_from(&format!("SELECT *, CAST(7 AS BIGINT) AS k FROM ({EVENTS})"));
@@ -1058,12 +920,6 @@ fn hot_null_only_keys_conform_to_a_typed_null_or_vanish() {
     assert_eq!(got.type_of("k"), "BIGINT");
 }
 
-// ---------------------------------------------------------------------------
-// present fields: no change
-// ---------------------------------------------------------------------------
-
-/// A query whose every read binds emits exactly the SQL it emitted before
-/// the emitter could know what the input carries.
 #[test]
 fn present_field_sql_is_byte_identical_to_unprobed() {
     let fx = fixture();
@@ -1105,13 +961,6 @@ fn present_field_sql_is_byte_identical_to_unprobed() {
     }
 }
 
-// ---------------------------------------------------------------------------
-// the probe's skip predicate
-// ---------------------------------------------------------------------------
-
-/// The probe is skipped only for a query that reads nothing beyond the
-/// envelope timestamps: no field, no text search, no default extract
-/// (plan R2).
 #[test]
 fn the_probe_is_skipped_only_for_envelope_reads() {
     let needs = |dsl: &str| needs_input_columns(&parser::parse(dsl).expect("parses"));
@@ -1145,8 +994,6 @@ fn the_probe_is_skipped_only_for_envelope_reads() {
     }
 }
 
-/// A hot key only ever `null` needs the cold description unless a pin
-/// conforms it.
 #[test]
 fn an_unpinned_null_only_hot_key_needs_the_probe() {
     let hot = HotColumns::new(["host", "_time"], ["k"]);

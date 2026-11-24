@@ -9,22 +9,12 @@ use super::SqlValue;
 use super::compare::{NullPolicy, comparison_sql, in_list_sql, pattern_target};
 use super::state::{EmitterState, Use};
 
-/// Translate the search stage tokens into WHERE clauses on the emitter state.
-///
-/// Time filters are emitted first as a global WHERE clause (hoisted from
-/// groups during parsing). Then group tokens are emitted.
-///
-/// A single-group query emits its tokens directly; a multi-group (OR)
-/// query collects each group's clauses and combines them as
-/// `(a AND b) OR (c AND d)`.
 pub(crate) fn emit_search(
     search: &SearchStage,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
-    // Emit hoisted time filter as a top-level WHERE clause. TRY_CAST, not
-    // CAST: one malformed hot-side value must degrade to NULL (excluded),
-    // never throw the whole query (ADR-0008). The read resolves like any
-    // other, so a source without `_time` is refused here.
+    // TRY_CAST, not CAST: one malformed hot-side value must degrade to NULL
+    // (excluded), never throw the whole query (ADR-0008).
     if let Some(tf) = &search.time_filter {
         let interval = tf.node.duration.to_interval_string();
         let time = state.read_field(crate::schema::TIME, Use::Operand)?;
@@ -34,9 +24,6 @@ pub(crate) fn emit_search(
         state.time_filter = Some(tf.node.duration);
     }
 
-    // A bound binds as the instant the parser read, in the text `DuckDB`
-    // prints for it, so both lanes compare one value (ADR-0017's
-    // amendment of 2026-11-08).
     if let Some(earliest) = &search.earliest {
         let time = state.read_field(crate::schema::TIME, Use::Operand)?;
         let p = state.push_param(SqlValue::String(earliest.node.instant().cast_text()));
@@ -55,25 +42,16 @@ pub(crate) fn emit_search(
     match search.groups.len() {
         0 => {}
         1 => {
-            // single group: emit tokens straight onto the state
             for token in &search.groups[0] {
                 emit_search_token(&token.node, state)?;
             }
         }
-        // multi-group (OR) — collect each group's WHERE clauses separately
         _ => emit_or_groups(&search.groups, state)?,
     }
 
     Ok(())
 }
 
-/// Emit OR-separated groups as a single parenthesised WHERE clause.
-///
-/// Each group's clauses are collected separately and AND-joined, then the
-/// groups are OR-joined: `(a AND b) OR (c AND d)`. The whole expression is
-/// wrapped in parens so the OR doesn't interact with other top-level WHERE
-/// clauses (e.g. the hoisted time filter). Groups that emit no clauses (a
-/// lone `*`, say) drop out.
 fn emit_or_groups(
     groups: &[Vec<Spanned<SearchToken>>],
     state: &mut EmitterState,
@@ -98,32 +76,6 @@ fn emit_or_groups(
     Ok(())
 }
 
-/// Emit the two-column bare/quoted text-search predicate.
-///
-/// Bare-word search hits `message` and additionally `_raw` where present
-/// (ADR-0009). Containment is total (ADR-0015): a NULL/missing column does
-/// not contain the term, so every positive or negated composition has a
-/// two-valued answer. The in-memory filter ([`crate::filter`]) mirrors these
-/// semantics exactly.
-///
-/// Searching `_raw` is **whole-event search**, deliberately: except when a
-/// collector supplied its own pre-parse line, `_raw` is the server's JSON
-/// serialization of the event as it arrived, so an ILIKE over it matches
-/// another field's value (`nginx` finds `service=nginx`) *and* a field name
-/// (`debug` finds `debug_mode`) — and the negated form excludes on exactly
-/// the same basis. That reach is why bare words are worth having; a match
-/// confined to one column is what field filters (`message=/debug/`) are for.
-/// Documented in the DSL reference under "Text search"; changing it means
-/// changing both.
-///
-/// Containment is literal: the term binds through [`contains_pattern`], so
-/// `_`, `%` and `\` in a term or phrase are the characters themselves, never
-/// LIKE wildcards — the same rule the in-memory filter's substring search
-/// applies. Both parameters carry the one escaped pattern.
-///
-/// Both columns are read through the resolver (ADR-0062): neither is
-/// assumed present, and a source without one reads it as NULL, which
-/// contains nothing.
 fn push_text_search(
     text: &str,
     negated: bool,
@@ -144,10 +96,8 @@ fn push_text_search(
     Ok(())
 }
 
-/// The `ILIKE` pattern for "contains `text` literally": each `\`, `%` and
-/// `_` is prefixed with `\`, the predicate's declared `ESCAPE` character,
-/// and the result is wrapped in `%…%`. Escaping `\` itself is what keeps a
-/// term ending in a backslash from escaping the closing `%`.
+/// Escaping `\` itself is what keeps a term ending in a backslash from
+/// escaping the closing `%`.
 fn contains_pattern(text: &str) -> String {
     let mut pattern = String::with_capacity(text.len() + 2);
     pattern.push('%');
@@ -161,12 +111,10 @@ fn contains_pattern(text: &str) -> String {
     pattern
 }
 
-/// Bind `ILIKE` to a text value only. Foreign sources can carry a numeric or
-/// boolean `message`/`_raw`, and heterogeneous NDJSON is inferred as `JSON`;
-/// non-string cells must not become matches through stringification while a
-/// JSON string cell must remain searchable. The CASE produces nullable text
-/// before the single pattern placeholder is applied. `ESCAPE '\'` declares
-/// the escape character [`contains_pattern`] writes.
+/// Foreign sources can carry a numeric or boolean `message`/`_raw`, and
+/// heterogeneous NDJSON is inferred as `JSON`; non-string cells must not
+/// become matches through stringification while a JSON string cell must
+/// remain searchable.
 fn text_contains(column: &str, param: &str) -> String {
     format!(
         "COALESCE((CASE WHEN typeof({column}) = 'VARCHAR' THEN CAST({column} AS VARCHAR) WHEN typeof({column}) = 'JSON' AND json_type(CAST({column} AS JSON)) = 'VARCHAR' THEN json_extract_string(CAST({column} AS JSON), '$') ELSE NULL END) ILIKE {param} ESCAPE '\\', FALSE)"
@@ -180,7 +128,6 @@ fn emit_search_token(
     match token {
         SearchToken::FieldFilter(ff) => emit_field_filter(ff, state)?,
         SearchToken::TextSearch(ts) => {
-            // wildcard = no filter
             if ts.term == "*" {
                 return Ok(());
             }
@@ -207,26 +154,11 @@ fn emit_search_token(
     Ok(())
 }
 
-/// Emit one field filter: the comparison arm the catalog pin types
-/// (ADR-0011), and the operator as the author typed it (ADR-0060).
-///
-/// An exact value binds through [`compare::compare_form`]. A glob or regex
-/// matches the pin's canonical pattern text ([`pattern_target`]); under
-/// `!=` it is the complement of the `=` predicate under the search-stage
-/// `!=` rule, so `f=P` and `f!=P` divide every row between them.
-///
-/// A comma list honours each element's kind: `f=a,b*` is
-/// `f=a OR f=b*` and `f!=a,b*` is `f!=a AND f!=b*`. List elements are not
-/// charged to the lateral-expansion budget (ADR-0024): the search stage
-/// has no lateral aliases, and each element renders one term over the
-/// field, so a list's SQL grows linearly with its length.
 fn emit_field_filter(
     ff: &crate::ast::FieldFilter,
     state: &mut EmitterState,
 ) -> Result<(), super::EmitError> {
     let field = state.read_field(&ff.field, Use::Operand)?;
-    // The catalog pin typing this comparison: `None` outside the
-    // catalog-backed paths, which keeps every branch below literal-driven.
     let pin = state.compare_pin(&ff.field);
     let clause = match (&ff.value, ff.op) {
         (FilterValue::Single(Scalar::Exact(v)), op) => {
@@ -250,11 +182,8 @@ fn emit_field_filter(
                 }
             }
             if patterns.is_empty() {
-                // Positive exact lists render as set membership.
                 in_list_sql(&field, exact, state)
             } else {
-                // The exact elements stay one membership test, and each
-                // pattern ORs its own predicate after it, in written order.
                 let target = pattern_target(&field, pin);
                 let mut terms = Vec::with_capacity(patterns.len() + 1);
                 if !exact.is_empty() {
@@ -267,10 +196,6 @@ fn emit_field_filter(
             }
         }
         (FilterValue::List(elements), FilterOp::Ne) => {
-            // Search-stage `f!=a,b` is compositionally `f!=a AND f!=b`:
-            // an exact element binds through the same equality form as a
-            // positive list, then the scalar `!=` renderer supplies the
-            // NULL widening; a pattern takes its own complement.
             enum Term<'a> {
                 Exact(CompareForm),
                 Pattern(&'a Scalar),
@@ -300,7 +225,6 @@ fn emit_field_filter(
                 .collect::<Result<Vec<_>, _>>()?
                 .join(" AND ")
         }
-        // The parser rejects ordered comma lists before emission.
         (FilterValue::List(_), FilterOp::Gt | FilterOp::Gte | FilterOp::Lt | FilterOp::Lte) => {
             unreachable!("ordered operators cannot reach a comma-separated list")
         }
@@ -309,19 +233,6 @@ fn emit_field_filter(
     Ok(())
 }
 
-/// The predicate one glob or regex renders over its pattern target.
-///
-/// `=` is the bare pattern test, nullable on purpose: `NOT f=P` keeps
-/// three-valued logic and drops a row whose target is NULL, as `NOT f=x`
-/// does. `!=` is `NOT COALESCE(…, FALSE)` (ADR-0060): true unless the
-/// field has canonical pattern text that the pattern matches, so a
-/// missing field or a value its pin shelved to NULL matches, as it
-/// matches `f!=x`. The COALESCE states that directly instead of leaning
-/// on every target renderer turning a NULL field into a NULL target
-/// (the severity `CASE` has no `ELSE`).
-///
-/// A regex binds through [`EmitterState::push_regex_param`], so it counts
-/// toward the statement's regex parameters; a glob never reaches RE2.
 fn pattern_sql(
     target: &str,
     pattern: &Scalar,

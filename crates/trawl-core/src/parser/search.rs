@@ -21,7 +21,6 @@ use crate::parser::primitives::{
 };
 use crate::pattern::PatternKind;
 
-/// Parse a `last=2h` time filter.
 fn time_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     just("last=")
@@ -30,7 +29,6 @@ fn time_filter<'src>()
         .labelled("time filter")
 }
 
-/// Parse a `"quoted phrase"` search.
 fn quoted_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     quoted_string()
@@ -38,8 +36,6 @@ fn quoted_search<'src>()
         .labelled("quoted search")
 }
 
-/// Detect whether a value contains glob characters (`*` or `?`).
-///
 /// The single glob predicate: it decides the value kind here, and
 /// [`crate::parser::comment::hint_for`] asks it before promising a quoted
 /// rewrite matches "exactly" — a second spelling of the rule could make a
@@ -48,77 +44,37 @@ pub(crate) fn has_glob_chars(s: &str) -> bool {
     s.contains('*') || s.contains('?')
 }
 
-/// The message an ordered operator with a glob value carries (ADR-0060).
-/// A payload: the hint quotes the glob, which only its production holds.
 pub(crate) const MSG_ORDERED_GLOB: &str = "glob patterns only support `=` and `!=`";
 
-/// The message an ordered operator with a regex value carries (ADR-0060).
 pub(crate) const MSG_ORDERED_REGEX: &str = "regex patterns only support `=` and `!=`";
 
-/// The message a recognised regex followed by `"` carries (ADR-0060).
 pub(crate) const MSG_QUOTE_AFTER_REGEX: &str =
     "a regex ends at its closing '/'; '\"' cannot follow it";
 
-/// The message a time clause inside parentheses or under `NOT` carries
-/// (ADR-0061 ruling 2).
 pub(crate) const MSG_NESTED_TIME_CLAUSE: &str =
     "a time clause cannot sit inside parentheses or under NOT";
 
-/// The message an `earliest=` or `latest=` clause carries when
-/// [`TimeBound::read`] has no instant for it (ADR-0017's amendment of
-/// 2026-11-08).
 pub(crate) const MSG_UNREADABLE_BOUND: &str = "cannot read this time bound as a timestamp";
 
-/// The message `last=` beside an absolute bound carries (ADR-0061's
-/// amendment of 2026-11-08).
 pub(crate) const MSG_LAST_WITH_BOUND: &str = "cannot combine 'last=' with 'earliest='/'latest='";
 
-/// The message a group of only `OR` separators carries (ADR-0061
-/// ruling 4).
 pub(crate) const MSG_OR_ONLY_GROUP: &str = "a group needs a search term or filter, not only OR";
 
-/// The message `NOT-` directly before a backtick carries (ADR-0061
-/// ruling 5).
 pub(crate) const MSG_NOT_DASH_BEFORE_BACKTICK: &str =
     "'NOT-' cannot sit directly before a backticked name";
 
-/// A parsed filter value, with what the field filter's diagnostics need
-/// to know about it. Parser-local: none of it reaches the AST.
 #[derive(Clone)]
 struct ParsedValue {
     value: FilterValue,
-    /// Whether an element's own production already emitted an error: the
-    /// ADR-0014 opener, a regex body or glob that a pattern check refused,
-    /// a `"` after a regex, a regex a raw line break cuts, a quoted value
-    /// with an unknown escape, or a bare value that opens with `"`. A pattern that fails to build is refused after
-    /// the parse (`crate::parser::parse`), so it is not counted here. Such a value gets no operator error on top: one
-    /// error per value, and the first one names what the user has to
-    /// change.
+    /// Whether an element's own production already emitted an error. A
+    /// pattern that fails to build is refused after the parse
+    /// (`crate::parser::parse`), so it is not counted here. Such a value
+    /// gets no operator error on top: one error per value.
     reported: bool,
 }
 
 /// Parse the value side of a field filter: one element, or a comma list
-/// of them.
-///
-/// Each element carries its own kind (ADR-0060): a recognised `/body/` is
-/// a regex, a quoted value is exact, and a bare value is a glob when it
-/// holds `*` or `?` and exact otherwise. So `f=a,b*,/c/` is an exact, a
-/// glob and a regex. The comparison operator is parsed separately by
-/// [`field_filter`]; nothing here reads it.
-///
-/// A body holds no raw line break and no `|` after whitespace (ADR-0061
-/// ruling 1, [`crate::parser::primitives::first_cut`]). A `/…/` run the
-/// earlier rule read as a regex, followed as a regex must be, reads as
-/// follows when a cut sits in its body:
-///
-/// - a `|` after whitespace anywhere in it is a new pipe stage, which
-///   ends the value: the bare arm reads up to the whitespace, so
-///   `path=/tmp* | where x / 2 == 1` is a glob and a pipeline on one line
-///   or two. The run is recorded, and a query that then fails names it
-///   (`crate::parser::parse`), since `msg=/err | warn/` meant a regex;
-/// - otherwise a raw line break is an emitted error over the run: the
-///   author wrote one regex across two lines, and reading the first line
-///   as a value and the second as text would mean something else.
+/// of them. Each element carries its own kind (ADR-0060).
 fn filter_value<'src>()
 -> impl Parser<'src, ParserInput<'src>, ParsedValue, ParserExtra<'src>> + Clone {
     // A regex is a `/body/` followed by a byte that ends a bare value, or
@@ -185,15 +141,10 @@ fn filter_value<'src>()
             (Scalar::Regex(body), reported)
         });
 
-    // A quoted value (`service="Activity Monitor"`, quotes stripped) is
-    // never a pattern: the wildcards in `host="a*b"` are data, while the
-    // ones in `host=a*b` are the pattern.
-    //
     // Both spellings are admitted in every position of a comma list, not
     // just alone, so `format` can quote a list element that would
     // otherwise re-lex as something else — a `#` in one is a parse error
     // bare (ADR-0014 ruling 2), and the round trip has to survive it.
-    // An unknown escape inside it is its own emitted error.
     let quoted = quoted_string_reported().map(|(s, reported)| (Scalar::Exact(s), reported));
     let bare = pipe_cut_run
         .ignore_then(bare_value())
@@ -204,8 +155,6 @@ fn filter_value<'src>()
             if !has_glob_chars(&s) {
                 return (Scalar::Exact(s), reported);
             }
-            // A glob gets the checks every pattern gets, unless the value
-            // already reported its own error: one error per value.
             let reported = reported
                 || check_pattern(PatternKind::Glob, &s, extra.span(), extra.state(), emitter);
             (Scalar::Glob(s), reported)
@@ -228,16 +177,8 @@ fn filter_value<'src>()
         .labelled("filter value")
 }
 
-/// Parse a `field=value` filter, including `field>=100`, `field!=200`,
-/// `field=200,301,404`, `field=/pattern/`, and glob auto-detection.
-///
-/// The operator (`=`, `>=`, `<=`, `!=`, `>`, `<`) is parsed as part of the
-/// field filter — no `:` separator. Uses `.rewind()` lookahead on
-/// `field_name + operator` so that bare words like `NOT` or `error` don't
-/// commit the parser.
-///
-/// The operator is kept as typed (ADR-0060). An ordered operator takes
-/// neither a list nor a pattern, and either is an emitted error.
+/// Uses `.rewind()` lookahead on `field_name + operator` so that bare
+/// words like `NOT` or `error` don't commit the parser.
 fn field_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     field_name()
@@ -280,9 +221,6 @@ fn field_filter<'src>()
         .labelled("field filter")
 }
 
-/// Emit the comment-opener diagnostics for a search-stage bare term
-/// (ADR-0014).
-///
 /// A `#` anywhere in the term is an error: the opener is never data and
 /// never a comment inside a token. A term starting with `//` is an error
 /// too — a comment line in that spelling must fail rather than silently
@@ -327,22 +265,12 @@ fn check_term<'src>(
     })
 }
 
-/// Parse a bare text search term, optionally negated with `-`.
-///
-/// A backtick is a metacharacter here, not a word byte: it opens a quoted
-/// field name (ADR-0013 ruling 7), and text search is the last alternative
-/// in the leaf choice. If a term could absorb one, a quoted name the
-/// grammar refuses — or one whose filter never reaches an operator — would
-/// not error at all: no alternative would match, and the query would
-/// silently become a substring search for the literal ticks
-/// (`` service=`my service` `` searching the whole line). So it ends the
-/// term in every position, leading or mid-word, negated as much as bare —
-/// the same exclusion [`crate::parser::primitives::bare_value`] makes on the
-/// value side. The deliberate cost: a bare word carrying a tick must be
-/// double-quoted (`` "a`b" ``).
-///
-/// A comment opener inside the term, and a term opening with `//`, are
-/// parse errors ([`check_term`], ADR-0014).
+/// A backtick ends the term in every position, leading or mid-word,
+/// negated as much as bare: it opens a quoted field name, and if a term
+/// could absorb one, a quoted name the grammar refuses would not error
+/// at all — the query would silently become a substring search for the
+/// literal ticks. The deliberate cost: a bare word carrying a tick must
+/// be double-quoted (`` "a`b" ``).
 fn text_search<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     let negated = just('-')
@@ -363,13 +291,6 @@ fn text_search<'src>()
             })
         });
 
-    // `NOT-` directly before a backtick is an emitted error (ADR-0061
-    // ruling 5), for the same reason as `-` before one below: no
-    // spelling keeps the pair apart. `NOT- `…`` re-lexes as `NOT` over a
-    // term `-`, and `NOT `…`` negates the field, so neither text nor a
-    // formatter can say "the word `NOT-`, then this field". The term
-    // stops only at ASCII whitespace, so it also absorbs non-ASCII layout
-    // between `NOT` and `-` ([`is_not_dash`]), with the same result.
     let positive = check_term(
         any()
             .filter(|c: &char| {
@@ -417,7 +338,6 @@ fn is_not_dash(term: &str) -> bool {
         .is_some_and(|layout| layout.chars().all(comment::is_layout))
 }
 
-/// Parse `earliest="2026-03-14T03:00:00Z"` absolute time bound.
 fn earliest_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     just("earliest=")
@@ -426,7 +346,6 @@ fn earliest_filter<'src>()
         .labelled("earliest filter")
 }
 
-/// Parse `latest="2026-03-14T03:15:00Z"` absolute time bound.
 fn latest_filter<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     just("latest=")
@@ -435,30 +354,21 @@ fn latest_filter<'src>()
         .labelled("latest filter")
 }
 
-/// Parse a `last=`, `earliest=` or `latest=` time clause.
 fn time_clause<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     choice((time_filter(), earliest_filter(), latest_filter()))
 }
 
-/// Parse a single search token, including NOT prefix and parenthesized
-/// groups, in any position but the top level of the search stage.
-///
-/// A time clause here is an emitted error over the clause (ADR-0061
-/// ruling 2): it bounds the whole search, so inside parentheses it reads
-/// as a group that matches in one lane and not the other once hoisted,
-/// and under `NOT` the negation has nothing to negate. The top level
-/// ([`search_stage`]) reads a clause before it asks this parser, so a
-/// clause reaches this arm only from inside a group or a `NOT`.
+/// The top level ([`search_stage`]) reads a time clause before it asks
+/// this parser, so a clause reaches this arm only from inside a group or
+/// a `NOT` (ADR-0061 ruling 2).
 fn search_token<'src>()
 -> impl Parser<'src, ParserInput<'src>, SearchToken, ParserExtra<'src>> + Clone {
     recursive(|token| {
-        // NOT followed by another token (or group) = negation.
         // Use rewind-based lookahead: NOT must be followed by something
         // that's a valid token start, otherwise treat "NOT" as text search.
         let not_token = keyword("NOT")
             .then(
-                // Keeps "NOT |" and a trailing "NOT" out of the negation arm.
                 any()
                     .filter(|c: &char| {
                         c.is_alphanumeric()
@@ -466,7 +376,6 @@ fn search_token<'src>()
                             || *c == '"'
                             || *c == '-'
                             || *c == '('
-                            // a backtick opens a quoted field name
                             || *c == '`'
                     })
                     .rewind()
@@ -517,7 +426,6 @@ fn search_token<'src>()
                 SearchToken::Group(groups)
             });
 
-        // Leaf tokens (non-recursive)
         let nested_time_clause = time_clause().validate(|clause, extra, emitter| {
             emitter.emit(Rich::custom(extra.span(), MSG_NESTED_TIME_CLAUSE));
             clause
@@ -533,7 +441,6 @@ fn search_token<'src>()
     })
 }
 
-/// Intermediate enum for parsing OR-separated groups.
 #[derive(Clone)]
 enum TokenOrSep<T> {
     Token(T),
@@ -543,9 +450,6 @@ enum TokenOrSep<T> {
 /// The search stage's time clauses, taken out of its groups in text
 /// order, the last of each kind winning its slot.
 ///
-/// Only the top level holds a clause: a clause inside parentheses or
-/// under `NOT` is a parse error (ADR-0061 ruling 2, [`search_token`]).
-/// Every clause taken is also recorded in `clauses` with its span, since
 /// the three slots keep only the last of each kind.
 ///
 /// Each clause is checked as it is taken, because a later clause of its
@@ -559,15 +463,12 @@ struct Hoist {
     earliest: Option<Spanned<TimeBound>>,
     latest: Option<Spanned<TimeBound>>,
     clauses: Vec<Spanned<TimeClause>>,
-    /// Whether a `last=` and an absolute clause have each been taken, and
-    /// whether the pair has been refused, which happens once.
     seen_last: bool,
     seen_absolute: bool,
     paired: bool,
 }
 
 impl Hoist {
-    /// Take the time clauses out of one top-level token list.
     fn take(
         &mut self,
         tokens: &mut Vec<Spanned<SearchToken>>,
@@ -612,8 +513,6 @@ impl Hoist {
     }
 }
 
-/// The bound an `earliest=` or `latest=` clause spells, or `None` after
-/// refusing the clause over its span.
 fn read_bound(
     text: &str,
     span: &std::ops::Range<usize>,
@@ -657,7 +556,6 @@ pub(crate) fn search_stage<'src>()
                     }
                 }
             }
-            // Remove empty groups (trailing OR, leading OR, double OR).
             groups.retain(|g| !g.is_empty());
 
             // Hoist time clauses out of the OR groups — they apply
@@ -667,7 +565,6 @@ pub(crate) fn search_stage<'src>()
             for group in &mut groups {
                 hoist.take(group, emitter);
             }
-            // Remove groups that became empty after hoisting.
             groups.retain(|g| !g.is_empty());
 
             SearchStage {
@@ -689,7 +586,6 @@ mod tests {
     #[test]
     fn test_time_filter() {
         let result = search_stage().parse("last=2h").into_result().unwrap();
-        // Time filter is hoisted out of groups.
         assert!(result.groups.is_empty());
         let tf = result.time_filter.expect("time_filter should be hoisted");
         assert_eq!(
@@ -833,8 +729,6 @@ mod tests {
         Scalar::Regex(s.to_string())
     }
 
-    /// The operator is what the author typed, whatever the value's kind
-    /// (ADR-0060): `!=` with a pattern excludes it.
     #[test]
     fn ne_keeps_its_operator_for_a_pattern() {
         assert_eq!(
@@ -851,8 +745,6 @@ mod tests {
         );
     }
 
-    /// Each list element carries its own kind: a bare `*`/`?` makes a
-    /// glob, a quoted element is exact, and a regex element is a regex.
     #[test]
     fn list_elements_carry_their_own_kind() {
         assert_eq!(
@@ -879,8 +771,6 @@ mod tests {
                 FilterValue::List(vec![exact("a*"), glob("b?")])
             )
         );
-        // A regex body may hold a `,`: the regex is read before the list
-        // splits.
         assert_eq!(
             only_filter("f=x,/a,b/"),
             filter(
@@ -891,7 +781,6 @@ mod tests {
         );
     }
 
-    /// The one error `dsl` produces, with the source text it marks.
     fn one_error(dsl: &str) -> (crate::parser::ParseError, &str) {
         let errors = crate::parser::parse(dsl).expect_err(dsl);
         assert_eq!(errors.len(), 1, "{dsl}: {errors:?}");
@@ -900,9 +789,6 @@ mod tests {
         (error, marked)
     }
 
-    /// An ordered operator takes no pattern (ADR-0060). The error marks
-    /// the operator through the end of the value, and its hint names
-    /// `=`/`!=` — and, for a glob alone, quoting to compare text.
     #[test]
     fn an_ordered_operator_with_a_pattern_is_an_error() {
         for (dsl, marked, quoted) in [
@@ -949,8 +835,6 @@ mod tests {
         );
     }
 
-    /// A quoted value is never a pattern, so an ordered comparison of its
-    /// text stays one.
     #[test]
     fn an_ordered_operator_with_a_quoted_pattern_shape_compares_text() {
         assert_eq!(
@@ -963,9 +847,6 @@ mod tests {
         );
     }
 
-    /// One error per value: an ordered list keeps the list error alone,
-    /// pattern elements or not, and a value whose own production already
-    /// reported a `#` gets no operator error on top.
     #[test]
     fn one_error_per_value() {
         for dsl in ["f>a,b*", "f<=a*,/c/"] {
@@ -1015,7 +896,6 @@ mod tests {
 
     #[test]
     fn test_field_filter_quoted_value() {
-        // service="kernel" should strip quotes.
         let result = search_stage()
             .parse(r#"service="kernel""#)
             .into_result()
@@ -1033,7 +913,6 @@ mod tests {
 
     #[test]
     fn test_field_filter_quoted_value_with_spaces() {
-        // service="Activity Monitor" — quotes allow spaces in field values.
         let result = search_stage()
             .parse(r#"service="Activity Monitor""#)
             .into_result()
@@ -1068,12 +947,9 @@ mod tests {
             .parse("service=nginx _severity=error last=2h")
             .into_result()
             .unwrap();
-        // Time filter hoisted, 2 tokens remain in group.
         assert_eq!(result.groups[0].len(), 2);
         assert!(result.time_filter.is_some());
     }
-
-    // ── backtick escape (ADR-0013 ruling 7) ────────────────────────────
 
     /// `last=` stays an unconditional keyword and `` `last` ``=5 is the
     /// field — in the SAME query, so BOTH `field_filter` sites (the
@@ -1101,7 +977,6 @@ mod tests {
         );
     }
 
-    /// The other two members of the closed keyword set behave the same.
     #[test]
     fn backticked_earliest_and_latest_are_field_filters() {
         let result = search_stage()
@@ -1120,8 +995,6 @@ mod tests {
         );
     }
 
-    /// `NOT` must see a backtick as a token start, else it degrades to a
-    /// bare text search for the word "NOT".
     #[test]
     fn not_negates_a_backticked_field_filter() {
         let result = search_stage()
@@ -1142,22 +1015,16 @@ mod tests {
         }
     }
 
-    /// A backtick ends a bare word and a bare value alike, in every
-    /// position: no unquoted position may absorb the one character whose
-    /// meaning is settled before the grammar runs. Without the refusal
-    /// each shape below answers something quietly different — a substring
-    /// search for the literal ticks, or a filter narrowed to half the
-    /// value the user wrote beside a stray text term.
     #[test]
     fn no_unquoted_position_absorbs_a_backtick() {
         for dsl in [
-            "er`ror",                // a bare word carrying a tick
-            "service=`nginx`",       // the typo: ticks are not value quotes
-            "service=`my service`",  // …which read as a filter plus a term
-            "status=200,`a b` more", // …and as an IN-list element
-            "host=a+`b` more",       // a tick after an operator in a value
-            "-`http-status`=500",    // a negated quoted NAME, unspellable
-            "-`a b`",                // …and one the whitespace split in two
+            "er`ror",
+            "service=`nginx`",
+            "service=`my service`",
+            "status=200,`a b` more",
+            "host=a+`b` more",
+            "-`http-status`=500",
+            "-`a b`",
         ] {
             let result = search_stage().then_ignore(end()).parse(dsl).into_result();
             assert!(
@@ -1167,8 +1034,6 @@ mod tests {
         }
     }
 
-    /// …and the double-quoted form is how a tick reaches a value or a
-    /// term, carrying it verbatim.
     #[test]
     fn a_double_quoted_value_still_carries_a_backtick() {
         let result = search_stage()
@@ -1200,7 +1065,6 @@ mod tests {
 
     #[test]
     fn test_not_at_end_is_text_search() {
-        // "NOT" at end of input (no following token) → text search.
         let result = search_stage().parse("NOT").into_result().unwrap();
         assert_eq!(result.groups[0].len(), 1);
         assert_eq!(
@@ -1214,7 +1078,6 @@ mod tests {
 
     #[test]
     fn test_not_negates_field_filter() {
-        // "NOT _severity=error" → single NOT(FieldFilter) token.
         let result = search_stage()
             .parse("NOT _severity=error")
             .into_result()
@@ -1237,7 +1100,6 @@ mod tests {
 
     #[test]
     fn test_not_parenthesized_group() {
-        // "NOT (service=nginx OR service=apache) _severity=error"
         let result = search_stage()
             .parse("NOT (service=nginx OR service=apache) _severity=error")
             .into_result()
@@ -1252,7 +1114,6 @@ mod tests {
 
     #[test]
     fn test_parenthesized_group() {
-        // "(service=nginx OR service=apache)"
         let result = search_stage()
             .parse("(service=nginx OR service=apache)")
             .into_result()
@@ -1311,7 +1172,6 @@ mod tests {
 
     #[test]
     fn test_or_implicit_and_binds_tighter() {
-        // "a b OR c d" → [[a, b], [c, d]]
         let result = search_stage()
             .parse("service=nginx _severity=error OR service=postgres _severity=warn")
             .into_result()
@@ -1339,13 +1199,11 @@ mod tests {
 
     #[test]
     fn test_time_filter_hoisted_from_or_groups() {
-        // `service=nginx last=2h OR service=postgres` — time filter applies globally.
         let result = search_stage()
             .parse("service=nginx last=2h OR service=postgres")
             .into_result()
             .unwrap();
         assert_eq!(result.groups.len(), 2);
-        // Neither group should contain the time filter.
         for group in &result.groups {
             for token in group {
                 assert!(
@@ -1354,7 +1212,6 @@ mod tests {
                 );
             }
         }
-        // Hoisted time filter should be present.
         let tf = result.time_filter.expect("time_filter should be hoisted");
         assert_eq!(tf.node.duration.quantity, 2);
         assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
@@ -1362,7 +1219,6 @@ mod tests {
 
     #[test]
     fn test_last_time_filter_wins() {
-        // Multiple time filters — last one wins.
         let result = search_stage()
             .parse("last=1h service=nginx last=2h")
             .into_result()
@@ -1370,13 +1226,9 @@ mod tests {
         let tf = result.time_filter.expect("time_filter should be hoisted");
         assert_eq!(tf.node.duration.quantity, 2);
         assert_eq!(tf.node.duration.unit, TimeUnit::Hours);
-        // Only the service token remains in the group.
         assert_eq!(result.groups[0].len(), 1);
     }
 
-    /// Every hoisted clause is recorded with its own span, the ones the
-    /// last of each kind displaced included, in text order across the OR
-    /// groups: only the top level holds a clause (ADR-0061 ruling 2).
     #[test]
     fn every_hoisted_clause_is_recorded_with_its_span() {
         let hoisted = |input: &'static str| -> (SearchStage, Vec<(TimeClause, &'static str)>) {
@@ -1419,12 +1271,6 @@ mod tests {
         assert!(plain.hoisted.is_empty());
     }
 
-    /// Every `earliest=` and `latest=` clause reads through
-    /// `compare::bound_instant`, and `last=` never sits beside one
-    /// (ADR-0017 and ADR-0061, amendments of 2026-11-08). Each refusal
-    /// is a parse error over exactly the clause to change: an unreadable
-    /// clause over itself, even when a later clause of its kind
-    /// overrides it, and a `last=` pair over the clause that completes it.
     #[test]
     #[allow(clippy::too_many_lines)]
     fn absolute_bounds_are_checked_and_spanned() {
@@ -1454,39 +1300,30 @@ mod tests {
         };
 
         let cases: [(&str, Vec<_>); 14] = [
-            // A word DuckDB has no reading for.
             (r#"earliest="yesterday""#, vec![unreadable(0..20)]),
             // Read, but its cast text is `+10000-…`, NULL to DuckDB.
             (
                 r#"service=api latest="10000-01-01""#,
                 vec![unreadable(12..32)],
             ),
-            // Outside both calendars.
             (r#"latest="300000-01-01""#, vec![unreadable(0..21)]),
-            // An overridden clause is still checked.
             (
                 r#"earliest="bad" earliest="2026-03-14""#,
                 vec![unreadable(0..14)],
             ),
-            // …and so is the clause that overrides a good one.
             (
                 r#"earliest="2026-03-14" latest="soon""#,
                 vec![unreadable(22..35)],
             ),
-            // Each unreadable clause carries its own error.
             (
                 r#"earliest="bad" latest="worse""#,
                 vec![unreadable(0..14), unreadable(15..29)],
             ),
-            // Spans are bytes: a multibyte prefix moves them by its length.
             (r#""é" earliest="yesterday""#, vec![unreadable(5..25)]),
-            // A clause beside an OR is still top level, and still checked.
             (r#"a OR earliest="nope""#, vec![unreadable(5..20)]),
-            // `last=` with an absolute bound: over the later clause.
             (r#"last=1h earliest="2026-03-14""#, vec![with_last(8..29)]),
             (r#"last=1h latest="2026-03-14""#, vec![with_last(8..27)]),
             (r#"earliest="2026-03-14" last=1h"#, vec![with_last(22..29)]),
-            // The first clause that completes a pair, and only it.
             (
                 r#"last=1h earliest="2026-03-14" latest="2026-03-15""#,
                 vec![with_last(8..29)],
@@ -1495,8 +1332,6 @@ mod tests {
                 r#"last=1h a OR b last=2h latest="2026-03-14""#,
                 vec![with_last(23..42)],
             ),
-            // The two checks are independent: an unreadable clause that
-            // completes a pair carries both errors.
             (
                 r#"last=1h earliest="bad""#,
                 vec![unreadable(8..22), with_last(8..22)],
@@ -1513,8 +1348,6 @@ mod tests {
         };
         let at = |text: &str| literal_timestamp(text).expect("a timestamp");
 
-        // Every spelling the cast reads is a bound, its text kept as
-        // written beside the instant that executes.
         for (text, instant) in [
             ("2026-03-14", "2026-03-14 00:00:00"),
             ("2026-03-14T09:00:00", "2026-03-14 09:00:00"),
@@ -1535,15 +1368,12 @@ mod tests {
             }
         }
 
-        // The last valid clause of a kind still wins.
         let search = parsed(r#"earliest="2026-03-14" earliest="2026-03-15""#);
         let earliest = search.earliest.expect("the bound").node;
         assert_eq!(earliest.text(), "2026-03-15");
         assert_eq!(earliest.instant(), at("2026-03-15"));
         assert_eq!(search.hoisted.len(), 2);
 
-        // Unquoted, the keyword is a field filter (ADR-0062), so its
-        // value is never read as a bound.
         for input in ["earliest=2026-03-14", "earliest=yesterday"] {
             let search = parsed(input);
             assert!(search.earliest.is_none(), "{input:?}");
@@ -1557,7 +1387,6 @@ mod tests {
             );
         }
 
-        // An inverted interval parses; it answers empty in both lanes.
         let search = parsed(r#"earliest="2026-03-15" latest="2026-03-14""#);
         assert!(
             search.earliest.expect("earliest").node.instant()
@@ -1565,9 +1394,6 @@ mod tests {
         );
     }
 
-    /// A clause beside an `OR` is still top level, and keeps its slot:
-    /// the last of each kind wins in text order, whichever OR group holds
-    /// it, and a group the clauses emptied is dropped.
     #[test]
     fn top_level_or_time_clauses_keep_last_wins_order() {
         let input = "a last=1h OR b OR last=2h";
@@ -1580,7 +1406,6 @@ mod tests {
 
     #[test]
     fn test_only_time_filter_produces_empty_groups() {
-        // A query with only a time filter — groups become empty after hoisting.
         let result = search_stage().parse("last=5m").into_result().unwrap();
         assert!(result.groups.is_empty());
         assert!(result.time_filter.is_some());

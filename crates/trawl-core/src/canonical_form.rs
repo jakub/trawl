@@ -5,23 +5,13 @@
 //! The canonical form of a parsed query (ADR-0061): what two parses must
 //! share to mean the same thing.
 //!
-//! The canonical form is the AST with every span and the search stage's
-//! `hoisted` list left out. Both record where something sat in the
-//! source, not what the query asks. Nothing else is normalised: token
-//! order, group nesting, scalar kind, operator, list order, float source
-//! text, alias keywords, `Int` against `Neg`, and `TextSearch` against
-//! `QuotedSearch` all count.
-//!
-//! [`same_query`] is the one owner of that rule. It compares two trees in
-//! lockstep rather than building a span-free copy, and it walks with an
-//! explicit stack: `MAX_EXPR_DEPTH` bounds nesting, not tree depth, so
-//! `1+1+…` folds to a left-leaning tree as deep as the chain is long, and
-//! derived `PartialEq` on it would recurse once per term.
+//! It walks with an explicit stack: `MAX_EXPR_DEPTH` bounds nesting, not
+//! tree depth, so `1+1+…` folds to a left-leaning tree as deep as the
+//! chain is long, and derived `PartialEq` on it would recurse once per term.
 //!
 //! Every AST struct is destructured in full and every enum matched
 //! without a wildcard arm, so a new field or variant fails to compile
-//! here until someone decides whether it counts. Leaf types that hold no
-//! span and no subtree are compared with their derived `PartialEq`.
+//! here until someone decides whether it counts.
 
 use crate::ast::{
     AggExpr, DedupStage, DropStage, EventStatsStage, Expr, ExtractStage, FieldFilter,
@@ -31,15 +21,12 @@ use crate::ast::{
     WhereStage,
 };
 
-/// Whether two queries have the same canonical form: equal in everything
-/// but spans and `SearchStage.hoisted`.
 #[must_use]
 pub fn same_query(a: &Query, b: &Query) -> bool {
     let mut walk = Walk::default();
     walk.query(a, b) && walk.drain()
 }
 
-/// One pair of subtrees the walk has still to compare.
 enum Pair<'q> {
     Token(&'q SearchToken, &'q SearchToken),
     Expr(&'q Expr, &'q Expr),
@@ -52,13 +39,11 @@ struct Walk<'q> {
     pending: Vec<Pair<'q>>,
 }
 
-/// The node of a spanned value, its span ignored.
 fn node<T>(spanned: &Spanned<T>) -> &T {
     let Spanned { node, span: _ } = spanned;
     node
 }
 
-/// Two optional spanned values, their spans ignored.
 fn same_optional<T>(
     a: Option<&Spanned<T>>,
     b: Option<&Spanned<T>>,
@@ -77,8 +62,6 @@ fn same_time_filter(a: &TimeFilter, b: &TimeFilter) -> bool {
     da == db
 }
 
-/// A bound is its written text (ADR-0061): the instant it reads as
-/// follows from the text, and two spellings of one instant still differ.
 fn same_bound(a: &TimeBound, b: &TimeBound) -> bool {
     a.text() == b.text()
 }
@@ -162,8 +145,6 @@ impl<'q> Walk<'q> {
             && self.groups(ga, gb)
     }
 
-    /// OR-separated groups of AND-joined tokens: same shape, then each
-    /// token pair queued.
     fn groups(
         &mut self,
         a: &'q [Vec<Spanned<SearchToken>>],
@@ -178,7 +159,6 @@ impl<'q> Walk<'q> {
         true
     }
 
-    /// Two expression lists: same length, then each pair queued.
     fn exprs(&mut self, a: &'q [Spanned<Expr>], b: &'q [Spanned<Expr>]) -> bool {
         if a.len() != b.len() {
             return false;
@@ -207,7 +187,6 @@ impl<'q> Walk<'q> {
         fa == fb && aa == ab && self.exprs(xa, xb)
     }
 
-    // one arm per stage, each destructured in full on both sides
     #[allow(clippy::too_many_lines)]
     fn stage(&mut self, a: &'q PipeStage, b: &'q PipeStage) -> bool {
         match a {
@@ -414,7 +393,6 @@ impl<'q> Walk<'q> {
         }
     }
 
-    /// Compare every queued pair, stopping at the first difference.
     fn drain(&mut self) -> bool {
         while let Some(pair) = self.pending.pop() {
             let same = match pair {
@@ -583,7 +561,6 @@ mod tests {
 
     #[test]
     fn a_scalar_kind_differs() {
-        // Exact, Glob and Regex carrying the same characters
         assert_differ("a=x*", r#"a="x*""#);
         assert_differ("a=/x/", "a=x");
         assert_differ("a=/x*/", "a=x*");
@@ -594,14 +571,11 @@ mod tests {
         // `Neg(Neg(Int(1)))`
         assert_differ("* | where a == - -1", "* | where a == --1");
         assert_differ("* | where a == - -1.5", "* | where a == --1.5");
-        // an Int against a Float, a string against a number
         assert_differ("* | where a == 1", "* | where a == 1.0");
         assert_differ("* | where a == 1", r#"* | where a == "1""#);
         assert_differ("* | where a == true", r#"* | where a == "true""#);
         assert_differ("* | where a == null", r#"* | where a == "null""#);
-        // a field reference against a string literal
         assert_differ("* | where a == b", r#"* | where a == "b""#);
-        // a bare word against a quoted phrase
         assert_differ("foo", r#""foo""#);
     }
 
@@ -630,13 +604,9 @@ mod tests {
             r#"earliest="2026-01-02T00:00:00Z""#,
         );
         assert_differ(r#"x latest="2026-01-01T00:00:00Z""#, "x");
-        // a time clause against a field named like its keyword
         assert_differ("last=1h", "`last`=1h");
     }
 
-    /// A bound's identity is its written text, not the instant it reads
-    /// as (ADR-0061): two spellings of one instant are two queries, and
-    /// the same spelling twice is one.
     #[test]
     fn resolved_bounds_do_not_change_source_identity() {
         for (a, b) in [
@@ -666,7 +636,6 @@ mod tests {
             );
             assert_differ(a, b);
         }
-        // Where the clause sits is not identity either.
         assert_same(r#"x earliest="2026-03-14""#, r#"earliest="2026-03-14" x"#);
     }
 
@@ -692,18 +661,15 @@ mod tests {
 
     #[test]
     fn order_nesting_and_spelling_count() {
-        // token order and list order
         assert_differ("a b", "b a");
         assert_differ("a=1,2", "a=2,1");
         assert_differ("* | where a in (1, 2)", "* | where a in (2, 1)");
         assert_differ("* | table a, b", "* | table b, a");
-        // group nesting, in the search stage and in expressions
         assert_differ("a b", "(a b)");
         assert_differ("a OR b", "(a OR b)");
         assert_differ("a b OR c", "a (b OR c)");
         assert_differ("* | where a + b * c", "* | where (a + b) * c");
         assert_differ("* | where (a == b) == c", "* | where a == (b == c)");
-        // an alias keyword is what the author typed
         assert_differ("* | head 1", "* | limit 1");
         assert_differ("* | table a", "* | fields a");
         assert_differ("* | let x = 1", "* | eval x = 1");
@@ -750,11 +716,7 @@ mod tests {
         assert!(same_query(&b, &a));
     }
 
-    /// The comparison walks with an explicit stack, so a flat chain far
-    /// deeper than the parser admits compares on a tokio worker's 2 MiB
-    /// stack in a debug build. `1+1+…` folds to a left-leaning tree as
-    /// deep as the chain is long; such a tree comes only from code, so the
-    /// deep chains are built there.
+    /// Such a tree comes only from code, so the deep chains are built there.
     #[test]
     fn a_flat_chain_compares_on_a_worker_stack() {
         use crate::parser::depth_fixtures::{chain_of, flat_chain, int, spliced};

@@ -32,7 +32,6 @@ fn advice(text: &str) -> AdviceReport {
     advise(&parsed(text))
 }
 
-/// The one finding `text` gives.
 fn only(text: &str) -> trawl_core::advice::Advice {
     let report = advice(text);
     assert_eq!(report.omitted, 0, "{text:?}");
@@ -68,8 +67,6 @@ fn negated_field_shape_is_advised() {
          write NOT \"service!=…\""
     );
 
-    // The longest operator wins at the split byte, and the value may hold
-    // operator bytes of its own.
     for (text, op) in [
         ("-n<5", "<"),
         ("-n<=5", "<="),
@@ -89,8 +86,6 @@ fn negated_field_shape_is_advised() {
         );
     }
 
-    // Anywhere in the search stage: inside brackets, under NOT, in a
-    // second OR group.
     for (text, span) in [
         ("(a OR -service=x)", 6..16),
         ("NOT -service=x", 4..14),
@@ -125,7 +120,6 @@ fn search_stage_in_is_advised() {
         );
     }
 
-    // `IN`, any case of the lowercase-reading `not`, any group contents.
     for (text, hint) in [
         ("event_type IN (a)", IN_HINT),
         ("event_type Not in (a OR b)", NOT_IN_HINT),
@@ -137,7 +131,6 @@ fn search_stage_in_is_advised() {
         assert_eq!(finding.hint, hint, "{text:?}");
     }
 
-    // At any depth, and a run's group is still read.
     let finding = only("a OR (b event_type in (x))");
     assert_eq!(finding.span, 8..23);
     let report = advice("event_type in (-service=x)");
@@ -153,7 +146,6 @@ fn search_stage_in_is_advised() {
             (AdviceKind::NegatedFieldShape, 15..25),
         ]
     );
-    // A run inside a matched group.
     let report = advice("f not in (g in (x))");
     let kinds: Vec<_> = report
         .findings
@@ -167,7 +159,6 @@ fn search_stage_in_is_advised() {
             (AdviceKind::SearchStageIn, 10..16),
         ]
     );
-    // Two runs in one sequence.
     let report = advice("f in (a) g NOT in (b)");
     let spans: Vec<_> = report.findings.iter().map(|f| f.span.clone()).collect();
     assert_eq!(spans, [0..6, 9..19]);
@@ -202,8 +193,7 @@ fn advice_non_triggers_stay_silent() {
 }
 
 /// Field names the copy must spell so that each offered spelling reads as
-/// what the copy claims: custom, dotted, `@`-led, grammar and search
-/// keywords, expression keywords, and dotted names a keyword leads.
+/// what the copy claims.
 const NAMES: &[&str] = &[
     "service",
     "event_type",
@@ -233,7 +223,6 @@ const NAMES: &[&str] = &[
 
 const SAMPLE: &str = "web01";
 
-/// What an offered spelling claims to be.
 #[derive(Debug, PartialEq)]
 enum Claim {
     Filter(FilterOp),
@@ -253,9 +242,6 @@ fn filter_op(op: &str) -> FilterOp {
     }
 }
 
-/// The spellings a negated-field-shape hint offers, in order: each word
-/// holding `…`, with the `NOT` before it when there is one, and its
-/// trailing punctuation cut.
 fn offered_spellings(hint: &str) -> Vec<String> {
     let words: Vec<&str> = hint.split(' ').collect();
     let mut spellings = Vec::new();
@@ -273,7 +259,6 @@ fn offered_spellings(hint: &str) -> Vec<String> {
     spellings
 }
 
-/// The one top-level token `text` parses to.
 fn single_token(text: &str) -> Query {
     let query = parsed(text);
     assert_eq!(query.search.groups.len(), 1, "{text:?}");
@@ -298,7 +283,6 @@ fn assert_field_filter(text: &str, token: &SearchToken, name: &str, op: FilterOp
     );
 }
 
-/// Checks the negated-field-shape copy for `-<name><op><sample>`.
 fn check_negated_copy(name: &str, op: &str) {
     let term = format!("{name}{op}{SAMPLE}");
     let text = format!("-{term}");
@@ -342,14 +326,10 @@ fn check_negated_copy(name: &str, op: &str) {
                 assert_eq!(phrase, &term, "{spelled:?}");
             }
         }
-        // A spelling the copy offers draws no advice of its own.
         assert_eq!(advice(&spelled), AdviceReport::default(), "{spelled:?}");
     }
 }
 
-/// Checks the search-stage `in` copy for `<name> <keyword> (a, b)`, and
-/// whether it applied: `false` when the search stage does not read
-/// `name` there as a positive text term.
 fn check_in_copy(name: &str, keyword: &str, negated: bool) -> bool {
     let text = format!("{name} {keyword} (a, b)");
     let Ok(query) = parser::parse(&text) else {
@@ -454,7 +434,6 @@ fn advice_is_capped_in_source_order() {
     let expected: Vec<_> = (0..MAX_ADVICE_FINDINGS).map(|i| i * 5..i * 5 + 4).collect();
     assert_eq!(spans, expected);
 
-    // Mixed kinds, nested and across OR groups, stay in source order.
     let text = "(x -b=1) f in (-c=2) OR NOT -d=3 g NOT in (h)";
     let report = advice(text);
     let found: Vec<_> = report

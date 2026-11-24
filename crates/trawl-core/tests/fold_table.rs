@@ -4,14 +4,8 @@
 
 //! The text fold's lowercase table against the bundled `DuckDB` (ADR-0015).
 //!
-//! [`trawl_core::text::fold_ci`] folds with a committed copy of `DuckDB`'s
-//! `lower()` mapping, so the live filter and `sightings` attribution match
-//! `ILIKE` on every character. These tests regenerate the mapping from the
-//! bundled `DuckDB` and hold the committed table, `ILIKE` and `fold_ci` to
-//! it, so a `DuckDB` bump that changes the mapping fails here first.
-//!
-//! `cargo test -p trawl-core --test fold_table -- --ignored regenerate`
-//! rewrites the committed table from the bundled `DuckDB`.
+//! These tests hold the committed table, `ILIKE` and `fold_ci` to the bundled
+//! `DuckDB`, so a `DuckDB` bump that changes the mapping fails here first.
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -20,10 +14,8 @@ use duckdb::Connection;
 
 use trawl_core::text::fold_ci;
 
-/// The committed table, relative to the crate root.
 const TABLE_PATH: &str = "src/text/duckdb_lower.rs";
 
-/// The command that rewrites [`TABLE_PATH`].
 const REGENERATE: &str = "cargo test -p trawl-core --test fold_table -- --ignored regenerate";
 
 /// Every Unicode scalar value but NUL, as `cp`: the two ranges either side
@@ -32,8 +24,6 @@ const REGENERATE: &str = "cargo test -p trawl-core --test fold_table -- --ignore
 const SCALARS: &str = "SELECT cp::INTEGER AS cp FROM range(1, 55296) AS t(cp) \
      UNION ALL SELECT cp::INTEGER FROM range(57344, 1114112) AS t(cp)";
 
-/// The code point `lower()` maps one scalar value to, for every scalar
-/// value it changes, in code point order.
 fn mapping_sql() -> String {
     format!(
         "SELECT cp, unicode(lower(chr(cp))) FROM ({SCALARS}) \
@@ -45,7 +35,6 @@ fn duckdb() -> Connection {
     Connection::open_in_memory().unwrap()
 }
 
-/// The library version string of the bundled `DuckDB`, such as `v1.5.5`.
 fn duckdb_version(conn: &Connection) -> String {
     conn.query_row("SELECT library_version FROM pragma_version()", [], |row| {
         row.get(0)
@@ -53,12 +42,6 @@ fn duckdb_version(conn: &Connection) -> String {
     .unwrap()
 }
 
-/// `DuckDB`'s `lower()` mapping: each scalar value it changes, with the one
-/// code point it maps to.
-///
-/// Panics, naming the code points, when `lower()` maps any scalar value to
-/// other than exactly one code point: the fold is one code point to one,
-/// and a table cannot stand for anything else.
 fn duckdb_lower_mapping(conn: &Connection) -> BTreeMap<char, char> {
     let not_one_to_one: Vec<String> = conn
         .prepare(&format!(
@@ -89,7 +72,6 @@ fn duckdb_lower_mapping(conn: &Connection) -> BTreeMap<char, char> {
         .collect()
 }
 
-/// The committed table's source text for `mapping` under `version`.
 fn render(version: &str, mapping: &BTreeMap<char, char>) -> String {
     let mut out = format!(
         "// This Source Code Form is subject to the terms of the Mozilla Public\n\
@@ -123,7 +105,6 @@ fn table_file() -> std::path::PathBuf {
     std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(TABLE_PATH)
 }
 
-/// The `(from, to)` pairs of the committed table's source text.
 fn committed_pairs(text: &str) -> BTreeMap<char, char> {
     let scalar = |hex: &str| {
         char::from_u32(u32::from_str_radix(hex, 16).expect("hex")).expect("scalar value")
@@ -142,7 +123,6 @@ fn committed_pairs(text: &str) -> BTreeMap<char, char> {
         .collect()
 }
 
-/// Rewrites the committed table from the bundled `DuckDB`.
 #[test]
 #[ignore = "rewrites src/text/duckdb_lower.rs; run after a DuckDB bump"]
 fn regenerate() {
@@ -188,7 +168,6 @@ fn ilike_folds_through_the_same_table() {
     let mapping = duckdb_lower_mapping(&conn);
     let values = |rows: &mut dyn Iterator<Item = String>| rows.collect::<Vec<_>>().join(", ");
 
-    // Every pair of the table matches under `ILIKE`, both ways round.
     conn.execute_batch(&format!(
         "CREATE TEMP TABLE pairs (u INTEGER, l INTEGER); INSERT INTO pairs VALUES {}",
         values(
@@ -213,9 +192,6 @@ fn ilike_folds_through_the_same_table() {
         "ILIKE does not match these table pairs: {unmatched:?}"
     );
 
-    // Where Rust's full lowercase mapping disagrees with the table, `ILIKE`
-    // sides with the table: the scalar matches its table fold and never its
-    // Rust fold.
     let disagreements: Vec<(char, String, char)> = ('\u{1}'..=char::MAX)
         .filter_map(|c| {
             let table = mapping.get(&c).copied().unwrap_or(c);

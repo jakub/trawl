@@ -16,18 +16,6 @@
 //! [`trawl_core::fuzz_input`], not here, because the PREPARE fixture in
 //! trawl-engine replays the same committed cases and the two would
 //! otherwise decode them differently the first time either changed.
-//!
-//! Three claims are under test.
-//!
-//! 1. Neither emitter lane panics, for any pin map, on any input the
-//!    parser accepted. libFuzzer owns that check: nothing here catches a
-//!    panic, so a panic aborts the process and is reported as a crash.
-//! 2. Every typed failure is an outcome someone named. See
-//!    [`classify_emit_failure`] — the classifiers exist to fail the build
-//!    when a new error variant appears, not to inspect the error.
-//! 3. Pins change the SQL, never whether a query is emittable — except
-//!    where the crate documents a closed vocabulary. That is the
-//!    differential oracle at the bottom of the target.
 
 #![no_main]
 
@@ -41,21 +29,13 @@ use trawl_core::json_path::{PathError, PathErrorKind};
 use trawl_core::parser::ParseError;
 use trawl_core::schema::{CanonicalType, FieldTypes};
 
-/// The parquet glob every case emits against.
-///
-/// Fixed, because the source path is not what this oracle is about:
-/// varying it would spend fuzzer time inside `validate_source_path`
+/// Fixed: varying it would spend fuzzer time inside `validate_source_path`
 /// instead of inside the pin rule table.
 const SRC: &str = "test.parquet";
 
-/// Accept a parse failure by naming every field of [`ParseError`].
-///
-/// This function looks like it does nothing, and that is the point: the
-/// exhaustive destructuring is the guard. With no `..`, a field added to
-/// `ParseError` stops compiling right here and whoever adds it has to
-/// decide whether the fuzzer should check the new information, where a
-/// `..` would swallow that decision and leave the target reporting green
-/// while covering less than it claims.
+/// The exhaustive destructuring is the guard. With no `..`, a field added
+/// to `ParseError` stops compiling right here and whoever adds it has to
+/// decide whether the fuzzer should check the new information.
 fn classify_parse_failure(errors: &[ParseError]) {
     for err in errors {
         let ParseError {
@@ -65,9 +45,6 @@ fn classify_parse_failure(errors: &[ParseError]) {
             hint: _,
         } = err;
 
-        // Every rejection path renders somewhere: the CLI prints it, the
-        // TUI draws it, `/api/v1/validate` puts it on the wire. An empty
-        // rendering is a rejection with no reason attached.
         assert!(
             !err.to_string().is_empty(),
             "a ParseError rendered as empty text: {err:?}"
@@ -75,12 +52,8 @@ fn classify_parse_failure(errors: &[ParseError]) {
     }
 }
 
-/// Accept an emit failure by naming every variant of [`EmitError`].
-///
-/// Same guard as [`classify_parse_failure`], one level up: no `_` arm and
-/// no `..` inside any variant pattern, so a new variant or a new field on
-/// an existing one is a compile error rather than an error shape silently
-/// accepted as a known outcome.
+/// Same guard as [`classify_parse_failure`]: no `_` arm and no `..`, so a
+/// new variant or a new field on an existing one is a compile error.
 fn classify_emit_failure(err: &EmitError, query: &str) {
     match err {
         EmitError::UnknownFunction {
@@ -126,10 +99,8 @@ fn classify_emit_failure(err: &EmitError, query: &str) {
     }
 }
 
-/// Accept a JSON path refusal by naming every variant of
-/// [`JsonPathFault`] and [`PathErrorKind`], for the same reason as
-/// [`classify_emit_failure`]: a new kind of path refusal is a compile
-/// error here, not an outcome accepted unread.
+/// Same reason as [`classify_emit_failure`]: a new kind of path refusal is
+/// a compile error here.
 fn classify_json_path_fault(fault: &JsonPathFault) {
     match fault {
         JsonPathFault::NotLiteral => {}
@@ -145,27 +116,15 @@ fn classify_json_path_fault(fault: &JsonPathFault) {
     }
 }
 
-/// Accept a pin rule table refusal by naming every variant of
-/// [`CompareError`].
-///
-/// One variant today. The match stays exhaustive anyway for the reason
-/// the other two classifiers do: the differential oracle below leans on
+/// One variant today. The differential oracle below leans on
 /// `CompareError`'s doc comment claiming SEVERITY is the only pin with a
-/// closed vocabulary, so a second variant would mean that claim moved and
-/// the oracle needs rereading. Failing to compile is how that gets
-/// noticed.
+/// closed vocabulary, so a second variant means the oracle needs rereading.
 fn classify_compare_failure(err: &CompareError) {
     match err {
         CompareError::UnknownSeverityToken { token: _ } => {}
     }
 }
 
-/// One lane's outcome, rendered for a crash report.
-///
-/// The SQL text on success, the message on failure. Whoever reads a
-/// libFuzzer artifact has the input bytes and nothing else, so the
-/// assertion message has to carry enough to tell which lane went wrong
-/// and how.
 fn describe(result: &Result<EmittedQuery, EmitError>) -> String {
     match result {
         Ok(emitted) => format!("ok, sql {:?}", emitted.sql),
@@ -173,7 +132,6 @@ fn describe(result: &Result<EmittedQuery, EmitError>) -> String {
     }
 }
 
-/// The whole bug report for a differential failure.
 fn report(
     query: &str,
     pins: &FieldTypes,
@@ -221,19 +179,10 @@ fuzz_target!(|input: &str| {
         classify_emit_failure(err, case.query);
     }
 
-    // The differential oracle, and the crate invariant it asserts.
-    //
-    // `CompareError`'s doc comment states that SEVERITY is the only pin
-    // with a closed vocabulary and that every other rule table entry is
-    // total over literals by construction. Read as a testable claim: a
-    // pin decides how a comparison is rendered, never whether the query
-    // can be emitted at all. So with no SEVERITY pin anywhere in the map,
-    // the two lanes must agree exactly on emittability.
-    //
-    // With a SEVERITY pin the lanes are allowed to disagree in one
-    // direction only: `_severity=banana` names no ladder point and is a
-    // refusal under the pin where the pin-blind lane happily emits a text
-    // comparison.
+    // A pin decides how a comparison is rendered, never whether the query
+    // can be emitted at all. With a SEVERITY pin the lanes may disagree in
+    // one direction only: `_severity=banana` names no ladder point and is a
+    // refusal under the pin.
     let severity_pinned = pins.iter().any(|(_, ty)| ty == CanonicalType::Severity);
     if !severity_pinned {
         assert_eq!(
@@ -246,10 +195,6 @@ fuzz_target!(|input: &str| {
         );
     }
 
-    // Unconditional, SEVERITY included: pins may narrow what emits, never
-    // widen it. A query the pin-blind emitter refuses is malformed on its
-    // own terms — an unknown function, a bad aggregation — and no pin map
-    // can make it well formed.
     if blind.is_err() {
         assert!(
             pinned.is_err(),

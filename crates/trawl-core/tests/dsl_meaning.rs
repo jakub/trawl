@@ -10,22 +10,6 @@
 //! the parser and the formatter make the same way twice would pass a
 //! format-then-reparse check, so the parser is checked against what the
 //! author wrote instead.
-//!
-//! The notation (spans are ignored):
-//!
-//! - `ff(field op scalar(kind,"text"))`: a field filter. The operator is
-//!   the one typed, and `!=` stays `!=`; it is never folded into `not`.
-//! - `ff(field op list[scalar(..), …])`: a comma list, in written order.
-//! - `text("t")`, `-text("t")`, `phrase("p")`: text searches.
-//! - `not(..)`: `NOT`.
-//! - `grp(a b|c)`: a group. A space joins with AND and `|` with OR.
-//! - `… @last(1h)`, `… @earliest("…")`, `… @latest("…")`: the search
-//!   stage's time slots, which hold the last top-level clause of each
-//!   kind.
-//! - `… |> head(1)`, `… |> where((x / 2) == 1)`: a pipe stage after the
-//!   search stage, an expression with every binary node parenthesised.
-//! - `err("fragment" @ a..b)`: the query's one error, a fragment of its
-//!   message and its byte span. `errs(…)` lists several, in order.
 
 use std::fmt;
 use std::ops::Range;
@@ -34,8 +18,6 @@ use trawl_core::ast::{
     Expr, FilterOp, FilterValue, PipeStage, Query, Scalar, SearchToken, Spanned,
 };
 use trawl_core::parser::parse;
-
-// ── The notation ──────────────────────────────────────────────────────
 
 fn operator(op: FilterOp) -> &'static str {
     match op {
@@ -143,7 +125,6 @@ fn meaning(query: &Query) -> String {
     out
 }
 
-/// What a query is expected to read as.
 #[derive(Clone)]
 enum Want {
     Means(String),
@@ -151,7 +132,6 @@ enum Want {
         fragment: &'static str,
         span: Range<usize>,
     },
-    /// Exactly these errors, in order.
     Errors(Vec<(&'static str, Range<usize>)>),
 }
 
@@ -185,7 +165,6 @@ fn errs(errors: &[(&'static str, Range<usize>)]) -> Want {
     Want::Errors(errors.to_vec())
 }
 
-/// How `dsl` actually reads, in the notation.
 fn read(dsl: &str) -> String {
     match parse(dsl) {
         Ok(query) => meaning(&query),
@@ -199,9 +178,6 @@ fn read(dsl: &str) -> String {
     }
 }
 
-/// Whether `dsl` reads as `want`. An error row holds when the query
-/// reports exactly one error, whose message holds the fragment and whose
-/// span is the one stated.
 fn holds(dsl: &str, want: &Want) -> bool {
     match (want, parse(dsl)) {
         (Want::Means(m), Ok(query)) => meaning(&query) == *m,
@@ -235,11 +211,8 @@ fn check_all(rows: &[(String, Want)]) {
     );
 }
 
-// ── The table ─────────────────────────────────────────────────────────
-
 const OPERATORS: [&str; 6] = ["=", "!=", "<", "<=", ">", ">="];
 
-/// The message fragments of the errors the table expects.
 const ORDERED_GLOB: &str = "glob patterns only support `=` and `!=`";
 const ORDERED_REGEX: &str = "regex patterns only support `=` and `!=`";
 const ORDERED_LIST: &str = "comma-separated lists only support `=` and `!=`";
@@ -261,28 +234,18 @@ fn long_multibyte_body() -> String {
     "é".repeat(513)
 }
 
-/// How a value reads under an ordered operator, given how it reads
-/// under `=`/`!=`.
 #[derive(Clone, Copy)]
 enum Ordered {
-    /// The same value: an ordered comparison of it.
     Compares,
-    /// An error from the operator through the end of the value.
     Refused(&'static str),
-    /// The list error, over the whole filter.
     RefusedList,
 }
 
-/// How a value reads under every operator.
 enum Reads {
-    /// A value, under `=`/`!=`, with what an ordered operator does to it.
     Value(String, Ordered),
-    /// The same error under every operator, over the value alone.
     Error(&'static str),
 }
 
-/// Operator × value kind (ADR-0060): every operator, with every kind of
-/// value the search stage can hold.
 fn operator_rows() -> Vec<(String, Want)> {
     let exact = |t: &str| format!("scalar(exact,{t:?})");
     let glob = |t: &str| format!("scalar(glob,{t:?})");
@@ -291,42 +254,32 @@ fn operator_rows() -> Vec<(String, Want)> {
     let long = format!("/{}/", long_multibyte_body());
 
     let values: Vec<(String, Reads)> = vec![
-        // bare exact
         ("web".into(), Reads::Value(exact("web"), Ordered::Compares)),
-        // quoted exact
         (
             r#""a b""#.into(),
             Reads::Value(exact("a b"), Ordered::Compares),
         ),
-        // glob
         (
             "web*".into(),
             Reads::Value(glob("web*"), Ordered::Refused(ORDERED_GLOB)),
         ),
-        // a quoted glob is exact text, so an ordered operator compares it
         (
             r#""web*""#.into(),
             Reads::Value(exact("web*"), Ordered::Compares),
         ),
-        // regex
         (
             "/x+/".into(),
             Reads::Value(regex("x+"), Ordered::Refused(ORDERED_REGEX)),
         ),
-        // a quoted regex shape is exact text too
         (
             r#""/x+/""#.into(),
             Reads::Value(exact("/x+/"), Ordered::Compares),
         ),
-        // an invalid regex is an error under every operator, and the only
-        // one: no ordered-pattern error on top
         ("/[/".into(), Reads::Error(INVALID_REGEX)),
-        // over the limit in bytes, not in characters
         (
             long,
             Reads::Error("regex pattern too long (1026 bytes, max 1024)"),
         ),
-        // a list of exact values
         (
             r#"a,"b c",d"#.into(),
             Reads::Value(
@@ -334,12 +287,10 @@ fn operator_rows() -> Vec<(String, Want)> {
                 Ordered::RefusedList,
             ),
         ),
-        // a list with a glob element
         (
             "a,b*".into(),
             Reads::Value(list(&[exact("a"), glob("b*")]), Ordered::RefusedList),
         ),
-        // a list with a regex element, first, in the middle and last
         (
             "/x+/,b".into(),
             Reads::Value(list(&[regex("x+"), exact("b")]), Ordered::RefusedList),
@@ -376,13 +327,8 @@ fn operator_rows() -> Vec<(String, Want)> {
     rows
 }
 
-/// What follows a closing `/` decides whether it closes a regex
-/// (ADR-0060's table): a byte that ends a bare value, or the end, makes a
-/// regex; `"` is an error; `#` is the opener error; anything else makes
-/// the whole run a bare value.
 fn follower_rows() -> Vec<(String, Want)> {
     let rows: Vec<(&str, Want)> = vec![
-        // ASCII whitespace, and the end
         ("m=/x/", means(r#"ff(m = scalar(regex,"x"))"#)),
         ("m=/x/ a", means(r#"ff(m = scalar(regex,"x")) text("a")"#)),
         ("m=/x/\ta", means(r#"ff(m = scalar(regex,"x")) text("a")"#)),
@@ -392,13 +338,11 @@ fn follower_rows() -> Vec<(String, Want)> {
             "m=/x/\x0ca",
             means(r#"ff(m = scalar(regex,"x")) text("a")"#),
         ),
-        // `)`: a group closes a regex tight
         ("(m=/x/)", means(r#"grp(ff(m = scalar(regex,"x")))"#)),
         (
             "(a OR msg=/x/)",
             means(r#"grp(text("a")|ff(msg = scalar(regex,"x")))"#),
         ),
-        // `(` and a backtick begin the next token
         (
             "m=/x/(a)",
             means(r#"ff(m = scalar(regex,"x")) grp(text("a"))"#),
@@ -407,8 +351,6 @@ fn follower_rows() -> Vec<(String, Want)> {
             "m=/x/`f`=1",
             means(r#"ff(m = scalar(regex,"x")) ff(f = scalar(exact,"1"))"#),
         ),
-        // `,`: the list continues, and the regex is read before the list
-        // splits, so a body may hold a `,`
         (
             "m=/x/,b",
             means(r#"ff(m = list[scalar(regex,"x"), scalar(exact,"b")])"#),
@@ -418,32 +360,22 @@ fn follower_rows() -> Vec<(String, Want)> {
             "m=/a,b/,/c/",
             means(r#"ff(m = list[scalar(regex,"a,b"), scalar(regex,"c")])"#),
         ),
-        // a body may hold whitespace that no `|` follows: this is one
-        // regex, `tmp OR dir=`, closed by the group
         (
             "(dir=/tmp OR dir=/)",
             means(r#"grp(ff(dir = scalar(regex,"tmp OR dir=")))"#),
         ),
-        // ADR-0061 ruling 1: alternation without whitespace before the
-        // `|` is a regex, and so is whitespace after one
         (
             "msg=/err|warn/",
             means(r#"ff(msg = scalar(regex,"err|warn"))"#),
         ),
         ("m=/a| b/", means(r#"ff(m = scalar(regex,"a| b"))"#)),
         ("m=/a\tb/", means(r#"ff(m = scalar(regex,"a\tb"))"#)),
-        // …and a raw line break in a run the earlier rule closed is an
-        // error over the run, never a value and a word on the next line
         ("msg=/a\nb/", err(REGEX_LINE_BREAK, 4..9)),
         ("msg=/a\r\nb/", err(REGEX_LINE_BREAK, 4..10)),
         ("f=x,/a\nb/", err(REGEX_LINE_BREAK, 4..9)),
-        // `"`: an error over the regex and the quote, and it wins over an
-        // invalid body, which is never validated
         (r#"m=/x/"y""#, err(QUOTE_AFTER_REGEX, 2..6)),
         (r#"m=/[/""#, err(QUOTE_AFTER_REGEX, 2..6)),
-        // `#`: the ADR-0014 opener error, through the bare value
         ("m=/x/#", err(OPENER_IN_VALUE, 5..6)),
-        // anything else: the whole run is a bare value, never validated
         ("path=/api/*", means(r#"ff(path = scalar(glob,"/api/*"))"#)),
         (
             "path=/var/log",
@@ -460,16 +392,10 @@ fn follower_rows() -> Vec<(String, Want)> {
         ),
         ("m=/[a/]/", means(r#"ff(m = scalar(exact,"/[a/]/"))"#)),
         ("m=/tmp/s", means(r#"ff(m = scalar(exact,"/tmp/s"))"#)),
-        // no trailing flags: the `i` continues the word, so this is a glob
         ("m=/err.*/i", means(r#"ff(m = scalar(glob,"/err.*/i"))"#)),
-        // a recognised regex that does not compile is an error, never a
-        // glob
         ("msg=/*/", err(INVALID_REGEX, 4..7)),
         ("(a OR msg=/*/)", err(INVALID_REGEX, 10..13)),
-        // `!=` with a pattern keeps its operator
         ("host!=*", means(r#"ff(host != scalar(glob,"*"))"#)),
-        // #321's spelling: a value opening with `"` is no glob and no
-        // value, under every operator (ADR-0061 ruling 3)
         (r#"host<"*"#, err(QUOTE_OPENS_VALUE, 5..7)),
         (r#"host="*"#, err(QUOTE_OPENS_VALUE, 5..7)),
         (r#"f=a,"b"#, err(QUOTE_OPENS_VALUE, 4..6)),
@@ -477,8 +403,6 @@ fn follower_rows() -> Vec<(String, Want)> {
         (r#""é" m=/[/"#, err(INVALID_REGEX, 7..10)),
         (r#""é" m=/x/"y""#, err(QUOTE_AFTER_REGEX, 7..11)),
         (r#""é" m=/x/#"#, err(OPENER_IN_VALUE, 10..11)),
-        // an unknown escape in a closed quoted value is its own error at
-        // the backslash pair, never an unclosed-quote error (ADR-0068)
         (r#"host="a\sb""#, err(UNKNOWN_ESCAPE, 7..9)),
         (r#"host=a,"b\sb""#, err(UNKNOWN_ESCAPE, 9..11)),
     ];
@@ -502,22 +426,17 @@ fn meaning_table() {
     check_all(&rows);
 }
 
-/// What the search stage admits (ADR-0061 rulings 1-5), beside what it
-/// still reads. These rows hold pipe stages, time clauses and groups, so
-/// they are not filters the context check can wrap.
+/// These rows hold pipe stages, time clauses and groups, so they are not
+/// filters the context check can wrap.
 fn admission_rows() -> Vec<(String, Want)> {
     let glob_then_division = r#"ff(path = scalar(glob,"/tmp*")) |> where(((x / 2) == 1))"#;
     let rows: Vec<(&str, Want)> = vec![
-        // ruling 1: a new pipe stage always ends what came before it, on
-        // one line or two, so a later `/` cannot close a regex across it
         ("path=/tmp* | where x / 2 == 1", means(glob_then_division)),
         ("path=/tmp*\n| where x / 2 == 1", means(glob_then_division)),
         (
             "path=/tmp*\n  | where x / 2 == 1",
             means(glob_then_division),
         ),
-        // …and a run the earlier rule read as a regex is named beside the
-        // error it ends in
         (
             "msg=/err | warn/",
             errs(&[
@@ -525,8 +444,6 @@ fn admission_rows() -> Vec<(String, Want)> {
                 ("unknown command 'warn'", 12..13),
             ]),
         ),
-        // ruling 2: a time clause only at the top level, where it keeps
-        // its slot beside an OR, the last of each kind winning
         ("a last=1h OR b", means(r#"text("a")|text("b") @last(1h)"#)),
         (
             "last=1h a OR b last=2h",
@@ -542,14 +459,9 @@ fn admission_rows() -> Vec<(String, Want)> {
             r#"NOT earliest="2026-01-01T00:00:00Z""#,
             err(NESTED_TIME_CLAUSE, 4..35),
         ),
-        // ruling 4: a group of only OR separators, like `()`
         ("(OR)", err(OR_ONLY_GROUP, 0..4)),
         ("a (or OR) b", err(OR_ONLY_GROUP, 2..9)),
         ("(a OR)", means(r#"grp(text("a"))"#)),
-        // ruling 5: `NOT-` directly before a backtick, beside the refusal
-        // of `-` before one, which stays as it was
-        // `NOT-` then a backtick has no spelling apart: with a space it
-        // reads as `NOT` over the term `-`
         ("NOT-`x`=1", err(NOT_DASH_BEFORE_BACKTICK, 0..4)),
         (
             "NOT- `x`=1",
@@ -565,15 +477,12 @@ fn admission_table() {
     check_all(&admission_rows());
 }
 
-// ── Pattern operands (ADR-0063) ───────────────────────────────────────
-
 const PATTERN_NOT_LITERAL: &str = "a pattern must be literal text in the query";
 const REGEX_TOO_LONG: &str = "regex pattern too long (1025 bytes, max 1024)";
 const REGEX_TOO_LARGE: &str = "regex pattern too large once compiled";
 const BATCH_TOO_LARGE: &str = "regex pattern too large for the batch engine once compiled";
 const CLASS_SET_SYNTAX: &str = "nested character classes and the class set operators";
 
-/// A row whose one error covers `part`, where it first occurs in `dsl`.
 fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
     let start = dsl
         .find(part)
@@ -581,17 +490,10 @@ fn refused_at(dsl: &str, part: &str, fragment: &'static str) -> (String, Want) {
     (dsl.to_string(), err(fragment, start..start + part.len()))
 }
 
-/// What the right side of `matches`, `like` and `ilike` admits: literal
-/// text only, in every spelling. Every pattern body then gets the checks
-/// a `/body/` regex gets: syntax, the 1024-byte limit, and the compile.
 #[allow(clippy::too_many_lines)]
 fn pattern_rows() -> Vec<(String, Want)> {
     let over = "a".repeat(1025);
     let quoted_over = format!("\"{over}\"");
-    // Every character of a `like` operand is a repeat position, and so is
-    // each anchor of the `^…$` it becomes, so the repeat budget, not the
-    // 1024-byte cap, bounds one: 62 four-byte characters are 248 bytes and
-    // are admitted, and a 63rd is refused.
     let four_bytes = "\u{1F600}".repeat(62);
     let four_bytes_over = "\u{1F600}".repeat(63);
     let glob_at_limit = format!("*[{}]", "a".repeat(1021));
@@ -618,7 +520,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             PATTERN_NOT_LITERAL,
         ),
         refused_at("* | where code like 5", "5", PATTERN_NOT_LITERAL),
-        // A literal pattern still reads as its text, in every spelling.
         (
             "x | where message matches /a/".to_string(),
             means(r#"text("x") |> where((message matches "a"))"#),
@@ -635,8 +536,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#"x | where host ilike ("a%")"#.to_string(),
             means(r#"text("x") |> where((host ilike "a%"))"#),
         ),
-        // A quoted `matches` body is checked as a `/body/` one is: today
-        // `"["` would match nothing at run time.
         refused_at(r#"x | where m matches "[""#, r#""[""#, INVALID_REGEX),
         refused_at(
             &format!("x | where m matches {quoted_over}"),
@@ -648,7 +547,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#""\\w{64}""#,
             REGEX_TOO_LARGE,
         ),
-        // …and so is an `extract` body.
         refused_at(r#"x | extract "[""#, r#""[""#, INVALID_REGEX),
         refused_at(
             &format!("x | extract {quoted_over}"),
@@ -661,9 +559,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#""(?P<w>\w{63})""#,
             REGEX_TOO_LARGE,
         ),
-        // A class nested in a class, or a class set operator, which the
-        // batch engine's RE2 reads as plain characters, is refused in
-        // every regex body.
         refused_at(
             r#"x | where m matches "[\\pL&&a]""#,
             r#""[\\pL&&a]""#,
@@ -679,8 +574,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#""(?P<x>[a[b]])""#,
             CLASS_SET_SYNTAX,
         ),
-        // A body whose program the batch engine compiles past 512 KiB is
-        // refused, though it fits the 1 MiB limit in Rust.
         refused_at(
             r"x | where m matches /\B(?:\pL?){15}\PL/",
             r"/\B(?:\pL?){15}\PL/",
@@ -691,7 +584,6 @@ fn pattern_rows() -> Vec<(String, Want)> {
             r#""(?P<x>\B(?:\pL?){15}\PL)""#,
             BATCH_TOO_LARGE,
         ),
-        // A glob, `like` or `ilike` operand is capped at 1024 bytes.
         refused_at(
             &format!("host=*{over}"),
             &format!("*{over}"),
@@ -736,15 +628,10 @@ fn pattern_table() {
     check_all(&pattern_rows());
 }
 
-// ── Context invariance ────────────────────────────────────────────────
-
-/// The contexts a filter `F` must mean the same in: the text before and
-/// after it, and how its tokens read there given how they read alone.
 struct Context {
     before: &'static str,
     after: &'static str,
-    /// The meaning of the context, from the top-level tokens `F` reads as
-    /// alone.
+    /// The meaning of the context, from the tokens the filter reads as alone.
     wrap: fn(&[String]) -> String,
 }
 
@@ -769,7 +656,6 @@ const CONTEXTS: [Context; 9] = [
         after: "))",
         wrap: |t| format!("grp(grp({}))", t.join(" ")),
     },
-    // `NOT` takes the first token alone
     Context {
         before: "NOT ",
         after: "",
@@ -804,7 +690,6 @@ const CONTEXTS: [Context; 9] = [
     },
 ];
 
-/// The top-level tokens `filter` reads as alone, each in the notation.
 fn tokens_alone(filter: &str) -> Vec<String> {
     let query = parse(filter).unwrap_or_else(|e| panic!("{filter:?} must parse: {e:?}"));
     assert!(query.pipeline.is_empty(), "{filter:?} is not a filter");
@@ -814,7 +699,6 @@ fn tokens_alone(filter: &str) -> Vec<String> {
     }
 }
 
-/// Every non-error row means the same in every context.
 #[test]
 fn context_every_meaning_holds_in_every_context() {
     let mut rows = Vec::new();
@@ -832,8 +716,6 @@ fn context_every_meaning_holds_in_every_context() {
     check_all(&rows);
 }
 
-/// Every error row gives the same one error in every context, its span
-/// moved by the text before the filter.
 #[test]
 fn context_every_error_holds_in_every_context() {
     let mut rows = Vec::new();
@@ -850,7 +732,6 @@ fn context_every_error_holds_in_every_context() {
     check_all(&rows);
 }
 
-/// The defect that opened ADR-0060: a regex a group closes read as text.
 #[test]
 fn context_a_regex_a_group_closes_is_a_regex() {
     assert_eq!(

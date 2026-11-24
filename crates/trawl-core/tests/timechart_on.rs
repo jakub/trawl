@@ -3,16 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `timechart on <column>`: what the buckets are cut from.
-//!
-//! The stage's default — and an explicit `on _time` — buckets the
-//! envelope timestamp through its `TRY_CAST` (ADR-0008). An explicit
-//! column is bucketed as stored: no cast, so a column that is not a
-//! timestamp is refused by `DuckDB`'s binder instead of coercing to NULL
-//! and collapsing every row into one empty bucket.
-//!
-//! Every assertion here runs the emitted SQL through the bundled
-//! `DuckDB`, because the claim under test is about what `DuckDB` does
-//! with the emitted text, not about the text alone.
 
 mod timechart_on {
     use duckdb::Connection;
@@ -21,10 +11,6 @@ mod timechart_on {
     use trawl_core::emitter::{self, EmittedQuery};
     use trawl_core::parser;
 
-    /// Emit `dsl` against `source` with a fixed anchor.
-    ///
-    /// Fixed rather than captured so a `last=` window in a test query
-    /// means one interval, not one per emission.
     fn emit(dsl: &str, source: &str) -> EmittedQuery {
         let query = parser::parse(dsl).expect("dsl parses");
         let anchor = EvalContext::at(
@@ -35,8 +21,6 @@ mod timechart_on {
         emitter::emit(&query, source, anchor).expect("emit succeeds")
     }
 
-    /// Write a parquet file from a `SELECT`, returning its path. The
-    /// directory has to outlive the returned path, so the caller keeps it.
     fn write_parquet(dir: &tempfile::TempDir, name: &str, select: &str) -> String {
         let path = dir
             .path()
@@ -50,7 +34,6 @@ mod timechart_on {
         path
     }
 
-    /// The `INTERVAL '…'` literal inside the emitted bucket expression.
     fn bucket_interval(sql: &str) -> &str {
         let after = sql
             .split_once("time_bucket(INTERVAL '")
@@ -59,9 +42,6 @@ mod timechart_on {
         after.split_once('\'').expect("the literal closes").0
     }
 
-    /// A relation whose only timestamp is `_run_time` — the shape
-    /// `from saved <name> run=all` produces — buckets on that column, and
-    /// the buckets collect every row that falls in them.
     #[test]
     fn buckets_run_time_across_runs() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -108,9 +88,6 @@ mod timechart_on {
         );
     }
 
-    /// Omitting `span=` derives the bucket from the `last=` window exactly
-    /// as it does without `on`: the clause chooses the column, never the
-    /// interval.
     #[test]
     fn default_span_unchanged() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -133,7 +110,6 @@ mod timechart_on {
                 "window {window:?} must derive one interval for both lanes"
             );
 
-            // And it is SQL `DuckDB` runs, not just matching text.
             let conn = Connection::open_in_memory().expect("in-memory duckdb");
             conn.prepare(&named.sql).expect("the emitted SQL binds");
         }
@@ -146,12 +122,6 @@ mod timechart_on {
         );
     }
 
-    /// A column that is not a timestamp is bucketed as stored, and the
-    /// emission carries a probe that reads that column, with that
-    /// stage's own prefix in force, so the executor can say which
-    /// column and which type
-    /// (`executor::timechart_input_refuses_each_non_timestamp` in
-    /// trawl-engine asserts the 400 the probe composes).
     #[test]
     fn refuses_varchar_naming_type() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -198,8 +168,6 @@ mod timechart_on {
             check.sql
         );
 
-        // And it is a statement DuckDB answers, with the type the
-        // executor refuses on.
         let conn = Connection::open_in_memory().expect("in-memory duckdb");
         let mut stmt = conn.prepare(&check.sql).expect("the probe binds");
         assert!(check.params.is_empty(), "no parameters in this prefix");
@@ -212,9 +180,6 @@ mod timechart_on {
         );
     }
 
-    /// The emission for a `timechart` without `on` is byte-for-byte what
-    /// it was before the clause existed — the text below is the committed
-    /// `pipe_timechart_explicit_span` snapshot at the parent commit.
     #[test]
     fn plain_timechart_unchanged() {
         const BEFORE: &str = "SELECT time_bucket(INTERVAL '5 minutes', TRY_CAST(\"_time\" AS TIMESTAMP)) AS \"_time\", COUNT(*) AS \"count\"\n\
@@ -229,10 +194,8 @@ mod timechart_on {
             "an omitted clause probes nothing"
         );
 
-        // `on _time` is the same bucket source spelled out, so it emits
-        // the same SQL and probes nothing — the envelope timestamp is
-        // the default, and `DuckDB` folds an identifier over ASCII, so
-        // every spelling of it is that same column.
+        // `DuckDB` folds an identifier over ASCII, so every spelling of `_time`
+        // is that same column.
         for spelling in ["_time", "_TIME", "_Time"] {
             let explicit = emit(
                 &format!("* | timechart on {spelling} span=5m count()"),

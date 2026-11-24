@@ -8,13 +8,8 @@ use crate::aggregate::Aggregate;
 use crate::ast::{Expr, LiteralValue, Spanned};
 use crate::parser::suggest;
 
-/// Known function names accepted by the emitter (canonical list in `parser::suggest`).
 pub(crate) use crate::parser::suggest::KNOWN_FUNCTIONS;
 
-/// Validate that a function name is known and argument count is correct.
-///
-/// Single source of truth for arity: [`check_call`] runs it first, for
-/// every call in every position.
 pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), EmitError> {
     if !KNOWN_FUNCTIONS.contains(&name) {
         return Err(EmitError::UnknownFunction {
@@ -39,7 +34,6 @@ pub(crate) fn validate_function_arity(name: &str, argc: usize) -> Result<(), Emi
     Ok(())
 }
 
-/// Return `(min_args, max_args)` for a function. `None` max means unbounded.
 fn function_arity(name: &str) -> (usize, Option<usize>) {
     match name {
         "count" => (0, Some(1)),
@@ -47,7 +41,6 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
         "if" | "replace" | "split" | "date_diff" => (3, Some(3)),
         "case" => (2, None),
         "substr" => (2, Some(3)),
-        // round(x[, precision]) and sev(value[, dialect])
         "round" | "sev" => (1, Some(2)),
         "now" => (0, Some(0)),
         "contains"
@@ -60,7 +53,6 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
         | "json"
         | "json_extract_string"
         | "json_extract" => (2, Some(2)),
-        // everything else: exactly 1
         _ => (1, Some(1)),
     }
 }
@@ -69,33 +61,20 @@ fn function_arity(name: &str) -> (usize, Option<usize>) {
 /// rather than parameterized (`DuckDB` requirement).
 pub(crate) fn literal_int_positions(name: &str) -> &'static [usize] {
     match name {
-        "round" => &[1], // precision arg
-        "split" => &[2], // index arg (0-indexed DSL → 1-indexed DuckDB)
+        "round" => &[1],
+        "split" => &[2],
         _ => &[],
     }
 }
 
-// ── Date/time unit allowlists ─────────────────────────────────────────
-
-/// Units valid for `date_trunc` and `date_diff`.
 pub const DATE_UNITS: &[&str] = &[
     "year", "quarter", "month", "week", "day", "hour", "minute", "second",
 ];
 
-/// Units valid for `date_part` (superset of `DATE_UNITS`).
 pub const DATE_PART_UNITS: &[&str] = &[
     "year", "quarter", "month", "week", "day", "hour", "minute", "second", "dow", "doy", "epoch",
 ];
 
-/// Arg positions (0-indexed) that must be string literals drawn from a
-/// closed vocabulary — date/time unit names, and `sev()`'s dialect.
-///
-/// Returns `(arg_index, allowlist)` pairs. [`check_call`] runs
-/// `validate_unit_literal` for each returned pair, which is the point of
-/// the table: the SSE lane and the `extract kv` batch tail never run
-/// `translate_function`, so a vocabulary they cannot honour has to be
-/// refused from the shared table or it would 400 in batch and silently
-/// null live.
 pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [&'static str])] {
     match name {
         "date_part" => &[(0, DATE_PART_UNITS)],
@@ -105,16 +84,6 @@ pub(crate) fn unit_literal_positions(name: &str) -> &'static [(usize, &'static [
     }
 }
 
-/// Arg positions (0-indexed) whose string literal must reach
-/// [`translate_function`] as its own text rather than as a bound `?`
-/// parameter.
-///
-/// `sev()`'s dialect is not an operand: it selects which reading
-/// expression is emitted
-/// ([`crate::conform::severity_reading_sql_bind_once`]), so the
-/// translation has to see the token itself. Same precedent as
-/// [`literal_int_positions`], which inlines `split()`'s index because the
-/// emitted SQL indexes a list with it.
 pub(crate) fn literal_text_positions(name: &str) -> &'static [usize] {
     match name {
         "sev" => &[1],
@@ -122,15 +91,6 @@ pub(crate) fn literal_text_positions(name: &str) -> &'static [usize] {
     }
 }
 
-/// Arg positions (0-indexed) whose value is read through `to_json`
-/// ([`crate::conform::untyped_text`]) rather than used as an operand.
-///
-/// `DuckDB` infers a prepared statement's parameter types from where they
-/// sit, and `to_json(?)` gives it nothing to infer from, so the statement
-/// fails to prepare. A bare literal at such a position therefore carries
-/// its own type (`CAST(? AS BIGINT)`), which is exactly the type the
-/// parameter binds anyway, so the reading is unchanged. Non-literals are
-/// columns and expressions, which type themselves.
 pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     match name {
         "sev" => &[0],
@@ -138,22 +98,6 @@ pub(crate) fn json_read_positions(name: &str) -> &'static [usize] {
     }
 }
 
-/// The type an argument with no type of its own reads as at `position` of
-/// `name` (ADR-0062), where an untyped NULL leaves `DuckDB` no single
-/// overload to bind: `DATE_PART('day', NULL)` has a candidate per temporal
-/// type, `PERCENTILE_CONT … ORDER BY NULL` is an ordering by a constant,
-/// and `CONTAINS(NULL, NULL)` matches both the text and the list overload.
-/// Each is the type the function reads a Trawl field as.
-///
-/// The argument is a NULL by construction: an absent unpinned field, a
-/// copy of one whatever pin its own name has, or any expression the
-/// relation walk proves untyped, which takes a cast to this type. After a pivot whose columns carry data, a read of a `let`
-/// alias that is NULL by construction may bind the pivot's column
-/// instead, and takes a `COALESCE` with a NULL of this type
-/// ([`super::relation::Nullness`]). `None` everywhere else, where the
-/// untyped NULL binds and is kept: `trawl-engine`'s `absent_field` sweep
-/// runs every known function with each argument absent in turn, and all at
-/// once, bare and composed, against typed NULLs.
 pub(crate) fn absent_argument_type(name: &str, position: usize) -> Option<&'static str> {
     match (name, position) {
         ("date_part" | "date_trunc", 1) | ("date_diff", 1 | 2) => Some("TIMESTAMP"),
@@ -163,15 +107,6 @@ pub(crate) fn absent_argument_type(name: &str, position: usize) -> Option<&'stat
     }
 }
 
-/// The arguments a call can return as its own value: every argument of
-/// `coalesce`, the branches of `if` and `case`, and the operand of `min`,
-/// `max`, `first` and `last`. When each of them is an untyped NULL, the
-/// call is one too: `DuckDB` types it from those arguments alone.
-///
-/// `None` for every other known function. Its result has a type of its
-/// own whatever its arguments are (`lower` VARCHAR, `abs` and `+` a
-/// number, `contains` BOOLEAN, `sum` HUGEINT, `values` a list), so an
-/// all-NULL call still gives `DuckDB` an overload to pick.
 pub(crate) fn passthrough_arguments<'a, T>(name: &str, args: &'a [T]) -> Option<Vec<&'a T>> {
     match name {
         "coalesce" | "min" | "max" | "first" | "last" => Some(args.iter().collect()),
@@ -189,11 +124,6 @@ pub(crate) fn passthrough_arguments<'a, T>(name: &str, args: &'a [T]) -> Option<
     }
 }
 
-/// What one closed-vocabulary argument is called in its error message.
-///
-/// The mechanism is shared with the date/time units, the noun is not: a
-/// `sev()` second argument is a dialect, and telling an operator their
-/// "unit" is wrong would name a concept the function does not have.
 fn literal_noun(func_name: &str) -> &'static str {
     match func_name {
         "sev" => "dialect",
@@ -201,23 +131,13 @@ fn literal_noun(func_name: &str) -> &'static str {
     }
 }
 
-/// Arg position (0-indexed) of a `strftime`/`strptime` format string, if any.
-///
-/// When the arg at this index is a string literal, [`check_call`] runs it
-/// through `validate_format_literal`, so an invalid code is rejected the
-/// same way in every lane.
 pub(crate) fn format_literal_position(name: &str) -> Option<usize> {
     match name {
-        // DSL arg order: strftime(ts, fmt), strptime(str, fmt) — fmt is index 1.
         "strftime" | "strptime" => Some(1),
         _ => None,
     }
 }
 
-/// Arg position (0-indexed) of a JSON path, if any. [`check_call`] runs
-/// the argument through [`validate_json_path`], so a computed or refused
-/// path is rejected before either lane runs (ADR-0017's amendment of
-/// 2026-11-13).
 pub(crate) fn json_path_position(name: &str) -> Option<usize> {
     match name {
         "json" | "json_extract_string" | "json_extract" => Some(1),
@@ -225,8 +145,6 @@ pub(crate) fn json_path_position(name: &str) -> Option<usize> {
     }
 }
 
-/// Validate a JSON path argument: it must be a string literal the
-/// [`crate::json_path`] grammar accepts.
 fn validate_json_path(func_name: &str, path: Option<&str>) -> Result<(), EmitError> {
     let fault = match path {
         None => JsonPathFault::NotLiteral,
@@ -244,15 +162,6 @@ fn validate_json_path(func_name: &str, path: Option<&str>) -> Result<(), EmitErr
     })
 }
 
-/// Validate that a date/time unit argument is a known literal.
-///
-/// `allowlist` is the set of accepted unit names for this `(func, arg)` pair
-/// (the caller already fetched it via `unit_literal_positions`, so it is passed
-/// in directly rather than re-derived). `unit_literal` is `Some(value)` when the
-/// arg at `arg_idx` is a string literal, or `None` when it is a computed
-/// expression. Rejects non-literals and unknown units; this check runs in
-/// both the batch and streaming paths so an unsupported unit can never error
-/// in batch while silently nulling in live tail.
 pub(crate) fn validate_unit_literal(
     func_name: &str,
     arg_idx: usize,
@@ -279,17 +188,6 @@ pub(crate) fn validate_unit_literal(
     Ok(())
 }
 
-/// Validate a `strftime`/`strptime` format-string literal.
-///
-/// chrono is the canonical format authority for both the batch (`DuckDB`) and
-/// streaming (eval) paths. An invalid code (e.g. `%Q`) or a trailing `%`
-/// parses into a `chrono::format::Item::Error`; rejecting it here at
-/// emit/compile time makes both paths fail identically instead of
-/// erroring-in-batch / silently-nulling-in-stream. The same `Item::Error`
-/// detection is used by the defensive runtime guard in `eval::eval_strftime`.
-///
-/// Only call this for string-literal format args: a non-literal (field ref)
-/// can't be checked up front and keeps its runtime behaviour (eval nulls).
 pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), EmitError> {
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
@@ -302,14 +200,6 @@ pub(crate) fn validate_format_literal(func_name: &str, fmt: &str) -> Result<(), 
     Ok(())
 }
 
-/// One call's own rules, in the order ADR-0001 (Amendment 2026-11-11)
-/// fixes: the name, then the argument count, then each literal position
-/// that is present, in ascending order. An absent optional position
-/// (`round(x)`, `sev(x)`) is skipped. The arguments themselves are not
-/// visited: the caller walks them.
-///
-/// The one body of the rule. `calls::check_calls` runs it on every call
-/// in a pipeline, and `emit_call_args` runs it as its precondition.
 pub(crate) fn check_call(name: &str, args: &[Spanned<Expr>]) -> Result<(), EmitError> {
     validate_function_arity(name, args.len())?;
     let int_positions = literal_int_positions(name);
@@ -326,16 +216,13 @@ pub(crate) fn check_call(name: &str, args: &[Spanned<Expr>]) -> Result<(), EmitE
         } else if format_position == Some(i)
             && let Some(format) = string_literal(&arg.node)
         {
-            // A computed format cannot be checked up front and keeps its
-            // runtime behaviour (eval nulls).
             validate_format_literal(name, format)?;
         }
     }
     Ok(())
 }
 
-/// The integer an integer-literal position (`literal_int_positions`)
-/// holds. Anything else is refused, including `-1`, which parses as a
+/// Anything else is refused, including `-1`, which parses as a
 /// negation of `1` rather than as a literal.
 pub(crate) fn int_literal_arg(name: &str, index: usize, arg: &Expr) -> Result<i64, EmitError> {
     match arg {
@@ -346,7 +233,6 @@ pub(crate) fn int_literal_arg(name: &str, index: usize, arg: &Expr) -> Result<i6
     }
 }
 
-/// The text of a string literal argument; `None` for anything else.
 fn string_literal(arg: &Expr) -> Option<&str> {
     match arg {
         Expr::Literal(LiteralValue::String(s)) => Some(s),
@@ -354,11 +240,6 @@ fn string_literal(arg: &Expr) -> Option<&str> {
     }
 }
 
-/// Translate a DSL function call to `DuckDB` SQL.
-///
-/// `state` is here for one arm: `now()` binds the statement's anchor as a
-/// parameter (ADR-0017 §3). Nothing else in this function may push a
-/// parameter; see the arm's own note.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn translate_function(
     name: &str,
@@ -380,7 +261,6 @@ pub(crate) fn translate_function(
             }
             Ok(format!("COALESCE({})", args.join(", ")))
         }
-        // new scalar functions
         "if" => require_n_args(name, args, 3, |a| {
             format!("IF({}, {}, {})", a[0], a[1], a[2])
         }),
@@ -409,24 +289,14 @@ pub(crate) fn translate_function(
                 format!("ROUND({}, {})", a[0], a[1])
             }
         }),
-        // `now()` is one instant per unit of output (ADR-0017 §3): the
-        // instant is captured in Rust at the head of the query and bound
-        // here as a TIMESTAMP parameter, so the SQL prefix and the
-        // `rust_stages` tail behind `extract kv` read the same value by
-        // construction.
-        //
         // The explicit `CAST(? AS TIMESTAMP)` is not decoration: an
         // unadorned placeholder leaves the result type to the driver's
-        // parameter inference, so `typeof(now())` would depend on it.
-        // SQL's own `now()` is no way out either: it is TIMESTAMPTZ.
+        // parameter inference. SQL's own `now()` is TIMESTAMPTZ.
         //
         // Only the zero-arg `now` may push a parameter in this function.
         // A pushing arm with arguments would push after its arguments'
         // own placeholders were rendered by `emit_call_args`, putting the
         // parameter list out of order with the `?`s in the SQL.
-        //
-        // The search stage's `last=` window deliberately keeps `DuckDB`'s
-        // own clock (`emitter::search`) and does not come through here.
         "now" => {
             let anchor = state.anchor();
             require_n_args(name, args, 0, |_| {
@@ -437,11 +307,9 @@ pub(crate) fn translate_function(
         }
         "typeof" => require_one_arg(name, args, |a| format!("TYPEOF({a})")),
         "tonumber" => require_one_arg(name, args, |a| format!("TRY_CAST({a} AS DOUBLE)")),
-        // The ladder function (ADR-0013 ruling 9): the one reading
-        // kernel, in SQL. Its argument goes through `untyped_text`
-        // because `sev(x)` must read a column of any physical type (a
-        // VARCHAR `level`, a BIGINT one, a foreign parquet's JSON),
-        // exactly as the conform rung reads its own.
+        // Its argument goes through `untyped_text` because `sev(x)` must
+        // read a column of any physical type (a VARCHAR `level`, a BIGINT
+        // one, a foreign parquet's JSON).
         "sev" => {
             if args.is_empty() || args.len() > 2 {
                 return Err(EmitError::InvalidAggregation {
@@ -481,7 +349,6 @@ pub(crate) fn translate_function(
             ))
         }
         "tostring" => require_one_arg(name, args, |a| format!("CAST({a} AS VARCHAR)")),
-        // string functions
         "contains" => require_n_args(name, args, 2, |a| format!("CONTAINS({}, {})", a[0], a[1])),
         "startswith" => require_n_args(name, args, 2, |a| {
             format!("STARTS_WITH({}, {})", a[0], a[1])
@@ -500,7 +367,6 @@ pub(crate) fn translate_function(
             }
             Ok(format!("CONCAT({})", args.join(", ")))
         }
-        // date/time functions
         "date_part" => require_n_args(name, args, 2, |a| format!("DATE_PART({}, {})", a[0], a[1])),
         "date_trunc" => {
             require_n_args(name, args, 2, |a| format!("DATE_TRUNC({}, {})", a[0], a[1]))
@@ -508,20 +374,15 @@ pub(crate) fn translate_function(
         "date_diff" => require_n_args(name, args, 3, |a| {
             format!("DATE_DIFF({}, {}, {})", a[0], a[1], a[2])
         }),
-        // strftime: emit in DSL order (timestamp, format). DuckDB's STRFTIME is
-        // overloaded and accepts (timestamp, format) directly, so no swap is
-        // needed. A text-level swap would also desynchronize the `?`
-        // placeholders from emit_call_args' DSL-order param push: whenever the
-        // timestamp arg itself produces bound params (e.g. a nested strptime
-        // with literal args), the placeholders would bind positionally to the
-        // wrong values.
+        // DuckDB's STRFTIME accepts (timestamp, format) directly. A text-level
+        // swap would desynchronize the `?` placeholders from emit_call_args'
+        // DSL-order param push.
         "strftime" => require_n_args(name, args, 2, |a| format!("STRFTIME({}, {})", a[0], a[1])),
         // TRY_STRPTIME (not STRPTIME) so an unparseable input yields NULL, not a
         // whole-query error — matching the streaming eval path, which nulls.
         "strptime" => require_n_args(name, args, 2, |a| {
             format!("TRY_STRPTIME({}, {})", a[0], a[1])
         }),
-        // conditional
         "case" => {
             if args.len() < 2 {
                 return Err(EmitError::InvalidAggregation {
@@ -541,11 +402,6 @@ pub(crate) fn translate_function(
             sql.push_str(" END");
             Ok(sql)
         }
-        // json functions. The document passes through `TRY_CAST(… AS
-        // JSON)`, so a value that is not JSON reads as NULL instead of
-        // failing the statement, while an error raised computing the
-        // document still raises (ADR-0017, amendment of 2026-11-13).
-        // The document is written once.
         "json" | "json_extract_string" => require_n_args(name, args, 2, |a| {
             format!("JSON_EXTRACT_STRING(TRY_CAST({} AS JSON), {})", a[0], a[1])
         }),
@@ -564,13 +420,6 @@ pub(crate) fn translate_function(
     }
 }
 
-/// Translate an aggregate call to `DuckDB` SQL. `name` is the spelling
-/// the query wrote, which the arity messages repeat.
-///
-/// No wildcard arm: an aggregate added to [`Aggregate`] does not compile
-/// until it has SQL here, and the live lane's `stream::new_acc_state`
-/// holds it to an accumulator the same way (ADR-0001, Amendment
-/// 2026-11-08).
 fn translate_aggregate(
     aggregate: Aggregate,
     name: &str,
@@ -601,23 +450,8 @@ fn translate_aggregate(
     }
 }
 
-/// The canonical type a function declares its result to be: the one table
-/// that lets a call be a pinned comparison subject (ADR-0013 ruling 9).
-///
-/// One entry, and the narrowness is the design. A function-wrapped
-/// subject is otherwise excluded on decidability, since nothing tells the
-/// binder what `lower(status)` is. A declared result pin restores that
-/// decidability for exactly the functions that have one: `sev()` answers
-/// a `SeverityNumber` whatever it is handed, so `| where sev(level) >=
-/// "error"` binds through the same rule table `_severity` does, equality
-/// takes the band (a plain-BIGINT `sev()` would compile `== "error"` to
-/// `== 17` and silently miss `error2`-`error4`), and the result renders
-/// as tokens.
-///
-/// The declaration is the function's, never the catalog's: it holds under
-/// [`crate::pin_scope::PinScope::unpinned`] too, which is what makes
-/// `sev()` the escape hatch for a corpus trawl did not write (embedded
-/// `--data` over foreign parquet).
+/// The one table that lets a call be a pinned comparison subject
+/// (ADR-0013 ruling 9).
 #[must_use]
 pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
     match name {
@@ -626,17 +460,10 @@ pub fn function_result_pin(name: &str) -> Option<crate::schema::CanonicalType> {
     }
 }
 
-/// Whether `name` spells an aggregate ([`Aggregate::from_name`]).
 pub fn is_aggregate_function(name: &str) -> bool {
     Aggregate::from_name(name).is_some()
 }
 
-/// The quoted SQL identifier an un-aliased aggregation projects.
-///
-/// `count()` → `"count"`, `avg(duration)` → `"avg_duration"`. A thin
-/// wrapper over [`crate::projection::agg_output_name`], the one
-/// derivation the stream compiler and the pin-scope walk read too, so the
-/// collision check counts with the names this writes.
 pub(crate) fn default_agg_alias(agg: &crate::ast::AggExpr) -> String {
     quote_field(&crate::projection::agg_output_name(agg))
 }
@@ -714,9 +541,6 @@ mod tests {
         )
     }
 
-    /// A throwaway emitter state for translation tests. Only the `now`
-    /// arm reads it — every other arm is a pure string rewrite — and the
-    /// anchor it carries is asserted against explicitly where it matters.
     fn state() -> super::super::state::EmitterState {
         super::super::state::EmitterState::new(
             "t.parquet",
@@ -725,8 +549,6 @@ mod tests {
         )
         .expect("a valid source")
     }
-
-    // ── translate_function: aggregates ──────────────────────────────────
 
     #[test]
     fn translate_count_no_args() {
@@ -824,8 +646,6 @@ mod tests {
         );
     }
 
-    // ── translate_function: scalars ─────────────────────────────────────
-
     #[test]
     fn translate_lower() {
         assert_eq!(
@@ -865,8 +685,6 @@ mod tests {
             "COALESCE(a, b, c)"
         );
     }
-
-    // ── translate_function: new scalars ────────────────────────────────
 
     #[test]
     fn translate_if() {
@@ -972,8 +790,6 @@ mod tests {
         );
     }
 
-    /// `now()` is the statement anchor, bound as a TIMESTAMP parameter
-    /// under an explicit cast, never `DuckDB`'s own clock (ADR-0017 §3).
     #[test]
     fn translate_now_binds_the_anchor_under_an_explicit_cast() {
         let mut st = state();
@@ -1015,9 +831,6 @@ mod tests {
 
     #[test]
     fn translate_strftime_dsl_order() {
-        // DSL (ts, fmt) emits in the same order: STRFTIME is overloaded in
-        // DuckDB so no swap is needed, and DSL order keeps the `?`
-        // placeholders aligned with emit_call_args' param push.
         assert_eq!(
             translate_function("strftime", &args(&["ts", "fmt"]), &mut state()).unwrap(),
             "STRFTIME(ts, fmt)"
@@ -1026,15 +839,11 @@ mod tests {
 
     #[test]
     fn translate_strptime_uses_try_variant() {
-        // TRY_STRPTIME nulls on unparseable input (matches streaming eval), so a
-        // single bad value never errors the whole batch query.
         assert_eq!(
             translate_function("strptime", &args(&["s", "fmt"]), &mut state()).unwrap(),
             "TRY_STRPTIME(s, fmt)"
         );
     }
-
-    // ── translate_function: new aggregates ───────────────────────────────
 
     #[test]
     fn translate_first() {
@@ -1084,8 +893,6 @@ mod tests {
         );
     }
 
-    // ── translate_function: error cases ─────────────────────────────────
-
     #[test]
     fn translate_unknown_function() {
         let err = translate_function("bogus", &[], &mut state()).unwrap_err();
@@ -1121,8 +928,6 @@ mod tests {
         let err = translate_function("p99", &[], &mut state()).unwrap_err();
         assert!(matches!(err, EmitError::InvalidAggregation { .. }));
     }
-
-    // ── is_aggregate_function ───────────────────────────────────────────
 
     #[test]
     fn aggregates_detected() {
@@ -1258,7 +1063,7 @@ mod tests {
         for (name, aggregate, nullary, sql) in cases {
             assert_eq!(Aggregate::from_name(name), Some(aggregate), "{name}");
             assert!(is_aggregate_function(name), "{name}");
-            // Matched exactly, as before the enum.
+            // Matched exactly.
             assert_eq!(Aggregate::from_name(&name.to_uppercase()), None, "{name}");
 
             assert!(validate_function_arity(name, 1).is_ok(), "{name}");
@@ -1276,8 +1081,6 @@ mod tests {
             "COUNT(*)"
         );
     }
-
-    // ── validate_unit_literal ───────────────────────────────────────────
 
     #[test]
     fn date_part_accepts_allowlisted_units() {
@@ -1327,7 +1130,6 @@ mod tests {
 
     #[test]
     fn date_trunc_rejects_dow_not_in_allowlist() {
-        // dow is in DATE_PART_UNITS but not in DATE_UNITS (date_trunc allowlist)
         let err = validate_unit_literal("date_trunc", 0, DATE_UNITS, Some("dow")).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
@@ -1359,8 +1161,6 @@ mod tests {
         let err = emit(&q, "/data/**/*.parquet", anchor()).unwrap_err();
         assert!(matches!(err, EmitError::UnsupportedOperation { .. }));
     }
-
-    // ── validate_format_literal ─────────────────────────────────────────
 
     #[test]
     fn validate_format_literal_accepts_standard_codes() {
@@ -1406,8 +1206,6 @@ mod tests {
         assert!(matches!(err, EmitError::InvalidFormat { .. }), "{err}");
     }
 
-    // ── default_agg_alias ───────────────────────────────────────────────
-
     fn agg(dsl: &str) -> crate::ast::AggExpr {
         let query = crate::parser::parse(dsl).expect("dsl parses");
         match &query.pipeline[0].node {
@@ -1434,8 +1232,6 @@ mod tests {
         assert_eq!(default_agg_alias(&agg("| stats dc(host)")), "\"dc_host\"");
     }
 
-    /// The quoted identifier is the verbatim output name, so a
-    /// backticked alias survives into the SQL untouched.
     #[test]
     fn alias_quotes_a_backticked_name_verbatim() {
         assert_eq!(
@@ -1444,11 +1240,6 @@ mod tests {
         );
     }
 
-    // ── sev() dialect resolution ────────────────────────────────────────
-
-    /// The translation never defaults a dialect it cannot parse: 1-7 are
-    /// valid readings in both dialects, so degrading syslog to `OTel`
-    /// would give a wrong number rather than a missing one.
     #[test]
     fn sev_refuses_a_dialect_it_cannot_parse_rather_than_defaulting() {
         let otel = translate_function(
@@ -1464,9 +1255,6 @@ mod tests {
         )
         .unwrap();
         assert_ne!(otel, syslog);
-        // Bypassing the arg walk (this is the defensive door): an
-        // unparseable token is an error naming the vocabulary, and the
-        // emitted SQL is never the OTel one.
         let err = translate_function(
             "sev",
             &["\"x\"".to_owned(), "bogus".to_owned()],
@@ -1474,7 +1262,6 @@ mod tests {
         )
         .expect_err("an unknown dialect must be refused");
         assert!(err.to_string().contains("otel, syslog"), "{err}");
-        // Arity is still checked first.
         let err = translate_function("sev", &[], &mut state()).expect_err("arity");
         assert!(err.to_string().contains("1 to 2 arguments"), "{err}");
     }

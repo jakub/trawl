@@ -4,24 +4,10 @@
 
 //! The closed set of aggregate functions, and where one may stand
 //! (ADR-0001, Amendment 2026-11-08).
-//!
-//! The SQL translator ([`crate::emitter`]) and the live accumulators
-//! ([`crate::stream`]) both match [`Aggregate`] with no wildcard arm, so
-//! an aggregate added here does not compile until both lanes implement
-//! it. A name outside the set is not an aggregate, whatever slot it is
-//! written in.
-//!
-//! [`check_positions`] refuses an aggregate written where neither lane
-//! can run it. Both validation doors call it at the same point, so both
-//! lanes answer one query with one sentence.
 
 use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
 use crate::emitter::EmitError;
 
-/// One aggregate function. Two have a second spelling: `dc` and
-/// `distinct_count` are [`Self::DistinctCount`], `values` and `list` are
-/// [`Self::Values`].
-///
 /// The AST keeps the spelling the query wrote ([`crate::ast::AggExpr`]),
 /// because an output's default name derives from it
 /// ([`crate::projection::agg_output_name`]).
@@ -45,7 +31,6 @@ pub enum Aggregate {
 }
 
 impl Aggregate {
-    /// Every aggregate, in declaration order.
     pub const ALL: [Self; 15] = [
         Self::Count,
         Self::Avg,
@@ -64,8 +49,6 @@ impl Aggregate {
         Self::Stddev,
     ];
 
-    /// The aggregate a function name spells, matched exactly: `Count`
-    /// is not `count`.
     #[must_use]
     pub fn from_name(name: &str) -> Option<Self> {
         Some(match name {
@@ -88,7 +71,6 @@ impl Aggregate {
         })
     }
 
-    /// Every name [`Self::from_name`] reads as this aggregate.
     #[must_use]
     pub const fn spellings(self) -> &'static [&'static str] {
         match self {
@@ -111,7 +93,6 @@ impl Aggregate {
     }
 }
 
-/// Where an expression stands, for [`check_positions`].
 #[derive(Debug, Clone, Copy)]
 enum Position<'a> {
     /// Evaluated once per row: a `where` condition or a `let` value.
@@ -123,16 +104,9 @@ enum Position<'a> {
     Operand(&'a str),
 }
 
-/// Refuse an aggregate call written where neither lane can run it: in a
-/// per-row expression (`where`, `let`), at any depth, or inside another
-/// aggregate's operand. A scalar call around an aggregate in an
-/// aggregation slot aggregates it, so `stats coalesce(sum(x), 0)` stays
-/// legal and `stats sum(coalesce(count(x), 0))` does not.
-///
+/// Refuse an aggregate call written where neither lane can run it.
 /// The walk keeps its own stack, so a flat chain deeper than a worker's
-/// stack cannot overflow it (ADR-0061). Children are visited left to
-/// right and stages in order, so the refusal reported is the first one
-/// written.
+/// stack cannot overflow it (ADR-0061).
 ///
 /// # Errors
 ///
@@ -153,7 +127,6 @@ pub fn check_positions(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError> {
             PipeStage::Timechart(t) => push_slots(&mut stack, &t.aggregations),
             PipeStage::EventStats(e) => push_slots(&mut stack, &e.aggregations),
             PipeStage::Pivot(p) => push_slots(&mut stack, std::slice::from_ref(&p.aggregation)),
-            // Field names and settings only: no expression to stand in.
             PipeStage::Sort(_)
             | PipeStage::Limit(_)
             | PipeStage::Table(_)
@@ -227,15 +200,9 @@ fn push_slots<'a>(stack: &mut Vec<(&'a Expr, Position<'a>)>, slots: &'a [AggExpr
 mod tests {
     use crate::ast::{BinaryOp, Expr, PipeStage, Spanned, WhereStage};
 
-    /// Validation of a flat chain of 100,000 `+` terms in a `where`
-    /// finishes on a 2 MiB thread.
-    ///
     /// The parser cannot produce the chain (a query is at most 64 KiB),
     /// so the AST is built by hand. Building, validating and dropping it
-    /// all happen on the small thread. Over a `where`, `validate_pipeline`
-    /// walks the chain in [`super::check_positions`] and in the call
-    /// check: the complexity budget and the projection check have nothing
-    /// to do there.
+    /// all happen on the small thread.
     #[test]
     fn flat_expression_validation_is_bounded() {
         const TERMS: usize = 100_000;

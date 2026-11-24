@@ -8,25 +8,6 @@
 //! static that every metered [`super::Preparer`] reaches with no handle
 //! passed to it: SSE setup in trawl-server and the batch tail in
 //! trawl-engine draw on the same bytes.
-//!
-//! A metered build reserves before it builds and keeps what it reserved
-//! for as long as the pattern lives. It holds one build transient while
-//! it compiles, then resizes the hold to the pattern's charge and moves
-//! the hold into the pattern, so the bytes return when the last clone of
-//! the pattern drops. A request that has answered does not release them;
-//! the work that holds the pattern does, when it ends.
-//!
-//! A batch statement holds an RE2 allowance from the same reservation
-//! ([`RegexSites::re2_allowance`]): `DuckDB` compiles each regex the
-//! statement binds once on every thread that runs it, outside any memory
-//! limit trawl sets, so the bytes it may take are held before the
-//! statement binds and returned when the work that runs it ends. One
-//! query holds at most [`QUERY_RESERVATION_CAP`] of the reservation, its
-//! pattern charges and its allowance together.
-//!
-//! A hold that does not fit is refused at once. Nothing waits for bytes
-//! to come back, so a full reservation answers a query with a capacity
-//! refusal, first come, first served.
 
 use std::num::NonZeroU32;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -38,19 +19,7 @@ const MIB: u64 = 1 << 20;
 
 /// The most regex memory every query in the process may hold at once, in
 /// bytes: 1.25 GiB, against the charges [`super::charge`] computes and the
-/// RE2 allowances of batch statements ([`RegexSites::re2_allowance`]). A
-/// fixed constant with no config key, like `MAX_LATERAL_EXPANSION`.
-///
-/// It holds as many queries as `max_concurrent_queries`' default runs at
-/// most, eight, each an ordinary search of five corpus patterns on four
-/// threads, which holds about 137.6 MiB of RE2 allowance, with about
-/// 179 MiB left for live streams. It still holds them with a `sev()` read
-/// and filtered on in each: about 140.5 MiB each, with about 156 MiB
-/// left. It holds them beside a hot buffer too, whose branch of the
-/// hot+cold union conforms the `_severity` pin. Each search's filter runs
-/// in both branches, but a thread runs one branch at a time, so it
-/// counts once: about 144.6 MiB each, with about 123 MiB left, and
-/// 147.5 MiB with the `sev()`, with about 100 MiB left.
+/// RE2 allowances of batch statements ([`RegexSites::re2_allowance`]).
 pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 
 /// The most one query may hold of the reservation at once, in bytes: its
@@ -61,51 +30,25 @@ pub const REGEX_RESERVATION_BYTES: u64 = 1280 * MIB;
 pub const QUERY_RESERVATION_CAP: u64 = 512 * MIB;
 
 /// What one regex site other than an extract's may take in `DuckDB`'s
-/// RE2, on one thread, in bytes: 6.88 MiB, rounded up to a whole KiB.
-///
-/// RE2 bounds each regex by its 8 MiB default `max_mem` (`re2.h`,
-/// `kDefaultMaxMem`), which `DuckDB` never changes: two thirds for the
-/// forward program and its DFA, one third for the reverse one
-/// (`re2.cc`). A match answers yes or no from the forward program, so
-/// its share has a ceiling whatever the body is. The figure is the
-/// worst measured over the `matches` bodies at the full body limit, on 1
-/// and 4 threads, 5.50 MiB a site, with a 25 % margin
+/// RE2, on one thread, in bytes: 6.88 MiB, rounded up to a whole KiB
 /// (`docs/evidence/issue-335/re2-memory.txt`, parts `SITE_SIZE` and
 /// `ALLOWANCE`, "flat by kind").
 pub const MATCH_SITE_RE2_BYTES: u64 = 7046 * KIB;
 
 /// What one `regexp_extract` site may take in `DuckDB`'s RE2, on one
-/// thread, in bytes: 13.38 MiB, rounded up to a whole KiB.
-///
-/// An extract finds where its match starts and reads its groups, so RE2
-/// builds the reverse program beside the forward one, and the whole 8 MiB
-/// `max_mem` applies ([`MATCH_SITE_RE2_BYTES`]). The figure is the worst
-/// measured over the extract bodies at the full body limit, on 1 and 4
-/// threads, 10.66 MiB a site, with a 25 % margin
+/// thread, in bytes: 13.38 MiB, rounded up to a whole KiB
 /// (`docs/evidence/issue-335/re2-memory.txt`, parts `SITE_SIZE` and
 /// `ALLOWANCE`, "flat by kind").
 pub const EXTRACT_SITE_RE2_BYTES: u64 = 13702 * KIB;
 
 /// What one regex call whose pattern the emitter writes may take in
-/// `DuckDB`'s RE2, on one thread, in bytes: 9 KiB.
-///
-/// Those patterns are `crate::conform`'s four (`FIXED_REGEXES`): the
-/// severity reading's whitespace trims, its digits guard and its ASCII
-/// gate. They are short, so a site holds far less than a query's regex
-/// does. The figure is the worst median measured over the four, as 512
-/// and 2048 sites on 1 and 4 threads over rows built to grow each one's
-/// DFA, 6.6 KiB a site, with a 25 % margin, rounded up to a whole KiB
+/// `DuckDB`'s RE2, on one thread, in bytes: 9 KiB. Those patterns are
+/// `crate::conform`'s four (`FIXED_REGEXES`)
 /// (`docs/evidence/issue-335/re2-memory.txt`, part `FIXED_SITES`).
 pub const FIXED_SITE_RE2_BYTES: u64 = 9 * KIB;
 
 /// The regex calls one emitted statement makes `DuckDB` compile, by the
 /// kind of RE2 program each one is.
-///
-/// Each kind counts every copy `DuckDB`'s binder and optimizer can make
-/// of its calls, over the finished statement
-/// ([`crate::emitter::regex_calls`]). The parameter kinds are never below
-/// the emit-time counter's count of regex-bearing parameters, lateral and
-/// pivot copies included ([`crate::emitter::MAX_REGEX_PARAMS`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RegexSites {
     /// `regexp_extract` calls: one per `extract` stage, and the copies
@@ -148,7 +91,6 @@ const STARTING_LIMIT: u64 = if cfg!(test) {
 
 static RESERVATION: RegexReservation = RegexReservation::new(STARTING_LIMIT);
 
-/// The process-wide regex reservation every metered ledger holds from.
 #[must_use]
 pub fn reservation() -> &'static RegexReservation {
     &RESERVATION
@@ -157,9 +99,7 @@ pub fn reservation() -> &'static RegexReservation {
 /// A pool of regex memory, in bytes, that holds are taken from.
 #[derive(Debug)]
 pub struct RegexReservation {
-    /// The most `reserved` may come to.
     limit: AtomicU64,
-    /// What the live holds add up to.
     reserved: AtomicU64,
     #[cfg(any(test, feature = "test-support"))]
     probe: probe::Probe,
@@ -175,13 +115,11 @@ impl RegexReservation {
         }
     }
 
-    /// What the live holds add up to, in bytes.
     #[must_use]
     pub fn reserved(&self) -> u64 {
         self.reserved.load(Ordering::Acquire)
     }
 
-    /// The most the live holds may add up to, in bytes.
     #[must_use]
     pub fn limit(&self) -> u64 {
         self.limit.load(Ordering::Acquire)
@@ -214,7 +152,6 @@ impl RegexReservation {
             .map_err(|_| RegexRefusal::Reservation)
     }
 
-    /// Return `bytes` to the reservation.
     fn shrink(&self, bytes: u64) {
         self.reserved.fetch_sub(bytes, Ordering::AcqRel);
     }
@@ -231,16 +168,12 @@ pub struct RegexHold {
 }
 
 impl RegexHold {
-    /// The bytes this hold keeps from the reservation.
     #[must_use]
     pub fn bytes(&self) -> u64 {
         self.bytes
     }
 
     /// Hold `bytes` instead of what this hold keeps now.
-    ///
-    /// Shrinking always succeeds. Growing takes the difference from the
-    /// reservation as [`RegexReservation::try_hold`] does.
     ///
     /// # Errors
     ///
@@ -303,7 +236,6 @@ mod probe {
         }
     }
 
-    /// The gate one [`ChargePause`] installs.
     #[derive(Debug)]
     struct Gate {
         open: Mutex<bool>,
@@ -343,7 +275,6 @@ mod probe {
     }
 
     impl ChargePause {
-        /// How many builds have reached the gate.
         #[must_use]
         pub fn arrivals(&self) -> usize {
             self.gate.arrivals.load(Ordering::SeqCst)
@@ -375,13 +306,11 @@ mod probe {
     }
 
     impl RegexReservation {
-        /// How many holds this reservation has granted.
         #[must_use]
         pub fn holds(&self) -> u64 {
             self.probe.holds.load(Ordering::SeqCst)
         }
 
-        /// How many holds have been returned to this reservation.
         #[must_use]
         pub fn releases(&self) -> u64 {
             self.probe.releases.load(Ordering::SeqCst)
@@ -417,8 +346,6 @@ mod probe {
             }
         }
 
-        /// The metered build's and the batch statement's side: free
-        /// unless a test paused it.
         pub(crate) fn after_charge(&self) {
             let gate = self
                 .probe
@@ -434,12 +361,6 @@ mod probe {
 
     /// Set the process-wide reservation's limit to `bytes`, for an
     /// integration test that runs a server in a process of its own.
-    ///
-    /// A setter, not an environment variable read at first use: the test
-    /// that sets the limit names it in its own code, before it starts
-    /// work that holds, and a process that inherited the variable from
-    /// its parent cannot set it by accident. The test may build a pattern
-    /// first, to size the limit from its charge, and drop it.
     ///
     /// # Panics
     ///
@@ -471,8 +392,6 @@ pub(crate) fn private_reservation(limit: u64) -> &'static RegexReservation {
 mod tests {
     use super::*;
 
-    /// A hold within the limit is granted, and one that does not fit is
-    /// refused at once, leaving what is held as it was.
     #[test]
     fn a_hold_that_does_not_fit_is_refused_at_once() {
         let pool = private_reservation(100);
@@ -488,8 +407,6 @@ mod tests {
         assert_eq!((pool.holds(), pool.releases()), (2, 2));
     }
 
-    /// A sum past `u64::MAX` is refused, never wrapped, on a new hold and
-    /// on growth.
     #[test]
     fn holds_never_overflow() {
         let pool = private_reservation(u64::MAX);
@@ -502,9 +419,6 @@ mod tests {
         assert_eq!(pool.reserved(), 0);
     }
 
-    /// Shrinking a hold always succeeds and returns the difference.
-    /// Growing takes the difference while it fits, and a growth that does
-    /// not fit is refused with the hold unchanged.
     #[test]
     fn resize_shrinks_freely_and_grows_within_the_limit() {
         let pool = private_reservation(100);
@@ -522,8 +436,6 @@ mod tests {
         assert_eq!((pool.holds(), pool.releases()), (2, 2));
     }
 
-    /// Holds raced from many threads never take the reservation past its
-    /// limit, and every byte comes back.
     #[test]
     fn racing_holds_stay_within_the_limit() {
         let pool = private_reservation(1000);
@@ -547,9 +459,6 @@ mod tests {
         assert_eq!(pool.holds(), pool.releases());
     }
 
-    /// A paused reservation parks a build at the charge point until the
-    /// pause is released, and a dropped pause lets every later build
-    /// straight past.
     #[test]
     fn a_pause_parks_the_build_until_released() {
         let pool = private_reservation(u64::MAX);
@@ -565,9 +474,6 @@ mod tests {
         pool.after_charge();
     }
 
-    /// Each site costs its kind's figure once on every thread: the
-    /// five-pattern ordinary search and a one-extract parser, on the
-    /// default four threads, and a sum past `u64::MAX` saturates.
     #[test]
     fn the_allowance_is_each_site_once_a_thread() {
         let four = NonZeroU32::new(4).expect("not zero");
@@ -617,9 +523,6 @@ mod tests {
         assert_eq!(past.re2_allowance(four), u64::MAX);
     }
 
-    /// The figures are the measured by-kind model's, 6.88 and 13.38 MiB,
-    /// each rounded up to a whole KiB: never under the model, and less
-    /// than a KiB over it.
     #[test]
     fn site_figures_round_the_model_up_to_a_kib() {
         let kib_over =
@@ -628,8 +531,6 @@ mod tests {
         assert_eq!(EXTRACT_SITE_RE2_BYTES, kib_over(1338));
     }
 
-    /// The fixed-site figure is the measured worst median, 6.6 KiB a site
-    /// a thread, with the 25 % margin, rounded up to a whole KiB.
     #[test]
     fn the_fixed_site_figure_is_the_measured_one_with_its_margin() {
         let measured_tenths_kib: u64 = 66;
@@ -638,8 +539,6 @@ mod tests {
         assert_eq!(FIXED_SITE_RE2_BYTES, 9 * KIB);
     }
 
-    /// trawl-core's own tests share the process-wide reservation across
-    /// threads, so it has no limit there.
     #[test]
     fn the_process_reservation_has_no_limit_under_unit_tests() {
         assert_eq!(reservation().limit(), u64::MAX);

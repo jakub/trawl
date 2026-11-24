@@ -4,71 +4,10 @@
 
 //! A regex body as the batch engine reads it (ADR-0063).
 //!
-//! The live lane and the kv tail build a regex with regex-automata's meta
-//! engine, and the batch lane hands the body to `DuckDB`'s RE2. The two
-//! dialects differ (ADR-0001), and some of the differences change what a
-//! body costs as well as what it matches. This module holds the two
-//! things a regex body passes through for the batch engine: the refusal
-//! of class syntax RE2 reads differently, and the view, the program the
-//! meta engine runs, whose compiled size the ledger caps at
-//! [`super::MAX_BATCH_COMPILED_BYTES`].
-//!
-//! # Class set syntax
-//!
-//! The Rust engine reads a class nested in a bracketed class
-//! (`[a[bc]]`) and the class set operators `&&`, `--` and `~~`. RE2 reads
-//! none of them. Inside a class it reads `&`, `-` and `~` as characters
-//! and joins every operand into one union, and it reads `[` as a
-//! character, so the first `]` closes the class and the rest of a nested
-//! class reads as more pattern after it. `[\pL&&a]` matches only `a` in
-//! the live lane and any letter, or `&`, in the batch lane. One position
-//! of the walk can be several classes in RE2, which compiles them into a
-//! program the walk never priced. So a regex body that holds either form
-//! is refused ([`class_set_refusal`]). Escaped characters (`[a\&&b]`,
-//! `[\[]`) and POSIX classes (`[[:alpha:]]`) are neither, and both engines
-//! read them alike.
-//!
-//! # The view
-//!
-//! RE2 reads the Perl classes `\w`, `\d` and `\s` and the word assertions
-//! `\b` and `\B` as ASCII, and the Rust engine reads them as Unicode. The
-//! view ([`view`]) is the body with each of them written out in its ASCII
-//! meaning, in syntax the Rust engine reads the way RE2 reads the
-//! original. It is the program that runs in the live lane and the kv
-//! tail, so they match as the batch lane does. [`super::Preparer::build`]
-//! compiles the body as written under [`super::MAX_REGEX_COMPILED_BYTES`]
-//! to admit it, then compiles the view under
-//! [`super::MAX_BATCH_COMPILED_BYTES`] and keeps the view's program, which
-//! is the one charged. The view's size also measures what RE2 compiles:
-//! `\w{20}` is about 1 MiB in Rust as written and 2 KiB as RE2 reads it.
-//! An `extract` body's view keeps its groups as written, so capture names
-//! and indices do not move; the batch lane binds unnamed ones as
-//! non-capturing, which counts a few KiB more at most, toward refusal. A
-//! glob, `like` or `ilike` operand never reaches RE2 and has no view.
-//!
-//! RE2's ASCII meanings, from the bundled `perl_groups.cc` and `parse.cc`:
-//!
-//! - `\d` is `[0-9]`, `\s` is `[\t\n\f\r ]` (no `\v`), and `\w` is
-//!   `[0-9A-Za-z_]`. `\D`, `\S` and `\W` are their complements over all of
-//!   Unicode, so they stay large classes with few ranges.
-//! - Under `(?i)` RE2 case-folds a Perl class like any other class: `\w`
-//!   gains the Kelvin sign and the long s, and `\W` loses them. The view
-//!   writes the ASCII class where the Perl class stood, so the Rust
-//!   engine folds it under the same flags.
-//! - `\b` and `\B` test ASCII word characters. The view writes each word
-//!   assertion as `(?-u:…)`. A word assertion compiles to one state either
-//!   way, so this keeps the meaning and does not change the size.
-//!
-//! One difference remains. RE2 tests an assertion at every byte offset, so
-//! an empty match on `\B` can sit inside a multi-byte character: `\B`
-//! matches `xéy` in RE2. The meta engine never places an empty match
-//! inside a character, so the view does not match there. Only a body that
-//! can match empty on `\B`, such as `\B` or `x*\B`, is affected
-//! (`regex_class_view_premise` pins those rows).
-//!
-//! Everything else that this module does not refuse reads the same in
-//! both engines, or is syntax RE2 refuses, which `DuckDB` reports when the
-//! query runs.
+//! Under `(?i)` RE2 case-folds a Perl class like any other class: `\w`
+//! gains the Kelvin sign and the long s, and `\W` loses them. The view
+//! writes the ASCII class where the Perl class stood, so the Rust
+//! engine folds it under the same flags.
 
 use regex_syntax::ast::{
     self, Ast, ClassBracketed, ClassPerl, ClassPerlKind, ClassSet, ClassSetItem, ClassSetRange,
@@ -78,9 +17,6 @@ use regex_syntax::ast::{
 
 use super::PatternError;
 
-/// [`PatternError::ClassSetSyntax`] when `ast` holds a class nested in a
-/// bracketed class, or a class set operation.
-///
 /// The syntax tree's own visitor keeps a heap stack, so a deeply nested
 /// body cannot overflow the thread's stack here.
 pub(crate) fn class_set_refusal(ast: &Ast) -> Result<(), PatternError> {
@@ -90,10 +26,8 @@ pub(crate) fn class_set_refusal(ast: &Ast) -> Result<(), PatternError> {
     }
 }
 
-/// Stops the walk at the first class set syntax it meets.
 struct ClassSetFinder;
 
-/// The walk met class set syntax.
 struct Found;
 
 impl Visitor for ClassSetFinder {
@@ -110,9 +44,6 @@ impl Visitor for ClassSetFinder {
 
     fn visit_class_set_item_pre(&mut self, item: &ClassSetItem) -> Result<(), Found> {
         match item {
-            // A set item sits inside a bracketed class, so a bracketed
-            // item is a class nested in one. A POSIX class is an `Ascii`
-            // item, and an escaped `[` or `]` a `Literal`.
             ClassSetItem::Bracketed(_) => Err(Found),
             ClassSetItem::Empty(_)
             | ClassSetItem::Literal(_)
@@ -129,13 +60,8 @@ impl Visitor for ClassSetFinder {
     }
 }
 
-/// The body `ast` parses from, as RE2 reads it, in syntax the Rust engine
-/// reads the same way ([module docs](self)).
-///
-/// The rewrite runs on a copy of the syntax tree and prints it back, as
-/// [`super::batch_extract`] does. A body with none of the five escapes
-/// prints back as its tree reads, which is the body itself unless it
-/// holds `(?x)` whitespace or comments. It builds nothing.
+/// A body with none of the five escapes prints back as its tree reads,
+/// which is the body itself unless it holds `(?x)` whitespace or comments.
 pub(crate) fn view(ast: &Ast) -> String {
     let mut tree = ast.clone();
     // An explicit stack, as the syntax tree's own visitor keeps, so a
@@ -167,8 +93,6 @@ pub(crate) fn view(ast: &Ast) -> String {
     regex
 }
 
-/// What a Perl class or a word assertion becomes in the view, or `None`
-/// for any other node.
 fn ascii_node(node: &Ast) -> Option<Ast> {
     match node {
         Ast::ClassPerl(perl) => Some(Ast::class_bracketed(ascii_class(perl))),
@@ -190,8 +114,6 @@ fn ascii_node(node: &Ast) -> Option<Ast> {
     }
 }
 
-/// `assertion` inside `(?-u:…)`, where the Rust engine tests ASCII word
-/// characters, as RE2 does.
 fn ascii_assertion(assertion: &ast::Assertion) -> Ast {
     let span = assertion.span;
     let item = |kind| FlagsItem { span, kind };
@@ -208,10 +130,6 @@ fn ascii_assertion(assertion: &ast::Assertion) -> Ast {
     })
 }
 
-/// Rewrite every Perl class inside a bracketed class's set. A body the
-/// ledger builds holds no nested class or set operation
-/// ([`class_set_refusal`]), but the rewrite reaches them too, so the view
-/// of any body is RE2's reading of its Perl classes.
 fn ascii_set(set: &mut ClassSet) {
     enum Open<'a> {
         Set(&'a mut ClassSet),
@@ -242,7 +160,6 @@ fn ascii_set(set: &mut ClassSet) {
     }
 }
 
-/// RE2's reading of a Perl class: its ASCII ranges, negated as written.
 /// Each bound is a `\x` escape, which reads the same under `(?x)`.
 fn ascii_class(perl: &ClassPerl) -> ClassBracketed {
     let ranges: &[(char, char)] = match perl.kind {

@@ -5,12 +5,6 @@
 //! An unknown escape in a quoted string is one parse error at the
 //! backslash pair (ADR-0068, "An unknown escape is reported where it is
 //! lexed").
-//!
-//! A quoted string decodes `\\`, `\"`, `\n`, `\t` and `\r`. Any other
-//! backslash is an emitted error over the backslash and the character
-//! after it, and the string still closes, so no later arm reads the same
-//! text again. The raw positions (extract and rex bodies, `/…/` regexes,
-//! bare words and values, comments) decode nothing and do not change.
 
 use std::ops::Range;
 
@@ -19,14 +13,12 @@ use trawl_core::ast::{
 };
 use trawl_core::parser::{ParseError, parse};
 
-/// The head of the unknown-escape message for `\s`.
 const UNKNOWN_ESCAPE_S: &str =
     r#"unknown escape \s: a quoted string decodes only \\, \", \n, \t and \r"#;
 const UNREADABLE_BOUND: &str = "cannot read this time bound as a timestamp";
 const UNTERMINATED: &str = "unterminated string literal";
 const QUOTE_OPENS_VALUE: &str = "a value that opens with '\"' must be a complete quoted string";
 
-/// One expected error: a message and its span.
 type Expected = (&'static str, Range<usize>);
 
 fn errors(dsl: &str) -> Vec<ParseError> {
@@ -36,7 +28,6 @@ fn errors(dsl: &str) -> Vec<ParseError> {
     }
 }
 
-/// The whole error list, as (message, span) pairs.
 fn error_list(dsl: &str) -> Vec<(String, Range<usize>)> {
     errors(dsl)
         .into_iter()
@@ -50,7 +41,6 @@ fn want(list: &[Expected]) -> Vec<(String, Range<usize>)> {
         .collect()
 }
 
-/// The survey query: one error, at the pair, naming the three ways out.
 #[test]
 fn unknown_escape_in_matches_operand() {
     let dsl = r#"* | where m matches "^\s+at ""#;
@@ -68,32 +58,23 @@ fn unknown_escape_in_matches_operand() {
     assert!(hint.contains("extract"), "{hint:?}");
 }
 
-/// Every ordinary quoted string reports the escape first, at the pair, and
-/// each site's whole error list is pinned: a closed string never falls
-/// back to a scanner that reports it again.
 #[test]
 fn unknown_escape_reports_at_every_quoted_site() {
     let rows: Vec<(&str, Vec<Expected>)> = vec![
-        // the search stage
         (r#""a\sb""#, vec![(UNKNOWN_ESCAPE_S, 2..4)]),
         (r#"x "a\sb" y"#, vec![(UNKNOWN_ESCAPE_S, 4..6)]),
         (r#"NOT "a\sb""#, vec![(UNKNOWN_ESCAPE_S, 6..8)]),
         (r#"(a OR "a\sb")"#, vec![(UNKNOWN_ESCAPE_S, 8..10)]),
         (r#"host="a\sb""#, vec![(UNKNOWN_ESCAPE_S, 7..9)]),
         (r#"host!="a\sb""#, vec![(UNKNOWN_ESCAPE_S, 8..10)]),
-        // an ordered operator with a quoted value adds nothing on top
         (r#"host>="a\sb""#, vec![(UNKNOWN_ESCAPE_S, 8..10)]),
         (r#"host=a,"b\sb""#, vec![(UNKNOWN_ESCAPE_S, 9..11)]),
         (r#"host="a\sb",c"#, vec![(UNKNOWN_ESCAPE_S, 7..9)]),
-        // an ordered operator with a list: the escape is the one error
         (r#"host<a,"b\sb""#, vec![(UNKNOWN_ESCAPE_S, 9..11)]),
-        // two escapes, two errors, in source order
         (
             r#"host="a\sb","c\sd""#,
             vec![(UNKNOWN_ESCAPE_S, 7..9), (UNKNOWN_ESCAPE_S, 14..16)],
         ),
-        // a time bound: the escape first, then the bound the kept value
-        // cannot be read as, which is true of the corrected query too
         (
             r#"earliest="2026\s""#,
             vec![(UNKNOWN_ESCAPE_S, 14..16), (UNREADABLE_BOUND, 0..17)],
@@ -102,7 +83,6 @@ fn unknown_escape_reports_at_every_quoted_site() {
             r#"latest="2026\s""#,
             vec![(UNKNOWN_ESCAPE_S, 12..14), (UNREADABLE_BOUND, 0..15)],
         ),
-        // pipe stages
         (r#"* | from saved "a\sb""#, vec![(UNKNOWN_ESCAPE_S, 17..19)]),
         (r#"| from saved "a\sb""#, vec![(UNKNOWN_ESCAPE_S, 15..17)]),
         (r#"* | where m == "a\sb""#, vec![(UNKNOWN_ESCAPE_S, 17..19)]),
@@ -139,7 +119,6 @@ fn unknown_escape_reports_at_every_quoted_site() {
         .collect();
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 
-    // the span covers the backslash and the whole following character
     let dsl = "\"a\\éb\"";
     let got = error_list(dsl);
     assert_eq!(got.len(), 1, "{got:?}");
@@ -147,11 +126,8 @@ fn unknown_escape_reports_at_every_quoted_site() {
     assert!(got[0].0.starts_with("unknown escape \\é:"), "{got:?}");
 }
 
-/// What the escape arm must not change: the end of input, an unclosed
-/// filter value's fallback, and the five escapes.
 #[test]
 fn unknown_escape_edges_keep_existing_errors() {
-    // a backslash at the end of input is still an unterminated string
     let got = errors(r#""a\"#);
     let [one] = &got[..] else { panic!("{got:?}") };
     assert_eq!(one.message, UNTERMINATED);
@@ -166,7 +142,6 @@ fn unknown_escape_edges_keep_existing_errors() {
     assert_eq!(one.span, 5..10);
     assert_eq!(one.hint.as_deref(), Some("close the quote"));
 
-    // an unclosed quoted search or expression string has no fallback
     assert_eq!(
         error_list(r#""a\sb"#),
         want(&[(UNTERMINATED, 5..5)]),
@@ -178,7 +153,6 @@ fn unknown_escape_edges_keep_existing_errors() {
         "expression string"
     );
 
-    // the five escapes decode as before
     let query = parse(r#""\\ \" \n \t \r""#).expect("the five escapes parse");
     let [group] = &query.search.groups[..] else {
         panic!("{query:?}")
@@ -192,7 +166,6 @@ fn unknown_escape_edges_keep_existing_errors() {
     assert_eq!(q.phrase, "\\ \" \n \t \r");
 }
 
-/// Assert `dsl` parses and its tree holds `node`, compared by `Debug`.
 fn holds_node(dsl: &str, node: &impl std::fmt::Debug) {
     let query = parse(dsl).unwrap_or_else(|e| panic!("{dsl:?} must parse: {e:?}"));
     let tree = format!("{query:?}");
@@ -200,11 +173,8 @@ fn holds_node(dsl: &str, node: &impl std::fmt::Debug) {
     assert!(tree.contains(&node), "{dsl:?}: {node} not in {tree}");
 }
 
-/// The raw positions decode nothing, so a backslash there stays valid and
-/// stays in the tree as written.
 #[test]
 fn unknown_escape_leaves_raw_positions_alone() {
-    // extract and rex bodies are raw strings
     for kw in ["extract", "rex"] {
         holds_node(
             &format!(r#"* | {kw} "(?<x>\d+)" from m"#),
@@ -246,7 +216,6 @@ fn unknown_escape_leaves_raw_positions_alone() {
         r#"* | where m matches /"\s"/"#,
         &trawl_core::ast::LiteralValue::String(r#""\s""#.to_string()),
     );
-    // a comment is not lexed at all
     assert_eq!(
         parse("a # \"\\s\"").expect("a comment holding an escape parses"),
         parse("a").expect("a parses")

@@ -4,9 +4,6 @@
 
 //! Shared display-name contract for saved queries.
 
-/// Trim outer whitespace, preserving interior spacing, Unicode and punctuation.
-/// Unsafe display characters are rejected before trimming. This shares the
-/// field-name policy, including its refusal of invisible format characters and joiners.
 pub fn normalize(name: &str) -> Result<&str, &'static str> {
     if name.chars().any(crate::sanitize::is_unsafe_display_char) {
         return Err("Name must not contain control or invisible formatting characters.");

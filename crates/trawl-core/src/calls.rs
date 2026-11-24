@@ -4,13 +4,6 @@
 
 //! Every call a pipeline writes, checked once before either lane runs it
 //! (ADR-0001, Amendment 2026-11-11).
-//!
-//! [`check_calls`] applies the one per-call rule
-//! ([`crate::emitter::check_call`]: name, argument count, literal
-//! positions) to every call in every stage, the stages after
-//! `extract kv` included. Both validation doors call it right after
-//! [`crate::aggregate::check_positions`], so a bad call gets one sentence
-//! whichever lane would have run it.
 
 use crate::ast::{AggExpr, Expr, PipeStage, Spanned};
 use crate::emitter::{EmitError, check_call};
@@ -24,11 +17,6 @@ enum Work<'a> {
 
 /// Refuse the first call, in written order, that breaks its function's
 /// rule.
-///
-/// Stages are walked in order, and within a stage its conditions,
-/// assignments and aggregation slots in order. A call is checked before
-/// its arguments, so `foo(bar(x))` reports `foo`. A field named like a
-/// function (`count`, `lower`) is a field, never a call.
 ///
 /// The walk keeps its own stack, so a flat chain deeper than a worker's
 /// stack cannot overflow it (ADR-0061).
@@ -52,9 +40,6 @@ pub(crate) fn check_calls(stages: &[Spanned<PipeStage>]) -> Result<(), EmitError
             PipeStage::Timechart(t) => stack.extend(t.aggregations.iter().rev().map(Work::Slot)),
             PipeStage::EventStats(e) => stack.extend(e.aggregations.iter().rev().map(Work::Slot)),
             PipeStage::Pivot(p) => stack.push(Work::Slot(&p.aggregation)),
-            // Field names and settings only: no call to check. An
-            // `extract kv` mints columns and nothing else, so the stages
-            // after it are walked like any other.
             PipeStage::Sort(_)
             | PipeStage::Limit(_)
             | PipeStage::Table(_)
@@ -101,9 +86,6 @@ mod tests {
     use crate::ast::{BinaryOp, Expr, PipeStage, Spanned, WhereStage};
     use crate::emitter::EmitError;
 
-    /// A flat chain of 100,000 `+` terms with one bad call at its bottom
-    /// is refused on a 2 MiB thread.
-    ///
     /// The parser cannot produce the chain (a query is at most 64 KiB),
     /// so the AST is built by hand. Building, checking and dropping it all
     /// happen on the small thread. The result is matched, never printed:

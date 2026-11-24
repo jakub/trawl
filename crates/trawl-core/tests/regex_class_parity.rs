@@ -3,14 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Regex classes answer alike in the live lane and in batch SQL.
-//!
-//! The live lane runs each regex from its RE2 view, so `\d \D \w \W \s
-//! \S`, `\b` and `\B` read as the bundled `DuckDB` reads them. Each case
-//! runs one body through both lanes over the same subjects: the live lane
-//! compiles the query and evaluates each row, and the batch lane executes
-//! the emitted SQL on `DuckDB`. The matrix is the one the unit test
-//! `pattern::tests::regex_class_view_premise` checks against the view
-//! itself.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -26,9 +18,6 @@ use trawl_core::row;
 use trawl_core::schema::FieldTypes;
 use trawl_core::stream::{StageResult, StreamPlan, compile_stream_plan};
 
-/// The subjects of the premise test: the non-ASCII characters where
-/// Unicode and ASCII classes part, ASCII controls, and composites that put
-/// a non-ASCII character next to a word character or a line end.
 const SUBJECTS: [&str; 29] = [
     "\u{663}",
     "\u{e9}",
@@ -61,15 +50,10 @@ const SUBJECTS: [&str; 29] = [
     "aK",
 ];
 
-/// The bodies that can match empty on `\B`, before their case forms.
 const EMPTY_NON_BOUNDARY_FORMS: [&str; 2] = [r"\B", r"x*\B"];
 
-/// The subjects that put one multi-byte character between two ASCII word
-/// characters.
 const SPLIT_WORD_SUBJECTS: [&str; 4] = ["x\u{e9}y", "x\u{663}y", "x\u{212a}y", "x\u{17f}y"];
 
-/// `body` as written, under `(?i)`, and scoped `(?i:…)` followed by an
-/// unscoped copy.
 fn case_forms(body: &str) -> [String; 3] {
     [
         body.to_owned(),
@@ -78,7 +62,6 @@ fn case_forms(body: &str) -> [String; 3] {
     ]
 }
 
-/// Each body of the class matrix, with its construct family.
 fn bodies() -> Vec<(String, String)> {
     let mut bodies = Vec::new();
     for class in [r"\d", r"\D", r"\w", r"\W", r"\s", r"\S"] {
@@ -117,12 +100,6 @@ fn bodies() -> Vec<(String, String)> {
     bodies
 }
 
-/// The rows the lanes may answer differently: the accepted empty-`\B`
-/// difference, which `pattern::tests::regex_class_view_premise` pins
-/// exactly. RE2 tests an assertion at every byte offset, so an empty match
-/// on `\B` can sit inside a multi-byte character; trawl's engine never
-/// places an empty match inside a character. Those bodies still run, and
-/// are compared, on every other subject.
 fn accepted_differences() -> BTreeSet<(String, &'static str)> {
     EMPTY_NON_BOUNDARY_FORMS
         .iter()
@@ -131,8 +108,6 @@ fn accepted_differences() -> BTreeSet<(String, &'static str)> {
         .collect()
 }
 
-/// `text` as its code points, so a report names the subject whatever it
-/// holds.
 fn code_points(text: &str) -> String {
     if text.is_empty() {
         return "(empty)".to_owned();
@@ -143,7 +118,6 @@ fn code_points(text: &str) -> String {
         .join(" ")
 }
 
-/// One event a subject: its index as `id`, the subject as `message`.
 fn events(subjects: &[&str]) -> Vec<Map<String, Value>> {
     subjects
         .iter()
@@ -157,7 +131,6 @@ fn events(subjects: &[&str]) -> Vec<Map<String, Value>> {
         .collect()
 }
 
-/// The events as an ndjson file `read_json` can reach.
 fn source(events: &[Map<String, Value>]) -> tempfile::NamedTempFile {
     let mut tmp = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -188,8 +161,6 @@ fn bind_params(params: &[SqlValue]) -> Vec<Box<dyn duckdb::ToSql>> {
         .collect()
 }
 
-/// The batch lane: `dsl` emitted over `path` and executed on `conn`, each
-/// row as its `id` and the text of each of `columns`, `None` for null.
 fn batch_rows(
     conn: &Connection,
     dsl: &str,
@@ -230,9 +201,6 @@ fn batch_rows(
     .unwrap_or_else(|e| panic!("{dsl:?} reads: {e}"))
 }
 
-/// The live lane: `dsl`'s search filter and stream plan, compiled as a
-/// live stream compiles them, over each event. Each row it keeps is its
-/// `id` and the text of each of `columns`, `None` for null or absent.
 fn live_rows(
     dsl: &str,
     events: &[Map<String, Value>],
@@ -281,11 +249,6 @@ fn live_rows(
     kept
 }
 
-/// Each body of the class matrix, as a search-stage regex and as a
-/// `where … matches`, selects the same subjects in the live lane and in
-/// batch SQL, apart from the accepted empty-`\B` rows. Every family has
-/// subjects it matches and subjects it does not, so agreement cannot come
-/// from both lanes answering one way.
 #[test]
 fn regex_class_lane_parity() {
     let conn = Connection::open_in_memory().unwrap();
@@ -345,20 +308,12 @@ fn regex_class_lane_parity() {
     );
 }
 
-/// The subjects of the capture check: the premise subjects, and
-/// composites a group of more than one character can match.
 fn capture_subjects() -> Vec<&'static str> {
     let mut subjects = SUBJECTS.to_vec();
     subjects.extend(["ab 12", "e\u{e9} \u{663}3", "x_1 \u{200a}y"]);
     subjects
 }
 
-/// `extract` over the class matrix's subjects writes the same columns and
-/// values in the live lane and in batch SQL: a named group's text, null
-/// where the row does not match, where an optional group takes no part,
-/// and where a group captures nothing. Unnamed groups before and around
-/// named ones capture in the live program and are no columns, so they do
-/// not shift a named group's value.
 #[test]
 fn regex_class_capture_parity() {
     let conn = Connection::open_in_memory().unwrap();

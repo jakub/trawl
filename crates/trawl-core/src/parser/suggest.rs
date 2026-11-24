@@ -9,7 +9,6 @@
 //! one renderer every surface that offers a field name goes through, so a
 //! name trawl prints is a name trawl can parse back.
 
-/// All recognized pipe stage keywords.
 pub const KNOWN_PIPE_STAGES: &[&str] = &[
     "from",
     "stats",
@@ -35,9 +34,7 @@ pub const KNOWN_PIPE_STAGES: &[&str] = &[
     "eventstats",
 ];
 
-/// Known function names — single source of truth, also used by emitter validation.
 pub const KNOWN_FUNCTIONS: &[&str] = &[
-    // aggregates
     "count",
     "avg",
     "sum",
@@ -55,7 +52,6 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
     "list",
     "median",
     "stddev",
-    // scalars
     "lower",
     "upper",
     "length",
@@ -79,21 +75,17 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
     "tonumber",
     "tostring",
     "sev",
-    // string
     "contains",
     "startswith",
     "endswith",
     "split",
     "concat",
-    // date/time
     "date_part",
     "date_trunc",
     "date_diff",
     "strftime",
     "strptime",
-    // conditional
     "case",
-    // json
     "json",
     "json_extract",
     "json_extract_string",
@@ -105,68 +97,32 @@ pub const KNOWN_FUNCTIONS: &[&str] = &[
 /// The grammar's closed keyword set: three words the search stage reads
 /// unconditionally, before any field filter (`last=2h`, `earliest="…"`,
 /// `latest="…"`).
-///
-/// A field of one of these names is reachable only through backticks, so
-/// [`quote_dsl_field`] always quotes them (ADR-0013 ruling 7).
 pub const GRAMMAR_KEYWORDS: &[&str] = &["last", "earliest", "latest"];
 
 /// The words an EXPRESSION position reads before it tries a field
-/// reference: the literal words (`true`/`false`/`null`) and the operator
-/// words (`and`/`or`/`not`/`in`/`matches`/`like`/`ilike`). The boolean
-/// operators are also read in capitals; `OR` and `NOT` are quoted through
-/// [`SEARCH_KEYWORDS`] and [`FIELD_START_KEYWORDS`], so only `AND` is
-/// listed here.
-///
-/// Bare, these do not name a column inside `| where` / `| let`: a field
-/// called `true` renders as the boolean literal — a silent change of
-/// meaning — and one called `not` or `NOT` turns the surrounding text
-/// into a parse error. A rendered name must be pasteable in every field
-/// position, so [`quote_dsl_field`] backticks the whole set, exactly as
-/// it does [`GRAMMAR_KEYWORDS`].
+/// reference. The boolean operators are also read in capitals; `OR` and
+/// `NOT` are quoted through [`SEARCH_KEYWORDS`] and
+/// [`FIELD_START_KEYWORDS`], so only `AND` is listed here.
 pub const EXPRESSION_KEYWORDS: &[&str] = &[
     "true", "false", "null", "and", "AND", "or", "not", "in", "matches", "like", "ilike",
 ];
 
 /// The SEARCH stage's group separator, in the two spellings the grammar
-/// reads (`search.rs`: `keyword("OR").or(keyword("or"))`) before it tries
-/// a field filter.
-///
-/// `or` is also an expression keyword; `OR` is reachable as a field name
-/// only through backticks, and rendered bare it would not merely change
-/// meaning — `OR=x` splits the search stage into two groups and leaves
-/// the filter as a text search for `=x`, so the predicate vanishes.
+/// reads before it tries a field filter.
 pub const SEARCH_KEYWORDS: &[&str] = &["OR", "or"];
 
 /// The keywords a parser tries at the START of a field reference's
-/// position, before the field: `OR`/`or`/`NOT` at a search token start,
-/// and `true`/`false`/`null`/`not`/`NOT` at an expression atom or a `not`
-/// operand.
-///
-/// `keyword()` ends a match at any character that cannot continue an
-/// identifier, and `.` is one, so these words claim the first dot
-/// segment as well as the whole name: bare, `true.a` lexes as the literal
-/// `true` followed by `.a`, and `OR.a=x` as the OR separator followed by
-/// text. [`quote_dsl_field`] therefore backticks a name whose whole name
-/// or first dot segment is one of these. An `@`-name is exempt: the
-/// `@` is the first character, so no keyword can claim its start (but
-/// see [`backtick_dsl_field`] for a bare `@`-name directly under `NOT`).
+/// position. `keyword()` ends a match at `.`, so these words claim the
+/// first dot segment as well as the whole name. An `@`-name is exempt.
 pub const FIELD_START_KEYWORDS: &[&str] = &["OR", "or", "NOT", "true", "false", "null", "not"];
 
 /// The keywords the parser reads only in a fixed position AFTER some
 /// other token, never where a field reference starts: the binary and
-/// list operators, the clause words of individual stages, and the stage
-/// names themselves (read right after `|`).
-///
-/// A field named `by.x` or `in.a` is not shadowed by these, so
-/// [`quote_dsl_field`] does not quote them as a first segment. Whole
-/// names that need quoting for another reason stay in
-/// [`GRAMMAR_KEYWORDS`] and [`EXPRESSION_KEYWORDS`]. A drift-guard test
-/// requires every `keyword("…")` in the parser to be in this list or in
-/// [`FIELD_START_KEYWORDS`].
+/// list operators and the clause words of individual stages. A field
+/// named `by.x` or `in.a` is not shadowed by these.
 pub const POSITIONAL_KEYWORDS: &[&str] = &[
-    // operators read after a left operand
-    "and", "AND", "in", "matches", "like", "ilike", // stage clause words
-    "by", "as", "on", "from", "sep", "kv", "span", "run", "saved", "all", "latest",
+    "and", "AND", "in", "matches", "like", "ilike", "by", "as", "on", "from", "sep", "kv", "span",
+    "run", "saved", "all", "latest",
 ];
 
 /// Whether `name` lexes as a BARE field name — the unquoted production
@@ -190,16 +146,7 @@ fn is_bare_segment(segment: &str) -> bool {
 }
 
 /// Render a field name as DSL text: bare when the bare production can
-/// spell it and it is not a keyword of the grammar
-/// ([`GRAMMAR_KEYWORDS`]), of the search stage's group separator
-/// ([`SEARCH_KEYWORDS`]) or of an expression position
-/// ([`EXPRESSION_KEYWORDS`]), and its first dot segment is not a
-/// field-start keyword ([`FIELD_START_KEYWORDS`]); else backtick-quoted
-/// with embedded backticks doubled (ADR-0013 ruling 7).
-///
-/// The one renderer every suggestion surface goes through — autocomplete
-/// insertions and the query formatter — so a name trawl offers is a name
-/// trawl can parse back.
+/// spell it and no keyword claims it, else backtick-quoted.
 ///
 /// Returns `None` when the field-name grammar cannot represent `name` at
 /// all: the empty name, or one carrying a control/invisible display
@@ -218,8 +165,6 @@ pub fn quote_dsl_field(name: &str) -> Option<String> {
     backtick_dsl_field(name)
 }
 
-/// Whether a field-start keyword claims `name`'s whole name or its first
-/// dot segment. `@`-names are exempt (see [`FIELD_START_KEYWORDS`]).
 fn starts_with_field_start_keyword(name: &str) -> bool {
     if name.starts_with('@') {
         return false;
@@ -245,10 +190,6 @@ pub fn backtick_dsl_field(name: &str) -> Option<String> {
     Some(format!("`{}`", name.replace('`', "``")))
 }
 
-/// Compute the Levenshtein edit distance between two strings.
-///
-/// Two rows rather than the full matrix, so the working space is
-/// proportional to `b` alone.
 pub fn levenshtein(a: &str, b: &str) -> usize {
     let a_chars: Vec<char> = a.chars().collect();
     let b_chars: Vec<char> = b.chars().collect();
@@ -276,9 +217,6 @@ pub fn levenshtein(a: &str, b: &str) -> usize {
     prev[b_len]
 }
 
-/// Find the closest match in `candidates` for `input`, within `max_distance`.
-///
-/// Returns `None` if no candidate is within range or if the input is empty.
 pub fn suggest_closest<'a>(
     input: &str,
     candidates: &[&'a str],
@@ -301,12 +239,10 @@ pub fn suggest_closest<'a>(
     best.map(|(name, _)| name)
 }
 
-/// Suggest a pipe stage name for a typo.
 pub fn suggest_pipe_stage(input: &str) -> Option<&'static str> {
     suggest_closest(input, KNOWN_PIPE_STAGES, 2)
 }
 
-/// Suggest a function name for a typo.
 pub fn suggest_function(input: &str) -> Option<&'static str> {
     suggest_closest(input, KNOWN_FUNCTIONS, 2)
 }
@@ -314,8 +250,6 @@ pub fn suggest_function(input: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── DSL field-name quoting (ADR-0013 ruling 7) ─────────────────────
 
     #[test]
     fn a_bare_lexable_name_renders_bare() {
@@ -346,9 +280,6 @@ mod tests {
         assert_eq!(quote_dsl_field("trailing.").as_deref(), Some("`trailing.`"));
     }
 
-    /// The closed keyword set is three, and the rule is uniform: a
-    /// rendered name is pasteable in every position, so these are always
-    /// quoted even where a bare spelling would happen to parse.
     #[test]
     fn the_three_grammar_keywords_are_always_quoted() {
         assert_eq!(GRAMMAR_KEYWORDS, ["last", "earliest", "latest"]);
@@ -357,9 +288,6 @@ mod tests {
         }
     }
 
-    /// The capital boolean keywords: `AND` is read only after a left
-    /// operand, so it claims no first dot segment, but `OR` and `NOT` are
-    /// read at a field's start and claim one.
     #[test]
     fn capital_boolean_keywords_are_quoted_where_they_claim_the_name() {
         assert_eq!(quote_dsl_field("AND").as_deref(), Some("`AND`"));
@@ -368,11 +296,6 @@ mod tests {
         assert_eq!(quote_dsl_field("NOT.x").as_deref(), Some("`NOT.x`"));
     }
 
-    /// An expression position reads its keywords BEFORE it tries a field
-    /// reference, so a bare rendering there is either a silent change of
-    /// meaning (`true`, `false`, `null` lex as literals) or a parse error
-    /// (`not`). Every one of them round-trips as a field reference only
-    /// through backticks.
     #[test]
     fn expression_keywords_round_trip_in_expression_positions() {
         use crate::ast::{Expr, PipeStage};
@@ -395,7 +318,6 @@ mod tests {
                 );
             }
 
-            // …and the same name bare does NOT reach the AST as a field.
             let bare = crate::parser::parse(&format!("| where {kw} == 1"));
             let bare_is_field = bare.is_ok_and(|q| match &q.pipeline[0].node {
                 PipeStage::Where(w) => matches!(
@@ -412,10 +334,6 @@ mod tests {
         }
     }
 
-    /// The search stage reads its group separator in TWO spellings before
-    /// it tries a field filter, so both are quoted. Rendered bare, `OR=x`
-    /// is not a changed predicate but a VANISHED one: an OR separator
-    /// followed by a text search for `=x`.
     #[test]
     fn the_or_separator_round_trips_in_the_search_stage() {
         use crate::ast::SearchToken;
@@ -436,8 +354,6 @@ mod tests {
                 other => panic!("{kw:?}: expected one term, got {other:?}"),
             }
 
-            // …and bare, the same text is the separator: the filter is
-            // gone entirely, not merely reinterpreted.
             let bare = crate::parser::parse(&format!("{kw}=x"))
                 .unwrap_or_else(|e| panic!("{kw}=x must parse: {e:?}"));
             assert!(
@@ -450,8 +366,6 @@ mod tests {
         }
     }
 
-    /// A field-start keyword claims the first dot segment of a bare name,
-    /// so `quote_dsl_field` quotes it there as well as whole. The words
     /// are written out, not read from [`FIELD_START_KEYWORDS`], so
     /// dropping one from the constant fails here.
     #[test]
@@ -468,7 +382,6 @@ mod tests {
                     "{name:?} must be quoted"
                 );
             }
-            // the keyword must be the whole first segment…
             for name in [format!("{kw}x.a"), format!("{kw}_x.a"), format!("a.{kw}")] {
                 assert_eq!(
                     quote_dsl_field(&name).as_deref(),
@@ -476,7 +389,6 @@ mod tests {
                     "{name:?}"
                 );
             }
-            // …and an `@`-name is exempt from the first-segment rule.
             let at = format!("@{kw}.a");
             assert_eq!(quote_dsl_field(&at).as_deref(), Some(at.as_str()), "{at:?}");
         }
@@ -493,8 +405,6 @@ mod tests {
             assert_eq!(backtick_dsl_field(name), None, "{name:?}");
         }
 
-        // Bare under NOT, an `@`-name leaves NOT as text; backticked, the
-        // filter is negated.
         let negated = |q: &str| {
             let parsed = crate::parser::parse(q).unwrap_or_else(|e| panic!("{q}: {e:?}"));
             parsed.search.all_tokens().any(|t| {
@@ -510,8 +420,6 @@ mod tests {
         assert!(negated(&format!("NOT {quoted}=x")));
     }
 
-    /// The parser sources the keyword guard reads. A `read_dir` check
-    /// keeps the list complete: a new parser file must join it.
     const PARSER_SOURCES: &[(&str, &str)] = &[
         ("comment.rs", include_str!("comment.rs")),
         ("depth.rs", include_str!("depth.rs")),
@@ -533,9 +441,6 @@ mod tests {
     const NON_LITERAL_KEYWORD_CALLS: &[(&str, &str, &[&str])] =
         &[("pipe.rs", "kw", &["extract", "rex"])];
 
-    /// Every `keyword(` call in the source, as its argument: `Ok(word)`
-    /// for a string literal, `Err(expression)` for anything else. Lines
-    /// that are `//` comments are skipped.
     fn keyword_calls(source: &str) -> Vec<Result<String, String>> {
         let mut out = Vec::new();
         for line in source.lines() {
@@ -548,7 +453,7 @@ mod tests {
                 let after = &rest[at + "keyword(".len()..];
                 rest = after;
                 if before.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_') {
-                    continue; // another function's name, e.g. `is_keyword(`
+                    continue;
                 }
                 if let Some(lit) = after.strip_prefix('"') {
                     let end = lit.find('"').expect("a keyword literal closes on its line");
@@ -562,10 +467,6 @@ mod tests {
         out
     }
 
-    /// The drift guard for [`FIELD_START_KEYWORDS`]: every keyword the
-    /// parser matches is either quoted as a first segment or named
-    /// positional. A new `keyword("x")` forces a decision about whether
-    /// `x.a` still renders bare.
     #[test]
     fn parser_keywords_are_quoted_or_positional() {
         let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/src/parser");
@@ -648,11 +549,6 @@ mod tests {
         }
     }
 
-    /// The drift guard: `is_bare_field_name` claims to mirror the bare
-    /// production, and `quote_dsl_field` claims its output parses back to
-    /// the same name. Both claims are checked against the REAL parser
-    /// over a hostile corpus — a grammar change that isn't mirrored here
-    /// fails loudly instead of emitting suggestions that don't parse.
     #[test]
     fn quoting_agrees_with_the_real_grammar() {
         for name in [
@@ -691,8 +587,6 @@ mod tests {
                 other => panic!("expected Table, got {other:?}"),
             }
 
-            // …and the bare claim is exactly the bare production, keyword
-            // exclusion aside.
             let bare_parses = crate::parser::parse(&format!("| table {name}"))
                 .ok()
                 .and_then(|q| match &q.pipeline[0].node {
@@ -708,12 +602,6 @@ mod tests {
         }
     }
 
-    // ── the round trip, over every field position ──────────────────────
-
-    /// Names chosen to break a naive helper: every grammar keyword and
-    /// literal, the three unconditional search spellings, stage names,
-    /// and the shapes only backticks can express.
-    ///
     /// The keyword half is written out here rather than read from
     /// [`GRAMMAR_KEYWORDS`]/[`SEARCH_KEYWORDS`]/[`EXPRESSION_KEYWORDS`] on
     /// purpose: drawing the corpus from the constants under test would
@@ -722,7 +610,6 @@ mod tests {
     /// `just("...=")` out of the grammar.
     fn adversarial_names() -> Vec<&'static str> {
         vec![
-            // shapes the bare grammar cannot express at all
             "request id",
             "http-status",
             "x-request-id",
@@ -746,7 +633,6 @@ mod tests {
             "http://x",
             "(a)",
             "*",
-            // shapes it can — including the ones the FOLD makes equal
             "host",
             "host.name",
             "@timestamp",
@@ -761,7 +647,6 @@ mod tests {
             "limit",
             "eventstats",
             "timechart",
-            // every keyword spelling the grammar matches
             "true",
             "false",
             "null",
@@ -800,7 +685,6 @@ mod tests {
             "pivot",
             "sample",
             "fields",
-            // a field-start keyword as the first dot segment
             "AND.a",
             "OR.a",
             "or.a.b",
@@ -814,12 +698,8 @@ mod tests {
         ]
     }
 
-    /// A field position for each door the helper's output must survive.
     /// Read positions only: a write position adds the sealed-prefix
     /// policy, which is not a quoting question.
-    ///
-    /// The `NOT` position takes the backticked spelling of an `@`-name:
-    /// the one context [`backtick_dsl_field`] exists for.
     fn read_positions(rendered: &str) -> Vec<String> {
         let under_not = if rendered.starts_with('@') {
             backtick_dsl_field(rendered).expect("a rendered name is representable")
@@ -888,8 +768,6 @@ mod tests {
         }
     }
 
-    /// Every name the query carries in a field position, whatever door it
-    /// came through.
     fn field_positions(query: &crate::ast::Query) -> Vec<String> {
         use crate::ast::PipeStage;
         let mut out = Vec::new();
@@ -949,17 +827,10 @@ mod tests {
         out
     }
 
-    /// The helper is the grammar's inverse: whatever it renders parses
-    /// back to the name it was given, in EVERY field position — that is
-    /// the contract every suggestion surface leans on, and one position
-    /// cannot stand in for the rest (`| sort -{name}` reads the tick
-    /// after an operator, `{name}=1` reads it at a token start).
     #[test]
     fn quote_dsl_field_round_trips_in_every_position() {
         for original in adversarial_names() {
             let Some(rendered) = quote_dsl_field(original) else {
-                // refused names are the ones the grammar cannot express;
-                // a caller declines to offer them rather than inventing one.
                 panic!("{original:?} was refused but is expressible");
             };
             for dsl in read_positions(&rendered) {
@@ -974,13 +845,6 @@ mod tests {
         }
     }
 
-    /// The half a forgotten keyword breaks: when the helper renders a name
-    /// bare, the bare spelling must mean that name in every position.
-    /// `true` and `last` are good identifiers that some position reads as
-    /// something else first — the boolean literal inside `| where`, the
-    /// time keyword in the search stage — which is why `quote_dsl_field`
-    /// backticks them even though [`is_bare_field_name`] calls them
-    /// lexable.
     #[test]
     fn a_bare_rendering_means_that_name_in_every_position() {
         for original in adversarial_names() {
@@ -1060,12 +924,9 @@ mod tests {
         assert_eq!(suggest_pipe_stage("Stats"), Some("stats"));
     }
 
-    /// Ensures every entry in `KNOWN_PIPE_STAGES` actually parses as a valid
-    /// pipe stage. Catches drift between this list and the parser's `choice()`.
     #[test]
     fn known_pipe_stages_all_parse() {
         for &stage in KNOWN_PIPE_STAGES {
-            // Build a minimal valid query for each stage.
             let query = match stage {
                 "stats" => "| stats count()".to_string(),
                 "timechart" => "| timechart span=1h count()".to_string(),
@@ -1094,13 +955,9 @@ mod tests {
         }
     }
 
-    /// Ensures every entry in `KNOWN_FUNCTIONS` is recognized by the emitter
-    /// (catches drift between the list and the emitter's match arms).
     #[test]
     fn known_functions_all_validate() {
         for &func in KNOWN_FUNCTIONS {
-            // Build a query that uses the function in a stats stage.
-            // Functions with 0 args: count, now. Others: pass one dummy arg.
             let query = match func {
                 "count" | "now" => format!("| stats {func}()"),
                 "if" | "replace" => format!("| let x = {func}(a, b, c)"),
@@ -1121,7 +978,6 @@ mod tests {
                 "split" | "date_diff" => format!(r#"| let x = {func}(a, "b", 1)"#),
                 "case" => format!(r#"| let x = {func}(a > 1, "yes", "no")"#),
                 "round" => format!("| let x = {func}(a)"),
-                // Aggregates use stats, scalars use let/eval
                 _ if crate::emitter::is_aggregate_function(func) => {
                     format!("| stats {func}(x)")
                 }

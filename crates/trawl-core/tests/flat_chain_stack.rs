@@ -5,16 +5,6 @@
 //! The longest deep texts `MAX_QUERY_LEN` admits end in an answer on a
 //! tokio worker's 2 MiB stack, never in a stack overflow (#447).
 //!
-//! Each chain, run and bracket nest that 64 KiB can spell is refused for
-//! its tree depth. The grammar builds each expression tree in full before
-//! it is refused, so the parse also drops it on this stack. A search
-//! `NOT` run or bracket nest that long is refused by the search pre-scan
-//! before the grammar reads it. A deep text followed by a grammar error
-//! is refused for the grammar error: a deep expression as long as 64 KiB
-//! spells, and a search as deep as the pre-scan lets the grammar read. A
-//! chain of `let` aliases is no level deep, so it parses, and the checks
-//! after the parse walk it.
-//!
 //! A parse cancelled after the grammar drops a deep tree too; the parser's
 //! own tests cover it
 //! (`parser::tests::a_parse_cancelled_after_the_grammar_drops_a_deep_tree`),
@@ -35,9 +25,6 @@ fn phase(case: &str, phase: &str) {
     eprintln!("case={case} phase={phase}");
 }
 
-/// The text `prefix`, then as many `unit`s as fit `MAX_QUERY_LEN` with
-/// `core` and `suffix`, then `core`, then `suffix`. A unit is one level of
-/// a run, or one term and its operator in a chain.
 fn longest(prefix: &str, unit: &str, core: &str, suffix: &str) -> String {
     let units = (MAX_QUERY_LEN - prefix.len() - core.len() - suffix.len()) / unit.len();
     let text = format!("{prefix}{}{core}{suffix}", unit.repeat(units));
@@ -48,7 +35,6 @@ fn longest(prefix: &str, unit: &str, core: &str, suffix: &str) -> String {
     text
 }
 
-/// `(` × n, `core`, `)` × n, as long as `MAX_QUERY_LEN` admits.
 fn longest_brackets(core: &str) -> String {
     let n = (MAX_QUERY_LEN - core.len()) / 2;
     let text = format!("{}{core}{}", "(".repeat(n), ")".repeat(n));
@@ -60,7 +46,6 @@ fn longest_brackets(core: &str) -> String {
 fn the_longest_texts_return_on_a_worker_stack() {
     assert_eq!(MAX_TREE_DEPTH, 64);
     let refused = [
-        // `1+` is one term and one level of a chain
         (
             "where chain",
             longest("* | where ", "1+", "1", " > 0"),
@@ -91,7 +76,6 @@ fn the_longest_texts_return_on_a_worker_stack() {
             longest("* | let x = abs(", "1+", "1", ")"),
             DEEP_EXPRESSION,
         ),
-        // `-` repeats with no space between
         (
             "minus run",
             longest("* | where ", "-", "1", ""),
@@ -120,7 +104,6 @@ fn the_longest_texts_return_on_a_worker_stack() {
             ),
         ),
     ];
-    // a0 = 1, a1 = a0, …: each value one name, so no level deep
     let links: Vec<String> = (1..4_000).map(|i| format!("a{i} = a{}", i - 1)).collect();
     let aliases = format!("* | let a0 = 1, {}", links.join(", "));
     assert!(aliases.len() <= MAX_QUERY_LEN, "{}", aliases.len());

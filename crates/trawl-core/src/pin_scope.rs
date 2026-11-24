@@ -3,72 +3,32 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! The compile-time pin scope walk (ADR-0011).
-//!
-//! Which catalog pin applies to a field reference depends on where in the
-//! pipeline the reference sits: `rename status as st | where st>400` must
-//! stay pin-aware under the new name, `let status=<expr> | where
-//! status>400` must not apply the original pin to a derived value, and
-//! `stats count() by status | where status=…` keeps the group-by key's
-//! pin. [`PinScope`] carries the catalog snapshot through the pipeline,
-//! advancing per stage; the SQL emitter and the stream compiler consume
-//! the same walk, so which pin applies at each stage is identical in both
-//! lanes by construction.
 
 use crate::ast::{AggExpr, Expr, LiteralValue, PipeStage, Spanned};
 use crate::schema::{CanonicalType, FieldTypes, catalog_key};
 
-/// What a pin-aware comparison is comparing — the one classifier all
-/// three lanes bind through (ADR-0011, ADR-0013 ruling 9).
-///
-/// Subjects widen; the rule table does not. A subject here is either a
-/// bare pinned field reference or a call that declares its result type
-/// ([`crate::emitter::function_result_pin`]) over a bare field reference —
-/// nothing else, because "which pin types this comparison" has to be
-/// decidable from the AST alone in the emitter, the stream compiler and
-/// the in-memory evaluator alike.
 #[derive(Debug, Clone, Copy)]
 pub enum PinnedSubject<'e> {
-    /// A bare field reference whose name carries a catalog pin.
     Field(&'e str),
-    /// A pin-declaring call — `sev(level)`, `sev(level, "syslog")`. The
-    /// lanes translate or evaluate the CALL itself; only its PIN comes
-    /// from here.
     Call(&'e Spanned<Expr>),
 }
 
-/// The set of catalog pins in force at one point in a pipeline.
-///
-/// A thin newtype over [`FieldTypes`] (Arc-shared, copy-on-write): cloning
-/// is a refcount bump, and a stage that kills or remaps pins pays one
-/// bounded copy — pipeline length × the catalog's size, which is capped
-/// install-wide (`MAX_PINNED_FIELDS`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PinScope {
     pins: FieldTypes,
 }
 
 impl PinScope {
-    /// The scope at the pipeline's root: the full catalog snapshot.
     #[must_use]
     pub fn root(pins: &FieldTypes) -> Self {
         Self { pins: pins.clone() }
     }
 
-    /// The explicitly pin-blind scope (embedded mode, plain unit tests).
-    /// There is no `Default`-flavoured door on the consuming APIs —
-    /// pin-blindness is always spelled out at the call site.
     #[must_use]
     pub fn unpinned() -> Self {
         Self::default()
     }
 
-    /// Pin each of `names` as `ty` where the scope has no pin for it. A
-    /// pin already in scope wins, whatever its type.
-    ///
-    /// The kv batch tail uses this to type the SQL step's unpinned
-    /// TIMESTAMP columns as instants. The engine supplies the names; the
-    /// scope only keeps them under their [`catalog_key`], so a mixed-case
-    /// name is found the way [`Self::pin_for`] looks it up.
     pub fn fill_unpinned<'a>(
         &mut self,
         names: impl IntoIterator<Item = &'a str>,
@@ -81,40 +41,16 @@ impl PinScope {
         }
     }
 
-    /// Whether the scope holds no pins — the pin-blind fast path.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.pins.is_empty()
     }
 
-    /// The pin typing a comparison against `dsl_name` at this point in the
-    /// pipeline, looked up through [`catalog_key`]'s ASCII fold — the same
-    /// lookup the emitter and the live matcher share.
     #[must_use]
     pub fn pin_for(&self, dsl_name: &str) -> Option<CanonicalType> {
         self.pins.pin_for(dsl_name)
     }
 
-    /// Classify an expression as a pinned comparison SUBJECT, with the
-    /// pin that types the comparison — the shared recognition behind the
-    /// SQL emitter, the stream compiler and the in-memory evaluator, so
-    /// the three adopt and decline exactly the same shapes.
-    ///
-    /// Two shapes qualify:
-    ///
-    /// 1. a bare field reference the scope pins;
-    /// 2. a call whose name declares a result pin
-    ///    ([`crate::emitter::function_result_pin`]) over a bare field
-    ///    reference, with every further argument a string literal (the
-    ///    dialect). Its pin is the function's declaration, so it holds
-    ///    even under [`Self::unpinned`] — `sev()` is how a corpus with no
-    ///    catalog gets a severity comparison at all.
-    ///
-    /// Everything else declines, structurally: field-vs-field, arithmetic,
-    /// a call over an arbitrary expression (`sev(lower(level))` still
-    /// EMITS — it simply is not a comparison subject), and a call whose
-    /// dialect argument is computed, which both erroring lanes refuse
-    /// downstream anyway.
     #[must_use]
     pub fn subject_pin<'e>(
         &self,
@@ -142,42 +78,9 @@ impl PinScope {
         }
     }
 
-    /// Advance the scope over one pipe stage: the scope before the call
-    /// types that stage's own expressions; after it, the scope describes
-    /// the stage's output schema.
-    ///
     /// The match is exhaustive on purpose — a new stage variant must state
     /// its scope rule here or fail to compile, never silently keep a wrong
-    /// pin. The rules:
-    ///
-    /// - `rename` remaps the pin from the old name to the new one (and an
-    ///   unpinned source scrubs any pin the target name held). All
-    ///   sources resolve against the pre-stage scope — the SQL aliases
-    ///   them off the pre-stage row, so `rename a as b, b as c` gives
-    ///   `b` the original `a` and `c` the original `b`.
-    /// - `table`/`fields` restrict to the named columns; `drop` removes.
-    /// - `let` resolves every assignment's pin against the pre-stage
-    ///   scope. A bare field-ref alias copies the source's pin; any
-    ///   other expression kills the target's pin (the value is derived).
-    ///   The pins stay parallel even where the VALUES do not: the SQL
-    ///   desugars to one projection (`COLUMNS(c -> c NOT IN …)`) in which
-    ///   `DuckDB` binds an input COLUMN first and a sibling's lateral
-    ///   alias only when the name resolves to no column (see
-    ///   [`crate::stream`]'s `apply_let`), so `let a = status, b = a`
-    ///   hands `b` the pin of the pre-stage `a` — none, when the alias is
-    ///   what bound. A conservative miss, identical in both lanes.
-    /// - aggregation stages (`stats`/`timechart`/`top`/`rare`/`pivot`)
-    ///   keep their group-by keys and kill every derived output
-    ///   (aggregate aliases, the `timechart` `_time` bucket, `count`).
-    /// - `eventstats` keeps its inputs (non-reducing) and kills only the
-    ///   aggregate output columns.
-    /// - `extract <regex>` kills the capture-group names it (re)writes;
-    ///   `extract kv` passes the scope through, which is what makes the kv
-    ///   tail pin-aware. The residual — a kv key shadowing a pinned name
-    ///   takes that pin's reading — is accepted, and identical in both
-    ///   lanes because both consume this walk.
-    /// - `from saved` reads someone else's output: the scope clears.
-    /// - selection/ordering stages pass the scope through.
+    /// pin.
     pub fn advance(&mut self, stage: &PipeStage) {
         match stage {
             PipeStage::Where(_)
@@ -195,11 +98,7 @@ impl PinScope {
             PipeStage::Rename(r) => {
                 // Parallel, like `let`: every source resolves against the
                 // pre-stage scope, because the SQL aliases every source
-                // off the pre-stage row (`* EXCLUDE (sources), src AS
-                // tgt, …`). In a chain (`rename a as b, b as c`) the row
-                // gives `b` the original `a` and `c` the original `b`;
-                // resolving sequentially would instead hand `c` the
-                // original `a`'s pin and leave `b` unpinned.
+                // off the pre-stage row.
                 let resolved: Vec<(String, Option<CanonicalType>)> = r
                     .renames
                     .iter()
@@ -217,20 +116,13 @@ impl PinScope {
             }
             PipeStage::Let(l) => {
                 // Two passes so every source pin resolves against the
-                // pre-stage scope (parallel SELECT semantics, see above).
+                // pre-stage scope.
                 let resolved: Vec<(String, Option<CanonicalType>)> = l
                     .assignments
                     .iter()
                     .map(|(target, expr)| {
                         let pin = match &expr.node {
                             Expr::FieldRef(source) => self.pin_for(source),
-                            // A call that declares its result type hands
-                            // that type to the target (ADR-0013 ruling
-                            // 9): `let s = sev(level) | where s >=
-                            // "error"` is the same comparison as the
-                            // inline one, and `| stats count() by s`
-                            // keeps it. Declared, so it applies to an
-                            // unpinned scope too.
                             Expr::FunctionCall { name, .. } => {
                                 crate::emitter::function_result_pin(name)
                             }
@@ -270,41 +162,27 @@ impl PinScope {
                 self.pins.remove("count");
             }
             PipeStage::Pivot(p) => {
-                // The pivoted value columns are dynamic; only the group-by
-                // keys survive with their identity.
                 self.restrict_to_names(p.by.iter().map(String::as_str));
             }
             PipeStage::EventStats(es) => self.remove_agg_outputs(&es.aggregations),
             PipeStage::Extract(e) => match &e.mode {
                 crate::ast::ExtractMode::Regex(pattern) => {
-                    // The names come from the regex syntax tree, which
-                    // builds nothing (ADR-0063). The emitter rejects a
-                    // body that does not parse; nothing to scrub here for
-                    // one.
+                    // The emitter rejects a body that does not parse;
+                    // nothing to scrub here for one.
                     if let Ok(captures) = crate::pattern::price::captures(pattern) {
                         for capture in captures {
                             self.pins.remove(&catalog_key(&capture.name));
                         }
                     }
                 }
-                // kv passes through — see the method doc for the accepted
-                // shadow residual.
                 crate::ast::ExtractMode::KeyValue { .. } => {}
             },
             PipeStage::FromSaved(_) => self.pins = FieldTypes::new(),
         }
     }
 
-    /// The names this scope pins `SEVERITY`, excluding the envelope's own
-    /// `_severity`.
-    ///
     /// [`FieldTypes`] iterates a `BTreeMap`, so the list comes out in key
     /// order and the wire order is stable.
-    ///
-    /// `_severity` is left out because every renderer already keys off
-    /// that name (ADR-0013 §6): carrying it here would make two rules for
-    /// one column, and the name-keyed one has to stay for the surfaces
-    /// that never see a pipeline (a raw result, a saved run).
     fn severity_columns(&self) -> Vec<String> {
         self.pins
             .iter()
@@ -315,15 +193,11 @@ impl PinScope {
             .collect()
     }
 
-    /// Restrict the scope to the named columns (through [`catalog_key`]).
     fn restrict_to_names<'a>(&mut self, names: impl Iterator<Item = &'a str>) {
         let keep: Vec<String> = names.map(catalog_key).collect();
         self.pins.restrict_to(&keep);
     }
 
-    /// Kill the output column of every aggregation, named through the
-    /// ONE derivation every lane reads
-    /// ([`crate::projection::agg_output_name`]).
     fn remove_agg_outputs(&mut self, aggregations: &[AggExpr]) {
         for agg in aggregations {
             let name = crate::projection::agg_output_name(agg);
@@ -332,20 +206,6 @@ impl PinScope {
     }
 }
 
-/// The result columns a query hands back that hold `SeverityNumber`s and
-/// are NOT the envelope's `_severity` — the rendering channel for
-/// `sev()`'s output (ADR-0013 ruling 9).
-///
-/// The same walk the emitter and the stream compiler consume, run to the
-/// end of the pipeline: whatever the final scope pins `SEVERITY` is what
-/// the rows carry, so `| let s = sev(level) | stats count() by s` names
-/// `s` and `| let s = sev(level) | stats count()` names nothing. A name
-/// the result set does not actually carry is simply never matched by the
-/// renderers, which look columns up by name.
-///
-/// Advisory and presentational: the number is what the wire carries in
-/// every machine format, and a caller that ignores this list renders the
-/// number, which is never wrong — only less legible.
 #[must_use]
 pub fn severity_output_columns(pipeline: &[Spanned<PipeStage>], root: &PinScope) -> Vec<String> {
     let mut scope = root.clone();
@@ -370,8 +230,6 @@ mod tests {
         ft
     }
 
-    /// Walk the pipeline of `dsl` from `root`, returning the scope after
-    /// every stage has been applied.
     fn walk(dsl: &str, root: &[(&str, CT)]) -> PinScope {
         let query = parser::parse(dsl).expect("dsl parses");
         let mut scope = PinScope::root(&pins(root));
@@ -387,8 +245,6 @@ mod tests {
         ("service", CT::Varchar),
         ("_time", CT::Timestamp),
     ];
-
-    // ── pass-through stages ───────────────────────────────────────────
 
     #[test]
     fn selection_and_ordering_stages_pass_the_scope_through() {
@@ -406,8 +262,6 @@ mod tests {
             assert_eq!(scope.pin_for("dur"), Some(CT::BigInt), "{dsl}");
         }
     }
-
-    // ── rename ────────────────────────────────────────────────────────
 
     #[test]
     fn rename_remaps_the_pin_to_the_new_name() {
@@ -431,8 +285,6 @@ mod tests {
 
     #[test]
     fn rename_chain_resolves_against_the_pre_stage_scope() {
-        // SQL: `* EXCLUDE (status, dur), status AS dur, dur AS d2` —
-        // `dur` is the original `status`, `d2` the original `dur`.
         let scope = walk("* | rename status as dur, dur as d2", ROOT);
         assert_eq!(scope.pin_for("dur"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("d2"), Some(CT::BigInt));
@@ -465,13 +317,10 @@ mod tests {
         assert_eq!(scope.pin_for("status"), None);
     }
 
-    // ── let ───────────────────────────────────────────────────────────
-
     #[test]
     fn let_bare_alias_copies_the_pin() {
         let scope = walk("* | let s2 = status", ROOT);
         assert_eq!(scope.pin_for("s2"), Some(CT::Varchar));
-        // The source keeps its pin — `let` adds a column.
         assert_eq!(scope.pin_for("status"), Some(CT::Varchar));
     }
 
@@ -490,10 +339,6 @@ mod tests {
 
     #[test]
     fn let_sibling_reference_resolves_against_the_pre_stage_scope() {
-        // `b = a` names no pre-stage column here, so its VALUE comes from
-        // the sibling's lateral alias — but its pin resolves against the
-        // pre-stage scope, where `a` is unpinned: the conservative miss
-        // both lanes agree on.
         let scope = walk("* | let a = status, b = a", ROOT);
         assert_eq!(scope.pin_for("a"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("b"), None);
@@ -501,24 +346,18 @@ mod tests {
 
     #[test]
     fn let_overwrite_and_alias_resolve_in_parallel() {
-        // `x = status` reads the original status column even though the
-        // same stage overwrites `status`.
         let scope = walk("* | let status = 1, x = status", ROOT);
         assert_eq!(scope.pin_for("status"), None);
         assert_eq!(scope.pin_for("x"), Some(CT::Varchar));
     }
 
     #[test]
-    /// Zero aliases (ADR-0013 §6): a bare alias copies the pin of the
-    /// column it NAMES, and `timestamp` is not `_time`.
     fn let_alias_copies_the_named_columns_pin() {
         let scope = walk("* | let t = _time", ROOT);
         assert_eq!(scope.pin_for("t"), Some(CT::Timestamp));
         let scope = walk("* | let t = timestamp", ROOT);
         assert_eq!(scope.pin_for("t"), None);
     }
-
-    // ── selection ─────────────────────────────────────────────────────
 
     #[test]
     fn table_restricts_the_scope() {
@@ -542,8 +381,6 @@ mod tests {
         assert_eq!(scope.pin_for("dur"), Some(CT::BigInt));
     }
 
-    // ── aggregations ──────────────────────────────────────────────────
-
     #[test]
     fn stats_keeps_group_by_keys_and_kills_everything_else() {
         let scope = walk("* | stats count() by status", ROOT);
@@ -554,8 +391,6 @@ mod tests {
 
     #[test]
     fn stats_alias_matching_a_pinned_name_is_killed() {
-        // `avg(x) as dur` groups by status: `dur` in the output is the
-        // aggregate, never the pinned column.
         let scope = walk("* | stats avg(x) as dur by status", ROOT);
         assert_eq!(scope.pin_for("dur"), None);
         assert_eq!(scope.pin_for("status"), Some(CT::Varchar));
@@ -565,7 +400,6 @@ mod tests {
     fn timechart_kills_the_time_bucket_and_keeps_by_keys() {
         let scope = walk("* | timechart span=5m count() by service", ROOT);
         assert_eq!(scope.pin_for("service"), Some(CT::Varchar));
-        // `_time` in the output is the computed bucket, not the column.
         assert_eq!(scope.pin_for("_time"), None);
         assert_eq!(scope.pin_for("timestamp"), None);
         assert_eq!(scope.pin_for("status"), None);
@@ -613,10 +447,8 @@ mod tests {
                 ("avg_dur", CT::Double),
             ],
         );
-        // Non-reducing: every input column survives.
         assert_eq!(scope.pin_for("dur"), Some(CT::BigInt));
         assert_eq!(scope.pin_for("service"), Some(CT::Varchar));
-        // The aliased output column is the aggregate now.
         assert_eq!(scope.pin_for("avg_dur"), None);
     }
 
@@ -625,8 +457,6 @@ mod tests {
         let scope = walk("* | eventstats avg(x) as dur", &[("dur", CT::BigInt)]);
         assert_eq!(scope.pin_for("dur"), None);
     }
-
-    // ── extract ───────────────────────────────────────────────────────
 
     #[test]
     fn extract_regex_kills_capture_group_names() {
@@ -642,8 +472,6 @@ mod tests {
         assert_eq!(scope.pin_for("dur"), Some(CT::BigInt));
     }
 
-    // ── from saved ────────────────────────────────────────────────────
-
     #[test]
     fn from_saved_clears_the_scope() {
         let mut scope = PinScope::root(&pins(ROOT));
@@ -655,36 +483,25 @@ mod tests {
         assert_eq!(scope.pin_for("status"), None);
     }
 
-    // ── composites ────────────────────────────────────────────────────
-
     #[test]
     fn rename_then_where_carries_the_pin_under_the_new_name() {
         let query = parser::parse("* | rename status as st | where st > 400").expect("parses");
         let mut scope = PinScope::root(&pins(ROOT));
         scope.advance(&query.pipeline[0].node);
-        // At the `where` stage the pin lives under `st`.
         assert_eq!(scope.pin_for("st"), Some(CT::Varchar));
         assert_eq!(scope.pin_for("status"), None);
     }
 
-    // ── the pin-declaring subject (ADR-0013 ruling 9) ────────────────
-
-    /// A call whose name declares a result pin hands it to the `let`
-    /// target — and it does so under an UNPINNED scope, because the
-    /// declaration is the function's, not the catalog's.
     #[test]
     fn let_adopts_a_declared_function_result_pin() {
         let scope = walk("* | let s = sev(level)", ROOT);
         assert_eq!(scope.pin_for("s"), Some(CT::Severity));
         let scope = walk(r#"* | let s = sev(level, "syslog")"#, &[]);
         assert_eq!(scope.pin_for("s"), Some(CT::Severity));
-        // A function with NO declared result pin still unpins its target.
         let scope = walk("* | let s = lower(level)", ROOT);
         assert_eq!(scope.pin_for("s"), None);
     }
 
-    /// The adopted pin follows the pipeline like any other: a group-by
-    /// key keeps it, an aggregate output does not.
     #[test]
     fn a_declared_pin_survives_as_a_group_by_key() {
         let scope = walk("* | let s = sev(level) | stats count() by s", ROOT);
@@ -697,9 +514,6 @@ mod tests {
         assert_eq!(scope.pin_for("s"), None);
     }
 
-    /// The classifier admits exactly two shapes, and the declared one
-    /// needs a BARE field reference plus literal trailing arguments —
-    /// everything else stays literal-driven, structurally.
     #[test]
     fn subject_pin_admits_a_pinned_field_and_a_declaring_call() {
         let scope = PinScope::root(&pins(ROOT));
@@ -726,16 +540,12 @@ mod tests {
             subject(r#"* | where sev(level, "syslog") == 1"#),
             Some((true, CT::Severity))
         );
-        // A call over an ARBITRARY expression still emits; it is simply
-        // not a subject. Nor is a computed dialect, or a function with no
-        // declared result.
         assert_eq!(subject("* | where sev(lower(level)) == 1"), None);
         assert_eq!(subject("* | where sev(level, other) == 1"), None);
         assert_eq!(subject("* | where lower(status) == 1"), None);
         assert_eq!(subject("* | where status + 1 == 1"), None);
     }
 
-    /// The render channel: which output columns hold `SeverityNumber`s.
     #[test]
     fn severity_output_columns_names_declared_columns_only() {
         let names = |dsl: &str, root: &[(&str, CT)]| {
@@ -747,21 +557,15 @@ mod tests {
             names("* | let s = sev(level) | stats count() by s", &[]),
             ["s"]
         );
-        // Projected away, or aggregated over: nothing to render.
         assert!(names("* | let s = sev(level) | table message", &[]).is_empty());
         assert!(names("* | let s = sev(level) | stats count()", &[]).is_empty());
         assert!(names("* | let s = lower(level)", &[]).is_empty());
-        // The envelope slot is name-keyed by every renderer already, so it
-        // is deliberately NOT carried here — but a column that TOOK its
-        // pin is.
         assert!(names("*", SEVERITY_ROOT).is_empty());
         assert_eq!(names("* | rename _severity as sv", SEVERITY_ROOT), ["sv"]);
         assert_eq!(names("* | let sv = _severity", SEVERITY_ROOT), ["sv"]);
     }
 
     const SEVERITY_ROOT: &[(&str, CT)] = &[("_severity", CT::Severity), ("message", CT::Varchar)];
-
-    // ── fill-if-absent ────────────────────────────────────────────────
 
     #[test]
     fn fill_unpinned_pins_a_name_the_scope_leaves_open() {
@@ -786,7 +590,6 @@ mod tests {
         scope.fill_unpinned(["Time"], CT::Timestamp);
         assert_eq!(scope.pin_for("Time"), Some(CT::Timestamp));
         assert_eq!(scope.pin_for("time"), Some(CT::Timestamp));
-        // A pin held under the folded key wins over a mixed-case fill.
         let mut scope = PinScope::root(&pins(&[("time", CT::Varchar)]));
         scope.fill_unpinned(["TIME"], CT::Timestamp);
         assert_eq!(scope.pin_for("Time"), Some(CT::Varchar));

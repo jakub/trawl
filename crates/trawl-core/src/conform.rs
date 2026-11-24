@@ -5,194 +5,37 @@
 //! The one expression that binds a pinned column to its catalog type
 //! (ADR-0009 slice 2, ADR-0011).
 //!
-//! Two lanes conform the same value, and both build their SQL here:
-//!
-//! - **compaction** (`trawl-server`) conforms a WAL batch on its way to
-//!   parquet, and the boot pass rewrites standing files the same way — this
-//!   is what the corpus DURABLY holds;
-//! - **the hot branch** ([`crate::emitter`]'s `REPLACE` list over the
-//!   hot-buffer ndjson) conforms the same events while they are still in
-//!   memory, so a query sees the value it will keep seeing after the
-//!   compactor runs.
-//!
-//! They cannot be two expressions. A value that reads `true` while it is
-//! hot and NULL once it compacts is a query whose answer changes with a
-//! background timer, minutes after the fact, with nothing in the request to
-//! explain it.
-//!
-//! Two rules make one expression deterministic:
-//!
-//! 1. **Text first.** Both lanes read their source through `read_json`,
-//!    which types each column from the batch's CONTENTS: a field holding
-//!    only strings infers VARCHAR, one holding a number beside a string
-//!    infers JSON, and JSON's cast domain is strictly narrower than
-//!    VARCHAR's (`TRY_CAST(JSON '"1.5"' AS BIGINT)` is NULL where
-//!    `TRY_CAST('1.5' AS BIGINT)` rounds to 2 — and JSON's is WIDER for a
-//!    numeric under a BOOLEAN pin, where `200` reads `true`; both probed by
-//!    execution in `trawl-engine/tests/duckdb_probe.rs`). Casting the
-//!    inferred type would make one event's reading a function of what
-//!    happened to share its batch. Every pinned column therefore goes
-//!    through its TEXT form first ([`untyped_text`], in BOTH lanes — a
-//!    per-lane spelling is a per-lane stored value under the VARCHAR pin,
-//!    whose guard is the identity), and the guarded cast applies to that
-//!    text: the cast domain is VARCHAR, always.
-//! 2. **The guard is the cast.** A bare `TRY_CAST` to a typed pin ROUNDS
-//!    rather than fails (`'1.5'` → 2) and reads a vocabulary the rendering
-//!    does not round-trip (`'TRUE'` → `true`), so every typed rung is
-//!    wrapped in a round-trip check ([`guarded_cast`]): a value the cast
-//!    would ALTER becomes NULL — counted as a conflict, and still findable
-//!    in `_raw` — instead of being silently rewritten.
-//!
-//! The live mirror of these readings — what the in-memory SSE matcher must
-//! answer for the same wire value, before it compares or globs anything —
-//! lives in [`crate::compare`] ([`crate::compare::conformed_bigint`],
-//! [`crate::compare::conformed_boolean`],
-//! [`crate::compare::conformed_timestamp`],
-//! [`crate::compare::try_cast_double`]), and every pairing is executed
-//! side by side against the bundled `DuckDB`, never assumed.
+//! The live mirror of these readings lives in [`crate::compare`], and every
+//! pairing is executed side by side against the bundled `DuckDB`, never
+//! assumed.
 
 use crate::schema::CanonicalType;
 use crate::severity::Dialect;
 
 /// The session setting every connection that conforms — or that reads a
 /// conformed hot branch — MUST install before running this module's SQL.
-///
-/// The TIMESTAMP rung parses through `TIMESTAMPTZ` so an offset in the text
-/// is APPLIED rather than ignored (ADR-0011), and both halves of that parse
-/// consult the session zone: a text with NO offset is read as the session
-/// zone, and the instant is rendered back to a zoneless `TIMESTAMP` in it.
-/// The shared `DuckDB` runtime includes ICU and defaults `TimeZone` to the HOST zone
-/// (probed by execution), so without this pin what compaction writes — and
-/// what a query reads out of the hot buffer — would be a function of
-/// `/etc/localtime`.
-///
-/// UTC is not a preference: ingest canonicalizes `_time` to RFC 3339 UTC
-/// (ADR-0008) and every stored timestamp is UTC, so the session that reads
-/// them has to agree.
 pub const SESSION_TIME_ZONE_SQL: &str = "SET TimeZone='UTC'";
 
 /// The ONE numeric comparison space (ADR-0011 ruling #6).
-///
-/// Two questions in this codebase compare a TEXT against a number, and
-/// both are answered here so they cannot drift apart: the BIGINT rung's
-/// round-trip guard below, and the VARCHAR-pinned comparison rules in
-/// [`crate::compare`] (`status=200` matching a stored `"200.0"`,
-/// `id>1737000000123456789` ordering ids).
-///
-/// `DECIMAL(38,6)` because it is EXACT over every `i64` and far past it
-/// (magnitudes below 10^32), where a DOUBLE comparison goes blind above
-/// 2^53 and silently equates neighbours: `id=1737000000123456789` would
-/// match three distinct stored ids, and `id!=9007199254740993` would
-/// suppress the genuinely different `9007199254740992` — snowflake ids
-/// and nanosecond epochs are exactly that shape. The costs are stated
-/// where they bite ([`crate::compare`]'s module doc): fractions quantize
-/// at 10^-6, and a magnitude at or above 10^32 — like `nan` and `inf` —
-/// has no reading at all, which is a NULL, never a false match.
 pub const DECIMAL_COMPARISON_SPACE: &str = "DECIMAL(38,6)";
 
-/// `expr`'s reading in [`DECIMAL_COMPARISON_SPACE`] — NULL for a text the
-/// space cannot hold, which every caller treats as UNKNOWN rather than
-/// inventing an answer.
-///
-/// The live mirror is [`crate::compare::decimal_micros`], exact in `i128`
-/// and executed against this expression in
-/// `trawl-engine/tests/duckdb_probe.rs`.
+/// The live mirror is [`crate::compare::decimal_micros`].
 #[must_use]
 pub fn decimal_reading(expr: &str) -> String {
     format!("TRY_CAST({expr} AS {DECIMAL_COMPARISON_SPACE})")
 }
 
 /// The canonical TEXT of a pinned column, in BOTH conform lanes.
-///
-/// `json_extract_string(to_json(x), '$')` yields UNQUOTED strings
-/// (`n/a`, not `"n/a"`) over every inference class a hot snapshot can
-/// produce — VARCHAR, JSON from mixed values, and the homogeneous numeric,
-/// boolean and timestamp classes — where a plain `CAST(x AS VARCHAR)` on a
-/// JSON-inferred column would keep the quotes. It is also total over the
-/// physical types a standing parquet file can hold (BLOB, INTERVAL, UUID,
-/// DECIMAL, nested), rendering the complex ones as the JSON text
-/// `json_extract_string` can read back. All probed by execution.
-///
-/// The hot lane has no choice — the emitter has no `DESCRIBE` — and
-/// compaction, which does, must not reach for `CAST(x AS VARCHAR)`
-/// instead: the two renderings differ (a DOUBLE `1e20` is
-/// `100000000000000000000.0` here and `1e+20` there), and under the
-/// VARCHAR pin [`guarded_cast`] is the identity, so the text form is the
-/// stored value itself. Two spellings there are two corpora, where
-/// `note=/^1e/` matches while the event is hot and stops matching minutes
-/// later, once the compactor has run.
 #[must_use]
 pub fn untyped_text(quoted: &str) -> String {
     format!("json_extract_string(to_json({quoted}), '$')")
 }
 
-/// [`guarded_cast_in`] under the `OTel` dialect — the reading every live
-/// conform lane wants.
-///
-/// The dialect governs the SEVERITY rung alone, and every lane that
-/// conforms as events arrive (compaction, the boot pass, the emitter's hot
-/// branch) reads canonical `OTel` severity: ingest already resolved a
-/// syslog PRI numeral at its own door (the syslog profile's fixed
-/// derivation source, ADR-0013 slice 2), so what reaches a stored column
-/// is a ladder position, not a wire dialect. "Live conform is `OTel`" is
-/// therefore a fact about these call sites, not a property of the builder
-/// — the repin engine is the one caller that asserts otherwise, and it
-/// says so per arm through [`RepinTarget`].
 #[must_use]
 pub fn guarded_cast(text: &str, pin: CanonicalType) -> String {
     guarded_cast_in(text, pin, Dialect::Otel)
 }
 
-/// The conform expression for one pinned column, over its canonical
-/// `text` form — a typed cast that succeeds only when the value survives
-/// the round trip unchanged — reading NUMERIC severity in `dialect`.
-///
-/// `dialect` reaches exactly one rung: SEVERITY, whose numeric arm is the
-/// only dialect-sensitive reading in the vocabulary
-/// ([`crate::severity::reading_number`]). Every other pin is
-/// dialect-INVARIANT, which is what lets a caller thread one dialect
-/// through a pin-generic plan without asking whether it applies.
-///
-/// The comparison space is chosen per rung, and every one of them is
-/// executed against the bundled `DuckDB` in
-/// `trawl-engine/tests/duckdb_probe.rs`:
-///
-/// - `BIGINT` compares the cast against the text re-parsed in
-///   [`DECIMAL_COMPARISON_SPACE`] — an exact integer space across the
-///   whole BIGINT range, where a DOUBLE-space comparison goes blind above
-///   2^53 (both sides collapse to the same double, so
-///   `1735689600123456710.7` would conform to `…711` with no conflict). It
-///   keeps every representation drift (`'4.0'` → 4, `'0404'` → 404,
-///   `'1e3'` → 1000, `' 200'` → 200, `'200_000'` → 200000, `2^53 ± 1`
-///   exact, `i64::MAX`) and refuses every value change (`'1.5'`, `'nan'`,
-///   `''`, `u64::MAX`). Texts outside `DECIMAL`'s syntax are refused even
-///   where `BIGINT` reads them — `'0x10'` is 16 to the cast and NULL to
-///   the guard — which is the guard doing its job: hex is a spelling
-///   `DuckDB` will never write back. Residual tolerance: a fraction below
-///   `DECIMAL(38,6)`'s half-microstep (`'4.0000001'`) quantizes to the
-///   integer and is absorbed as representation drift; `'4.0000005'` rounds
-///   away and is refused;
-/// - `DOUBLE` is the bare cast. Over a text source the round trip is the
-///   identity — the guard would compare `TRY_CAST(text AS DOUBLE)` with
-///   itself — and DOUBLE-space comparison is deliberately
-///   precision-tolerant anyway: `u64::MAX` must conform to the DOUBLE pin
-///   despite the precision loss, because pinning DOUBLE *means* accepting
-///   it;
-/// - `TIMESTAMP` is likewise the bare (zone-aware) cast for the same
-///   reason, and it parses through `TIMESTAMPTZ` so an offset in the text
-///   is applied and a zoneless text reads as UTC — the semantics ingest
-///   already ratified for `_time` (ADR-0008). `TRY_CAST(text AS TIMESTAMP)`
-///   alone is a WALL-CLOCK parse that IGNORES the offset, so
-///   `09:00:00+05:30` would store `09:00` here and `03:30` through
-///   `read_json`'s own inference. Requires [`SESSION_TIME_ZONE_SQL`];
-/// - `BOOLEAN` compares strict text, so only the values `DuckDB` renders
-///   back conform: `'true'`/`'false'` and nothing else. `'TRUE'`, `'t'`,
-///   `'yes'` and `'1'` are all inside the CAST's vocabulary and all fail
-///   the round trip — which is also what makes the Boolean ladder rung
-///   reachable at all (`TRY_CAST(true AS BIGINT)` is 1, so under bare
-///   counting a boolean batch scored ≥90% BIGINT first);
-/// - `VARCHAR` is the text itself: stringification is lossless by
-///   construction, so there is nothing to guard.
 #[must_use]
 pub fn guarded_cast_in(text: &str, pin: CanonicalType, dialect: Dialect) -> String {
     match pin {
@@ -213,12 +56,6 @@ pub fn guarded_cast_in(text: &str, pin: CanonicalType, dialect: Dialect) -> Stri
         CanonicalType::Timestamp => {
             format!("TRY_CAST(TRY_CAST({text} AS TIMESTAMPTZ) AS TIMESTAMP)")
         }
-        // The SEVERITY rung IS the kernel (ADR-0013 slice 2, rulings
-        // 9-10): the pin's LIFETIME meaning is the full token-aware
-        // reading, so a stored `"error"` conforms to 17 whether it
-        // arrives live or is swept up by a repin. A numeric-only rung
-        // would rewrite history correctly and null the very next live
-        // row.
         CanonicalType::Severity => severity_reading_sql(text, dialect),
     }
 }
@@ -226,60 +63,40 @@ pub fn guarded_cast_in(text: &str, pin: CanonicalType, dialect: Dialect) -> Stri
 /// The RE2 character class matching [`crate::severity::WHITESPACE`] —
 /// the SQL spelling of the same set.
 ///
-/// Unicode `White_Space` is `Zs` (17 space separators) plus eight
-/// explicit characters, which is exactly what this class names. It is a
-/// SECOND spelling of the Rust const, and the equivalence is not
-/// reasoned: `trawl-engine/tests/duckdb_probe.rs` trims every character
-/// of the const through this class and asserts a NON-whitespace
-/// look-alike (U+200B) survives, so a divergence fails the suite.
-///
-/// A class rather than `trim(x, <chars>)` for two measured reasons: a
-/// `chr()` chain of 25 terms costs ~80ms per PREPARE in `DuckDB`'s binder
-/// (the expression names its subject five times), and a literal set of 25
+/// A class rather than `trim(x, <chars>)`: a `chr()` chain of 25 terms
+/// costs ~80ms per PREPARE in `DuckDB`'s binder, and a literal set of 25
 /// characters would put a raw newline inside generated SQL, which
-/// `EmitterState::finalize` re-indents line by line. The class costs ~6ms
-/// to plan and runs ~4x faster than either (183ms vs ~700ms per million
-/// rows).
+/// `EmitterState::finalize` re-indents line by line.
 macro_rules! whitespace_class {
     () => {
         r"[\p{Zs}\x{9}-\x{d}\x{85}\x{2028}\x{2029}]"
     };
 }
 
-/// A regex the emitter's own SQL carries as a literal, never a query's:
-/// the whitespace trim and the two guards of the severity reading.
-///
-/// `DuckDB` compiles an RE2 of each bound call on every thread that runs
-/// the statement, as it does for a query's own pattern, so the batch
-/// lane's RE2 allowance counts these calls too (ADR-0063,
-/// `crate::pattern::memory::FIXED_SITE_RE2_BYTES`).
+/// A regex the emitter's own SQL carries as a literal, never a query's
+/// (ADR-0063).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FixedRegex {
-    /// The `DuckDB` function the SQL calls it through.
     pub function: &'static str,
     /// The pattern: the SQL string literal's body, which holds no quote.
     pub pattern: &'static str,
 }
 
-/// The trim's leading half ([`trimmed_sql`]).
 const TRIM_LEADING: FixedRegex = FixedRegex {
     function: "regexp_replace",
     pattern: concat!("^", whitespace_class!(), "+"),
 };
 
-/// The trim's trailing half ([`trimmed_sql`]).
 const TRIM_TRAILING: FixedRegex = FixedRegex {
     function: "regexp_replace",
     pattern: concat!(whitespace_class!(), "+$"),
 };
 
-/// The reading's digits guard ([`reading_case`]).
 const STRICT_INTEGER: FixedRegex = FixedRegex {
     function: "regexp_full_match",
     pattern: "[+-]?[0-9]+",
 };
 
-/// The reading's ASCII gate ([`reading_case`]).
 const ASCII_ALNUM: FixedRegex = FixedRegex {
     function: "regexp_full_match",
     pattern: "[A-Za-z0-9]+",
@@ -291,9 +108,6 @@ const ASCII_ALNUM: FixedRegex = FixedRegex {
 pub const FIXED_REGEXES: [FixedRegex; 4] =
     [TRIM_LEADING, TRIM_TRAILING, STRICT_INTEGER, ASCII_ALNUM];
 
-/// `expr` with leading and trailing [`crate::severity::WHITESPACE`]
-/// removed — the SQL mirror of `str::trim_matches` over that set
-/// (`whitespace_class!`).
 fn trimmed_sql(expr: &str) -> String {
     format!(
         "regexp_replace(regexp_replace({expr}, '{}', ''), '{}', '')",
@@ -301,36 +115,15 @@ fn trimmed_sql(expr: &str) -> String {
     )
 }
 
-/// The SQL half of [`crate::severity::reading`]: `text_expr`'s point on
-/// the `OTel` ladder as a BIGINT, or NULL where it has no reading.
-///
-/// `text_expr` is the column's TEXT form — [`untyped_text`] for a caller
-/// with no `DESCRIBE`, a string literal for a probe. It is read exactly as
-/// the Rust kernel reads a string: trim the enumerated Unicode
-/// `White_Space` set ([`crate::severity::WHITESPACE`]), match
-/// the band token table, then the `OTel` exact short names, then a STRICT
-/// integer (`[+-]?[0-9]+` and nothing else — `1.5`, `1e1`, `1_2` and
-/// `0x10` are deferred here exactly as `str::parse::<i64>` refuses them
-/// there), which the dialect then maps.
-///
-/// Every arm is generated from [`crate::severity`]'s own tables
-/// ([`crate::severity::token_entries`], [`crate::severity::otel_name`],
-/// [`crate::severity::from_syslog`]), and the pairing with the Rust kernel
-/// is executed case by case against the bundled `DuckDB` in
-/// `trawl-engine/tests/duckdb_probe.rs` — never assumed.
-///
-/// The result is CAST to BIGINT because it types a stored column: the
-/// `SEVERITY` pin is physically BIGINT (`CanonicalType::as_duckdb`), and
-/// an INTEGER-typed conform would make the hot branch disagree with the
+/// The result is CAST to BIGINT because it types a stored column: an
+/// INTEGER-typed conform would make the hot branch disagree with the
 /// parquet side and throw the union.
 ///
-/// `text_expr` lands in the result up to five times — the ASCII gate, the
-/// `lower()` fold, the digits guard, and the `OTel` numeric arm's two
-/// halves of the cast (the syslog arm names it once) — which is free for a
-/// column (`DuckDB` evaluates the common subexpression once) but wrong for
-/// an expression carrying bound `?` parameters, since the emitter pushes
-/// one value per call and not per occurrence. A caller whose subject can
-/// carry parameters takes [`severity_reading_sql_bind_once`] instead.
+/// `text_expr` lands in the result up to five times, which is free for a
+/// column but wrong for an expression carrying bound `?` parameters, since
+/// the emitter pushes one value per call and not per occurrence. A caller
+/// whose subject can carry parameters takes
+/// [`severity_reading_sql_bind_once`] instead.
 #[must_use]
 pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) -> String {
     let trimmed = trimmed_sql(text_expr);
@@ -338,18 +131,8 @@ pub fn severity_reading_sql(text_expr: &str, dialect: crate::severity::Dialect) 
 }
 
 /// [`severity_reading_sql`] with its subject bound ONCE — the form
-/// `sev()` emits.
-///
-/// A one-element `list_transform` is `DuckDB`'s only inline binding
-/// construct, and `sev()` needs one for two reasons: its subject is an
-/// arbitrary expression that may carry `?` parameters (which must be
-/// pushed once and read once), and the emitted call may itself be
-/// embedded in a comparison. It is measurably slower than the repeated
-/// form (~2x over 3M rows, probed), which is why the conform rung — every
-/// row of every compaction — does not pay it.
-///
-/// The two shapes share [`reading_case`], so they cannot answer
-/// differently; the probe suite runs the matrix through BOTH.
+/// `sev()` emits. It is measurably slower than the repeated form (~2x
+/// over 3M rows, probed), which is why the conform rung does not pay it.
 #[must_use]
 pub fn severity_reading_sql_bind_once(
     text_expr: &str,
@@ -362,13 +145,6 @@ pub fn severity_reading_sql_bind_once(
     )
 }
 
-/// The reading's `CASE`, over an ALREADY-TRIMMED subject — the one arm
-/// generator behind both shapes above.
-///
-/// Rung order is the kernel's ([`crate::severity::reading_text`]): the
-/// band token table first, then the `OTel` exact short names it does not
-/// already carry (the duplicates — `error` is both — agree by
-/// construction), then the numeric arm.
 fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     let mut arms: Vec<String> = Vec::with_capacity(44);
     let mut seen: Vec<&str> = Vec::with_capacity(44);
@@ -408,11 +184,8 @@ fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
     // The token subject is gated on being ASCII alphanumeric, because
     // `DuckDB`'s `lower()` is UNICODE and the kernel's fold is ASCII:
     // `lower('İ')` (U+0130) is `i`, which would read as INFO in SQL and
-    // as nothing in Rust — a batch/live and hot/cold split on a value a
-    // sender chooses. Every token is `[a-z0-9]`, so a string carrying
-    // anything else can never BE one, and gating the subject means
-    // `lower()` only ever folds ASCII. A failed gate yields a NULL
-    // subject, so no `WHEN` matches and the numeric arm decides.
+    // as nothing in Rust. A failed gate yields a NULL subject, so no
+    // `WHEN` matches and the numeric arm decides.
     format!(
         "(CASE (CASE WHEN regexp_full_match({trimmed}, '{}') \
          THEN lower({trimmed}) END) {} ELSE {numeric_arm} END)",
@@ -423,13 +196,6 @@ fn reading_case(trimmed: &str, dialect: crate::severity::Dialect) -> String {
 
 /// The canonical token TEXT of a `SEVERITY`-pinned column — the SQL half
 /// of `compare::PatternForm::SeverityText`.
-///
-/// A total 24-arm table with an explicit NULL fallthrough, generated from
-/// [`crate::severity::otel_name`] so the SQL and the in-memory mirror
-/// cannot drift; the pairing is executed against the bundled `DuckDB` in
-/// `trawl-engine/tests/duckdb_probe.rs`. Out-of-ladder values cannot
-/// exist in a conformed column ([`guarded_cast`]'s SEVERITY rung nulls
-/// them), so the `ELSE NULL` arm is only ever reached by a NULL input.
 #[must_use]
 pub fn severity_token_text_sql(expr: &str) -> String {
     let arms: Vec<String> = (1..=24u8)
@@ -441,38 +207,17 @@ pub fn severity_token_text_sql(expr: &str) -> String {
     format!("(CASE {expr} {} END)", arms.join(" "))
 }
 
-/// A SQL string literal's body: single quotes doubled.
 fn sql_str(s: &str) -> String {
     s.replace('\'', "''")
 }
 
-/// The RFC 6901 JSON Pointer naming `field` as a TOP-LEVEL key: `~` → `~0`,
-/// `/` → `~1`, prefixed with `/`.
-///
-/// Pointer form, never `JSONPath`: a field name is a client-chosen JSON key,
-/// and `JSONPath` would parse `.`/`[`/`$` out of it (a leading `$` is a
-/// binder error outright, probed by execution). The pointer escape is total
-/// — every key, hostile or not, resolves as itself.
 #[must_use]
 pub fn raw_json_pointer(field: &str) -> String {
     format!("/{}", field.replace('~', "~0").replace('/', "~1"))
 }
 
-/// The wire text of `field` inside a `_raw`-shaped column (`raw_quoted`,
-/// already a quoted identifier), or NULL where `_raw` is not valid JSON,
-/// not an object, or does not carry the key.
-///
 /// Two arms under one `json_valid` guard (safe under vectorized execution —
-/// probed over a mixed-validity batch):
-///
-/// 1. the EXACT folded key, in pointer form;
-/// 2. best-effort case-variant recovery: `_raw` written before the ingest
-///    fold (or by a client whose spelling the fold collapsed) carries the
-///    ORIGINAL spelling, so the first `json_keys` entry whose lowercase is
-///    the folded name is re-read through a computed pointer. `lower()` is
-///    Unicode where the ingest fold is ASCII — an over-match there recovers
-///    a value that was never this field's, which is why this arm is
-///    best-effort and second.
+/// probed over a mixed-validity batch).
 #[must_use]
 pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
     let exact = sql_str(&raw_json_pointer(field));
@@ -486,20 +231,8 @@ pub fn raw_extract(raw_quoted: &str, field: &str) -> String {
     )
 }
 
-/// Whether `text_expr` reads as a different severity in each dialect —
-/// the SQL mirror of [`crate::severity::dialect_ambiguous`], and what the
-/// repin's ambiguity count is derived from.
-///
-/// `A IS NOT NULL AND B IS NOT NULL AND A <> B` over the two readings, so
-/// a value with only ONE reading is FALSE rather than NULL: an unreadable
-/// or one-dialect value is visible loss the plan already counts, and only
-/// a value both dialects claim differently is a silent mistranslation
-/// waiting on an operator's assertion.
-///
-/// `text_expr` lands in the result nine times over (five in the `OTel`
-/// reading, four in the syslog one), which is free for a column and wrong
-/// for an expression carrying bound `?` parameters — the same constraint
-/// [`severity_reading_sql`] documents.
+/// `text_expr` lands in the result nine times over, which is free for a
+/// column and wrong for an expression carrying bound `?` parameters.
 #[must_use]
 pub fn severity_dialect_ambiguous_sql(text_expr: &str) -> String {
     let otel = severity_reading_sql(text_expr, Dialect::Otel);
@@ -507,36 +240,14 @@ pub fn severity_dialect_ambiguous_sql(text_expr: &str) -> String {
     format!("({otel} IS NOT NULL AND {syslog} IS NOT NULL AND {otel} <> {syslog})")
 }
 
-/// The pin a repin rewrites to, with the dialect each arm reads its
-/// numerals in.
-///
-/// Two arms read text under a repin ([`resurrection_expr`]), and they do
-/// not have the same provenance, so they cannot share one dialect:
-///
-/// - `stored` reads the STORED column. Where the old pin was already
-///   `SEVERITY` that column holds canonical `OTel` ladder positions, and
-///   re-reading a canonical `3` as syslog would corrupt it to 17 — so the
-///   engine fixes this arm at [`Dialect::Otel`] for a `SEVERITY` source
-///   and only otherwise lets the operator's assertion reach it;
-/// - `raw` reads the `_raw` re-extraction, which is always the SENDER's
-///   own wire text and therefore always takes the asserted dialect.
-///
-/// Constructed by the repin engine alone (it is the one caller that knows
-/// the OLD pin); every other caller wants [`Self::otel`], which is the
-/// dialect-free reading the live lanes conform with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepinTarget {
-    /// The new pin.
     pub pin: CanonicalType,
-    /// Dialect for the STORED column's numerals.
     pub stored: Dialect,
-    /// Dialect for `_raw`'s numerals.
     pub raw: Dialect,
 }
 
 impl RepinTarget {
-    /// `pin` read in `OTel` on both arms — every non-repin caller, and the
-    /// default a repin that asserts nothing gets.
     #[must_use]
     pub fn otel(pin: CanonicalType) -> Self {
         Self {
@@ -547,18 +258,7 @@ impl RepinTarget {
     }
 }
 
-/// The repin rewrite's target-column expression (ADR-0011 slice B): the
-/// stored value's guarded reading under the NEW pin, and — where that is
-/// NULL, i.e. the column never carried the value or a prior conform
-/// shelved it — the `_raw` re-extraction's guarded reading.
-///
-/// One expression for the dry-run COUNT and the rewrite WRITE, by the same
-/// doctrine that makes the hot branch and compaction one builder: a plan
-/// that predicts with one expression and rewrites with another is a report
-/// that lies. Both arms go through [`guarded_cast_in`], so resurrection can
-/// never smuggle in a value the conform would have refused (`"1.5"` does
-/// not round into a BIGINT 2 just because it came back from `_raw`) — each
-/// under its own arm's dialect ([`RepinTarget`]).
+/// The repin rewrite's target-column expression (ADR-0011 slice B).
 #[must_use]
 pub fn resurrection_expr(
     quoted: &str,
@@ -577,16 +277,11 @@ pub fn resurrection_expr(
 mod tests {
     use super::*;
 
-    /// The VARCHAR pin is a pass-through: the text form IS the conform, so
-    /// no lane may wrap it in a cast that could fail.
     #[test]
     fn varchar_conform_is_the_text_itself() {
         assert_eq!(guarded_cast("t", CanonicalType::Varchar), "t");
     }
 
-    /// Every typed rung casts the TEXT, never the source column: the
-    /// expression handed in is the only thing any cast sees, so the domain
-    /// cannot vary with `read_json`'s inference.
     #[test]
     fn every_typed_rung_casts_only_the_text_form() {
         for pin in [
@@ -604,7 +299,6 @@ mod tests {
         }
     }
 
-    /// The guarded rungs re-read the cast in their comparison space.
     #[test]
     fn guarded_rungs_compare_the_cast_against_the_text() {
         assert_eq!(
@@ -620,9 +314,6 @@ mod tests {
         );
     }
 
-    /// The SEVERITY rung IS the reading kernel (ADR-0013 ruling 10) —
-    /// byte for byte, not merely "equivalent": one expression means a
-    /// stored `"error"` conforms to 17 live and under a repin alike.
     #[test]
     fn severity_rung_is_the_reading_kernel() {
         assert_eq!(
@@ -631,10 +322,6 @@ mod tests {
         );
     }
 
-    /// The reader's arms are GENERATED from the kernel's tables — every
-    /// band token and every exact short name, then a digits-only numeric
-    /// arm the dialect maps. The Rust/SQL pairing itself is executed in
-    /// `trawl-engine/tests/duckdb_probe.rs`; this pins the shape.
     #[test]
     fn severity_reading_sql_covers_both_name_tables_and_the_numeric_arm() {
         let sql = severity_reading_sql("t", crate::severity::Dialect::Otel);
@@ -651,27 +338,18 @@ mod tests {
                 "missing exact name {name}: {sql}"
             );
         }
-        // Digits only, and the OTel numeric arm is the ladder range.
         assert!(sql.contains("regexp_full_match"), "{sql}");
         assert!(sql.contains("BETWEEN 1 AND 24"), "{sql}");
-        // A stored column is BIGINT, whatever the arms' literals type as.
         assert!(sql.starts_with("CAST("), "{sql}");
         assert!(sql.ends_with(" AS BIGINT)"), "{sql}");
     }
 
-    /// The two shapes are one reading: the bind-once form names its
-    /// subject exactly once (a subject carrying `?` is pushed once), the
-    /// repeated form five times (free for a column, and measurably faster
-    /// — the reason the conform rung does not pay the lambda).
     #[test]
     fn severity_reading_sql_shapes_differ_only_in_where_the_subject_lands() {
         let repeated = severity_reading_sql("SUBJ", crate::severity::Dialect::Otel);
         let once = severity_reading_sql_bind_once("SUBJ", crate::severity::Dialect::Otel);
-        // The ASCII gate, the fold, the digits guard, and the cast's two
-        // halves — free for a column, wrong for a bound parameter.
         assert_eq!(repeated.matches("SUBJ").count(), 5, "{repeated}");
         assert_eq!(once.matches("SUBJ").count(), 1, "{once}");
-        // Same arms, both times.
         for (token, number) in crate::severity::token_entries() {
             let arm = format!("WHEN '{token}' THEN {number}");
             assert!(repeated.contains(&arm) && once.contains(&arm), "{arm}");
@@ -680,9 +358,6 @@ mod tests {
         assert!(!repeated.contains("list_transform"), "{repeated}");
     }
 
-    /// The dialect governs the NUMERIC arm and nothing else: the name
-    /// tables are identical, and syslog's 0-7 inversion is the one
-    /// difference.
     #[test]
     fn severity_reading_sql_dialect_changes_only_the_numeric_arm() {
         let otel = severity_reading_sql("t", crate::severity::Dialect::Otel);
@@ -701,8 +376,6 @@ mod tests {
         assert_ne!(otel, syslog);
     }
 
-    /// The canonical token text is a total 24-arm table with an explicit
-    /// NULL fallthrough — the SQL half of `PatternForm::SeverityText`.
     #[test]
     fn severity_token_text_covers_the_whole_ladder() {
         let sql = severity_token_text_sql("s");
@@ -717,8 +390,6 @@ mod tests {
         assert!(sql.ends_with("WHEN 24 THEN 'fatal4' END)"), "{sql}");
     }
 
-    /// The timestamp rung is zone-aware: it parses through `TIMESTAMPTZ`,
-    /// which applies an offset the plain TIMESTAMP cast would ignore.
     #[test]
     fn timestamp_rung_parses_through_timestamptz() {
         assert_eq!(
@@ -727,7 +398,6 @@ mod tests {
         );
     }
 
-    /// The hot lane's text form unquotes JSON strings.
     #[test]
     fn untyped_text_unquotes_through_json() {
         assert_eq!(
@@ -736,8 +406,6 @@ mod tests {
         );
     }
 
-    /// The pointer escape is RFC 6901: `~` first, then `/`, so the escapes
-    /// cannot collide.
     #[test]
     fn raw_json_pointer_escapes_rfc_6901() {
         assert_eq!(raw_json_pointer("status"), "/status");
@@ -747,8 +415,6 @@ mod tests {
         assert_eq!(raw_json_pointer("$weird"), "/$weird");
     }
 
-    /// The extraction embeds the field as a SQL literal, so a quote in a
-    /// client-chosen key cannot break out of the string.
     #[test]
     fn raw_extract_escapes_sql_quotes() {
         let sql = raw_extract("r", "a'b");
@@ -756,8 +422,6 @@ mod tests {
         assert!(!sql.contains("'/a'b'"), "unescaped literal leaked: {sql}");
     }
 
-    /// The dry run counts and the rewrite writes with THIS one expression:
-    /// stored reading first, `_raw` reading second, both guarded.
     #[test]
     fn resurrection_expr_is_stored_reading_then_guarded_raw_arm() {
         let sql = resurrection_expr(
@@ -774,7 +438,6 @@ mod tests {
                 raw_extract("\"_raw\"", "dur")
             )
         );
-        // Typed pins guard BOTH arms.
         let typed = resurrection_expr(
             "\"v\"",
             "\"_raw\"",
@@ -784,15 +447,6 @@ mod tests {
         assert_eq!(typed.matches("DECIMAL(38,6)").count(), 4);
     }
 
-    /// `guarded_cast` is `guarded_cast_in` at `OTel`, byte for byte, for
-    /// every pin — the delegation is what makes "live conform is `OTel`" a
-    /// fact about call sites rather than a second expression to keep in
-    /// step.
-    ///
-    /// Iterates [`CanonicalType::ALL`] rather than listing the variants: a
-    /// seventh canonical type joins this test the moment it joins `ALL`,
-    /// where a hand-written list would keep compiling and keep covering
-    /// six.
     #[test]
     fn guarded_cast_is_the_otel_reading_of_every_pin() {
         for pin in CanonicalType::ALL {
@@ -804,9 +458,6 @@ mod tests {
         }
     }
 
-    /// The dialect reaches the SEVERITY rung and nothing else, so a caller
-    /// may thread one dialect through a pin-generic plan without asking
-    /// whether it applies.
     #[test]
     fn only_the_severity_rung_reads_a_dialect() {
         for pin in [
@@ -832,9 +483,6 @@ mod tests {
         );
     }
 
-    /// The repin bundle carries one dialect PER ARM, because the two arms
-    /// read text of different provenance (a stored canonical severity is
-    /// dialect-free; `_raw` is always the sender's wire text).
     #[test]
     fn resurrection_arms_take_their_own_dialects() {
         let target = RepinTarget {
@@ -859,8 +507,6 @@ mod tests {
                 )
             )
         );
-        // The stored arm is the OTel reading and the raw arm the syslog
-        // one: the syslog inversion table appears exactly once.
         assert_eq!(sql.matches("WHEN 7 THEN 5").count(), 1, "{sql}");
         assert_eq!(sql.matches("BETWEEN 1 AND 24").count(), 1, "{sql}");
         assert_eq!(
@@ -869,9 +515,6 @@ mod tests {
         );
     }
 
-    /// The ambiguity predicate compares the two readings and demands BOTH
-    /// — a one-dialect value is visible loss the plan counts, not a silent
-    /// mistranslation.
     #[test]
     fn dialect_ambiguity_sql_compares_both_readings() {
         let sql = severity_dialect_ambiguous_sql("t");
@@ -883,10 +526,6 @@ mod tests {
         );
     }
 
-    /// Every regex call the severity readings write carries one of
-    /// [`FIXED_REGEXES`] through its own function, and every one of them
-    /// is written: the list the RE2 harness measures is the list that
-    /// ships.
     #[test]
     fn the_severity_readings_write_exactly_the_fixed_regexes() {
         for dialect in [

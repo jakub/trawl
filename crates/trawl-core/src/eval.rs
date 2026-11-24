@@ -4,9 +4,6 @@
 
 //! In-memory expression evaluator for the pipeline stages that run
 //! outside SQL.
-//!
-//! Evaluates `Expr` AST nodes against a [`crate::row::Row`] rather than
-//! emitting SQL. This is the runtime analog of `emitter/expr.rs`.
 
 use std::borrow::Cow;
 
@@ -21,61 +18,30 @@ use crate::row::Row;
 use chrono::{Datelike, NaiveDate, NaiveDateTime, NaiveTime, Timelike};
 use serde_json::Value;
 
-/// The prepared patterns an expression's `matches`, `like` and `ilike`
-/// read (ADR-0063): the evaluator only looks patterns up, so it can never
-/// build one per event.
 pub use crate::pattern::table::PatternTable;
 
-/// Result of evaluating an expression against an event.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EvalValue {
     Null,
     Bool(bool),
     Int(i64),
-    /// An unsigned integer above `i64::MAX` — the one JSON number shape
-    /// no signed integer can hold.
-    ///
-    /// It exists for identity and nothing else. Every value-domain
-    /// operation reads it as the `f64` it rounds to: arithmetic,
-    /// comparison, `typeof` (`DOUBLE`), truthiness, `tonumber`, the
-    /// accumulators. What it does not do is round on the way through —
-    /// the wire egress, `cell_text`, `cell_key` and the pinned read
-    /// reproduce the digits the sender sent, so a pass-through field
-    /// survives, `dedup` cannot merge two ids one apart, and a group is
-    /// still a group.
-    ///
-    /// Give it no novel semantics: it is a double with its digits kept.
+    /// An unsigned integer above `i64::MAX`. Every value-domain operation reads
+    /// it as the `f64` it rounds to; the wire egress, `cell_text`, `cell_key`
+    /// and the pinned read reproduce the digits the sender sent.
     UInt(u64),
     Float(f64),
     Str(String),
     Array(Vec<EvalValue>),
     /// A `DuckDB` TIMESTAMP: the wall-clock instant its `AS TIMESTAMP`
     /// cast produces, or one of the two infinities no calendar date can
-    /// express.
-    ///
-    /// The payload is [`compare::Instant`], whose derived `Ord` is
-    /// `DuckDB`'s TIMESTAMP ordering (`-infinity` below every date,
-    /// `infinity` above — probed); a bare `NaiveDateTime` would have
-    /// nowhere to put the infinities, so a stored one would read as NULL
-    /// here while batch compares it happily. Never unwrap the finite arm
-    /// inside a comparison — [`EvalValue::as_finite`] is that door, so a
-    /// calendar function cannot invent its own infinity rule.
+    /// express. Never unwrap the finite arm inside a comparison —
+    /// [`EvalValue::as_finite`] is that door.
     Timestamp(compare::Instant),
 }
 
 impl EvalValue {
-    /// The permissive logical predicate: `Null` and `false` are falsy,
-    /// every other value — including a non-empty string, a timestamp and
-    /// a list — is true.
-    ///
-    /// This is not `DuckDB`'s boolean domain: `DuckDB` casts a condition
-    /// and refuses a string outside its vocabulary (probed:
-    /// `an_if_condition_is_a_boolean_cast_not_truthiness`), which is what
-    /// [`read_condition`] mirrors and what `if`/`case` read their
-    /// condition through. This predicate stays behind `and`/`or`/`not` and
-    /// the streaming `where` gate on purpose: those decide whether a live
-    /// tail matches, and casting there instead would silently drop the
-    /// events a standing alert matches today.
+    /// This is not `DuckDB`'s boolean domain, which [`read_condition`] mirrors
+    /// and what `if`/`case` read their condition through.
     pub fn is_truthy(&self) -> bool {
         match self {
             Self::Null => false,
@@ -93,8 +59,6 @@ impl EvalValue {
     fn as_f64(&self) -> Option<f64> {
         match self {
             Self::Int(n) => Some(*n as f64),
-            // Numeric use rounds; only the pass-through paths keep the
-            // sender's digits.
             Self::UInt(n) => Some(*n as f64),
             Self::Float(n) => Some(*n),
             _ => None,
@@ -105,8 +69,6 @@ impl EvalValue {
         match self {
             Self::Str(s) => Some(s.clone()),
             Self::Int(n) => Some(n.to_string()),
-            // `tostring()`/`concat()` render what the expression read:
-            // the rounded double, not the stored digits.
             #[allow(clippy::cast_precision_loss)]
             Self::UInt(n) => Some(duckdb_double_to_string(*n as f64)),
             Self::Float(n) => Some(duckdb_double_to_string(*n)),
@@ -116,17 +78,6 @@ impl EvalValue {
         }
     }
 
-    /// This value as an instant, infinities included.
-    ///
-    /// A string is read by [`compare::literal_timestamp`] — the
-    /// `TRY_CAST(text AS TIMESTAMP)` a bound VARCHAR parameter gets, and
-    /// the one probe-pinned owner of that syntax (ADR-0017 §1). A second
-    /// parser here would drift: it would have to reject a malformed
-    /// offset (`+ab:cd`) and read the infinities on its own.
-    ///
-    /// Public for the kv batch tail's `dedup` in trawl-engine, which ranks
-    /// each row by its `_time` read this way, as batch SQL's
-    /// `TRY_CAST(_time AS TIMESTAMP)` ranks it.
     pub fn as_instant(&self) -> Option<compare::Instant> {
         match self {
             Self::Timestamp(instant) => Some(*instant),
@@ -135,12 +86,8 @@ impl EvalValue {
         }
     }
 
-    /// This value as a finite instant — the door every calendar function
-    /// reads through.
-    ///
     /// An infinity is `None` here on purpose: `date_part` and `date_diff`
-    /// answer NULL for one (probed, every unit), and routing them through
-    /// this door makes that one rule instead of eleven.
+    /// answer NULL for one (probed, every unit).
     pub(crate) fn as_finite(&self) -> Option<NaiveDateTime> {
         match self.as_instant()? {
             compare::Instant::At(at) => Some(at),
@@ -149,19 +96,11 @@ impl EvalValue {
     }
 }
 
-/// Render a `NaiveDateTime` in `DuckDB`'s canonical text format.
-///
-/// `DuckDB` represents timestamps as `"YYYY-MM-DD HH:MM:SS[.ffffff]"` with
-/// trailing fractional-second zeros trimmed. This must byte-match `DuckDB`
-/// output for the parity tests to pass.
 pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
-    // Sub-second micros straight off the naive time — no need to build a
-    // DateTime<Utc> just to read them.
     let micros = ts.nanosecond() / 1000;
     if micros == 0 {
         ts.format("%Y-%m-%d %H:%M:%S").to_string()
     } else {
-        // Format full 6-digit microsecond precision, then trim trailing zeros.
         let full = format!("{}.{micros:06}", ts.format("%Y-%m-%d %H:%M:%S"));
         full.trim_end_matches('0').to_string()
     }
@@ -175,10 +114,7 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 /// presentation rules that diverge from Rust's `Display`/`Debug`:
 ///
 /// 1. Integer-valued doubles always carry a `.0` suffix (`1.0`, not `1`).
-/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`. (A SQL *literal*
-///    `-0.0` renders `0.0`, but only because the parser constant-folds it to
-///    positive zero — a computed or stored `-0.0` renders signed, probe-pinned
-///    in `trawl-engine/tests/duckdb_probe.rs`.)
+/// 2. Negative zero keeps its sign: `-0.0` → `"-0.0"`.
 /// 3. Scientific notation kicks in at the same magnitude thresholds as Rust's
 ///    `{:?}` (`>= 1e16` and `< 1e-4`), so we lean on Debug for the switch-over.
 /// 4. The exponent always carries a sign and is zero-padded to a minimum of two
@@ -186,16 +122,7 @@ pub fn timestamp_to_duckdb_text(ts: &NaiveDateTime) -> String {
 ///    `e-5` (no sign, no pad).
 /// 5. Specials render lowercase: `inf`, `-inf`, `nan` — and a NaN keeps
 ///    its sign bit like any other value, so a negative one renders
-///    `-nan` (probed in `a_rendered_nan_keeps_its_sign`). Both spellings
-///    pass the DOUBLE pin's round-trip guard, so both are values a
-///    conformed column really stores.
-///
-/// The batch lane renders `tostring()`, `concat()`/`||` and any other
-/// `CAST(… AS VARCHAR)` over a float this way; mirroring it here is what
-/// keeps the two lanes from disagreeing about a float's text. It is also
-/// the DOUBLE pin's glob/regex text — re-exported as
-/// [`crate::compare::canonical_double_text`], so a pattern over a
-/// DOUBLE-pinned column matches the same string in both engines.
+///    `-nan` (probed in `a_rendered_nan_keeps_its_sign`).
 pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     if x.is_nan() {
         // The sign bit, not the ordering: `-nan < 0.0` is false, so the
@@ -205,21 +132,17 @@ pub(crate) fn duckdb_double_to_string(x: f64) -> String {
     if x.is_infinite() {
         return if x < 0.0 { "-inf" } else { "inf" }.to_string();
     }
-    // Rust Debug already gives shortest-roundtrip digits, the `.0` suffix on
-    // integer-valued doubles, and the same sci-notation thresholds as DuckDB.
     let s = format!("{x:?}");
     let Some(e_pos) = s.find('e') else {
         return s;
     };
 
-    // Rewrite the exponent to DuckDB form: always-signed, min two digits.
     let (mantissa, exp) = s.split_at(e_pos);
-    let exp = &exp[1..]; // drop the 'e'
+    let exp = &exp[1..];
     let (sign, mag) = match exp.strip_prefix('-') {
         Some(rest) => ('-', rest),
         None => ('+', exp.strip_prefix('+').unwrap_or(exp)),
     };
-    // `{:02}` zero-pads to 2 digits; 3-digit exponents pass through unpadded.
     let mag: u32 = mag.parse().unwrap_or(0);
     format!("{mantissa}e{sign}{mag:02}")
 }
@@ -230,7 +153,6 @@ impl From<EvalValue> for Value {
             EvalValue::Null => Value::Null,
             EvalValue::Bool(b) => Value::Bool(b),
             EvalValue::Int(n) => Value::Number(n.into()),
-            // Verbatim: this is the whole reason the variant exists.
             EvalValue::UInt(n) => Value::Number(n.into()),
             EvalValue::Float(n) => {
                 serde_json::Number::from_f64(n).map_or(Value::Null, Value::Number)
@@ -253,7 +175,6 @@ impl From<&Value> for EvalValue {
                 if let Some(i) = n.as_i64() {
                     Self::Int(i)
                 } else if let Some(u) = n.as_u64() {
-                    // Above `i64::MAX`: kept exactly, read as a double.
                     Self::UInt(u)
                 } else if let Some(f) = n.as_f64() {
                     Self::Float(f)
@@ -268,14 +189,9 @@ impl From<&Value> for EvalValue {
     }
 }
 
-/// Evaluate an expression AST node against an event row.
-///
 /// The pin-blind door: every comparison stays literal-driven, which is
 /// embedded mode's behaviour and the zero-cost path when no catalog
 /// exists. Catalog-backed callers go through [`eval_expr_with_pins`].
-///
-/// `patterns` holds the expression's prepared patterns
-/// ([`PatternTable::prepare`]).
 ///
 /// # Errors
 ///
@@ -293,18 +209,6 @@ pub fn eval_expr(
 
 /// Evaluate an expression with the catalog's pin scope typing bare
 /// field-vs-literal comparisons (ADR-0011).
-///
-/// `pins` is the scope in force at this stage of the pipeline (see
-/// [`crate::pin_scope::PinScope`]); the same rule table the SQL emitter
-/// renders decides how each comparison binds, wherever the walk meets one
-/// — inside `if()` conditions, under `not`/`and`/`or`, in `| let` values.
-/// An empty scope short-circuits every pinned check, so the pin-blind
-/// path stays zero-cost.
-///
-/// # Errors
-///
-/// [`PatternError::Missing`] when a pattern operand is not in
-/// `patterns`, as [`eval_expr`].
 pub fn eval_expr_with_pins(
     expr: &Spanned<Expr>,
     event: &Row,
@@ -316,11 +220,6 @@ pub fn eval_expr_with_pins(
     Ok(match &expr.node {
         Expr::Literal(lit) => eval_literal(lit),
         Expr::FieldRef(name) => {
-            // Bound the way `DuckDB` binds a column reference, and the
-            // way the pinned read beside it binds: a bare `let b = A`
-            // over a row carrying `a` reads that column rather than
-            // answering NULL, so a reference does not change meaning
-            // with the pin.
             let mapped = name.as_str();
             bind_event_key(event, mapped)
                 .and_then(|key| event.get(key))
@@ -349,11 +248,9 @@ pub fn eval_expr_with_pins(
             if matches!(target_val, EvalValue::Null) {
                 return Ok(EvalValue::Null);
             }
-            // SQL's `IN` is three-valued: a TRUE anywhere wins, but an
-            // element that answers UNKNOWN makes a non-match UNKNOWN
-            // rather than FALSE — `x IN (a, b)` with a NULL `b` and no
-            // match is NULL, and collapsing it to FALSE inverts under
-            // `NOT`.
+            // SQL's `IN` is three-valued: an element that answers UNKNOWN
+            // makes a non-match UNKNOWN rather than FALSE, and collapsing it
+            // to FALSE inverts under `NOT`.
             let mut unknown = false;
             for item in list {
                 match eval_eq(&target_val, &eval(item)?) {
@@ -371,16 +268,6 @@ pub fn eval_expr_with_pins(
     })
 }
 
-/// `lhs matches rhs`, `lhs like rhs` or `lhs ilike rhs`, through the
-/// pattern `patterns` prepared for `rhs`.
-///
-/// The right operand is the pattern, literal text by the one literal-only
-/// rule, and the left one the subject. A pinned subject matches its
-/// canonical pattern text: the in-memory mirror of the emitter's pinned
-/// pattern arm, through the same classifier, so the two lanes adopt and
-/// decline the same shapes. Any other subject matches when it is a
-/// string; a NULL or a non-string subject is NULL.
-///
 /// The lookup comes first, so a pattern the stage did not prepare fails
 /// on the first event whatever that event holds.
 fn eval_pattern(
@@ -410,13 +297,10 @@ fn eval_pattern(
     }
 }
 
-/// A bare literal, exactly as the SQL lane's door takes it — the AST value,
-/// so a float literal keeps its source token rather than a re-rendered
-/// double (ADR-0011 ruling #6, [`crate::ast::FloatLiteral`]) — including
-/// the sign fold for a negative number, which the parser hands over as
-/// `Unary{Neg, Literal}`. The two doors must adopt the same shapes or the
-/// batch and live lanes answer one query differently
-/// (`emitter::expr::bare_literal`).
+/// A bare literal, exactly as the SQL lane's door takes it
+/// (`emitter::expr::bare_literal`), including the sign fold for a negative
+/// number. The two doors must adopt the same shapes or the batch and live
+/// lanes answer one query differently.
 pub(crate) fn bare_literal_of(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
     bare_literal(expr)
 }
@@ -444,23 +328,14 @@ fn bare_literal(expr: &Expr) -> Option<Cow<'_, LiteralValue>> {
 /// `DuckDB` binds a column reference: an exact match wins, and any
 /// ASCII-case-insensitive match binds otherwise.
 ///
-/// Both halves are load-bearing, in both directions. Ingest ASCII-folds
-/// every key it writes, so `where Status>400` over a stored `status`
-/// finds its value only case-insensitively — but the pipeline lanes key
-/// rows by user-chosen names carried verbatim (`rename status as St`
-/// gives the row an `St` key, in the SQL result columns and in
-/// [`crate::stream::apply_stage`] alike), so a later `where st>400` —
-/// which `DuckDB` resolves to that `St` column — must find it too, and a
-/// fold-only lookup would miss. Exact-first keeps a row carrying two
-/// case-variant keys reading the one the reference names.
+/// Both halves are load-bearing. Ingest ASCII-folds every key it writes, so
+/// `where Status>400` over a stored `status` finds its value only
+/// case-insensitively, but `rename status as St` gives the row an `St` key,
+/// and a fold-only lookup would miss it.
 ///
-/// A residual ambiguity (several case-variants, none exact) has no
-/// `DuckDB` answer to mirror — it errors — so this picks the
-/// lexicographically-first variant: deterministic regardless of map
-/// order, and the same tie-break ingest's own fold-collision rule uses.
-///
-/// Public for the kv batch tail's `sort` and `dedup` in trawl-engine, so
-/// they bind a name as every other stage of the tail does.
+/// A residual ambiguity (several case-variants, none exact) picks the
+/// lexicographically-first variant, the same tie-break ingest's own
+/// fold-collision rule uses.
 pub fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
     if let Some((key, _)) = event.get_key_value(name) {
         return Some(key.as_str());
@@ -472,26 +347,18 @@ pub fn bind_event_key<'e>(event: &'e Row, name: &str) -> Option<&'e str> {
         .map(String::as_str)
 }
 
-/// The event value a pinned comparison reads, non-null.
-///
-/// The name is bound against the row's own spelling by
-/// [`bind_event_key`]. Binding, not non-nullness, decides which key is
-/// read: a bound key holding JSON null is that field's own NULL
-/// (UNKNOWN), never a reason to read a differently-cased sibling.
+/// Binding, not non-nullness, decides which key is read: a bound key
+/// holding JSON null is that field's own NULL (UNKNOWN), never a reason to
+/// read a differently-cased sibling.
 fn pinned_event_value<'e>(event: &'e Row, name: &str) -> Option<&'e EvalValue> {
     let key = bind_event_key(event, name)?;
     event.get(key).filter(|v| !matches!(v, EvalValue::Null))
 }
 
-/// Truth → `EvalValue`: UNKNOWN is SQL NULL, which the
-/// `not`/`and`/`or`/`is_truthy` machinery propagates three-valued.
 fn truth_to_eval(truth: Option<bool>) -> EvalValue {
     truth.map_or(EvalValue::Null, EvalValue::Bool)
 }
 
-/// The value a pinned subject reads for one event — the column's own
-/// value, or the pin-declaring call's result — or `None` for a NULL
-/// subject (an absent field, a JSON null, a call with no reading).
 fn subject_value(
     subject: &PinnedSubject<'_>,
     event: &Row,
@@ -504,9 +371,6 @@ fn subject_value(
             Some(cell) => cell.clone(),
             None => return Ok(None),
         },
-        // Evaluated by the ordinary expression path — the same value
-        // `| let s = sev(level)` would project, so a comparison and a
-        // projection can never read one event two ways.
         PinnedSubject::Call(call) => eval_expr_with_pins(call, event, pins, patterns, ctx)?,
     };
     if matches!(cell, EvalValue::Null) {
@@ -515,19 +379,10 @@ fn subject_value(
     Ok(Some(pin_read(&cell)))
 }
 
-/// The projection a pinned read gives one cell — the shape
-/// [`crate::pin_match`] conforms and compares, which is the JSON domain
-/// (retyping the search-stage matcher would change what it reads off the
-/// firehose, and cost a conversion per event to do it).
-///
-/// Every arm hands the matcher the cell's plain JSON value, with one
-/// deliberate difference: a non-finite double projects as its `DuckDB`
-/// text (`inf`, `-inf`, `nan`, `-nan`) rather than vanishing, since JSON
-/// cannot spell one and a `null` there makes a DOUBLE-pinned
-/// `| where d > 1` answer UNKNOWN over a stored infinity the batch query
-/// compares happily. That text is what the conformed column holds, and
-/// both [`crate::compare::try_cast_double`] and the SQL `TRY_CAST` read
-/// it back as the same double.
+/// A non-finite double projects as its `DuckDB` text (`inf`, `-inf`, `nan`,
+/// `-nan`) rather than vanishing: JSON cannot spell one, and a `null` there
+/// makes a DOUBLE-pinned `| where d > 1` answer UNKNOWN over a stored
+/// infinity the batch query compares happily.
 fn pin_read(cell: &EvalValue) -> serde_json::Value {
     match cell {
         EvalValue::Float(f) if !f.is_finite() => {
@@ -550,14 +405,6 @@ fn pin_read(cell: &EvalValue) -> serde_json::Value {
 /// A cell as the column its pin conforms it into holds it: the reading a
 /// pinned `| where` takes on the live lane, as a cell of the pin's type.
 ///
-/// The live lane reads events before any conform runs, so a field the
-/// catalog pins BIGINT arrives as whatever the sender wrote, `"404"`
-/// included, where a batch query reads the conformed column's `404`.
-/// This is the batch lanes' cell for it, through the same conform rules
-/// the live matcher compares with ([`crate::pin_match`]), so nothing is
-/// guessed: `"404"` under a BIGINT pin is `Int(404)`, `"…+05:30"` under
-/// TIMESTAMP the UTC instant the corpus holds.
-///
 /// `None` keeps the cell as sent, for a cell with no reading (the
 /// conform's round-trip guard stores NULL for `"1.5"` under BIGINT, so
 /// the value lives only in `_raw`) and for the pins with no scalar
@@ -572,23 +419,10 @@ pub fn conformed_cell(cell: &EvalValue, pin: crate::schema::CanonicalType) -> Op
     pin_match::conformed_cell(&pin_read(cell), pin)
 }
 
-/// The in-memory mirror of the emitter's pinned-comparison arm (ADR-0011,
-/// ADR-0013 ruling 9): detect a pinned-subject-vs-literal comparison and
-/// answer it through the shared comparison core. `None` falls through to
-/// literal-driven evaluation — same structural scope as the SQL side
-/// (`emitter::expr::try_pinned_comparison`), which consumes the same
-/// classifier, so the two lanes adopt and decline the same shapes.
-///
 /// There is deliberately no empty-scope fast path in front of the
 /// classifier: a pin-declaring call carries the function's pin, and
 /// `sev()` has to bind identically over a corpus with no catalog at all
 /// (embedded `--data`) or the two lanes would split there.
-///
-/// NULL policy is the pipeline's (strict): an absent field, a JSON null,
-/// or a value the conform would null out is UNKNOWN for every operator —
-/// no `!=` widening.
-///
-/// The pattern operators have an arm of their own, [`eval_pattern`].
 fn try_pinned_comparison(
     lhs: &Spanned<Expr>,
     op: BinaryOp,
@@ -611,7 +445,6 @@ fn try_pinned_comparison(
         (Some((subject, pin)), _) => {
             bare_literal(&rhs.node).map(|literal| (subject, pin, filter_op, literal))
         }
-        // `400 < status` is `status > 400`.
         (None, Some((subject, pin))) => {
             let flipped = match filter_op {
                 FilterOp::Gt => FilterOp::Lt,
@@ -628,23 +461,17 @@ fn try_pinned_comparison(
         return Ok(None);
     };
     // A literal the rule table refuses (an unknown severity token) cannot
-    // reach here: the compiler in front of both eval lanes —
-    // `stream::compile_stream_plan`, which every SSE stage and every
-    // `rust_stages` batch tail is compiled through — resolves the same
-    // form and rejects it. Falling through to the generic path is the
-    // honest defensive answer, not a second semantics.
+    // reach here: `stream::compile_stream_plan`, which every SSE stage and
+    // every `rust_stages` batch tail is compiled through, rejects it.
     let Some(form) = crate::compare::compare_form_bound(Some(pin), filter_op, &literal)
         .ok()
         .flatten()
     else {
         return Ok(None);
     };
-    // Native(String) is the VARCHAR pin's lexical rule — the stored text
-    // compares as text, whatever JSON shape the wire value took (the SQL
-    // side's generic emission compares the VARCHAR column against a
-    // string parameter, which is the same lexical answer). Any other
-    // Native form is degenerate under a pin and falls through to
-    // literal-driven evaluation, mirroring the SQL side's fall-through.
+    // Native(String) is the VARCHAR pin's lexical rule. Any other Native form
+    // is degenerate under a pin and falls through to literal-driven
+    // evaluation, mirroring the SQL side's fall-through.
     match &form {
         crate::compare::CompareForm::Native(SqlValue::String(_)) => {}
         crate::compare::CompareForm::Native(_) => return Ok(None),
@@ -653,7 +480,6 @@ fn try_pinned_comparison(
     let coerced = pin_match::coerce_form(form);
     let compare_op = pin_match::CompareOp::from_filter(filter_op);
     let Some(value) = subject_value(&subject, event, pins, patterns, ctx)? else {
-        // Plain SQL null propagation — strict, no `!=` widening.
         return Ok(Some(EvalValue::Null));
     };
     Ok(Some(truth_to_eval(pin_match::compare_values(
@@ -664,9 +490,6 @@ fn try_pinned_comparison(
     ))))
 }
 
-/// The in-memory mirror of the emitter's pinned IN-list arm: a pinned
-/// bare-field target with an all-literal list routes each element through
-/// the equality rule, OR-combined in SQL's three-valued logic.
 fn try_pinned_in_list(
     target: &Spanned<Expr>,
     list: &[Spanned<Expr>],
@@ -714,17 +537,13 @@ fn eval_literal(lit: &LiteralValue) -> EvalValue {
     }
 }
 
-// ── binary operations ──────────────────────────────────────────────
-
 fn eval_binary(lhs: &EvalValue, op: BinaryOp, rhs: &EvalValue) -> EvalValue {
-    // short-circuit logical ops (they handle Null specially)
     match op {
         BinaryOp::And => return eval_and(lhs, rhs),
         BinaryOp::Or => return eval_or(lhs, rhs),
         _ => {}
     }
 
-    // null propagation for everything else
     if matches!(lhs, EvalValue::Null) || matches!(rhs, EvalValue::Null) {
         return EvalValue::Null;
     }
@@ -756,7 +575,6 @@ fn eval_binary(lhs: &EvalValue, op: BinaryOp, rhs: &EvalValue) -> EvalValue {
 }
 
 fn eval_and(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
-    // SQL three-valued logic: false AND anything = false
     if matches!(lhs, EvalValue::Bool(false)) {
         return EvalValue::Bool(false);
     }
@@ -770,7 +588,6 @@ fn eval_and(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
 }
 
 fn eval_or(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
-    // SQL three-valued logic: true OR anything = true
     if lhs.is_truthy() {
         return EvalValue::Bool(true);
     }
@@ -783,18 +600,9 @@ fn eval_or(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     EvalValue::Bool(false)
 }
 
-/// `+ - *`, integer-exact where both operands are integers.
-///
-/// `int_op` is checked and an overflow is `Null`: `DuckDB` raises
-/// `Out of Range Error` on every one of these (probed:
-/// `integer_arithmetic_overflow_is_an_error_never_a_wrap`), a streaming
-/// lane has no error for one event's data (its one error, a missing
-/// prepared pattern, ends the stream), and ADR-0017 §5's rule is that
-/// eval nulls where batch errors. Unchecked arithmetic would panic in
-/// debug — one adversarial event killing a whole SSE subscription — and
-/// wrap silently in release. The DOUBLE arm is deliberately unchecked:
-/// `DuckDB` saturates a DOUBLE overflow to infinity rather than erroring,
-/// so IEEE is the mirror there.
+/// `int_op` is checked and an overflow is `Null`. The DOUBLE arm is
+/// deliberately unchecked: `DuckDB` saturates a DOUBLE overflow to infinity
+/// rather than erroring, so IEEE is the mirror there.
 fn eval_arithmetic(
     lhs: &EvalValue,
     rhs: &EvalValue,
@@ -812,8 +620,6 @@ fn eval_arithmetic(
     }
 }
 
-/// `/` — true division, in DOUBLE, for every numeric pair.
-///
 /// `DuckDB`'s `/` has no integer form: `5 / 2` is `2.5` and both
 /// operands go through DOUBLE, so a dividend above 2^53 comes back
 /// rounded (probed: `integer_division_is_true_division_through_double`).
@@ -827,8 +633,6 @@ fn eval_div(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
     }
 }
 
-/// `%` — the one arithmetic operator that splits on the operand types.
-///
 /// All-integer stays integral and `checked_rem` covers both shapes
 /// `DuckDB` refuses to answer with a number: `x % 0` is NULL, and
 /// `i64::MIN % -1` is an overflow error (probed:
@@ -854,9 +658,6 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         (EvalValue::Int(a), EvalValue::Int(b)) => EvalValue::Bool(a == b),
         (EvalValue::Bool(a), EvalValue::Bool(b)) => EvalValue::Bool(a == b),
         (EvalValue::Str(a), EvalValue::Str(b)) => EvalValue::Bool(a == b),
-        // The three timestamp shapes, spelled out so the two operand
-        // orders are symmetric by construction: two instants compare as
-        // instants, and a string is coerced — only ever the string side.
         // A text with no reading is NULL, never a lexical comparison: a
         // lexical fallback invents an ordering `DuckDB` does not have and
         // inverts under `NOT` (ADR-0017 §2).
@@ -865,12 +666,10 @@ fn eval_eq(lhs: &EvalValue, rhs: &EvalValue) -> EvalValue {
         | (EvalValue::Str(text), EvalValue::Timestamp(a)) => {
             compare::literal_timestamp(text).map_or(EvalValue::Null, |b| EvalValue::Bool(*a == b))
         }
-        // cross-type numeric comparison
         _ => match (lhs.as_f64(), rhs.as_f64()) {
             (Some(a), Some(b)) => {
                 EvalValue::Bool(compare::double_total_cmp(a, b) == std::cmp::Ordering::Equal)
             }
-            // string coercion: compare as strings if one side is a string
             _ => match (lhs.as_str_repr(), rhs.as_str_repr()) {
                 (Some(a), Some(b)) => EvalValue::Bool(a == b),
                 _ => EvalValue::Null,
@@ -888,9 +687,7 @@ fn eval_cmp(
         (EvalValue::Int(a), EvalValue::Int(b)) => Some(a.cmp(b)),
         (EvalValue::Str(a), EvalValue::Str(b)) => Some(a.cmp(b)),
         // `Instant`'s derived order is DuckDB's TIMESTAMP order, so the
-        // infinities sort where the engine sorts them. The string side is
-        // coerced and only the string side; no reading is UNKNOWN, not a
-        // lexical guess (ADR-0017 §2).
+        // infinities sort where the engine sorts them.
         (EvalValue::Timestamp(a), EvalValue::Timestamp(b)) => Some(a.cmp(b)),
         (EvalValue::Timestamp(a), EvalValue::Str(text)) => {
             compare::literal_timestamp(text).map(|b| a.cmp(&b))
@@ -906,8 +703,6 @@ fn eval_cmp(
     ordering.map_or(EvalValue::Null, |o| EvalValue::Bool(pred(o)))
 }
 
-// ── unary operations ───────────────────────────────────────────────
-
 fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
     match op {
         UnaryOp::Not => match operand {
@@ -916,8 +711,6 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
             other => EvalValue::Bool(!other.is_truthy()),
         },
         UnaryOp::Neg => match operand {
-            // checked_neg returns None on i64::MIN; null out rather than
-            // panic (debug) / wrap (release), consistent with div/mod guards.
             EvalValue::Int(n) => n.checked_neg().map_or(EvalValue::Null, EvalValue::Int),
             #[allow(clippy::cast_precision_loss)]
             EvalValue::UInt(n) => EvalValue::Float(-(n as f64)),
@@ -927,10 +720,6 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
     }
 }
 
-// ── scalar functions ───────────────────────────────────────────────
-
-/// Evaluate a scalar function call.
-///
 /// Returns `Some(value)` if the function name is known and handled,
 /// `None` if it is unknown (distinct from `Some(Null)`, which means the
 /// function evaluated to SQL NULL). The call site maps `None` to
@@ -939,14 +728,12 @@ fn eval_unary(op: UnaryOp, operand: EvalValue) -> EvalValue {
 #[allow(clippy::too_many_lines)]
 fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<EvalValue> {
     let v = match name {
-        // string
         "lower" => unary_str(args, str::to_lowercase),
         "upper" => unary_str(args, str::to_uppercase),
         #[allow(clippy::cast_possible_wrap)]
         "length" | "len" => args.first().map_or(EvalValue::Null, |v| match v {
-            // DuckDB's LENGTH() (emitted by emitter::functions) returns the
-            // character count, not the byte count, so use chars().count() to
-            // keep the streaming evaluator in parity with the batch path.
+            // DuckDB's LENGTH() returns the character count, not the
+            // byte count.
             EvalValue::Str(s) => EvalValue::Int(s.chars().count() as i64),
             _ => EvalValue::Null,
         }),
@@ -1017,19 +804,11 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
             // DuckDB CONCAT() *ignores* NULL args (unlike `||`, which
             // propagates NULL) and casts each non-null arg to VARCHAR before
             // joining — so CONCAT(NULL) == '' and CONCAT('x','-',NULL) == 'x-'.
-            // `as_str_repr` mirrors that CAST-to-VARCHAR (incl. Timestamp →
-            // DuckDB text); Null/Array yield None and are skipped. (Array can
-            // never legally reach CONCAT — DuckDB rejects it at bind time and
-            // the emitter errors too — so skipping it can't produce a value
-            // DuckDB wouldn't.)
             let result: String = args.iter().filter_map(EvalValue::as_str_repr).collect();
             EvalValue::Str(result)
         }
 
-        // numeric
         "abs" => args.first().map_or(EvalValue::Null, |v| match v {
-            // checked_abs returns None on i64::MIN; null out rather than
-            // panic (debug) / wrap (release), consistent with div/mod guards.
             EvalValue::Int(n) => n.checked_abs().map_or(EvalValue::Null, EvalValue::Int),
             #[allow(clippy::cast_precision_loss)]
             EvalValue::UInt(n) => EvalValue::Float(*n as f64),
@@ -1040,7 +819,6 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
         "floor" => eval_floor(args),
         "round" => eval_round(args),
 
-        // conditional / type
         "if" => {
             if args.len() != 3 {
                 return Some(EvalValue::Null);
@@ -1065,23 +843,16 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
         "isnotnull" => args.first().map_or(EvalValue::Null, |v| {
             EvalValue::Bool(!matches!(v, EvalValue::Null))
         }),
-        // The spellings `DuckDB` gives the values this lane can hold, probed
-        // in `trawl-engine/tests/duckdb_probe.rs`
-        // (`typeof_spells_a_bound_dsl_literal_by_its_bound_type`). An integer
-        // is BIGINT, not INTEGER: the emitter binds every DSL literal as a
-        // parameter, and a bound `i64` arrives as BIGINT — `INTEGER` is what a
-        // literal written into the SQL text answers, which the batch lane
-        // never produces. Two spellings stay divergent on purpose: the NULL
-        // type and lists, pinned in `trawl-core/tests/scalar_parity.rs`.
+        // An integer is BIGINT, not INTEGER: the emitter binds every DSL
+        // literal as a parameter, and a bound `i64` arrives as BIGINT.
+        // Two spellings stay divergent on purpose: the NULL type and
+        // lists, pinned in `trawl-core/tests/scalar_parity.rs`.
         "typeof" => args.first().map_or(EvalValue::Null, |v| {
             EvalValue::Str(
                 match v {
                     EvalValue::Null => "NULL",
                     EvalValue::Bool(_) => "BOOLEAN",
                     EvalValue::Int(_) => "BIGINT",
-                    // A field above `i64::MAX` has no spelling of its
-                    // own: it types as the `f64` every numeric rule
-                    // reads it as.
                     EvalValue::UInt(_) | EvalValue::Float(_) => "DOUBLE",
                     EvalValue::Str(_) => "VARCHAR",
                     EvalValue::Array(_) => "ARRAY",
@@ -1090,18 +861,12 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
                 .to_string(),
             )
         }),
-        // `now()` reads the context's instant, never the clock
-        // (ADR-0017 §3). One unit of output — a batch statement, a
-        // streamed event, an aggregate snapshot — sees one instant, so
-        // two calls inside one expression cannot disagree and the batch
-        // tail behind `extract kv` answers what the SQL prefix bound.
         "now" => ctx.now_value(),
         "case" => {
             let pairs = args.len() / 2;
             for i in 0..pairs {
                 match read_condition(&args[i * 2]) {
                     ConditionRead::True => return Some(args[i * 2 + 1].clone()),
-                    // FALSE and NULL alike move to the next arm.
                     ConditionRead::NotTaken => {}
                     // An unreadable condition does not mean "this arm
                     // does not match": `DuckDB` errors, so the whole call
@@ -1112,14 +877,12 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
                     ConditionRead::Unreadable => return Some(EvalValue::Null),
                 }
             }
-            // odd arg count → last arg is default
             if args.len() % 2 == 1 {
                 args[args.len() - 1].clone()
             } else {
                 EvalValue::Null
             }
         }
-        // json
         "json" | "json_extract_string" => eval_json_extract_string(args),
         "json_extract" => eval_json_extract(args),
         "json_valid" => args.first().map_or(EvalValue::Null, |v| match v {
@@ -1128,9 +891,6 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
             }
             _ => EvalValue::Null,
         }),
-        // A document that is not JSON is null; a valid one of the wrong
-        // shape has no keys and no length, as in `DuckDB` (ADR-0017,
-        // amendment of 2026-11-13).
         "json_keys" => args.first().map_or(EvalValue::Null, |v| match v {
             EvalValue::Str(s) => {
                 serde_json::from_str::<serde_json::Value>(s)
@@ -1153,18 +913,11 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
             _ => EvalValue::Null,
         }),
 
-        // The severity ladder function (ADR-0013 ruling 9) — the
-        // in-memory half of the shared kernel, read straight off the
-        // `EvalValue` rather than through a `serde_json` round trip: a
-        // string reads as text, an integer as a number in the requested
-        // dialect, and every other shape (float, bool, timestamp, array,
-        // NULL) has no reading. An unreadable value is `Null`, never
-        // `None` — `sev()` is a known function whatever it is handed.
+        // An unreadable value is `Null`, never `None`: `sev()` is a known
+        // function whatever it is handed.
         "sev" => {
             let dialect = match args.get(1) {
                 Some(EvalValue::Str(token)) => crate::severity::Dialect::from_token(token),
-                // No dialect argument is OTel; a token the compile-time
-                // gate would have refused has no reading at all.
                 None => Some(crate::severity::Dialect::Otel),
                 Some(_) => None,
             };
@@ -1176,7 +929,6 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
             reading.map_or(EvalValue::Null, |n| EvalValue::Int(i64::from(n)))
         }
 
-        // date/time scalar functions
         "tonumber" => eval_tonumber(args),
         "tostring" => eval_tostring(args),
         "date_part" => eval_date_part(args),
@@ -1190,12 +942,9 @@ fn eval_scalar_fn(name: &str, args: &[EvalValue], ctx: &EvalContext) -> Option<E
     Some(v)
 }
 
-/// The value `path` selects in the JSON text `doc`, read through `read`.
-///
-/// `None` when the path is outside the grammar ([`crate::json_path`]),
-/// the document is not JSON, or the path misses. The shared check refuses
-/// an out-of-grammar path before either lane runs; one that reaches eval
-/// anyway (fuzz, an internal caller) selects nothing, never the root.
+/// The shared check refuses an out-of-grammar path before either lane
+/// runs; one that reaches eval anyway (fuzz, an internal caller) selects
+/// nothing, never the root.
 fn json_select<R>(doc: &str, path: &str, read: impl FnOnce(&serde_json::Value) -> R) -> Option<R> {
     let steps = crate::json_path::parse(path).ok()?;
     let value = serde_json::from_str::<serde_json::Value>(doc).ok()?;
@@ -1209,7 +958,6 @@ fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
     match (&args[0], &args[1]) {
         (EvalValue::Str(json_str), EvalValue::Str(path)) => {
             json_select(json_str, path, |v| match v {
-                // A JSON `null` is SQL null, as `DuckDB` reads it.
                 serde_json::Value::Null => EvalValue::Null,
                 serde_json::Value::String(s) => EvalValue::Str(s.clone()),
                 other => EvalValue::Str(other.to_string()),
@@ -1220,18 +968,10 @@ fn eval_json_extract_string(args: &[EvalValue]) -> EvalValue {
     }
 }
 
-/// `json_extract(doc, path)` — the value's JSON text, as `DuckDB`
-/// returns it.
-///
 /// `DuckDB`'s `json_extract` yields JSON, not a decoded scalar: a string
 /// keeps its quotes (`"x"`), a number is its own text, and an
-/// array/object is compact JSON. Decoding here instead would make the
-/// same call answer differently in the two lanes, and `tostring()` over
-/// the result disagree outright.
-///
-/// A missing path is SQL NULL; a path that finds a JSON `null` is the
-/// text `null`, which is a value. [`eval_json_extract_string`] is the
-/// unquoting door.
+/// array/object is compact JSON. A missing path is SQL NULL; a path that
+/// finds a JSON `null` is the text `null`, which is a value.
 fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1244,31 +984,12 @@ fn eval_json_extract(args: &[EvalValue]) -> EvalValue {
     }
 }
 
-/// One JSON value in the text `DuckDB` renders it as.
-///
-/// `serde_json`'s own rendering is that text for every shape but one:
-/// it spells a positive exponent `e+300` where `DuckDB` spells it
-/// `e300` (measured — negative exponents already agree, and serde emits
-/// a lowercase `e`; `E` is handled defensively). So the rendering is
-/// serde's, with that one spelling normalized.
+/// `serde_json`'s own rendering is `DuckDB`'s text for every shape but one:
+/// it spells a positive exponent `e+300` where `DuckDB` spells it `e300`.
 ///
 /// The pass is string-aware: a JSON string may contain the bytes `e+`
 /// (`{"note":"cost e+300"}`), and rewriting those would corrupt the
-/// document. It therefore walks the text tracking whether it is inside a
-/// string — consuming the character after a backslash, so an escaped
-/// quote does not end one — and only ever drops a `+` that follows an
-/// `e` outside a string, which in valid JSON is only ever an exponent's
-/// sign (`true`/`false` carry an `e` too, never followed by `+`).
-///
-/// Residual: serde re-renders a number from its `f64`, where `DuckDB`
-/// renders from the source spelling, so exotic magnitudes still differ —
-/// pinned by `current_json_number_spelling_follows_serdes_f64`.
-///
-/// Public because the probe asserts it side by side with the engine, as
-/// it does [`timestamp_to_duckdb_text`]; a probe-local copy of this rule
-/// would be a second implementation of the very thing under test (and
-/// the naive one — a blind `replace` — corrupts a string containing
-/// `e+`).
+/// document.
 #[must_use]
 pub fn duckdb_json_text(value: &serde_json::Value) -> String {
     let rendered = value.to_string();
@@ -1303,23 +1024,12 @@ pub fn duckdb_json_text(value: &serde_json::Value) -> String {
     out
 }
 
-/// What `DuckDB` makes of an `IF`/`CASE WHEN` condition.
 enum ConditionRead {
-    /// A true condition: take this branch.
     True,
-    /// FALSE or SQL NULL — `DuckDB` treats both as not-taken and moves to
-    /// the else branch (or the next `CASE` arm).
     NotTaken,
-    /// No boolean reading at all. `DuckDB` raises a Conversion error, so
-    /// the whole call is NULL under the eval-nulls-where-batch-errors
-    /// rule (ADR-0017 §5).
     Unreadable,
 }
 
-/// Read a condition the way `DuckDB` casts one — the domain probed by
-/// `an_if_condition_is_a_boolean_cast_not_truthiness`, not
-/// [`EvalValue::is_truthy`].
-///
 /// Strings go through the one owner of that cast vocabulary
 /// ([`crate::compare::try_cast_boolean`]) — closed, case-insensitive and
 /// untrimmed, so `' true '` has no reading. Numbers read as `!= 0`,
@@ -1331,8 +1041,6 @@ fn read_condition(value: &EvalValue) -> ConditionRead {
         EvalValue::Null => return ConditionRead::NotTaken,
         EvalValue::Int(n) => *n != 0,
         EvalValue::UInt(n) => *n != 0,
-        // An exact zero test, both signs: `-0.0` is false and NaN — which
-        // no ordering comparison would call true — is true.
         #[allow(clippy::float_cmp)]
         EvalValue::Float(n) => *n != 0.0,
         EvalValue::Str(s) => match crate::compare::try_cast_boolean(s) {
@@ -1355,13 +1063,8 @@ fn unary_str(args: &[EvalValue], f: impl FnOnce(&str) -> String) -> EvalValue {
     })
 }
 
-/// `ceil(x)` — DOUBLE whatever the argument was.
-///
 /// `CEIL` returns DOUBLE over a BIGINT argument as well as over a DOUBLE
-/// one (probed: `ceil_floor_and_round_split_their_return_type_on_the_
-/// argument_type`), so an integer argument widens rather than passing
-/// through, and a fractional one may not be truncated into an `i64` —
-/// `ceil(-0.5)` is `-0.0`, a value no integer can carry.
+/// one, and `ceil(-0.5)` is `-0.0`, a value no integer can carry.
 #[allow(clippy::cast_precision_loss)]
 fn eval_ceil(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
@@ -1372,8 +1075,6 @@ fn eval_ceil(args: &[EvalValue]) -> EvalValue {
     })
 }
 
-/// `floor(x)` — DOUBLE whatever the argument was, exactly like
-/// [`eval_ceil`].
 #[allow(clippy::cast_precision_loss)]
 fn eval_floor(args: &[EvalValue]) -> EvalValue {
     args.first().map_or(EvalValue::Null, |v| match v {
@@ -1410,22 +1111,16 @@ fn eval_substr(args: &[EvalValue]) -> EvalValue {
     let chars: Vec<char> = s.chars().collect();
     let n = i64::try_from(chars.len()).unwrap_or(i64::MAX);
 
-    // Negative start counts from the end; 0 stays a position before the first
-    // char. Saturating add: an adversarial start near i64::MIN must not overflow
-    // before clamping (panics in debug, wraps in release).
     let start = if start < 0 {
         n.saturating_add(start).saturating_add(1)
     } else {
         start
     };
 
-    // Inclusive 1-based window [lo, hi]. Saturating arithmetic throughout —
-    // out-of-range start/len bounds clamp to the string range below.
     let (lo, hi) = match args.get(2) {
         None => (start, n),
         Some(EvalValue::Int(len)) => match len.cmp(&0) {
             std::cmp::Ordering::Equal => return EvalValue::Str(String::new()),
-            // Leftward, exclusive of start itself.
             std::cmp::Ordering::Less => (start.saturating_add(*len), start.saturating_sub(1)),
             std::cmp::Ordering::Greater => (start, start.saturating_add(*len).saturating_sub(1)),
         },
@@ -1442,13 +1137,8 @@ fn eval_substr(args: &[EvalValue]) -> EvalValue {
     EvalValue::Str(chars[(lo - 1) as usize..hi as usize].iter().collect())
 }
 
-/// `round(x [, precision])` — the one of the three rounding scalars that
-/// keeps an integer argument integral.
-///
 /// `ROUND` over a BIGINT returns BIGINT while `CEIL`/`FLOOR` widen to
-/// DOUBLE (probed: `ceil_floor_and_round_split_their_return_type_on_the_
-/// argument_type`), so the integer arm passes through unchanged and the
-/// DOUBLE arm, precision-0 case included, stays DOUBLE.
+/// DOUBLE.
 #[allow(clippy::cast_possible_truncation)]
 fn eval_round(args: &[EvalValue]) -> EvalValue {
     if args.is_empty() || args.len() > 2 {
@@ -1477,8 +1167,6 @@ fn eval_round(args: &[EvalValue]) -> EvalValue {
         EvalValue::Float((val * factor).round() / factor)
     }
 }
-
-// ── date/time scalar function implementations ──────────────────────
 
 /// `tonumber(x)` — mirrors `TRY_CAST(x AS DOUBLE)`.
 #[allow(clippy::cast_precision_loss)]
@@ -1516,9 +1204,6 @@ fn eval_date_part(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(unit) = &args[0] else {
         return EvalValue::Null;
     };
-    // NULL for an infinity, every unit — probed
-    // (`the_date_scalars_answer_for_an_infinity`), and one door rather
-    // than eleven arms.
     let Some(ts) = args[1].as_finite() else {
         return EvalValue::Null;
     };
@@ -1583,7 +1268,6 @@ fn eval_date_trunc(args: &[EvalValue]) -> EvalValue {
                 .and_then(|d| d.and_hms_opt(0, 0, 0))
         }
         "day" => ts.date().and_hms_opt(0, 0, 0),
-        // hour/minute/second share the truncators used by date_diff.
         "hour" => Some(trunc_to_hour(ts)),
         "minute" => Some(trunc_to_minute(ts)),
         "second" => Some(trunc_to_second(ts)),
@@ -1607,8 +1291,6 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(unit) = &args[0] else {
         return EvalValue::Null;
     };
-    // NULL whenever either side is infinite, both signs, both
-    // positions — probed.
     let Some(start) = args[1].as_finite() else {
         return EvalValue::Null;
     };
@@ -1637,14 +1319,12 @@ fn eval_date_diff(args: &[EvalValue]) -> EvalValue {
             days / 7
         }
         "day" => {
-            // Truncate to day midnight, count days between truncated values.
             let start_trunc = start.date().and_hms_opt(0, 0, 0).unwrap_or(start);
             let end_trunc = end.date().and_hms_opt(0, 0, 0).unwrap_or(end);
             let diff = end_trunc.signed_duration_since(start_trunc);
             diff.num_days()
         }
         "hour" => {
-            // Boundary-crossing: truncate both to hour, count hours between.
             let start_trunc = trunc_to_hour(start);
             let end_trunc = trunc_to_hour(end);
             let diff = end_trunc.signed_duration_since(start_trunc);
@@ -1683,26 +1363,14 @@ fn trunc_to_second(ts: NaiveDateTime) -> NaiveDateTime {
         .unwrap_or(ts)
 }
 
-/// Rewrite a user's format into the chrono spelling that means what
-/// `DuckDB` means by it.
-///
-/// Exactly one specifier differs in unit rather than in syntax: a bare
-/// `%f` is a six-digit microsecond field to `DuckDB` (probed:
-/// `percent_f_is_six_digit_microseconds`) and an unscaled nanosecond
-/// count to chrono — nine digits out, and a digit run read as
-/// nanoseconds in. chrono's fixed-width `%6f` is the same field
-/// `DuckDB` writes, so the translation is `%f` → `%6f` and nothing else.
+/// A bare `%f` is a six-digit microsecond field to `DuckDB` and an
+/// unscaled nanosecond count to chrono. chrono's fixed-width `%6f` is the
+/// same field `DuckDB` writes, so the translation is `%f` → `%6f` and
+/// nothing else.
 ///
 /// `%%` is an escaped percent, not a specifier: the `f` in `%%f` is a
 /// literal letter and must survive untouched, which is why this walks
 /// the format instead of replacing text.
-///
-/// This is eval's internal spelling of the user's format;
-/// `emitter::validate_format_literal` judges the text the user wrote,
-/// since that is the text the batch lane sends to the engine.
-///
-/// Borrowed when there is nothing to rewrite, which is every format
-/// without an `%f` in it.
 fn duckdb_strftime_format(fmt: &str) -> Cow<'_, str> {
     if !fmt.contains("%f") {
         return Cow::Borrowed(fmt);
@@ -1715,10 +1383,7 @@ fn duckdb_strftime_format(fmt: &str) -> Cow<'_, str> {
             continue;
         }
         match chars.next() {
-            // The one unit difference.
             Some('f') => out.push_str("%6f"),
-            // An escaped percent: both characters are literal, and the
-            // next character is not a specifier letter.
             Some('%') => out.push_str("%%"),
             Some(other) => {
                 out.push('%');
@@ -1745,18 +1410,12 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
-    // The chrono spelling of what the user asked for — `%f` means
-    // microseconds here, as it does to the engine.
     let fmt = duckdb_strftime_format(fmt);
     let fmt = fmt.as_ref();
-    // A `fmt` is fully user-controlled. chrono turns an invalid/incompatible
-    // specifier (e.g. `%Q`) into `Item::Error`, whose `Display` returns
-    // `fmt::Error` — `ts.format(fmt).to_string()` would then panic ("a Display
-    // implementation returned an error unexpectedly"). Detect the error item up
-    // front and return Null instead. Invalid format literals are rejected at
-    // emit/compile time in both paths (see emitter::validate_format_literal),
-    // so this guard covers only a non-literal (field-ref) format, which cannot
-    // be checked upfront.
+    // chrono turns an invalid specifier (e.g. `%Q`) into `Item::Error`, whose
+    // `Display` returns `fmt::Error`, so `ts.format(fmt).to_string()` would
+    // panic. Invalid format literals are rejected at emit time, so this guard
+    // covers only a non-literal (field-ref) format.
     if chrono::format::StrftimeItems::new(fmt)
         .any(|item| matches!(item, chrono::format::Item::Error))
     {
@@ -1765,28 +1424,8 @@ fn eval_strftime(args: &[EvalValue]) -> EvalValue {
     EvalValue::Str(ts.format(fmt).to_string())
 }
 
-/// `strptime(str, fmt)` — parse a string to `Timestamp` using chrono format.
-///
 /// `DuckDB`'s `STRPTIME` fills the components a format omits from a
-/// `1900-01-01 00:00:00` base: a year-only format yields `…-01-01 00:00:00`, a
-/// date-only format yields midnight, a time-only format yields `1900-01-01`, and
-/// a date with an incomplete time (`%Y-%m-%d %H`) keeps the hour and zero-fills
-/// minute/second. We mirror this exactly by parsing once into a
-/// `chrono::format::Parsed`, then resolving each half — letting chrono resolve
-/// derived fields first (ISO week, ordinal `%j`, `%s` epoch, am/pm) and injecting
-/// the `1900-01-01 00:00:00` defaults only for components that are genuinely
-/// missing (see `resolve_date`/`resolve_time`).
-///
-/// `chrono::format::parse` matches the whole input against the whole format, so
-/// trailing or insufficient input still rejects (both paths `Null`, as `DuckDB`
-/// does), and an unparseable value returns `Null` — matching the `TRY_STRPTIME`
-/// the batch emitter uses.
-///
-/// Codes that interact with the base injection or with time zones can diverge
-/// from `DuckDB` and follow chrono per ADR-0001's parity contract: a *bare*
-/// two-digit year (`%y` alone) resolves to `Null` — the injected `1900` base year
-/// conflicts with the parsed mod-100 — and offset codes (`%z`/`%Z`) keep the
-/// wall-clock time chrono parses rather than normalizing to UTC.
+/// `1900-01-01 00:00:00` base (see `resolve_date`/`resolve_time`).
 fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     if args.len() != 2 {
         return EvalValue::Null;
@@ -1797,23 +1436,12 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     let EvalValue::Str(fmt) = &args[1] else {
         return EvalValue::Null;
     };
-    // The same translation as `strftime`'s, so one format spells one
-    // thing in both directions.
-    //
-    // Residual, one-directional: chrono's `%6f` is fixed width, where
-    // `DuckDB` reads a variable-length fraction (`.5` is half a second,
-    // probed). A run of other than six digits therefore has no reading
-    // here and this returns NULL where the engine returns the instant —
-    // an under-read, preferred over chrono's bare `%f`, which reads those
-    // digits as nanoseconds and would make `.5` five of them. Pinned by
-    // `current_strptime_reads_only_a_six_digit_fraction`.
     let fmt = duckdb_strftime_format(fmt);
     let fmt = fmt.as_ref();
     let mut parsed = chrono::format::Parsed::new();
     if chrono::format::parse(&mut parsed, s, chrono::format::StrftimeItems::new(fmt)).is_err() {
         return EvalValue::Null;
     }
-    // A fully-specified datetime (or a `%s` epoch) resolves directly.
     if let Ok(dt) = parsed.to_naive_datetime_with_offset(0) {
         return EvalValue::Timestamp(compare::Instant::At(dt));
     }
@@ -1823,13 +1451,9 @@ fn eval_strptime(args: &[EvalValue]) -> EvalValue {
     }
 }
 
-/// Resolve a `NaiveDate` from a partially-filled `Parsed`, supplying the date
-/// components `DuckDB` would take from its `1900-01-01` base. chrono is tried
-/// first so derived fields (ISO week, ordinal `%j`) win; the base defaults are
-/// then injected most-significant first, retrying after each. `set_*` no-ops when
-/// the field already holds a value, so a year-only or ordinal-only input is never
-/// over-determined with a stray month/day. `None` means the present fields are
-/// contradictory (e.g. Feb 30) — the caller nulls, as `DuckDB` does.
+/// chrono is tried first so derived fields (ISO week, ordinal `%j`) win; the
+/// base defaults are then injected most-significant first, retrying after
+/// each. `set_*` no-ops when the field already holds a value.
 fn resolve_date(parsed: &mut chrono::format::Parsed) -> Option<NaiveDate> {
     if let Ok(date) = parsed.to_naive_date() {
         return Some(date);
@@ -1846,13 +1470,9 @@ fn resolve_date(parsed: &mut chrono::format::Parsed) -> Option<NaiveDate> {
     parsed.to_naive_date().ok()
 }
 
-/// Resolve a `NaiveTime` from a partially-filled `Parsed`, zero-filling the
-/// components a format omits (`DuckDB`'s `00:00:00` base). Mirrors `resolve_date`:
-/// chrono first (so am/pm and fractional seconds resolve), then hour→minute→second
-/// defaults with a retry after each. `None` means a present time field is out of
-/// range (a value chrono itself rejects) — the caller nulls. Note `%I` without
-/// `%p` does not null: the `set_hour(0)` default supplies the missing am/pm half,
-/// so it resolves to the 24-hour reading (matching `DuckDB`).
+/// `%I` without `%p` does not null: the `set_hour(0)` default supplies the
+/// missing am/pm half, so it resolves to the 24-hour reading (matching
+/// `DuckDB`).
 fn resolve_time(parsed: &mut chrono::format::Parsed) -> Option<NaiveTime> {
     if let Ok(time) = parsed.to_naive_time() {
         return Some(time);
@@ -1880,13 +1500,6 @@ mod tests {
         Spanned { node, span: 0..0 }
     }
 
-    /// The evaluation context these tests evaluate under.
-    ///
-    /// Fixed, never captured: a test that samples its own clock cannot
-    /// prove per-unit freezing, and nothing in this crate's `src/` may
-    /// self-serve a context (`tests/now_anchor_contract.rs`). The cases
-    /// that care about `now()` hold a context of their own and assert
-    /// against it.
     fn ctx() -> EvalContext {
         EvalContext::at(
             chrono::DateTime::parse_from_rfc3339("2026-08-24T12:00:00Z")
@@ -1895,20 +1508,15 @@ mod tests {
         )
     }
 
-    /// The patterns `expr` holds, prepared as a compiled stage prepares
-    /// them.
     fn prepared(expr: &Spanned<Expr>) -> PatternTable {
         PatternTable::prepare([expr], &mut crate::pattern::table::test_ledger())
             .expect("every pattern operand prepares")
     }
 
-    /// [`super::eval_expr`] over `expr`'s own prepared patterns.
     fn eval_expr(expr: &Spanned<Expr>, event: &Row, ctx: &EvalContext) -> EvalValue {
         super::eval_expr(expr, event, &prepared(expr), ctx).expect("every pattern is prepared")
     }
 
-    /// A cell conforms to the pin's own type exactly where the pinned
-    /// `| where` reads one, and keeps its own shape everywhere else.
     #[test]
     fn conformed_cell_is_the_pinned_columns_cell() {
         use crate::schema::CanonicalType;
@@ -1922,7 +1530,6 @@ mod tests {
             conformed_cell(&EvalValue::Int(9), CanonicalType::BigInt),
             Some(EvalValue::Int(9))
         );
-        // The round-trip guard stores NULL for these: no reading.
         assert_eq!(conformed_cell(&text("1.5"), CanonicalType::BigInt), None);
         assert_eq!(conformed_cell(&text("n/a"), CanonicalType::BigInt), None);
         assert_eq!(
@@ -1953,7 +1560,6 @@ mod tests {
             None
         );
 
-        // No scalar reading of the pin's own type.
         assert_eq!(conformed_cell(&text("200"), CanonicalType::Varchar), None);
         assert_eq!(
             conformed_cell(&text("error"), CanonicalType::Severity),
@@ -1965,8 +1571,6 @@ mod tests {
         );
     }
 
-    // ── pinned where/let comparisons (ADR-0011) ─────────────────────
-
     mod pinned {
         use super::*;
         use crate::parser;
@@ -1974,8 +1578,6 @@ mod tests {
         use crate::schema::CanonicalType as CT;
         use crate::schema::FieldTypes;
 
-        /// Evaluate the sole `where` condition of `dsl` against `event`
-        /// under `pins`.
         fn eval_where(dsl: &str, event: &str, pins: &[(&str, CT)]) -> EvalValue {
             let mut ft = FieldTypes::new();
             for (field, ty) in pins {
@@ -2015,7 +1617,6 @@ mod tests {
                 eval_where(dsl, r#"{"status": "200"}"#, VARCHAR_STATUS),
                 EvalValue::Bool(false)
             );
-            // No reading → UNKNOWN, not false — `NOT` cannot invert it.
             assert_eq!(
                 eval_where(dsl, r#"{"status": "accepted"}"#, VARCHAR_STATUS),
                 EvalValue::Null
@@ -2046,8 +1647,6 @@ mod tests {
             );
         }
 
-        /// Strict null policy: `!=` over an absent/null field is UNKNOWN
-        /// (plain SQL null propagation), not the search stage's widening.
         #[test]
         fn ne_over_absent_field_is_unknown() {
             for event in ["{}", r#"{"status": null}"#] {
@@ -2057,7 +1656,6 @@ mod tests {
                     "{event}"
                 );
             }
-            // Present, unreadable value still answers TRUE (text differs).
             assert_eq!(
                 eval_where(
                     "* | where status != 200",
@@ -2068,9 +1666,6 @@ mod tests {
             );
         }
 
-        /// A conform-nulled value under a typed pin is a stored NULL:
-        /// UNKNOWN for every operator, `!=` included (Strict, unlike the
-        /// search lane's `OR col IS NULL`).
         #[test]
         fn typed_pin_unreadable_value_is_unknown_even_for_ne() {
             assert_eq!(
@@ -2081,7 +1676,6 @@ mod tests {
                 eval_where("* | where dur > 1", r#"{"dur": "1.5"}"#, BIGINT_DUR),
                 EvalValue::Null
             );
-            // A readable spelling still compares in the pin's domain.
             assert_eq!(
                 eval_where("* | where dur > 1", r#"{"dur": "0404"}"#, BIGINT_DUR),
                 EvalValue::Bool(true)
@@ -2108,7 +1702,6 @@ mod tests {
             );
         }
 
-        /// Quote provenance is discarded: `status > "400"` is `status > 400`.
         #[test]
         fn quoted_numeric_literal_binds_content() {
             assert_eq!(
@@ -2121,7 +1714,6 @@ mod tests {
             );
         }
 
-        /// Pattern ops against a typed pin match the canonical text form.
         #[test]
         fn matches_over_typed_pin_targets_canonical_text() {
             assert_eq!(
@@ -2140,7 +1732,6 @@ mod tests {
                 ),
                 EvalValue::Bool(false)
             );
-            // The stored value is the conformed one: "0404" reads 404.
             assert_eq!(
                 eval_where(
                     "* | where dur matches \"^4\"",
@@ -2149,7 +1740,6 @@ mod tests {
                 ),
                 EvalValue::Bool(true)
             );
-            // No reading → NULL target → UNKNOWN.
             assert_eq!(
                 eval_where(
                     "* | where dur matches \"^4\"",
@@ -2160,10 +1750,6 @@ mod tests {
             );
         }
 
-        /// A pinned comparison binds the row's key the way `DuckDB` binds
-        /// a column reference — either case direction, because a pipeline
-        /// stage can make a mixed-case key (`rename status as St`) that a
-        /// later stage names differently (`where st>400`).
         #[test]
         fn pinned_lookup_binds_the_rows_key_case_insensitively() {
             for event in [r#"{"status": "404"}"#, r#"{"Status": "404"}"#] {
@@ -2175,7 +1761,6 @@ mod tests {
                     );
                 }
             }
-            // An exact key wins over a case-variant sibling...
             assert_eq!(
                 eval_where(
                     "* | where status > 400",
@@ -2184,8 +1769,6 @@ mod tests {
                 ),
                 EvalValue::Bool(false)
             );
-            // ...and binding, not non-nullness, picks the key: an exact
-            // key holding null is that field's own NULL.
             assert_eq!(
                 eval_where(
                     "* | where status > 400",
@@ -2196,10 +1779,6 @@ mod tests {
             );
         }
 
-        /// The pin-blind read binds the same way, so a reference does not
-        /// change meaning with the pin: `lower(Status)` and a bare
-        /// `let b = Status` reach the row's `status` exactly as the pinned
-        /// arm beside them does.
         #[test]
         fn unpinned_lookup_binds_the_rows_key_case_insensitively() {
             assert_eq!(
@@ -2210,7 +1789,6 @@ mod tests {
                 ),
                 EvalValue::Bool(true)
             );
-            // An exact key still wins over a case-variant sibling.
             assert_eq!(
                 eval_where(
                     "* | where status == \"exact\"",
@@ -2221,9 +1799,6 @@ mod tests {
             );
         }
 
-        /// A VARCHAR pin makes even a numeric wire value pattern-matchable
-        /// as its stored text; the pin-blind door answers NULL for a
-        /// non-string value.
         #[test]
         fn matches_over_varchar_pin_reads_the_stored_text() {
             assert_eq!(
@@ -2253,9 +1828,6 @@ mod tests {
             assert_eq!(eval_where(dsl, "{}", VARCHAR_STATUS), EvalValue::Null);
         }
 
-        /// Unpinned fields and the pin-blind door stay literal-driven: a
-        /// string value ordered against an int literal has no numeric
-        /// reading there.
         #[test]
         fn unpinned_field_falls_through_to_literal_driven_eval() {
             assert_eq!(
@@ -2266,9 +1838,6 @@ mod tests {
                 ),
                 EvalValue::Null
             );
-            // The pin-blind door: eval_expr never consults pins, so the
-            // comparison the pinned walk answers TRUE stays
-            // literal-driven here.
             let query = parser::parse("* | where status > 400").expect("parses");
             let cond = match &query.pipeline[0].node {
                 crate::ast::PipeStage::Where(w) => w.condition.clone(),
@@ -2343,8 +1912,6 @@ mod tests {
         crate::row::from_json(pairs.as_object().unwrap())
     }
 
-    // ── literals ───────────────────────────────────────────────────
-
     #[test]
     fn literal_int() {
         assert_eq!(
@@ -2385,8 +1952,6 @@ mod tests {
         );
     }
 
-    // ── field refs ─────────────────────────────────────────────────
-
     #[test]
     fn field_ref_present() {
         let ev = event(&json!({"host": "web-1"}));
@@ -2405,8 +1970,6 @@ mod tests {
     }
 
     #[test]
-    /// Zero aliases (ADR-0013 §6): `@timestamp` reads the key it spells,
-    /// and `_time` is not that key.
     fn field_ref_timestamp_is_not_an_alias_for_time() {
         let ev = event(&json!({"_time": "2026-01-01T00:00:00Z"}));
         assert_eq!(
@@ -2438,8 +2001,6 @@ mod tests {
         );
     }
 
-    // ── arithmetic ─────────────────────────────────────────────────
-
     #[test]
     fn add_ints() {
         let expr = binary(lit_int(2), BinaryOp::Add, lit_int(3));
@@ -2469,7 +2030,6 @@ mod tests {
 
     #[test]
     fn div_ints() {
-        // True division: `/` has no integer form in DuckDB.
         let expr = binary(lit_int(10), BinaryOp::Div, lit_int(4));
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -2499,8 +2059,6 @@ mod tests {
             (i64::MAX, BinaryOp::Add, 1),
             (i64::MIN, BinaryOp::Sub, 1),
             (i64::MAX, BinaryOp::Mul, 2),
-            // The one `%` with no integer answer — an error in DuckDB,
-            // not the NULL that `% 0` is, but the same NULL here.
             (i64::MIN, BinaryOp::Mod, -1),
         ] {
             let expr = binary(lit_int(lhs), op, lit_int(rhs));
@@ -2514,7 +2072,6 @@ mod tests {
 
     #[test]
     fn nan_compares_as_duckdb_orders_it() {
-        // NaN is equal to itself and greater than everything else.
         let nan = || binary(lit_int(0), BinaryOp::Div, lit_int(0));
         for (op, want) in [
             (BinaryOp::Eq, true),
@@ -2534,7 +2091,6 @@ mod tests {
             eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Bool(true)
         );
-        // …while the two zeros tie.
         let expr = binary(lit_float(-0.0), BinaryOp::Eq, lit_float(0.0));
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -2562,7 +2118,6 @@ mod tests {
 
     #[test]
     fn modulo_by_zero_float() {
-        // A DOUBLE operand takes the IEEE path, where `% 0` is NaN.
         let expr = binary(lit_int(5), BinaryOp::Mod, lit_float(0.0));
         let EvalValue::Float(value) = eval_expr(&expr, &empty_event(), &ctx()) else {
             panic!("5 % 0.0 must be a float");
@@ -2594,8 +2149,6 @@ mod tests {
         let expr = binary(field("duration"), BinaryOp::Mul, lit_int(1000));
         assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(100_000));
     }
-
-    // ── comparison ─────────────────────────────────────────────────
 
     #[test]
     fn eq_ints() {
@@ -2684,11 +2237,8 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    // ── Timestamp vs Str coercion in eval_cmp/eval_eq ──────────────
-
     #[test]
     fn timestamp_gt_str_past_is_true() {
-        // now() > a past timestamp string: should be true
         let expr = binary(
             call("now", vec![]),
             BinaryOp::Gt,
@@ -2715,7 +2265,6 @@ mod tests {
 
     #[test]
     fn timestamp_eq_str_same_instant() {
-        // strptime produces Timestamp; compare to the same string
         let expr = binary(
             call(
                 "strptime",
@@ -2732,7 +2281,6 @@ mod tests {
 
     #[test]
     fn where_timestamp_gt_now_for_future_event() {
-        // Event with far-future timestamp: `_time > now()` should be true.
         let ev = event(&json!({"_time": "2999-12-31 23:59:59"}));
         let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Bool(true));
@@ -2740,13 +2288,10 @@ mod tests {
 
     #[test]
     fn where_timestamp_gt_now_for_past_event() {
-        // Event with past timestamp: `_time > now()` should be false.
         let ev = event(&json!({"_time": "2000-01-01 00:00:00"}));
         let expr = binary(field("_time"), BinaryOp::Gt, call("now", vec![]));
         assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Bool(false));
     }
-
-    // ── logical ops ────────────────────────────────────────────────
 
     #[test]
     fn and_true_true() {
@@ -2768,7 +2313,6 @@ mod tests {
 
     #[test]
     fn and_false_null() {
-        // false AND null = false (SQL short-circuit)
         let expr = binary(lit_bool(false), BinaryOp::And, lit_null());
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -2806,8 +2350,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    // ── matches ────────────────────────────────────────────────────
-
     #[test]
     fn matches_regex() {
         let expr = binary(
@@ -2833,8 +2375,6 @@ mod tests {
             EvalValue::Bool(false)
         );
     }
-
-    // ── like / ilike ────────────────────────────────────────────────
 
     #[test]
     fn like_percent_wildcard() {
@@ -2887,10 +2427,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    /// A pattern the table does not hold is an error under every pattern
-    /// operator and in every position, pinned or not, never a non-match:
-    /// the lookup runs before the subject is read, so a NULL subject
-    /// fails too.
     #[test]
     fn a_pattern_operand_the_table_lacks_is_an_error() {
         let pinned_status = {
@@ -2914,8 +2450,6 @@ mod tests {
         }
     }
 
-    /// A computed pattern operand is refused at evaluation too, by the one
-    /// literal-only rule, rather than read as a non-match.
     #[test]
     fn a_computed_pattern_operand_is_an_error() {
         let expr = binary(
@@ -2933,8 +2467,6 @@ mod tests {
             Err(PatternError::Computed)
         );
     }
-
-    // ── unary ──────────────────────────────────────────────────────
 
     #[test]
     fn not_true() {
@@ -2978,8 +2510,6 @@ mod tests {
         );
     }
 
-    // ── in list ────────────────────────────────────────────────────
-
     #[test]
     fn in_list_found() {
         let expr = in_list(lit_int(200), vec![lit_int(200), lit_int(301), lit_int(404)]);
@@ -3003,8 +2533,6 @@ mod tests {
         let expr = in_list(lit_null(), vec![lit_int(200)]);
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
-
-    // ── scalar functions: string ───────────────────────────────────
 
     #[test]
     fn fn_lower() {
@@ -3032,7 +2560,6 @@ mod tests {
 
     #[test]
     fn fn_length_counts_chars_not_bytes() {
-        // DuckDB LENGTH() returns character count; "café" is 4 chars / 5 bytes.
         let expr = call("length", vec![lit_str("café")]);
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(4));
     }
@@ -3160,7 +2687,6 @@ mod tests {
                 "substr({s:?}, {start}, {len:?})"
             );
         }
-        // NULL propagation.
         assert_eq!(
             eval_substr(&[EvalValue::Null, EvalValue::Int(1), EvalValue::Int(3)]),
             EvalValue::Null
@@ -3185,7 +2711,6 @@ mod tests {
 
     #[test]
     fn abs_and_neg_null_on_i64_min_overflow() {
-        // abs(i64::MIN) and -(i64::MIN) overflow; both must null out, not panic.
         let abs_expr = call("abs", vec![lit_int(i64::MIN)]);
         assert_eq!(
             eval_expr(&abs_expr, &empty_event(), &ctx()),
@@ -3198,7 +2723,6 @@ mod tests {
             EvalValue::Null
         );
 
-        // Sanity: ordinary values still work.
         let ok = call("abs", vec![lit_int(-5)]);
         assert_eq!(eval_expr(&ok, &empty_event(), &ctx()), EvalValue::Int(5));
     }
@@ -3223,7 +2747,6 @@ mod tests {
                 EvalValue::Str(_)
             ));
         }
-        // Positive in-range len still works.
         assert_eq!(
             eval_substr(&[
                 EvalValue::Str("abcdef".into()),
@@ -3241,8 +2764,6 @@ mod tests {
             (1.0, "1.0"),
             (2.0, "2.0"),
             (0.0, "0.0"),
-            // A stored/computed -0.0 renders signed (only a SQL literal
-            // `-0.0` folds to positive zero) — probe-pinned.
             (-0.0, "-0.0"),
             (1.5, "1.5"),
             (-1.5, "-1.5"),
@@ -3293,7 +2814,6 @@ mod tests {
 
     #[test]
     fn fn_tostring_float_renders_duckdb_way() {
-        // tostring(1.0) -> "1.0" (DuckDB), not "1" (Rust to_string).
         let expr = call("tostring", vec![lit_float(1.0)]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3317,7 +2837,6 @@ mod tests {
 
     #[test]
     fn fn_concat_mixed_types() {
-        // DuckDB casts each arg to VARCHAR before joining (int/float/bool/ts).
         let expr = call(
             "concat",
             vec![lit_str("n="), lit_int(42), lit_str("/"), lit_bool(true)],
@@ -3330,7 +2849,6 @@ mod tests {
 
     #[test]
     fn fn_concat_skips_null() {
-        // DuckDB CONCAT *ignores* NULL args (unlike `||`): CONCAT('a',NULL,'b')=='ab'.
         let expr = call("concat", vec![lit_str("a"), lit_null(), lit_str("b")]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3340,7 +2858,6 @@ mod tests {
 
     #[test]
     fn fn_concat_trailing_null() {
-        // CONCAT('x','-',NULL) == 'x-'.
         let expr = call("concat", vec![lit_str("x"), lit_str("-"), lit_null()]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3350,15 +2867,12 @@ mod tests {
 
     #[test]
     fn fn_concat_all_null_is_empty_string() {
-        // DuckDB CONCAT(NULL) == '' (empty string), not NULL.
         let expr = call("concat", vec![lit_null(), lit_null()]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
             EvalValue::Str(String::new())
         );
     }
-
-    // ── scalar functions: numeric ──────────────────────────────────
 
     #[test]
     fn fn_abs_positive() {
@@ -3386,8 +2900,6 @@ mod tests {
 
     #[test]
     fn fn_ceil_widens_an_integer_argument() {
-        // CEIL(BIGINT) is DOUBLE in DuckDB, so an integer argument may not
-        // pass through as one.
         let expr = call("ceil", vec![lit_int(5)]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3397,7 +2909,6 @@ mod tests {
 
     #[test]
     fn fn_ceil_keeps_negative_zero() {
-        // `-0.0`, a value no integer can carry.
         let expr = call("ceil", vec![lit_float(-0.5)]);
         let EvalValue::Float(value) = eval_expr(&expr, &empty_event(), &ctx()) else {
             panic!("ceil(-0.5) must be a float");
@@ -3434,7 +2945,6 @@ mod tests {
 
     #[test]
     fn fn_round_no_precision() {
-        // ROUND(DOUBLE) is DOUBLE — only an INTEGER argument stays integral.
         let expr = call("round", vec![lit_float(1.6)]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3466,8 +2976,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(42));
     }
 
-    // ── scalar functions: conditional ──────────────────────────────
-
     #[test]
     fn fn_if_true() {
         let expr = call("if", vec![lit_bool(true), lit_str("yes"), lit_str("no")]);
@@ -3498,9 +3006,6 @@ mod tests {
             (lit_int(-1), Some("yes")),
             (lit_float(-0.0), Some("no")),
             (lit_null(), Some("no")),
-            // No boolean reading: DuckDB errors, so the call is NULL,
-            // not the else branch, which would answer a question DuckDB
-            // refuses.
             (lit_str("nonempty"), None),
             (lit_str(" true "), None),
             (lit_str(""), None),
@@ -3514,7 +3019,6 @@ mod tests {
 
     #[test]
     fn fn_case_stops_at_the_first_true_arm_and_nulls_on_an_unreadable_one() {
-        // An earlier match returns before the unreadable arm is read…
         let expr = call(
             "case",
             vec![
@@ -3527,8 +3031,6 @@ mod tests {
         );
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
 
-        // …and an unreadable arm reached in order nulls the whole call,
-        // whether the arm before it was false or NULL.
         for first in [lit_bool(false), lit_null()] {
             let expr = call(
                 "case",
@@ -3610,9 +3112,6 @@ mod tests {
         );
     }
 
-    /// `now()` reads the context, not the clock (ADR-0017 §3) — a
-    /// Timestamp, and specifically the anchor's own value.
-    ///
     /// Asserted against a fixed context rather than bracketed between two
     /// clock reads: the anchor is truncated to microseconds, so a
     /// bracketing test would fail whenever the capture landed in the same
@@ -3632,9 +3131,6 @@ mod tests {
         assert_eq!(result, at.now_value(), "and it IS the context's own value");
     }
 
-    /// One instant per unit of output: two `now()` calls in one
-    /// expression cannot disagree, however coarse or fine the platform
-    /// clock is.
     #[test]
     fn two_now_calls_in_one_expression_are_one_instant() {
         let expr = binary(call("now", vec![]), BinaryOp::Eq, call("now", vec![]));
@@ -3643,8 +3139,6 @@ mod tests {
             EvalValue::Bool(true)
         );
     }
-
-    // ── Timestamp variant ──────────────────────────────────────────
 
     #[test]
     fn timestamp_to_duckdb_text_no_frac() {
@@ -3670,20 +3164,15 @@ mod tests {
             "%Y-%m-%d %H:%M:%S%.f",
         )
         .unwrap();
-        // DuckDB trims trailing zeros: .100000 → .1
         assert_eq!(timestamp_to_duckdb_text(&ts), "2026-01-15 14:30:00.1");
     }
 
-    /// The syntax the string door reads is `compare::literal_timestamp`'s
-    /// (probe-pinned), not a parser of eval's own.
     #[test]
     fn as_finite_reads_the_literal_timestamp_syntax() {
         for (text, want) in [
             ("2026-01-15T14:30:00Z", "2026-01-15 14:30:00"),
             ("2026-01-15 14:30:00", "2026-01-15 14:30:00"),
             ("2026-01-15", "2026-01-15 00:00:00"),
-            // An offset is discarded — the wall-clock cast a bound
-            // string parameter gets.
             ("2026-01-15T14:30:00+02:00", "2026-01-15 14:30:00"),
         ] {
             let value = EvalValue::Str(text.to_string());
@@ -3695,8 +3184,6 @@ mod tests {
     fn as_finite_is_none_for_a_text_with_no_reading() {
         for text in [
             "not-a-date",
-            // A malformed offset: the engine rejects it, so stripping
-            // one unvalidated here would split the lanes.
             "2026-01-15 10:20:30+ab:cd",
             // Byte `len - 6` lands mid-emoji, where an offset stripper
             // slicing by byte would panic.
@@ -3709,8 +3196,6 @@ mod tests {
         }
     }
 
-    /// An infinity is an instant but not a finite one — the split every
-    /// calendar function reads through.
     #[test]
     fn as_instant_reads_an_infinity_that_as_finite_refuses() {
         for (text, want) in [
@@ -3738,7 +3223,6 @@ mod tests {
             .unwrap();
         let json_val = Value::from(EvalValue::Timestamp(compare::Instant::At(ts)));
         assert_eq!(json_val, json!("2026-01-15 14:30:00"));
-        // The two infinities egress as the words DuckDB casts them to.
         assert_eq!(
             Value::from(EvalValue::Timestamp(compare::Instant::Infinity)),
             json!("infinity")
@@ -3748,8 +3232,6 @@ mod tests {
             json!("-infinity")
         );
     }
-
-    // ── EvalValue conversions ──────────────────────────────────────
 
     #[test]
     fn eval_value_to_json_roundtrip() {
@@ -3779,8 +3261,6 @@ mod tests {
         }
     }
 
-    // ── truthiness ─────────────────────────────────────────────────
-
     #[test]
     fn truthiness() {
         assert!(!EvalValue::Null.is_truthy());
@@ -3792,11 +3272,8 @@ mod tests {
         assert!(EvalValue::Str("x".to_string()).is_truthy());
     }
 
-    // ── complex expressions (integration-style) ────────────────────
-
     #[test]
     fn complex_where_condition() {
-        // status >= 400 and status < 500
         let ev = event(&json!({"status": 404}));
         let expr = binary(
             binary(field("status"), BinaryOp::Gte, lit_int(400)),
@@ -3808,7 +3285,6 @@ mod tests {
 
     #[test]
     fn complex_let_expression() {
-        // duration * 1000 + 50
         let ev = event(&json!({"duration": 2}));
         let expr = binary(
             binary(field("duration"), BinaryOp::Mul, lit_int(1000)),
@@ -3820,7 +3296,6 @@ mod tests {
 
     #[test]
     fn nested_function_call() {
-        // upper(lower("HeLLo"))
         let expr = call("upper", vec![call("lower", vec![lit_str("HeLLo")])]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3830,7 +3305,6 @@ mod tests {
 
     #[test]
     fn if_with_field_condition() {
-        // if(isnotnull(message), length(message), 0)
         let ev = event(&json!({"message": "hello world"}));
         let expr = call(
             "if",
@@ -3857,8 +3331,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &ev, &ctx()), EvalValue::Int(0));
     }
 
-    // ── date/time scalar functions ─────────────────────────────────
-
     fn ts(s: &str) -> Spanned<Expr> {
         lit_str(s)
     }
@@ -3869,7 +3341,6 @@ mod tests {
             .unwrap_or_else(|e| panic!("bad ndt str {s}: {e}"))
     }
 
-    // tonumber
     #[test]
     fn fn_tonumber_from_str() {
         let expr = call("tonumber", vec![lit_str("1.23")]);
@@ -3899,7 +3370,6 @@ mod tests {
 
     #[test]
     fn fn_tonumber_from_bool() {
-        // TRY_CAST(bool AS DOUBLE) has a reading in both directions.
         for (input, want) in [(true, 1.0), (false, 0.0)] {
             let expr = call("tonumber", vec![lit_bool(input)]);
             assert_eq!(
@@ -3917,7 +3387,6 @@ mod tests {
 
     #[test]
     fn fn_tonumber_honors_inner_digit_separators() {
-        // `_` flanked by ASCII digits on both sides is dropped (DuckDB TRY_CAST).
         let expr = call("tonumber", vec![lit_str("1_000")]);
         assert_eq!(
             eval_expr(&expr, &empty_event(), &ctx()),
@@ -3933,8 +3402,6 @@ mod tests {
 
     #[test]
     fn fn_tonumber_rejects_misplaced_digit_separators() {
-        // Each of these keeps a `_` that lacks an ASCII digit on both sides, so
-        // f64::parse fails -> Null, exactly like DuckDB TRY_CAST.
         for bad in ["_1000", "1000_", "1__000", "1_e3", "1,000"] {
             let expr = call("tonumber", vec![lit_str(bad)]);
             assert_eq!(
@@ -3945,7 +3412,6 @@ mod tests {
         }
     }
 
-    // tostring
     #[test]
     fn fn_tostring_int() {
         let expr = call("tostring", vec![lit_int(42)]);
@@ -3976,7 +3442,6 @@ mod tests {
         );
     }
 
-    // date_part
     #[test]
     fn fn_date_part_year() {
         let expr = call(
@@ -4038,7 +3503,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    // date_trunc
     #[test]
     fn fn_date_trunc_year() {
         let expr = call(
@@ -4100,10 +3564,8 @@ mod tests {
         );
     }
 
-    // date_diff — boundary-crossing cases
     #[test]
     fn fn_date_diff_hour_boundary_crossing() {
-        // canonical case: 23:59:59 → 00:00:00 next day = 1 hour boundary crossed
         let expr = call(
             "date_diff",
             vec![
@@ -4143,7 +3605,6 @@ mod tests {
 
     #[test]
     fn fn_date_diff_negative() {
-        // end before start → negative count
         let expr = call(
             "date_diff",
             vec![
@@ -4157,7 +3618,6 @@ mod tests {
 
     #[test]
     fn fn_date_diff_week_boundary() {
-        // Mon 2026-07-13 → Mon 2026-07-20 = 1 week
         let expr = call(
             "date_diff",
             vec![
@@ -4169,7 +3629,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Int(1));
     }
 
-    // strftime
     #[test]
     fn fn_strftime_basic() {
         let expr = call(
@@ -4196,21 +3655,16 @@ mod tests {
 
     #[test]
     fn fn_strftime_invalid_specifier_returns_null_not_panic() {
-        // `%Q` is not a chrono specifier; chrono yields Item::Error whose
-        // Display returns fmt::Error, so a bare `.to_string()` panics —
-        // remotely triggerable through the SSE streaming path.
         let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Q")]);
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
     #[test]
     fn fn_strftime_trailing_percent_returns_null_not_panic() {
-        // A dangling `%` is also an Item::Error in chrono.
         let expr = call("strftime", vec![ts("2026-03-15 10:20:30"), lit_str("%Y-%")]);
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    // strptime
     #[test]
     fn fn_strptime_success() {
         let expr = call(
@@ -4232,8 +3686,6 @@ mod tests {
         assert_eq!(eval_expr(&expr, &empty_event(), &ctx()), EvalValue::Null);
     }
 
-    // Partial formats fill omitted components from DuckDB's 1900-01-01 00:00:00
-    // base (parity asserted against real DuckDB in tests/scalar_parity.rs).
     #[test]
     fn fn_strptime_partial_formats_fill_like_duckdb() {
         for (input, fmt, want) in [
@@ -4241,7 +3693,6 @@ mod tests {
             ("2023-11", "%Y-%m", "2023-11-01 00:00:00"),
             ("11-07", "%m-%d", "1900-11-07 00:00:00"),
             ("2023-11-07 14", "%Y-%m-%d %H", "2023-11-07 14:00:00"),
-            // unchanged date-only / time-only cases stay exact
             ("2023-11-07", "%Y-%m-%d", "2023-11-07 00:00:00"),
             ("14:30:00", "%H:%M:%S", "1900-01-01 14:30:00"),
         ] {
@@ -4254,11 +3705,6 @@ mod tests {
         }
     }
 
-    /// The date scalars over an infinity, one arm per probe row
-    /// (`the_date_scalars_answer_for_an_infinity`): `date_part` NULLs for
-    /// every unit, `date_trunc` passes the infinity through for every
-    /// unit, `date_diff` NULLs from either side, and `strftime` renders
-    /// the word whatever the format asks for.
     #[test]
     fn the_date_scalars_mirror_duckdb_over_an_infinity() {
         for (word, instant) in [
@@ -4302,8 +3748,6 @@ mod tests {
         }
     }
 
-    /// `Instant`'s order is `DuckDB`'s, so an infinity compares rather than
-    /// nulling — in both operand orders and against a plain text.
     #[test]
     fn an_infinity_compares_as_duckdb_orders_it() {
         for (lhs, op, rhs, want) in [
@@ -4326,19 +3770,14 @@ mod tests {
         }
     }
 
-    /// The translation rewrites the one specifier whose unit differs and
-    /// leaves an escaped percent alone.
     #[test]
     fn the_format_translation_touches_only_a_bare_percent_f() {
         for (input, want) in [
             ("%f", "%6f"),
             ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S.%6f"),
-            // An escaped percent is a literal, so its `f` is a letter.
             ("%%f", "%%f"),
             ("x%%fy", "x%%fy"),
-            // …and a real specifier after an escaped one still rewrites.
             ("%%%f", "%%%6f"),
-            // Untouched formats come back borrowed.
             ("%Y-%m-%d", "%Y-%m-%d"),
             ("", ""),
             ("100%", "100%"),
@@ -4351,9 +3790,6 @@ mod tests {
         ));
     }
 
-    /// `%f` renders six digits, zero-filled — the engine's field, not
-    /// chrono's nanosecond count (probe:
-    /// `percent_f_is_six_digit_microseconds`).
     #[test]
     fn fn_strftime_percent_f_is_microseconds() {
         for (text, want) in [
@@ -4367,10 +3803,6 @@ mod tests {
         }
     }
 
-    /// The one-directional residual the fixed-width mirror leaves: a
-    /// fraction of other than six digits has no reading here, where the
-    /// engine reads it. The alternative is worse: chrono's bare `%f`
-    /// reads those digits as nanoseconds, so `.5` parses as five of them.
     #[test]
     fn current_strptime_reads_only_a_six_digit_fraction() {
         let parse = |text: &str| {
@@ -4390,47 +3822,35 @@ mod tests {
             )))),
             "six digits read exactly"
         );
-        // DuckDB reads these as .5 and .123; the mirror under-reads.
         for text in ["2026-01-15 09:00:00.5", "2026-01-15 09:00:00.123"] {
             assert_eq!(parse(text), Some(EvalValue::Null), "{text:?}");
         }
     }
 
-    /// The spelling pass rewrites an exponent's `+` and nothing else —
-    /// least of all the bytes inside a JSON string.
     #[test]
     fn the_json_spelling_pass_only_touches_an_exponent_sign() {
         let render = |doc: &str| {
             let value: serde_json::Value = serde_json::from_str(doc).expect("valid JSON");
             duckdb_json_text(&value)
         };
-        // A bare number, and one nested in each composite shape.
         assert_eq!(render("1e300"), "1e300");
         assert_eq!(render("-1e300"), "-1e300");
         assert_eq!(render("[1e300,2]"), "[1e300,2]");
         assert_eq!(render(r#"{"a":{"b":[1e300]}}"#), r#"{"a":{"b":[1e300]}}"#);
-        // A negative exponent already agrees and is left alone.
         assert_eq!(render("1e-7"), "1e-7");
-        // Text that merely looks like an exponent survives verbatim…
         assert_eq!(render(r#"{"a":"cost e+300"}"#), r#"{"a":"cost e+300"}"#);
         assert_eq!(render(r#"["e+1",1e300]"#), r#"["e+1",1e300]"#);
-        // …including across an escaped quote, which must not be read as
-        // the end of the string.
         assert_eq!(
             render(r#"{"a":"quote \" then e+5","b":1e300}"#),
             r#"{"a":"quote \" then e+5","b":1e300}"#
         );
-        // The shapes with no exponent at all take the fast path.
         assert_eq!(
             render(r#"{"a":"x","b":[1,true,null]}"#),
             r#"{"a":"x","b":[1,true,null]}"#
         );
-        // `true`/`false` carry an `e` and must not lose anything.
         assert_eq!(render("[true,false,1e300]"), "[true,false,1e300]");
     }
 
-    /// `json_extract` returns JSON text — a string keeps its quotes, a
-    /// missing path is NULL, and a JSON `null` is the text `null`.
     #[test]
     fn fn_json_extract_returns_json_text() {
         let extract = |doc: &str, path: &str| {
@@ -4460,7 +3880,6 @@ mod tests {
         }
     }
 
-    // typeof(now())
     #[test]
     fn fn_typeof_now_is_timestamp() {
         let expr = call("typeof", vec![call("now", vec![])]);
@@ -4470,10 +3889,6 @@ mod tests {
         );
     }
 
-    // ── sev(): the ladder function (ADR-0013 ruling 9) ─────────────
-
-    /// The eval lane reads the same kernel the SQL lane's expression is
-    /// generated from, straight off the `EvalValue`.
     #[test]
     fn fn_sev_reads_the_ladder() {
         for (text, expected) in [
@@ -4484,7 +3899,6 @@ mod tests {
             ("17", EvalValue::Int(17)),
             ("007", EvalValue::Int(7)),
             ("+17", EvalValue::Int(17)),
-            // No reading is NULL, never an error and never a guess.
             ("0", EvalValue::Null),
             ("25", EvalValue::Null),
             ("-1", EvalValue::Null),
@@ -4508,8 +3922,6 @@ mod tests {
             eval_expr(&call("sev", vec![lit_int(25)]), &empty_event(), &ctx()),
             EvalValue::Null
         );
-        // A shape that names no rung — a float, a boolean, a missing
-        // field — has no reading.
         assert_eq!(
             eval_expr(&call("sev", vec![lit_float(17.0)]), &empty_event(), &ctx()),
             EvalValue::Null
@@ -4524,8 +3936,6 @@ mod tests {
         );
     }
 
-    /// The dialect governs numerics alone: syslog inverts 0-7, and a word
-    /// reads the same in both.
     #[test]
     fn fn_sev_dialect_inverts_numerics_only() {
         let sev = |arg: Spanned<Expr>, dialect: &str| {
@@ -4541,13 +3951,10 @@ mod tests {
         assert_eq!(sev(lit_int(0), "syslog"), EvalValue::Int(24));
         assert_eq!(sev(lit_int(8), "syslog"), EvalValue::Null);
         assert_eq!(sev(lit_str("error"), "syslog"), EvalValue::Int(17));
-        // Case-insensitive, and an unknown dialect reads nothing (the
-        // stream compiler refuses it before an event ever arrives).
         assert_eq!(sev(lit_int(3), "SYSLOG"), EvalValue::Int(17));
         assert_eq!(sev(lit_int(3), "rfc5424"), EvalValue::Null);
     }
 
-    /// Reading a real event column, in both wire shapes.
     #[test]
     fn fn_sev_over_event_columns() {
         let ev = event(&json!({"level": "warn", "syslog_severity": 3}));
@@ -4565,8 +3972,6 @@ mod tests {
         );
     }
 
-    // coverage test — every non-aggregate KNOWN_FUNCTION must return Some(_)
-    // from eval_scalar_fn. Fails CI if a scalar is added to the emitter but not eval.
     #[test]
     fn all_scalar_known_functions_return_some() {
         use crate::emitter::is_aggregate_function;
@@ -4582,7 +3987,7 @@ mod tests {
         ];
         for &func in KNOWN_FUNCTIONS {
             if is_aggregate_function(func) {
-                continue; // aggregates are not in eval_scalar_fn
+                continue;
             }
             let result = eval_scalar_fn(func, &generous_args, &ctx());
             assert!(

@@ -4,19 +4,10 @@
 
 use super::SqlValue;
 
-/// Double-quote a field name for safe use in SQL.
-///
-/// Any embedded double-quotes are escaped by doubling them. The name is
-/// otherwise verbatim: the DSL has zero aliases (ADR-0013 §6), so the
-/// name you type is the column in DESCRIBE is the identifier in the SQL.
 pub(crate) fn quote_field(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-/// The columns a projection listing `names` writes: each name once, at
-/// its first position, under `DuckDB`'s identifier fold
-/// ([`crate::schema::catalog_key`]).
-///
 /// A repeat would be a second column of one name. `DuckDB` renames it
 /// `host_1` inside a CTE, a column the live lane never makes (it keeps
 /// one `host`) and the relation walk never records.
@@ -28,15 +19,6 @@ pub(crate) fn first_of_each<'a>(names: impl IntoIterator<Item = &'a str>) -> Vec
         .collect()
 }
 
-/// Coerce a string filter value to the most specific `SqlValue`.
-///
-/// Tries `i64`, then `f64`, falls back to `String`.
-///
-/// This is the no-pin branch of the comparison rules (ADR-0011):
-/// unpinned fields, embedded mode, and every typed-pin case the rule
-/// table leaves unchanged route through here via
-/// [`crate::compare::compare_form`], which owns the decision of when a
-/// catalog pin overrides this literal-driven coercion.
 pub(crate) fn coerce_filter_value(s: &str) -> SqlValue {
     if let Ok(i) = s.parse::<i64>() {
         return SqlValue::Int(i);
@@ -56,8 +38,6 @@ mod tests {
         assert_eq!(quote_field(r#"field"name"#), r#""field""name""#);
     }
 
-    /// Zero aliases: `timestamp` and `@timestamp` are ordinary sender
-    /// field names and quote as themselves (ADR-0013 §6).
     #[test]
     fn quote_field_is_verbatim() {
         assert_eq!(quote_field("@timestamp"), "\"@timestamp\"");
@@ -79,8 +59,6 @@ mod tests {
             "an ASCII fold only, as DuckDB folds identifiers"
         );
     }
-
-    // ── coerce_filter_value ─────────────────────────────────────────────
 
     #[test]
     fn coerce_integer() {
@@ -122,7 +100,6 @@ mod tests {
 
     #[test]
     fn coerce_i64_overflow_becomes_float() {
-        // past i64::MAX, so the i64 parse fails and the f64 one wins
         assert_eq!(
             coerce_filter_value("9999999999999999999"),
             SqlValue::Float(9_999_999_999_999_999_999.0)

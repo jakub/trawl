@@ -3,34 +3,12 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Which catalog keys a query binds (ADR-0011).
-//!
-//! The incomplete-results notice on `/api/v1/query` intersects this set with
-//! the degraded-field set: a query that filters on a field whose pin has
-//! been shelving values is answering from data the pin destroyed, whether or
-//! not the field appears in the output. A `where` on a degraded field that
-//! projects it away is exactly the incomplete case, so the walk collects
-//! every bound name — filters, pipeline expressions, group-by keys, sort
-//! keys, projections — not the result columns.
-//!
-//! Not collected: bare-word and quoted text search, and the time filters. A
-//! bare term binds `message` and `_raw`, both envelope VARCHAR pins that
-//! cannot degrade in practice, and counting them would badge every text
-//! query on an install with one bad `_raw`.
-//!
-//! Not pin-scope-aware either. A name a `let` or `stats` invents can enter
-//! the set; it is not a catalog pin, so intersecting with the degraded set
-//! drops it. The one residual is a computed target that shadows a degraded
-//! field name (`| let status = … | where status > 400`), which costs one
-//! false badge on a query that reuses the name — accepted rather than
-//! defended, because the alternative is a second pin-scope walk whose only
-//! consumer is a notice.
 
 use std::collections::BTreeSet;
 
 use crate::ast::{Expr, PipeStage, Query, SearchToken, Spanned};
 use crate::schema;
 
-/// Every catalog key `query` binds, in sorted order.
 #[must_use]
 pub fn referenced_fields(query: &Query) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
@@ -43,24 +21,11 @@ pub fn referenced_fields(query: &Query) -> BTreeSet<String> {
     out
 }
 
-/// Parse `dsl` and collect its bound fields; an unparseable query
-/// contributes nothing.
-///
-/// Total by design: the notice is only ever stamped on a query that already
-/// executed, so a parse failure here means the caller and the executor
-/// disagree — and a notice is not the place to surface that.
 #[must_use]
 pub fn referenced_fields_in(dsl: &str) -> BTreeSet<String> {
     crate::parser::parse(dsl).map_or_else(|_| BTreeSet::new(), |q| referenced_fields(&q))
 }
 
-/// Whether `query` reads `message` or `_raw` without naming them: a text
-/// search, or an `extract` with no `from`.
-///
-/// [`referenced_fields`] leaves these out for the notice's sake (see the
-/// module doc), but they are reads all the same, and a foreign source can
-/// lack either column. The emitter's probe predicate asks here
-/// ([`crate::emitter::needs_input_columns`]).
 #[must_use]
 pub fn reads_text_implicitly(query: &Query) -> bool {
     query
@@ -75,7 +40,6 @@ pub fn reads_text_implicitly(query: &Query) -> bool {
 
 fn token_reads_text(token: &SearchToken) -> bool {
     match token {
-        // A lone `*` is no filter at all.
         SearchToken::TextSearch(t) => t.term != "*",
         SearchToken::QuotedSearch(_) => true,
         SearchToken::Not(inner) => token_reads_text(&inner.node),
@@ -90,9 +54,6 @@ fn token_reads_text(token: &SearchToken) -> bool {
     }
 }
 
-/// The catalog key a DSL field reference names — the ASCII fold, and
-/// nothing else. The DSL has zero aliases (ADR-0013 §6), so a reference
-/// names the column it spells.
 fn key(name: &str) -> String {
     schema::catalog_key(name)
 }
@@ -116,8 +77,6 @@ fn collect_token(token: &SearchToken, out: &mut BTreeSet<String>) {
                 collect_token(&token.node, out);
             }
         }
-        // Whole-event search and the time bounds bind no named field the
-        // notice should speak for (see the module doc).
         SearchToken::TextSearch(_)
         | SearchToken::QuotedSearch(_)
         | SearchToken::TimeFilter(_)
@@ -132,8 +91,6 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
     match stage {
         PipeStage::Where(s) => collect_expr(&s.condition.node, out),
         PipeStage::Let(s) => {
-            // RHS only: the targets are outputs, and a computed target is
-            // not a catalog field however it is spelled.
             for (_, expr) in &s.assignments {
                 collect_expr(&expr.node, out);
             }
@@ -147,10 +104,6 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
             collect_aggs(&s.aggregations, out);
         }
         PipeStage::Timechart(s) => {
-            // Only an explicitly named bucket source is a field
-            // reference. The default is `_time`, which the envelope
-            // always carries, so a plain `timechart` collects nothing
-            // it did not collect before this clause existed.
             if let Some(on) = s.on.as_deref().filter(|c| !crate::schema::is_event_time(c)) {
                 insert(on, out);
             }
@@ -177,23 +130,16 @@ fn collect_stage(stage: &PipeStage, out: &mut BTreeSet<String>) {
         }
         PipeStage::Dedup(s) => insert_all(&s.fields, out),
         PipeStage::Table(s) => insert_all(&s.fields, out),
-        // Sources only: the target is a name the stage creates.
         PipeStage::Rename(s) => {
             for (from, _) in &s.renames {
                 insert(from, out);
             }
         }
-        // `None` reads `message`, which the module doc excludes for the same
-        // reason bare-word search is excluded.
         PipeStage::Extract(s) => {
             if let Some(field) = &s.source_field {
                 insert(field, out);
             }
         }
-        // Stages that bind no field at all. `drop` is one of them on
-        // purpose: it names a column to remove, so nothing downstream can
-        // depend on that column's values and naming it must not badge the
-        // query.
         PipeStage::Drop(_)
         | PipeStage::Limit(_)
         | PipeStage::Tail(_)
@@ -251,8 +197,6 @@ mod tests {
                 "(status=500 OR path=/api/*) service=nginx",
                 &["path", "service", "status"],
             ),
-            // The incomplete case the notice exists for: filtered on,
-            // projected away.
             ("* | where duration > 1 | table host", &["duration", "host"]),
             ("* | let ms = duration * 1000", &["duration"]),
             (
@@ -271,8 +215,6 @@ mod tests {
                 &["duration", "host", "status"],
             ),
             ("* | sort -count, host | dedup host", &["count", "host"]),
-            // `drop` removes a column: the answer cannot depend on its
-            // values, so naming it there binds nothing.
             ("* | where duration > 1 | drop message", &["duration"]),
             ("* | rename service as svc", &["service"]),
             ("* | extract kv from raw_body", &["raw_body"]),
@@ -283,8 +225,6 @@ mod tests {
         }
     }
 
-    /// Whole-event search binds `message`/`_raw` and every query has a time
-    /// bound; badging on those would badge everything.
     #[test]
     fn text_search_and_time_bounds_bind_nothing() {
         for dsl in [
@@ -299,8 +239,6 @@ mod tests {
         }
     }
 
-    /// The notice speaks the catalog's spelling: the ASCII fold, and no
-    /// alias resolution, because the DSL has none (ADR-0013 §6).
     #[test]
     fn names_fold_and_never_alias() {
         assert_eq!(refs("timestamp>\"2026-01-01\""), vec!["timestamp"]);
@@ -310,16 +248,12 @@ mod tests {
         assert_eq!(refs("Status=200"), vec!["status"]);
     }
 
-    /// A query that cannot be parsed contributes nothing — the notice rides
-    /// on successful executions only.
     #[test]
     fn an_unparseable_query_contributes_nothing() {
         assert!(refs("| where |||").is_empty());
         assert!(refs("").is_empty());
     }
 
-    /// Text search and a `from`-less `extract` read `message`/`_raw`
-    /// without naming them; nothing else does.
     #[test]
     fn implicit_text_reads_are_text_search_and_default_extract() {
         let reads = |dsl: &str| reads_text_implicitly(&crate::parser::parse(dsl).expect("parses"));
@@ -347,8 +281,6 @@ mod tests {
         }
     }
 
-    /// Documented residual: a computed target shadowing a real field name
-    /// is over-collected. Pinned here so the cost stays visible.
     #[test]
     fn a_computed_target_shadowing_a_field_is_over_collected() {
         assert_eq!(

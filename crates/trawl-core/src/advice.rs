@@ -5,23 +5,9 @@
 //! Advice on a valid query: a note that names the query its author
 //! probably meant (ADR-0068).
 //!
-//! Advice never gates. It is not a [`crate::parser::ParseError`], and
-//! nothing about it changes whether a query is valid, runs, or what it
-//! returns. Every surface calls [`advise`] on the tree it parsed and draws
-//! the findings as advice, never as errors.
-//!
-//! Two search-stage shapes read like field filters and are text searches:
-//!
-//! - [`AdviceKind::NegatedFieldShape`]: `-service=coredns`, a negated text
-//!   search for the text `service=coredns`.
-//! - [`AdviceKind::SearchStageIn`]: `event_type in (a, b)`, text searches
-//!   for `event_type` and `in` beside a bracketed search group.
-//!
-//! The walk reads only the search stage and holds the nodes still to visit
-//! in a list on the heap, as [`crate::parser`]'s depth check does, so a
-//! deep tree costs heap, not stack. It never parses, formats, clones,
-//! debug-prints or compares the tree: the derived `Clone`, `Debug` and
-//! `PartialEq` recurse.
+//! The walk holds the nodes still to visit in a list on the heap, so a
+//! deep tree costs heap, not stack. It never clones, debug-prints or
+//! compares the tree: the derived `Clone`, `Debug` and `PartialEq` recurse.
 
 use std::ops::Range;
 
@@ -32,7 +18,6 @@ use crate::parser::suggest::{backtick_dsl_field, is_bare_field_name, quote_dsl_f
 /// [`AdviceReport::omitted`] and their copy is never built.
 pub const MAX_ADVICE_FINDINGS: usize = 8;
 
-/// Which shape a finding describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdviceKind {
     /// A negated text term shaped like a field filter: `-service=coredns`.
@@ -42,8 +27,6 @@ pub enum AdviceKind {
     SearchStageIn,
 }
 
-/// One finding: the shape, where it is, and fixed copy that names the
-/// field only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Advice {
     pub kind: AdviceKind,
@@ -70,9 +53,6 @@ const OPERATORS: [&str; 6] = [">=", "<=", "!=", ">", "<", "="];
 
 /// The advice for `query`, a tree a parse admitted, whose spans index the
 /// text it was parsed from.
-///
-/// Findings come in source order. At most [`MAX_ADVICE_FINDINGS`] are
-/// kept; the rest are only counted.
 #[must_use]
 pub fn advise(query: &Query) -> AdviceReport {
     let search = &query.search;
@@ -134,13 +114,11 @@ pub fn advise(query: &Query) -> AdviceReport {
     report
 }
 
-/// A node still to visit: one AND sequence from an index on, or one token.
 enum Work<'a> {
     Seq(&'a [Spanned<SearchToken>], usize),
     Token(&'a Spanned<SearchToken>),
 }
 
-/// A finding before its copy is built.
 enum Pending<'a> {
     Negated {
         span: Range<usize>,
@@ -206,8 +184,8 @@ impl Pending<'_> {
     }
 }
 
-/// The hint for `-name<op>…`. The quoted silencing form keeps the name as
-/// written: there it is text, not a field reference.
+/// The quoted silencing form keeps the name as written: there it is text,
+/// not a field reference.
 fn negated_hint(name: &str, op: &str) -> String {
     let under_not = not_field(name);
     let silence = format!("to keep the text search and silence this, write NOT \"{name}{op}…\"");
@@ -222,7 +200,6 @@ fn negated_hint(name: &str, op: &str) -> String {
     }
 }
 
-/// `name` spelled as a field filter's field.
 fn filter_field(name: &str) -> String {
     // A bare field name is ASCII and never empty, so the renderer always
     // spells it.
@@ -242,9 +219,6 @@ fn not_field(name: &str) -> String {
     }
 }
 
-/// The field name and operator of a term shaped `<field><op><value>`:
-/// split at the first byte of `<>!=`, where the longest operator must
-/// match, with a bare field name before it and at least one byte after.
 fn field_shape(term: &str) -> Option<(&str, &'static str)> {
     let at = term.find(['<', '>', '!', '='])?;
     let (name, rest) = term.split_at(at);
@@ -252,7 +226,6 @@ fn field_shape(term: &str) -> Option<(&str, &'static str)> {
     (rest.len() > op.len() && is_bare_field_name(name)).then_some((name, op))
 }
 
-/// A matched `F in (`, `F not in (` or `F NOT in (` run.
 struct InRun<'a> {
     field: &'a Spanned<SearchToken>,
     name: &'a str,
@@ -272,8 +245,6 @@ impl<'a> InRun<'a> {
     }
 }
 
-/// The run that starts at `tokens[index]`, if one does.
-///
 /// A time clause hoisted out from between the field word and the group
 /// cancels the match: the tokens look adjacent only because the clause
 /// is gone.
@@ -322,7 +293,6 @@ fn in_run<'a>(
     })
 }
 
-/// The term of a positive text search.
 fn positive_term(token: &SearchToken) -> Option<&str> {
     match token {
         SearchToken::TextSearch(TextSearch {

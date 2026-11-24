@@ -4,21 +4,6 @@
 
 //! The live lane's sampling boundaries (ADR-0017 §3), under a fixed
 //! clock.
-//!
-//! Two boundaries, and they are not the same boundary:
-//!
-//! - **pass-through**: one instant per event. A subscription's clock
-//!   advances between rows while each row is internally frozen: every
-//!   `now()` a row reads, in the search-stage window and in every stage
-//!   after it, is one value.
-//! - **aggregate snapshots**: one instant per emitted snapshot, for all
-//!   its post-stage rows. The events that fed that snapshot each sampled
-//!   their own instant, possibly much earlier.
-//!
-//! Nothing here reads a clock: every case names its instants, so a
-//! failure is a semantic change and never a race. That is also the
-//! property under test, since an evaluation path that sampled its own
-//! clock could not be pinned like this at all.
 
 use serde_json::{Map, Value, json};
 use trawl_core::context::EvalContext;
@@ -31,9 +16,6 @@ use trawl_core::stream::{
     StreamPlan, compile_stream_plan,
 };
 
-/// The live lane's doors over a compiled plan, which prepares every
-/// pattern its stages read, so none of them can answer
-/// `PatternError::Missing` here.
 const PREPARED: &str = "a compiled plan prepares every pattern";
 
 fn accept_event(
@@ -68,7 +50,6 @@ fn emit_snapshot(
     stream::emit_snapshot(aggregation, post_stages, ctx).expect(PREPARED)
 }
 
-/// An instant, named rather than sampled.
 fn at(text: &str) -> EvalContext {
     EvalContext::at(
         chrono::DateTime::parse_from_rfc3339(text)
@@ -77,9 +58,6 @@ fn at(text: &str) -> EvalContext {
     )
 }
 
-/// The text a cell holding that instant renders as — the same renderer
-/// the wire and a group key go through, so "byte-identical" is what is
-/// actually asserted.
 fn now_text(ctx: &EvalContext) -> String {
     row::cell_text(&ctx.now_value())
 }
@@ -92,8 +70,6 @@ fn cell(row: &Row, key: &str) -> String {
     row::cell_text(row.get(key).unwrap_or_else(|| panic!("no cell {key:?}")))
 }
 
-/// Compile a whole DSL the way `stream_query` does: one snapshot roots
-/// the filter and the plan.
 fn compile(dsl: &str) -> (CompiledFilter, StreamPlan) {
     let query = trawl_core::parser::parse(dsl).expect("dsl parses");
     let filter =
@@ -131,14 +107,6 @@ fn aggregate(dsl: &str) -> AggregatePlan {
     }
 }
 
-// ── pass-through: one instant per event ────────────────────────────
-
-/// Every `now()` one row reads is one value: across the sibling
-/// assignments of a single `let`, and across a later stage, while the
-/// subscription's clock advances between rows.
-///
-/// The `| where echo == third` is the load-bearing half: if the two
-/// stages sampled separately, the row would not be emitted at all.
 #[test]
 fn one_event_freezes_now_across_siblings_and_a_later_stage() {
     let (filter, mut stages) = pass_through(
@@ -176,16 +144,6 @@ fn one_event_freezes_now_across_siblings_and_a_later_stage() {
     );
 }
 
-/// The search-stage window and the pipeline are one `now()` reader, not
-/// two.
-///
-/// The event is crafted so its fate disagrees between two instants 90
-/// seconds apart: at `admits`, a 60-second window admits it and
-/// `_time >= now()` holds exactly; at `rejects`, the window has moved
-/// past it and the comparison is false. Under two clocks (a per-batch
-/// sample for the filter, a per-event one for the stages) the row is
-/// admitted by one and dropped by the other, in either direction. The
-/// door answers once.
 #[test]
 fn the_filter_and_the_stages_cannot_read_different_clocks() {
     let (filter, mut stages) = pass_through("last=60s | where _time >= now()");
@@ -212,8 +170,6 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
         "a fresher stage clock drops the row the window admitted"
     );
 
-    // And the reverse: the window rejects an event the stage would have
-    // kept.
     assert!(
         !filter
             .matches_at(&ev, &rejects)
@@ -225,7 +181,6 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
         .all(|stage| apply_stage(stage, &mut row, &admits) == StageResult::Pass);
     assert!(survives_stale, "the stage keeps it at the earlier instant");
 
-    // One context per event: one answer, whichever instant it is.
     assert!(
         matches!(
             accept_event(&filter, &mut stages, &ev, &admits),
@@ -240,14 +195,10 @@ fn the_filter_and_the_stages_cannot_read_different_clocks() {
     );
 }
 
-/// The door's `Done` is what ends a subscription, and it does not emit
-/// the event that produced it — the handler stops at the first one.
-///
-/// It also does not un-say it. The subscription's events arrive in bus
-/// batches, and the handler's `break` only covers the batch in hand; a
-/// door that answered `Done` once and then went back to emitting would
-/// put the next batch's events on the wire past `limit N`. The extra
-/// calls below are that next batch.
+/// The subscription's events arrive in bus batches, and the handler's `break`
+/// only covers the batch in hand; a door that answered `Done` once and then
+/// went back to emitting would put the next batch's events on the wire past
+/// `limit N`. The extra calls below are that next batch.
 #[test]
 fn a_limit_reports_done_rather_than_emitting() {
     let (filter, mut stages) = pass_through("* | limit 1");
@@ -267,13 +218,9 @@ fn a_limit_reports_done_rather_than_emitting() {
     }
 }
 
-/// The aggregate lane's pre-stages honour a `limit` too: exactly N
-/// events reach the accumulators.
-///
 /// This lane never stops asking, because an aggregate subscription keeps
 /// running so its snapshots stay current. So a `Done` that fired once and
-/// then lapsed would let every later event feed the accumulators, and the
-/// snapshot would count them.
+/// then lapsed would let every later event feed the accumulators.
 #[test]
 fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -302,11 +249,6 @@ fn a_pre_stage_limit_caps_what_reaches_the_accumulators() {
     );
 }
 
-/// A `limit` after the aggregation caps the snapshot's rows.
-///
-/// Three groups, `limit 1`: the snapshot carries one row. A lapsing
-/// `Done` would drop the second row and let the third through, which is
-/// both over the limit and a silently arbitrary row set.
 #[test]
 fn a_post_stage_limit_caps_a_snapshots_rows() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -332,17 +274,9 @@ fn a_post_stage_limit_caps_a_snapshots_rows() {
     assert_eq!(rows.len(), 1, "one row, not one DROPPED row: {rows:?}");
 }
 
-// ── aggregates: one instant per emitted snapshot ───────────────────
-
-/// Every post-stage row of one snapshot reads one instant, the
-/// snapshot's rather than any feeding event's, and the next snapshot
-/// reads the next one.
-///
 /// Two groups, so "one instant per snapshot" is discriminable from "one
 /// instant per row"; four feeding events at four distinct instants, so
-/// a leak from the feed lane would be visible; and
-/// `| where seen == seen2` drops the row outright if a snapshot's own
-/// two reads ever disagree.
+/// a leak from the feed lane would be visible.
 #[test]
 fn a_snapshot_stamps_one_instant_on_every_group_row() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) = aggregate(
@@ -387,8 +321,6 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
         }
     }
 
-    // A second snapshot over the same accumulators reads the next
-    // instant: the boundary is the emission, not the aggregation.
     let second = at("2026-08-24T11:05:30Z");
     let (_, rows) = emit_snapshot(
         &aggregation,
@@ -401,8 +333,6 @@ fn a_snapshot_stamps_one_instant_on_every_group_row() {
     }
 }
 
-/// The same for a `timechart` snapshot: the span buckets come from the
-/// events, the `now()` comes from the emission.
 #[test]
 fn a_timechart_snapshot_stamps_one_instant_too() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -443,9 +373,6 @@ fn a_timechart_snapshot_stamps_one_instant_too() {
     );
 }
 
-/// The snapshot instant is the caller's sample point, taken before the
-/// rows are: a post-stage that drops a group does not move it for the
-/// survivors.
 #[test]
 fn a_dropped_group_does_not_move_the_survivors_instant() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -473,13 +400,7 @@ fn a_dropped_group_does_not_move_the_survivors_instant() {
     assert_eq!(cell(&rows[0], "seen"), now_text(&snapshot));
 }
 
-/// The other half of ADR-0017 §3's aggregate rule: the events that feed
-/// a snapshot sample per event, exactly as pass-through does.
-///
-/// Grouping on the pre-stage `now()` makes that visible in the snapshot:
-/// two events under one instant are one group, a third under another
-/// instant is a second group. A per-snapshot feed instant would give one
-/// group of three.
+/// A per-snapshot feed instant would give one group of three.
 #[test]
 fn pre_stage_rows_sample_per_event() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -518,16 +439,10 @@ fn pre_stage_rows_sample_per_event() {
     );
 }
 
-// ── the timechart fallback reads the event's context ───────────────
-
-/// An event with no `_time` buckets at its own context's instant.
-///
 /// The instants here are in 2020, so a fresh clock read inside the
-/// fallback would land the event six years away from the bucket
-/// asserted. The pair straddles a span boundary by one second, which is
-/// the finer failure the coarse one hides: the bucket a bucketless event
-/// lands in is decided by the instant its own filter and stages read, not
-/// by a later one.
+/// fallback would land the event years away from the bucket asserted. The
+/// pair straddles a span boundary by one second, which is the finer
+/// failure the coarse one hides.
 #[test]
 fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -564,18 +479,6 @@ fn a_bucketless_event_buckets_at_its_own_contexts_instant() {
     );
 }
 
-/// A post-stage `limit` caps every snapshot, not the plan's lifetime.
-///
-/// ADR-0001 makes batch the contract and streaming the mirror, and an
-/// emitted snapshot is the live rendering of the batch result set: what
-/// `| stats count() by host | limit 1` caps there is one result set, so
-/// here it caps each snapshot. Spending the limit once would leave the
-/// stream permanently silent while the aggregation kept evolving, a
-/// mirror of nothing.
-///
-/// The asymmetry with a pre-aggregation `limit`, which stays sticky for
-/// the subscription's life, is the batch-mirroring one: that end caps
-/// the input set, and batch reads its input once.
 #[test]
 fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
@@ -606,8 +509,6 @@ fn a_post_stage_limit_is_re_armed_for_each_snapshot() {
     );
     assert_eq!(second.len(), 1, "and so does the next one: {second:?}");
 
-    // A pre-stage limit is the other rule, in the same plan shape: it
-    // caps the input once and stays spent.
     let (filter, mut pre_stages, mut aggregation, mut post_stages) =
         aggregate("* | limit 1 | stats count()");
     for i in 0..3 {

@@ -4,16 +4,8 @@
 
 //! The correlation builders under hostile input (ADR-0058).
 //!
-//! For any value without NUL, the composed text parses back to the query
-//! that was built, and the parsed query has the shape the builder
-//! promises: one quoted text search for `sightings`, quoted exact matches
-//! for `context`, the fixed stage list for both and for `compare`. The
-//! assertions read the PARSED text, not the built AST, so they hold
+//! The assertions read the PARSED text, not the built AST, so they hold
 //! independently of `Composed::verify`.
-//!
-//! The last tests run the composed `compare` and `sightings` statements in
-//! `DuckDB` over a small corpus, so the stage list is not only parseable
-//! but executes to the counts, rates and statuses it names.
 
 use std::io::Write as _;
 
@@ -37,10 +29,6 @@ const HOUR_US: i64 = 3_600_000_000;
 /// 2026-10-24T10:00:00Z.
 const T0: i64 = 1_792_836_000_000_000;
 
-// ── Generators ────────────────────────────────────────────────────────
-
-/// A piece of hostile text: the DSL's syntax characters, keywords,
-/// wildcards, newlines and non-ASCII, or any one character but NUL.
 fn hostile_piece() -> impl Strategy<Value = String> {
     prop_oneof![
         3 => prop::sample::select(vec![
@@ -56,7 +44,6 @@ fn hostile_piece() -> impl Strategy<Value = String> {
     ]
 }
 
-/// A string without NUL, rich in DSL syntax.
 fn hostile() -> impl Strategy<Value = String> {
     prop_oneof![
         3 => prop::collection::vec(hostile_piece(), 0..24).prop_map(|parts| parts.concat()),
@@ -64,7 +51,6 @@ fn hostile() -> impl Strategy<Value = String> {
     ]
 }
 
-/// A field name: a plain one, a keyword, or hostile text.
 fn group_name() -> impl Strategy<Value = String> {
     prop_oneof![
         2 => "[a-z_][a-z0-9_]{0,6}",
@@ -76,10 +62,6 @@ fn group_name() -> impl Strategy<Value = String> {
     ]
 }
 
-/// One well-formed filter value: bare and quoted exact text, globs,
-/// regexes (some holding `,`, `|`, a space or a `)`), and comma lists that
-/// mix them. Quoted values include shapes the formatter has to keep quoted
-/// (`"/x"`, `"=a"`, `"a*b"`, `"/foo/"`).
 fn well_formed_value(ordered: bool) -> BoxedStrategy<String> {
     let exact = prop_oneof![
         "[a-z0-9][a-z0-9.-]{0,5}",
@@ -123,7 +105,6 @@ fn well_formed_value(ordered: bool) -> BoxedStrategy<String> {
     .boxed()
 }
 
-/// One field filter under `=`, `!=`, or an ordered operator with exact text.
 fn well_formed_filter_token() -> impl Strategy<Value = String> {
     let field = prop::sample::select(vec!["host", "service", "msg", "path", "k8s.pod"]);
     prop_oneof![
@@ -133,7 +114,6 @@ fn well_formed_filter_token() -> impl Strategy<Value = String> {
     .prop_map(|(field, op, value)| format!("{field}{op}{value}"))
 }
 
-/// Groups of whitespace-joined tokens, joined by ` OR `.
 fn or_of_ands(token: impl Strategy<Value = String>) -> impl Strategy<Value = String> {
     prop::collection::vec(prop::collection::vec(token, 1..3), 1..3).prop_map(|groups| {
         groups
@@ -144,10 +124,6 @@ fn or_of_ands(token: impl Strategy<Value = String>) -> impl Strategy<Value = Str
     })
 }
 
-/// A well-formed search filter: field filters, `NOT`, and parenthesised
-/// groups nested up to three deep. A group closes tight on a regex as
-/// often as it closes after a space, so `(m=/x/)` and `(m=/x/ )` both
-/// occur.
 fn well_formed_filter() -> impl Strategy<Value = String> {
     let token = well_formed_filter_token().prop_recursive(3, 16, 3, |inner| {
         prop_oneof![
@@ -163,8 +139,6 @@ fn well_formed_filter() -> impl Strategy<Value = String> {
     });
     or_of_ands(token)
 }
-
-// ── Parsed-shape helpers ──────────────────────────────────────────────
 
 fn reparse(text: &str) -> Query {
     parse(text).unwrap_or_else(|e| panic!("composed text does not parse: {e:?}\n{text}"))
@@ -185,7 +159,6 @@ fn same_pipeline(a: &Query, b: &Query) -> bool {
     same_query(&alone(a), &alone(b))
 }
 
-/// Whether two search stages have the same canonical form.
 fn same_search(a: SearchStage, b: SearchStage) -> bool {
     let alone = |search| Query {
         search,
@@ -206,13 +179,9 @@ fn no_time_clause(query: &Query) {
     assert!(query.search.hoisted.is_empty());
 }
 
-// ── Properties ────────────────────────────────────────────────────────
-
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(512))]
 
-    /// The literal stays one quoted search token, and the pipeline is the
-    /// one `eventstats` stage, whatever the literal holds.
     #[test]
     fn sightings_literal_never_changes_the_pipeline(literal in hostile()) {
         let built = sightings_query(&literal);
@@ -256,8 +225,6 @@ proptest! {
         }
     }
 
-    /// Env and host values stay quoted exact matches (never a glob, a
-    /// regex or a second token) and add no pipe stage.
     #[test]
     fn context_values_stay_exact_matches(
         env in proptest::option::of(hostile()),
@@ -285,8 +252,6 @@ proptest! {
         prop_assert_eq!(single_group(&parsed), expected);
     }
 
-    /// A group name either is refused by name or reaches the `stats by`
-    /// and the sort exactly, with the stage list unchanged.
     #[test]
     fn compare_group_names_round_trip_or_are_refused(
         names in prop::collection::vec(group_name(), 0..3),
@@ -321,8 +286,6 @@ proptest! {
         prop_assert_eq!(tail, names.iter().map(String::as_str).collect::<Vec<_>>());
     }
 
-    /// A reserved column name in any ASCII case is refused: the DSL reads
-    /// `Compare_Side` as the column `compare_side`.
     #[test]
     fn compare_refuses_reserved_names_in_any_ascii_case(
         (name, cased) in prop::sample::select(COMPARE_COLUMNS.to_vec()).prop_flat_map(|name| {
@@ -353,9 +316,7 @@ proptest! {
         );
     }
 
-    /// Any filter text is either refused by its parse or shape, or becomes
-    /// the search stage it parses to, followed by the fixed stage list. A
-    /// filter that parses always formats faithfully (ADR-0061), so
+    /// A filter that parses always formats faithfully (ADR-0061), so
     /// `BuildError::Reparse` is a defect here, never an accepted refusal.
     #[test]
     fn compare_filter_never_adds_a_stage(filter in hostile()) {
@@ -389,9 +350,6 @@ proptest! {
         prop_assert!(same_search(own.search, parsed.search), "{}", built.text());
     }
 
-    /// A well-formed filter always composes: grouped and negated patterns,
-    /// `!=` patterns, pattern lists and a regex a group closes tight all
-    /// survive the reparse proof.
     #[test]
     fn compare_composes_every_well_formed_filter(filter in well_formed_filter()) {
         let own = parse(&filter)
@@ -409,8 +367,6 @@ proptest! {
         prop_assert!(same_search(own.search, parsed.search), "{}", built.text());
     }
 
-    /// `contains_ci` agrees with folding both sides and searching, and a
-    /// string always contains itself in any case.
     #[test]
     fn contains_ci_is_reflexive_under_case(text in hostile()) {
         prop_assert!(contains_ci(&text, &text));
@@ -449,8 +405,6 @@ fn compare_keeps_the_callers_spelling_of_a_mixed_case_group() {
     assert_eq!(stats.group_by, names);
 }
 
-// ── Execution ─────────────────────────────────────────────────────────
-
 fn anchor() -> EvalContext {
     EvalContext::at(
         chrono::DateTime::parse_from_rfc3339("2026-10-24T12:00:00Z")
@@ -459,7 +413,6 @@ fn anchor() -> EvalContext {
     )
 }
 
-/// Run `dsl` over `events` in `DuckDB`, each output row as a JSON object.
 fn run(dsl: &str, events: &[Value]) -> Vec<serde_json::Map<String, Value>> {
     let mut file = tempfile::Builder::new()
         .suffix(".ndjson")
@@ -521,7 +474,6 @@ fn number(row: &serde_json::Map<String, Value>, key: &str) -> Option<f64> {
 #[test]
 fn compare_executes_to_counts_rates_and_statuses() {
     let events = [
-        // host a: 3 in the foreground, 1 in the baseline.
         event("2026-10-24T10:05:00Z", "auth", "a", "fail"),
         event("2026-10-24T10:06:00Z", "auth", "a", "fail"),
         event("2026-10-24T10:59:59.999999Z", "auth", "a", "fail"),
@@ -532,7 +484,6 @@ fn compare_executes_to_counts_rates_and_statuses() {
         // host c: vanished; the baseline end is exclusive of the fg start.
         event("2026-10-24T09:00:00Z", "auth", "c", "fail"),
         event("2026-10-24T09:59:59Z", "auth", "c", "fail"),
-        // Outside both windows, and outside the filter.
         event("2026-10-24T08:59:59Z", "auth", "d", "fail"),
         event("2026-10-24T11:00:00Z", "auth", "d", "fail"),
         event("2026-10-24T10:10:00Z", "web", "e", "fail"),
@@ -587,7 +538,6 @@ fn compare_executes_to_counts_rates_and_statuses() {
     close(number(&rows[2], "compare_rate_change"), -2.0 / 60.0);
     close(number(&rows[2], "compare_relative_change"), -1.0);
 
-    // A minimum count of 3 keeps only the group that reaches it on one side.
     let composed = compare_query(
         "service=auth",
         Window {
@@ -694,7 +644,6 @@ fn sightings_counts_every_match_per_service_and_env() {
         "{rows:?}"
     );
 
-    // A literal carrying a quote matches it literally.
     let rows = run(
         sightings_query("10.0.4.17 \"quoted\"")
             .expect("builds")

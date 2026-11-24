@@ -2,21 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! DSL query formatter — canonical pretty-printing of parsed queries.
-//!
-//! Takes a parsed AST and produces a consistently formatted DSL string.
-//! One pipe stage per line, tight spacing in the search stage,
-//! minimal parenthesization in expressions.
-//!
 //! [`checked_format_query`] is the only way to format a query: it proves
-//! its text before returning it. The text reparses through
-//! [`parse_unbuilt`] to the query's canonical form ([`same_query`]), or
-//! the call is refused (ADR-0061). A formatted query means what its
-//! source meant.
-//!
-//! Rendering walks an explicit stack, not the call stack: `MAX_EXPR_DEPTH`
-//! bounds nesting, not tree depth, so `1+1+…` folds to a left-leaning
-//! tree as deep as the chain is long.
+//! its text before returning it (ADR-0061).
 
 use std::fmt::{self, Write};
 
@@ -29,18 +16,12 @@ use crate::canonical_form::same_query;
 use crate::parser::suggest::{backtick_dsl_field, quote_dsl_field};
 use crate::parser::{MAX_QUERY_LEN, first_cut, parse_unbuilt};
 
-/// Why [`checked_format_query`] returned no text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FormatError {
-    /// Even the compact layout is longer than [`MAX_QUERY_LEN`]. The query
-    /// itself still parses and runs: whether a query is admitted never
-    /// depends on how long its formatted text would be.
     TooLong {
         /// The length of the compact layout, in bytes.
         bytes: usize,
     },
-    /// The rendered text does not reparse to the query's canonical form.
-    /// This is a formatter defect, logged at error level when it happens.
     Unfaithful,
 }
 
@@ -61,20 +42,6 @@ impl fmt::Display for FormatError {
 
 impl std::error::Error for FormatError {}
 
-/// Format a parsed query, and prove the text means what the query means.
-///
-/// The readable layout comes first (`format_query`). When it is longer
-/// than [`MAX_QUERY_LEN`], the compact layout is tried: every pipe stage
-/// still starts its own line, with no space after its `|` or after a
-/// list's commas. Whichever fits is reparsed through [`parse_unbuilt`] and
-/// compared with [`same_query`], and returned only when the two are equal.
-/// Formatting the returned text again returns the same text.
-///
-/// # Errors
-///
-/// [`FormatError::TooLong`] when the compact layout is longer than
-/// [`MAX_QUERY_LEN`] too, and [`FormatError::Unfaithful`] when the text
-/// does not read back as the query.
 pub fn checked_format_query(query: &Query) -> Result<String, FormatError> {
     let readable = render(query, Layout::Readable);
     let text = if readable.len() <= MAX_QUERY_LEN {
@@ -91,14 +58,8 @@ pub fn checked_format_query(query: &Query) -> Result<String, FormatError> {
     verified(query, text)
 }
 
-/// `text`, when it reparses to `query`'s canonical form.
-///
 /// The reparse reads what the text means and builds none of its patterns:
 /// whether a pattern compiles is not part of what it means.
-///
-/// A mismatch is a formatter defect, so it is logged once, at error level,
-/// with a hash of the text: never the text, which is the query a client
-/// wrote.
 fn verified(query: &Query, text: String) -> Result<String, FormatError> {
     if parse_unbuilt(&text).is_ok_and(|reparsed| same_query(query, &reparsed)) {
         return Ok(text);
@@ -110,7 +71,6 @@ fn verified(query: &Query, text: String) -> Result<String, FormatError> {
     Err(FormatError::Unfaithful)
 }
 
-/// A hex digest of `text`, for a log line that must not carry the text.
 fn text_hash(text: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
@@ -118,19 +78,6 @@ fn text_hash(text: &str) -> String {
     format!("{:016x}", hasher.finish())
 }
 
-/// The readable layout, unchecked: what the tests snapshot.
-///
-/// Test-only on purpose: [`checked_format_query`] is the only way to hand
-/// formatted text to a caller, because only it proves the text reads back
-/// as the query (ADR-0061).
-///
-/// Output uses one pipe stage per line with `| ` prefix, and the time
-/// clauses first:
-/// ```text
-/// last=2h service=nginx _severity=error
-/// | stats count() by host
-/// | where count > 10
-/// ```
 #[cfg(test)]
 fn format_query(query: &Query) -> String {
     render(query, Layout::Readable)
@@ -147,7 +94,6 @@ pub(crate) fn format_agg_expr(agg: &AggExpr, out: &mut String) {
     out.push_str(&renderer.out);
 }
 
-/// Serialize a saved-query name in its DSL literal position.
 pub fn format_saved_name(name: &str) -> String {
     use chumsky::Parser as _;
     if crate::parser::primitives::plain_name()
@@ -161,28 +107,14 @@ pub fn format_saved_name(name: &str) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Spellings
-// ---------------------------------------------------------------------------
-
-/// Field names stored in an AST came through the parser, so the quoted-name
-/// grammar has already proved they are representable. Catalog-backed query
-/// builders use the fallible renderer directly instead.
-///
-/// The fallback echoes the raw name rather than panicking: `parse` cannot
-/// produce a name [`quote_dsl_field`] refuses — its refusal set IS that
-/// production's — so the branch is unreachable for any AST that came from
-/// a query, and a hand-built one is not worth a panic inside a response
-/// path. [`checked_format_query`] refuses the text it would make.
+/// The fallback echoes the raw name rather than panicking:
+/// [`checked_format_query`] refuses the text it would make.
 fn dsl_field(name: &str) -> String {
     quote_dsl_field(name).unwrap_or_else(|| name.to_string())
 }
 
 /// A string rendered for a double-quoted DSL position, escaped as the exact
-/// inverse of `primitives::quoted_string`: a backslash, a quote, and the
-/// three control characters it decodes (`\n`, `\t`, `\r`), so a quoted
-/// string in formatted text holds no raw line break or tab (ADR-0061).
-/// Other control characters have no escape and print as themselves.
+/// inverse of `primitives::quoted_string`.
 fn escape_quoted(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
@@ -198,32 +130,13 @@ fn escape_quoted(text: &str) -> String {
     out
 }
 
-/// Whether an exact filter value needs quoting in the formatted output.
-///
 /// The complement of `primitives::bare_value`, plus `"` which ends the
-/// quoted form — and, because a value position re-lexes more than that one
-/// production, four shapes whose bare rendering would parse back as
-/// something else:
+/// quoted form — and four shapes whose bare rendering would parse back as
+/// something else: a `#`, a value that could open a regex, a glob
+/// character, and a leading `=`, which fuses with the operator before it:
+/// `host>"=a"` written bare is `host>=a`.
 ///
-/// - a `#`, which the grammar refuses inside an unquoted token
-///   (ADR-0014 ruling 2), so `host="a#b"` rendered bare would come back a
-///   parse error rather than the same AST. `//` is deliberately not in
-///   this set: `#` is the only comment opener (ruling 3), so a value
-///   carries slashes freely and quoting them would change nothing but the
-///   spelling;
-/// - a value that could open a regex ([`could_open_a_regex`]);
-/// - a glob character, which the same production reads as a glob in an
-///   unquoted value, so `host!="a*b"` would come back a pattern;
-/// - a leading `=`, which fuses with the operator before it:
-///   `host>"=a"` written bare is `host>=a`. The operator is read longest
-///   first, so no other leading byte fuses (`host<<a` is `<` and `<a`).
-///   Quoted whatever the operator, since quoting an exact value never
-///   changes it.
-///
-/// The operator plays no part in the decision (ADR-0060): it is written as
-/// typed, and the value's kind alone decides how it is spelled. Keeping the
-/// sets aligned is what makes format → reparse yield the same AST for
-/// every exact value shape.
+/// The operator plays no part in the decision (ADR-0060).
 fn needs_quoting(s: &str) -> bool {
     s.is_empty()
         || s.starts_with('=')
@@ -256,10 +169,7 @@ fn needs_quoting(s: &str) -> bool {
 /// (`/foo/bar/`, `/api//v1`) stays bare: the shape closes inside it and
 /// the next byte continues the value. So does one opening with `//`
 /// (`//cdn.example.com/x`), whose shape has an empty body and never
-/// forms. A cut cannot sit inside a bare value, which holds no
-/// whitespace, so the rule needs no case of its own for one; a later cut
-/// only stops a shape this rule already quotes for. The rule quotes what
-/// would change meaning and nothing more.
+/// forms.
 fn could_open_a_regex(s: &str) -> bool {
     let Some(rest) = s.strip_prefix('/') else {
         return false;
@@ -273,11 +183,6 @@ fn could_open_a_regex(s: &str) -> bool {
 /// Whether `body` printed as `/body/` after `matches` reads back as the
 /// string `body`: the shape (`primitives::slash_run`: a body of at least
 /// one byte, none of them `/`) and the body rule ([`first_cut`]).
-///
-/// A string that fails either prints quoted instead. A quoted `matches`
-/// string is a string literal as a `/body/` one is, so both spellings give
-/// the same AST, and the parser gives both the same pattern checks
-/// (ADR-0063): a body that one spelling refuses, the other refuses too.
 fn spells_as_regex_literal(body: &str) -> bool {
     !body.is_empty() && !body.contains('/') && first_cut(body).is_none()
 }
@@ -293,8 +198,6 @@ fn is_negative_literal(expr: &Expr) -> bool {
     }
 }
 
-/// The precedence of a comparison: `==` and its kin, `matches`, `like`,
-/// `ilike`, and an `in` list.
 const COMPARISON: u8 = 4;
 
 /// Operator precedence (higher = binds tighter), the levels of
@@ -317,29 +220,17 @@ fn precedence(op: BinaryOp) -> u8 {
     }
 }
 
-/// The precedence of `not`, below every comparison.
 const NOT: u8 = 3;
 
-/// The precedence of a unary minus, above every binary operator.
 const NEG: u8 = 7;
 
-// ---------------------------------------------------------------------------
-// The renderer
-// ---------------------------------------------------------------------------
-
-/// How a rendering lays a query out.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Layout {
-    /// `| ` before each pipe stage and `, ` between list items.
     Readable,
-    /// `|` before each pipe stage and `,` between list items, for a query
-    /// whose readable layout is longer than [`MAX_QUERY_LEN`]. A 49 KB
-    /// `in (…)` list of short ids is 66 KB readable.
     Compact,
 }
 
 impl Layout {
-    /// What opens each pipe stage's line.
     fn stage_opener(self) -> &'static str {
         match self {
             Self::Readable => "| ",
@@ -347,9 +238,7 @@ impl Layout {
         }
     }
 
-    /// What separates the items of a list: fields, aggregates, arguments,
-    /// assignments, renames and `in` items. A filter value's list takes
-    /// no space in either layout.
+    /// A filter value's list takes no space in either layout.
     fn comma(self) -> &'static str {
         match self {
             Self::Readable => ", ",
@@ -358,23 +247,15 @@ impl Layout {
     }
 }
 
-/// Context for expression formatting — controls how certain literals render.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ExprContext {
     Normal,
-    /// RHS of a `matches` operator — a string literal renders as `/regex/`
-    /// when that spelling reads back as the same string
-    /// ([`spells_as_regex_literal`]).
     MatchesRhs,
 }
 
-/// One piece of output still to write. Pieces wait on an explicit stack,
-/// so a deep tree costs heap rather than call stack.
 enum Piece<'q> {
     Text(&'static str),
-    /// A binary operator, with a space on each side.
     Op(BinaryOp),
-    /// A search token. `under_not` when it sits directly under `NOT`.
     Token {
         token: &'q SearchToken,
         under_not: bool,
@@ -387,7 +268,6 @@ enum Piece<'q> {
     },
 }
 
-/// Renders one query, or one aggregate, into `out`.
 struct Renderer<'q> {
     out: String,
     layout: Layout,
@@ -417,7 +297,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// Write every pending piece, in order.
     fn drain(&mut self) {
         while let Some(piece) = self.pending.pop() {
             match piece {
@@ -435,13 +314,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    // -- search stage -------------------------------------------------------
-
-    /// The time clauses print first, in the order `last`, `earliest`,
-    /// `latest`, and the groups after them (ADR-0061). A clause applies to
-    /// the whole search wherever it sat, and printed after the groups it
-    /// would change the token before it: `last=1h NOT` is the search word
-    /// `NOT`, while `NOT last=1h` puts the clause under `NOT`.
     fn search(&mut self, search: &'q SearchStage) {
         let mut clauses = Vec::new();
         if let Some(ref tf) = search.time_filter {
@@ -465,7 +337,6 @@ impl<'q> Renderer<'q> {
         self.drain();
     }
 
-    /// Queue OR-separated groups of space-joined tokens.
     fn push_groups(&mut self, groups: &'q [Vec<Spanned<SearchToken>>]) {
         for (i, group) in groups.iter().enumerate().rev() {
             for (j, token) in group.iter().enumerate().rev() {
@@ -551,18 +422,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// Spell one value by its kind: a regex as `/body/`, a glob bare, and an
-    /// exact value quoted when its bare spelling would read as anything else.
-    ///
-    /// A glob is never quoted, because quoting makes it exact. So a glob whose
-    /// bare spelling would re-lex as something else — one holding whitespace
-    /// or a `#`, or opening with a complete quoted string — has no spelling
-    /// (ADR-0060 names the gap), and nor does a glob that
-    /// [could open a regex](could_open_a_regex): one opening with `/` and
-    /// holding no second `/`, which a later `/` closes into a regex (`/a*,b/`,
-    /// `f=/a* g=b/`). A glob spelled like a regex (`/a*/`) has none either, but
-    /// the parser never makes one: a bare value of that shape is a regex, or
-    /// an invalid-regex error (`/*/`).
     fn scalar(&mut self, scalar: &Scalar) {
         match scalar {
             Scalar::Regex(body) => {
@@ -575,8 +434,6 @@ impl<'q> Renderer<'q> {
             Scalar::Exact(s) => self.out.push_str(s),
         }
     }
-
-    // -- pipe stages --------------------------------------------------------
 
     fn stage(&mut self, stage: &'q PipeStage) {
         match stage {
@@ -660,7 +517,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// Render a field-name list (`table a, b`, `by a, b`).
     fn field_list(&mut self, fields: &[String]) {
         for (i, field) in fields.iter().enumerate() {
             if i > 0 {
@@ -670,7 +526,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// A ` by a, b` clause, when there are fields to group by.
     fn by(&mut self, fields: &[String]) {
         if !fields.is_empty() {
             self.out.push_str(" by ");
@@ -743,11 +598,10 @@ impl<'q> Renderer<'q> {
         self.by(&s.group_by);
     }
 
-    /// A `from saved` stage.
     fn saved_source(&mut self, s: &FromSavedStage) {
         let _ = write!(self.out, "from saved {}", format_saved_name(&s.name));
         match s.run {
-            SavedRunSelector::Latest => {} // default, don't emit
+            SavedRunSelector::Latest => {}
             SavedRunSelector::All => self.out.push_str(" run=all"),
             SavedRunSelector::Specific(id) => {
                 let _ = write!(self.out, " run={id}");
@@ -755,9 +609,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    // -- expressions --------------------------------------------------------
-
-    /// Render a whole expression, in a position that needs no parentheses.
     fn expr_root(&mut self, expr: &'q Expr) {
         self.pending.push(Piece::Expr {
             expr,
@@ -847,7 +698,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// Write `(` when `parens`, and say whether it did.
     fn open(&mut self, parens: bool) -> bool {
         if parens {
             self.out.push('(');
@@ -863,7 +713,6 @@ impl<'q> Renderer<'q> {
         }
     }
 
-    /// Queue comma-separated expressions, each needing no parentheses.
     fn push_list(&mut self, items: &'q [Spanned<Expr>]) {
         for (i, item) in items.iter().enumerate().rev() {
             self.pending.push(Piece::Expr {
@@ -900,21 +749,14 @@ impl<'q> Renderer<'q> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Parse → format helper.
     fn fmt(input: &str) -> String {
         let query = crate::parser::parse(input).unwrap();
         format_query(&query)
     }
-
-    // ── search stage ──────────────────────────────────────────────
 
     #[test]
     fn bare_star() {
@@ -949,15 +791,8 @@ mod tests {
         assert_eq!(fmt("host=web-01"), "host=web-01");
     }
 
-    /// The invariant the whole formatter rests on: format → reparse
-    /// yields the same AST. Idempotence alone does not prove it — a value
-    /// that re-lexes as a different kind reformats to itself while meaning
-    /// something else — so this compares the parsed queries by canonical form, spans aside.
-    ///
-    /// [`generated::a_formatted_query_reparses_to_the_same_ast`] proves it
-    /// for generated queries. These are shrunk cases it and its
-    /// search-only predecessor found, kept so they never depend on it
-    /// finding them again.
+    /// Shrunk cases the generated property found, kept so they never depend
+    /// on it finding them again.
     #[test]
     fn a_formatted_filter_value_reparses_to_the_same_ast() {
         fn parsed(dsl: &str) -> Query {
@@ -986,18 +821,6 @@ mod tests {
         }
     }
 
-    /// Generated queries for the format → reparse property.
-    ///
-    /// The domain is every AST shape `parse` makes, and nothing is left out
-    /// for being hard to spell. A search stage of field filters, text
-    /// terms, quoted phrases, `NOT` and groups, nested at most three deep,
-    /// with or without each time slot; and a pipeline of every stage, with
-    /// expressions over every operator, literal kind, function call and
-    /// `in` list. Field names are drawn from every shape the name
-    /// productions read: bare and dotted, keyword-named or keyword-prefixed
-    /// (`OR.a`, `not`, `last`), `@` names, and names only backticks can
-    /// spell. The formatter decides how to spell each one.
-    ///
     /// An exclusion is allowed only where the parser cannot make the AST,
     /// and each names the parse error or the production that makes it
     /// unreachable:
@@ -1065,8 +888,6 @@ mod tests {
             Spanned::new(node, 0..0)
         }
 
-        // ── names ────────────────────────────────────────────────────
-
         fn field() -> impl Strategy<Value = String> + Clone {
             let keywords: Vec<&'static str> = FIELD_START_KEYWORDS
                 .iter()
@@ -1094,7 +915,6 @@ mod tests {
             prop::collection::vec(field(), len)
         }
 
-        /// A name a stage writes.
         fn target() -> impl Strategy<Value = String> + Clone {
             field().prop_filter(
                 "assignment_target refuses a name in the reserved namespace",
@@ -1105,8 +925,6 @@ mod tests {
         fn distinct_targets(names: &[&str]) -> bool {
             crate::schema::duplicate_target_message(names.iter().copied(), "stage").is_none()
         }
-
-        // ── the search stage ─────────────────────────────────────────
 
         fn exact() -> impl Strategy<Value = Scalar> + Clone {
             let pieces = vec![
@@ -1408,8 +1226,6 @@ mod tests {
                 })
         }
 
-        // ── expressions ──────────────────────────────────────────────
-
         /// A float token as `primitives::float` reads one: its integer
         /// part takes no leading zero (`text::int`).
         fn float_text() -> impl Strategy<Value = String> + Clone {
@@ -1526,8 +1342,6 @@ mod tests {
                 ]
             })
         }
-
-        // ── the pipeline ─────────────────────────────────────────────
 
         fn agg() -> impl Strategy<Value = AggExpr> + Clone {
             (
@@ -1676,10 +1490,6 @@ mod tests {
         proptest! {
             #![proptest_config(ProptestConfig::with_cases(1024))]
 
-            /// `parse(format(q))` has `q`'s canonical form, for every
-            /// generated query: the formatter spells each token so the
-            /// parser reads it back, beside every neighbour and in every
-            /// nesting, and formatting the text again gives the same text.
             #[test]
             fn a_formatted_query_reparses_to_the_same_ast(query in query()) {
                 let text = super::super::checked_format_query(&query).map_err(|e| {
@@ -1694,13 +1504,6 @@ mod tests {
         }
     }
 
-    // ── generated query text ──────────────────────────────────────
-
-    /// What formatting `src` came to, when it parses: `Ok` for text that
-    /// reparses to the same canonical form and formats again to itself,
-    /// or for a too-long refusal; `Err` with what went wrong otherwise.
-    /// `None` when `src` does not parse, so there is nothing to format.
-    ///
     /// The reparse and the second format are done here rather than
     /// trusted to the checked renderer under test.
     fn format_verdict(src: &str) -> Option<Result<(), String>> {
@@ -1733,11 +1536,6 @@ mod tests {
         }
     }
 
-    /// Query text built from every token kind ADR-0061 lists, so the
-    /// property reaches what the parser accepts rather than what an AST
-    /// generator chose to build. Each strategy yields text; whether it
-    /// parses is the parser's call, and the property keeps what it
-    /// accepts.
     mod text {
         use proptest::prelude::*;
 
@@ -1745,9 +1543,6 @@ mod tests {
             prop::sample::select(items).prop_map(str::to_owned)
         }
 
-        /// Field names: plain and dotted, keyword-prefixed bare and
-        /// backticked, `@` names bare and backticked, and backticked
-        /// names that need it for a space, a backtick or a `#`.
         const NAMES: &[&str] = &[
             "host",
             "a.b",
@@ -1803,9 +1598,6 @@ mod tests {
             "`1a`",
         ];
 
-        /// Filter values of every kind: exact bare and quoted (with
-        /// quotes, escapes, `#`, a leading `=` or `/`), globs including
-        /// slash-opening ones, regexes, and lists that mix them.
         const VALUES: &[&str] = &[
             "web",
             "200",
@@ -1860,8 +1652,6 @@ mod tests {
         /// pattern operators come up more often.
         const FILTER_OPS: &[&str] = &["=", "=", "=", "!=", "!=", ">", ">=", "<", "<="];
 
-        /// Bare text terms, including the words and dashes the grammar
-        /// reads specially next to another token.
         const TERMS: &[&str] = &[
             "error",
             "NOT",
@@ -1933,8 +1723,6 @@ mod tests {
             r#"earliest="2026-03-14T09:00:00+05:30""#,
         ];
 
-        /// What sits between two search tokens: spaces, an `OR`, a line
-        /// break, a comment, and non-ASCII layout (U+00A0, U+2003).
         const SEARCH_GAPS: &[&str] = &[
             " ",
             " ",
@@ -2011,8 +1799,6 @@ mod tests {
             ]
         }
 
-        /// Expression atoms: names, every literal kind (with signs and
-        /// strings a regex literal cannot spell), and regex literals.
         const ATOMS: &[&str] = &[
             "host",
             "a.b",
@@ -2081,7 +1867,6 @@ mod tests {
             })
         }
 
-        /// Names a stage writes: `let` targets, aliases, renames.
         const TARGETS: &[&str] = &[
             "x", "y.z", "`OR.a`", "`true.a`", "`not`", "`a b`", "@t", "`last`", "n",
         ];
@@ -2107,7 +1892,6 @@ mod tests {
             ]
         }
 
-        /// Every pipe stage, with expressions where it takes them.
         fn stage() -> impl Strategy<Value = String> {
             prop_oneof![
                 4 => expr().prop_map(|e| format!("where {e}")),
@@ -2165,8 +1949,6 @@ mod tests {
             ]
         }
 
-        /// What opens a pipe stage: tight or spaced, on the same line
-        /// or a new one, or after a comment.
         const STAGE_OPENERS: &[&str] = &[" | ", "|", "\n| ", "\n|", " # c\n| "];
 
         pub(super) fn query() -> impl Strategy<Value = String> {
@@ -2192,10 +1974,8 @@ mod tests {
             ..proptest::prelude::ProptestConfig::default()
         })]
 
-        /// Every generated query text that parses formats to text that
-        /// reads back as the same query, or is refused as too long
-        /// (ADR-0061). 4096 cases count only the inputs that parse: one
-        /// that does not is rejected and another drawn.
+        /// 4096 cases count only the inputs that parse: one that does not is
+        /// rejected and another drawn.
         #[test]
         fn accepted_text_formats_faithfully(src in text::query()) {
             let verdict = format_verdict(&src);
@@ -2206,8 +1986,6 @@ mod tests {
         }
     }
 
-    /// Each risky token, written in the search stage, for
-    /// [`token_spellings_survive_every_neighbour`].
     const NEIGHBOUR_TOKENS: [(&str, &str); 13] = [
         ("NOT", "NOT"),
         ("NOT-", "NOT-"),
@@ -2227,7 +2005,6 @@ mod tests {
         ("a regex with a space", "msg=/a b/"),
     ];
 
-    /// Each context around a risky token, spelled as the text around `{}`.
     const NEIGHBOUR_CONTEXTS: [(&str, &[&str]); 7] = [
         ("a comma", &["{},b", "{} ,b", "f={},b", "x {},b"]),
         ("`)`", &["({})", "(a {})", "(a OR {})", "NOT ({})"]),
@@ -2278,10 +2055,6 @@ mod tests {
         ),
     ];
 
-    /// Each token whose spelling depends on what follows it, beside each
-    /// following context, formats faithfully (ADR-0061). A pair spelled
-    /// several ways counts as covered when at least one spelling parses;
-    /// every spelling that parses must format faithfully.
     #[test]
     fn token_spellings_survive_every_neighbour() {
         // A regex in an expression, beside the contexts an expression has.
@@ -2348,14 +2121,7 @@ mod tests {
         assert!(failures.is_empty(), "{}", failures.join("\n"));
     }
 
-    /// One named test per formatter defect ADR-0061 lists, each an input
-    /// that `parse` accepts and whose formatted text used to mean
-    /// something else or not parse at all. Every test goes through
-    /// [`assert_faithful`](regressions::assert_faithful), so the module
-    /// runs unchanged against an older tree with only the helpers
-    /// swapped (the red run in `docs/evidence/issue-332/`).
     mod regressions {
-        // ── helpers ──────────────────────────────────────────────────
         use crate::ast::Query;
         use crate::canonical_form::same_query;
         use crate::parser::parse;
@@ -2364,8 +2130,6 @@ mod tests {
             parse(src).unwrap_or_else(|e| panic!("{} must parse: {e:?}", shown(src)))
         }
 
-        /// `text` for a failure message: whole when short, else its
-        /// start and its length.
         fn shown(text: &str) -> String {
             match text.char_indices().nth(80) {
                 None => format!("{text:?}"),
@@ -2378,14 +2142,11 @@ mod tests {
                 .unwrap_or_else(|e| panic!("{}: formatting refused: {e}", shown(src)))
         }
 
-        /// The text `src` formats to.
         fn formatted(src: &str) -> String {
             checked(src, &parsed(src))
         }
 
-        /// `src` formats to text that reparses to the same canonical
-        /// form, and formatting that text again gives the same text. The
-        /// reparse is repeated here rather than trusted to the renderer
+        /// The reparse is repeated here rather than trusted to the renderer
         /// under test.
         fn assert_faithful(src: &str) {
             let query = parsed(src);
@@ -2410,7 +2171,6 @@ mod tests {
                 shown(&text)
             );
         }
-        // ── end of helpers ───────────────────────────────────────────
 
         /// `` `OR.a` `` printed bare re-lexes as the group separator `OR`
         /// and a text search, and the filter disappears.
@@ -2450,15 +2210,11 @@ mod tests {
             assert_faithful("* | let x = `not.a`");
         }
 
-        /// `NOT` negates the next token only when a backtick, a word
-        /// character, a quote, `-` or `(` starts it, so a bare `@x` after
-        /// `NOT` leaves `NOT` a search word.
         #[test]
         fn not_keeps_a_backticked_at_name() {
             assert_faithful("NOT `@x`=1");
         }
 
-        /// A `matches` string holding `/` cannot be spelled `/body/`.
         #[test]
         fn matches_a_string_holding_a_slash() {
             assert_faithful(r#"* | where m matches "a/b""#);
@@ -2530,15 +2286,13 @@ mod tests {
             assert_faithful(&format!("*{}", "|head 1".repeat(8000)));
         }
 
-        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
-        /// regex closes its group tight.
+        /// A regex closes its group tight (ADR-0060).
         #[test]
         fn a_regex_before_a_closing_parenthesis() {
             assert_faithful("(a OR msg=/x/ )");
         }
 
-        /// Fixed before ADR-0061 (ADR-0060), kept so it stays fixed: a
-        /// value that opens with `"` and never closes it has no faithful
+        /// A value that opens with `"` and never closes it has no faithful
         /// spelling, so it does not parse.
         #[test]
         fn an_unclosed_quote_under_an_ordered_operator() {
@@ -2546,11 +2300,6 @@ mod tests {
         }
     }
 
-    // ── the checked renderer ──────────────────────────────────────
-
-    /// The head chain of [`regressions::a_56_kb_head_chain`]: its readable
-    /// layout is past the query limit, so the compact one is returned,
-    /// still one stage per line.
     #[test]
     fn a_head_chain_past_the_limit_takes_the_compact_layout() {
         let query = crate::parser::parse(&format!("*{}", "|head 1".repeat(8000))).expect("parses");
@@ -2560,8 +2309,6 @@ mod tests {
         assert!(text.len() <= MAX_QUERY_LEN);
     }
 
-    /// Every stage the compact layout prints still starts its own line,
-    /// and every list it shortens reads back the same.
     #[test]
     fn the_compact_layout_reads_back_the_same() {
         for dsl in [
@@ -2592,8 +2339,7 @@ mod tests {
     }
 
     /// Escaping grows a quoted string, so a query under the limit can
-    /// format past it in both layouts. It is refused with the length, and
-    /// no shortened text comes back.
+    /// format past it in both layouts.
     #[test]
     fn a_too_long_rendering_is_refused_not_truncated() {
         let dsl = format!("\"{}\"", "\t".repeat(40_000));
@@ -2614,11 +2360,8 @@ mod tests {
     /// that dispatcher, so the capture would see nothing.
     static UNFAITHFUL_LOG: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-    /// One event a test dispatcher saw: its level, and each field's name
-    /// and rendered value.
     type Seen = (tracing::Level, Vec<(String, String)>);
 
-    /// The events a test dispatcher saw.
     #[derive(Clone, Default)]
     struct Events(std::sync::Arc<std::sync::Mutex<Vec<Seen>>>);
 
@@ -2654,9 +2397,6 @@ mod tests {
         fn exit(&self, _: &tracing::span::Id) {}
     }
 
-    /// Text that reads back as another query is refused, through the
-    /// check every rendering passes ([`verified`]). A faithful text that
-    /// differs only in layout passes it.
     #[test]
     fn a_candidate_that_reads_back_differently_is_refused() {
         let _log = UNFAITHFUL_LOG
@@ -2681,8 +2421,6 @@ mod tests {
         );
     }
 
-    /// Proving a text builds none of its patterns: the query built them
-    /// when it was parsed, and the reparse is one parse that builds none.
     #[test]
     fn verifying_a_text_builds_no_pattern() {
         let query = crate::parser::parse(
@@ -2698,9 +2436,6 @@ mod tests {
         assert_eq!(crate::parser::thread_parses() - parses, 1);
     }
 
-    /// An AST the parser never makes (a text term holding `=`) renders as
-    /// a field filter. The checked renderer refuses it and logs one error
-    /// carrying a hash of the text, never the text.
     #[test]
     fn an_unfaithful_rendering_is_refused_and_logged_without_its_text() {
         let mut query = crate::parser::parse("x").expect("parses");
@@ -2734,12 +2469,6 @@ mod tests {
         );
     }
 
-    /// Rendering walks an explicit stack, so a flat chain far deeper than
-    /// the parser admits renders on a tokio worker's 2 MiB stack in a
-    /// debug build. Such a tree comes only from code, and the checked
-    /// renderer refuses it as too long before its reparse once the text
-    /// passes `MAX_QUERY_LEN`. At the tree depth limit, every shape renders,
-    /// reads back and compares as the same query.
     #[test]
     fn flat_chains_format_on_a_worker_stack() {
         use crate::parser::depth_fixtures::{flat_chain, int, shapes, spliced, unary_run};
@@ -2816,9 +2545,6 @@ mod tests {
         }
     }
 
-    /// Quoted output escapes the three control characters
-    /// `primitives::quoted_string` decodes, so formatted text never
-    /// carries a raw line break or tab inside a quoted string.
     #[test]
     fn quoted_output_escapes_line_breaks_and_tabs() {
         for (dsl, want) in [
@@ -2835,9 +2561,6 @@ mod tests {
         }
     }
 
-    /// A hand-built AST can carry a name the grammar would never produce.
-    /// The formatter sits on a response path, so it renders what it was
-    /// given instead of panicking there.
     #[test]
     fn an_inexpressible_name_does_not_panic_the_formatter() {
         let mut query = crate::parser::parse("| table host").expect("parses");
@@ -2848,8 +2571,6 @@ mod tests {
         assert_eq!(format_query(&query), "| table a\u{202e}b");
     }
 
-    /// …and the rule stays tight: a value whose bare spelling parses back
-    /// unchanged is not quoted just for carrying a special character.
     #[test]
     fn values_that_round_trip_bare_are_not_quoted() {
         for (dsl, want) in [
@@ -2868,9 +2589,6 @@ mod tests {
         }
     }
 
-    /// A quoted search phrase prints escaped as `quoted_string` reads it,
-    /// so a phrase holding quotes or backslashes parses back as the same
-    /// one phrase instead of splitting into other search terms or groups.
     #[test]
     fn quoted_phrases_with_quotes_and_backslashes_round_trip() {
         for dsl in [
@@ -2910,12 +2628,6 @@ mod tests {
         }
     }
 
-    /// The absolute bounds are quoted strings too, so they print escaped
-    /// the same way and keep the text they were written with. The cast
-    /// reads a tab or a line break as the date/time separator, but no
-    /// timestamp holds a quote or a backslash, so a bound spelling one is
-    /// refused before anything formats it (ADR-0017's amendment of
-    /// 2026-11-08).
     #[test]
     fn quoted_time_bounds_round_trip() {
         let original = crate::parser::parse(
@@ -2990,7 +2702,6 @@ mod tests {
         insta::assert_snapshot!(fmt("message=/error.*/"), @"message=/error.*/");
     }
 
-    /// A regex closes its group tight (ADR-0060).
     #[test]
     fn a_regex_closes_its_group_tight() {
         insta::assert_snapshot!(fmt("(a OR msg=/x/ )"), @"(a OR msg=/x/)");
@@ -3048,8 +2759,6 @@ mod tests {
     fn not_token() {
         insta::assert_snapshot!(fmt("NOT service=nginx"), @"NOT service=nginx");
     }
-
-    // ── pipe stages ───────────────────────────────────────────────
 
     #[test]
     fn full_pipeline() {
@@ -3304,11 +3013,8 @@ mod tests {
         );
     }
 
-    // ── expressions ───────────────────────────────────────────────
-
     #[test]
     fn expr_minimal_parens() {
-        // a + b * c needs no parens: mul binds tighter
         insta::assert_snapshot!(
             fmt("* | let x = a + b * c"),
             @r"
@@ -3320,7 +3026,6 @@ mod tests {
 
     #[test]
     fn expr_needed_parens() {
-        // (a + b) * c needs parens
         insta::assert_snapshot!(
             fmt("* | let x = (a + b) * c"),
             @r"
@@ -3363,10 +3068,6 @@ mod tests {
         );
     }
 
-    /// Capital boolean operators print lowercase; a field whose name, or
-    /// first dot segment, a capital keyword claims prints backticked, and
-    /// `AND.x`, which no keyword claims, prints bare. Each reads back as
-    /// the query it came from (ADR-0061).
     #[test]
     fn uppercase_operators_format_lowercase() {
         insta::assert_snapshot!(
@@ -3424,8 +3125,6 @@ mod tests {
         );
     }
 
-    // ── round-trip / idempotency ──────────────────────────────────
-
     #[test]
     fn idempotent() {
         let input = "service=nginx   _severity=error last=2h  |stats count() by host|where count>10|sort -count|head 20";
@@ -3443,8 +3142,6 @@ mod tests {
         );
     }
 
-    // ── empty / edge cases ────────────────────────────────────────
-
     #[test]
     fn pipe_only_no_search() {
         insta::assert_snapshot!(fmt("| head 10"), @"| head 10");
@@ -3461,11 +3158,6 @@ mod tests {
         );
     }
 
-    // ── backtick-requiring names (ADR-0013 ruling 7) ──────────────
-
-    /// Every field name prints through the one DSL renderer, so a
-    /// formatted query parses back to the query it came from — including
-    /// names only backticks can spell.
     #[test]
     fn hostile_names_round_trip_through_the_formatter() {
         for dsl in [
@@ -3501,9 +3193,6 @@ mod tests {
         }
     }
 
-    /// The three grammar keywords are fields only backticks can reach,
-    /// so the formatter always quotes them — a printed query must not
-    /// turn a field filter into a time filter.
     #[test]
     fn the_grammar_keywords_print_quoted() {
         insta::assert_snapshot!(fmt("`last`=5 last=2h"), @"last=2h `last`=5");

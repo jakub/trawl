@@ -2,23 +2,10 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! The single source of the `timechart` bucket width.
-//!
-//! An explicit `span=` always wins; otherwise the width is picked from a
-//! fixed table keyed by how far back the query's time filter looks. Three
-//! callers ask this same question and must all get the same answer
-//! (ADR-0038): the SQL emitter (`emitter::pipeline::process_timechart`),
-//! the live stream compiler (`stream::compile_aggregation`), and the web
-//! chart, which asks it indirectly through [`query_span`] to size its
-//! x-axis before any row has arrived.
+//! The single source of the `timechart` bucket width (ADR-0038).
 
 use crate::ast::{PipeStage, Query, TimeUnit, TrawlDuration};
 
-/// Resolve the bucket width for a `timechart` stage.
-///
-/// An explicit `span` is returned unchanged. Otherwise the width is
-/// picked from the automatic band table, keyed by `last`'s duration (or
-/// no filter at all, which is treated the same as "an hour or less").
 #[must_use]
 pub fn resolve_span(span: Option<TrawlDuration>, last: Option<TrawlDuration>) -> TrawlDuration {
     if let Some(span) = span {
@@ -44,12 +31,8 @@ pub fn resolve_span(span: Option<TrawlDuration>, last: Option<TrawlDuration>) ->
     TrawlDuration { quantity, unit }
 }
 
-/// The bucket width a parsed query's `timechart` stage would use, if it
-/// has one.
-///
-/// `None` when the pipeline carries no `timechart` stage at all. When it
-/// carries more than one, the last stage is the one whose output the
-/// query actually returns, so it is the one asked.
+/// When the pipeline carries more than one `timechart`, the last stage is
+/// the one whose output the query actually returns, so it is the one asked.
 #[must_use]
 pub fn query_span(query: &Query) -> Option<TrawlDuration> {
     let tc = query.pipeline.iter().rev().find_map(|s| match &s.node {

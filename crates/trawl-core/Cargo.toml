@@ -8,9 +8,6 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-# `pattern::thread_builds` and `parser::thread_parses`, the per-thread regex
-# build and parse counters, and `text_layout::SPAN_CASES`, the span table
-# every client's caret tests read, for other crates' tests.
 test-support = []
 
 [dependencies]
