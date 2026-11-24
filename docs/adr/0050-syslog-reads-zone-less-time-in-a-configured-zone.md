@@ -51,3 +51,4 @@ An RFC 3164 frame carries wall-clock time with no zone and often no year: `Oct  
 A comment audit on 2026-11-23 removed these rulings from the code, where they were the only record. They were already in force. None is a new decision.
 
 - **`SyslogPeerFault` carries no key, value, service, or zone, and the `allow_cidrs` index is the only thing it adds to the setting path.** A `sender_timezones` or `source_service_map` key is a peer address from the configuration, so a fault that held it would let `Display` or `Debug` echo configuration (ADR-0047).
+- **A TOML error inside `sender_timezones` or `source_service_map` names the map, never the key.** The parser's error path would otherwise end in the peer address, such as `syslog.sender_timezones.10.0.0.1`, and that address is configuration. `without_peer_key` in `trawl-config` cuts the path back to the map before the error is shown (ADR-0047).

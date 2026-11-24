@@ -255,6 +255,7 @@ A comment audit on 2026-11-23 removed these rulings from the code, where they we
 
 - **Every field of `RequestRecord` holds a closed-set literal or a number, never text from the request or from an error.** The record is the source of the failure event, so text kept out of the record cannot reach the event by any path.
 - **An `Unrecorded` failure event carries `reached`, the furthest `Progress` mark the request passed.** The producer that recorded nothing is the thing to fix, and `reached` is the only lead to where it sits.
+- **`failure::failure_observer` sits directly inside `request_id_middleware` and outside the `TraceLayer`, and the `TraceLayer` logs no failure (`on_failure(())`).** Inside the request id, the observer has the id when it starts, and every other layer runs inside the record it scopes. Outside the `TraceLayer`, its one event per 5xx is emitted after the `http_request` span closes, so the event carries only the fields it names and never inherits the span's raw path or user agent.
 - **A panic in a task the request awaits becomes `ServerError::Panicked` with a fixed label, through `ServerError::from_join`.** That panic never unwinds the request, so the outer panic catcher never sees it. The error must stay typed up to the request, or the event reports an ordinary internal error. The request still answers with the fixed 500 sentence. A job row stores fixed text, such as `repin scan task panicked`. The payload is dropped unread, because `JoinError`'s `Display` quotes it.
 
 **The panic diagnostic.**

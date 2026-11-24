@@ -244,6 +244,7 @@ A comment audit on 2026-11-23 removed these rulings from the code, where they we
 
 - **`trawl-api` has no `duckdb` dependency, and its result types do not mirror DuckDB's.** The public API stays stable when the `duckdb` crate changes version.
 - **An `integer` cell decodes only from the canonical spelling the encoder writes, `-?(0|[1-9][0-9]*)`.** A sign on a positive value, leading zeros, `-0` and whitespace are refused (`land_decimal`), so hand-written clients cannot drift into spellings that other readers take differently.
+- **Correction.** The parquet export does not carry exact types for a `HUGEINT` column. DuckDB's parquet writer stores it as `DOUBLE`, so a `sum(id)` column that the query answers as `integer` reads back from the export as `float`. The test module `result_types_agree_across_query_saved_and_export` in `crates/trawl-engine/tests/absent_field.rs` pins this. This corrects the sentence "the parquet export carries exact types" in the 2026-10-22 amendment.
 
 **Charting a named column**
 
@@ -254,6 +255,8 @@ A comment audit on 2026-11-23 removed these rulings from the code, where they we
 - **A run's result is a parquet file, a zero-row run included, and a typed blob is kept only when parquet cannot hold the result exactly or the parquet write fails.** Parquet cannot hold a zero-column result or a `mixed` column, because parquet has no union type. `from saved` reads a zero-column blob as an empty source and refuses any other blob with a 409 that names the run.
 - **The stored type of an `integer` column comes from its cells: `BIGINT` when every cell fits `i64` or there is no cell, `UBIGINT` when some cell is above `i64::MAX` and none is negative.** A column that needs both a negative value and a value above `i64::MAX` has no exact stored type, because DuckDB's parquet writer stores `HUGEINT` as `DOUBLE`, which rounds above 2^53. The writer refuses that column (`StoredType::of`), and the run keeps a typed blob. Reading the file maps both stored types back to `integer`. A timestamp is stored as `TIMESTAMP` in UTC, the way the corpus stores `_time`.
 - **A run that names a file answers from that file or not at all.** `get_report_run` never falls back to the blob. A fallback would answer 200 with `result: null` beside a non-zero `row_count`, and every client would then describe a successful run as having no result data.
+- **`run=N` and `run=latest` resolve a run through one function, `source_for_run`, so a run id that names the latest run answers exactly as `run=latest` does.** The two selectors differ only in how they find the run, never in what a run means. A run with a typed blob that has columns refuses with a 409, not a 404 or a 500: the run exists and `GET /saved/{id}/runs/{run_id}` serves it, and for `run=latest` the next scheduled run replaces it.
+- **A read of a recorded run, through `from saved` or a capture of one, reads the run's own result and never the hot buffer (`ReadInput::Recorded`).** The recorded result is self-contained. The hot buffer holds live events, and a union would add them to a result that a past run already answered.
 
 **A missing run result**
 
