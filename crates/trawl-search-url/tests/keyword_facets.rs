@@ -2,9 +2,6 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! A facet on a field whose first dot segment is a field-start keyword
-//! keeps its predicate through the merge.
-//!
 //! Rendered bare, `OR.a="x"` is the search stage's OR separator followed
 //! by text, so the filter would vanish from the merged query. The merge
 //! renders facet fields through `quote_dsl_field`, which must backtick

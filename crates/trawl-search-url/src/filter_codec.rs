@@ -3,11 +3,6 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! Versioned, opaque encoding for the search URL's structured filters.
-//!
-//! The router percent-decodes query parameters before state sees them. A
-//! structural comma/equals codec therefore cannot safely carry arbitrary
-//! catalog names. JSON gives the payload one schema; unpadded base64url gives
-//! it an alphabet `URLSearchParams` leaves untouched.
 
 use std::fmt;
 
@@ -37,15 +32,10 @@ struct WireFilterFields {
     value: String,
 }
 
-/// A record is an OBJECT, never a JSON array.
-///
-/// serde's derived deserializer accepts both shapes: `{"op":"+",…}` and
-/// the positional `["+","host","web-01"]`. The array form is three to
-/// four times denser than the object form this codec writes, so a
-/// payload inside the raw `f` cap could decode into a filter set whose
-/// canonical re-encoding is well past it — a link the reader accepts and
-/// the producer cannot write back. Asking for a map closes that gap at
-/// the shape, and `decode_filters` re-checks the canonical size anyway.
+/// serde's derived deserializer also accepts the positional
+/// `["+","host","web-01"]`, which is denser than the object form this
+/// codec writes, so a payload inside the raw `f` cap could decode into a
+/// filter set whose canonical re-encoding is well past it.
 impl<'de> Deserialize<'de> for WireFilter {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ObjectOnly;
@@ -83,25 +73,13 @@ pub fn encode_payload<'a>(parts: impl Iterator<Item = (char, &'a str, &'a str)>)
     format!("{VERSION}{}", Base64UrlUnpadded::encode_string(&json))
 }
 
-/// Why a payload could not be decoded. The two cases stay apart because
-/// they are different claims about the link: one was never written by
-/// this codec, the other says it was and is not (ADR-0027). Neither is
-/// "zero filters" — a payload that decodes to nothing would run a wider
-/// query than the link says it does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PayloadError {
-    /// No `v1.` prefix: not a payload this codec ever wrote.
     NotVersioned,
-    /// Versioned, but the base64 or the JSON inside it did not decode.
     Undecodable,
-    /// Decoded, but a record is not one this codec writes: an operator
-    /// other than `+`/`-`, or an empty field name. Dropping the record
-    /// and returning the rest would run a query the link does not
-    /// describe, which is the whole thing ADR-0027 refuses.
     InvalidRecord,
 }
 
-/// Decode a payload written by this codec.
 pub fn decode_payload(raw: &str) -> Result<Vec<(char, String, String)>, PayloadError> {
     let encoded = raw
         .strip_prefix(VERSION)
@@ -151,11 +129,6 @@ mod tests {
         }
     }
 
-    /// The three answers stay apart: an unversioned payload, a
-    /// versioned one that does not decode, and a payload that decodes to
-    /// no filters at all. Only the third is an empty filter set, and the
-    /// URL reader refuses to run the first two rather than treating them
-    /// as one (ADR-0027).
     #[test]
     fn legacy_and_malformed_payloads_are_distinguished() {
         assert_eq!(
@@ -173,22 +146,16 @@ mod tests {
             Err(PayloadError::Undecodable)
         );
         assert_eq!(decode_payload("v1."), Err(PayloadError::Undecodable));
-        // …and an honestly empty list.
         assert_eq!(
             decode_payload(&encode_payload(std::iter::empty())),
             Ok(Vec::new())
         );
     }
 
-    /// The positional array form serde's derived reader would have
-    /// accepted. It is not a shape this codec writes, and it is dense
-    /// enough that a payload inside the raw cap decodes into filters
-    /// whose object-shaped re-encoding is far past it.
     #[test]
     fn a_positional_array_record_is_not_a_filter() {
         for json in [
             r#"[["+","host","web-01"]]"#,
-            // Mixed shapes fail whole, like every other bad record.
             r#"[{"op":"+","field":"host","value":"web-01"},["-","source","auth.log"]]"#,
         ] {
             let payload = format!(
@@ -203,15 +170,11 @@ mod tests {
         }
     }
 
-    /// A record this codec would never write fails the WHOLE payload.
-    /// Skipping it and returning the rest was the same lie by another
-    /// route: the link says two filters, the query carries one.
     #[test]
     fn an_unwritable_record_fails_the_whole_payload() {
         for parts in [
             vec![('x', "host", "prod")],
             vec![('+', "", "prod")],
-            // …including when the other records are perfectly good.
             vec![('+', "host", "web-01"), ('x', "source", "auth.log")],
             vec![('+', "host", "web-01"), ('-', "", "auth.log")],
         ] {
