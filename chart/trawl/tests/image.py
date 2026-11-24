@@ -27,8 +27,7 @@ class ImageSelection(unittest.TestCase):
     def assert_images(self, result, tag):
         self.assertEqual(result.returncode, 0, result.stderr)
         # All four containers of the default pod (init-auth, init-tls-dir,
-        # trawld, trawl-web) must use exactly the selected image. The Helm
-        # connection-test hook uses busybox and is not an app container.
+        # trawld, trawl-web) must use exactly the selected image.
         images = re.findall(r'^\s+image: (ghcr.io/jakub/trawl:\S+)$',
                             result.stdout, re.MULTILINE)
         self.assertEqual(images, [f"ghcr.io/jakub/trawl:{tag}"] * 4)
@@ -88,7 +87,6 @@ class ImageSelection(unittest.TestCase):
             root = Path(directory)
             selected = root / "product-chart"
             shutil.copytree(CHART, selected)
-            # Model a product revision that differs from the tooling checkout.
             metadata = selected / "Chart.yaml"
             metadata.write_text(re.sub(r"(?m)^description:.*$",
                                       "description: Selected product revision", metadata.read_text()))

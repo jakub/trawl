@@ -2,20 +2,11 @@
 # Pull a release's container image and Helm chart from ghcr.io with no
 # credentials, the way an evaluator without a GitHub account pulls them.
 #
-# Usage: check-anonymous-pulls.sh TAG IMAGE_REPOSITORY CHART_REPOSITORY
-#   TAG               a release tag, for example v0.9.0
-#   IMAGE_REPOSITORY  for example ghcr.io/jakub/trawl
-#   CHART_REPOSITORY  for example oci://ghcr.io/jakub/charts
-#
 # Docker and Helm read their registry credentials from their config files.
 # Both get fresh empty ones here, so no stored login can be offered.
-# release_version.py accepts the tags the release resolver accepts and names
-# what the release publishes for one. The image is pulled as
-# IMAGE_REPOSITORY:IMAGE_TAG, the tag release.yml pushes, which drops any
-# build metadata. The chart is pulled as CHART_REPOSITORY/trawl at VERSION,
-# TAG without its leading v: helm push stores a + in VERSION as _ in the OCI
-# tag, and helm pull maps it back. Each pull is tried three times, because a
-# registry may take a moment to serve a tag it has just accepted.
+# helm push stores a + in VERSION as _ in the OCI tag, and helm pull maps it
+# back. Each pull is tried three times, because a registry may take a moment
+# to serve a tag it has just accepted.
 set -euo pipefail
 
 [[ $# -eq 3 ]] || { echo "usage: check-anonymous-pulls.sh TAG IMAGE_REPOSITORY CHART_REPOSITORY" >&2; exit 2; }

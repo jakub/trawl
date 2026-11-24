@@ -22,8 +22,6 @@ CHART = Path(__file__).resolve().parents[1]
 RELEASE = "launch"
 FULLNAME = f"{RELEASE}-trawl"
 
-# Where each workload kind keeps its pod spec. A rendered object of any other
-# kind that carries containers fails the test instead of going unchecked.
 POD_SPEC_PATHS = {
     "Pod": ("spec",),
     "StatefulSet": ("spec", "template", "spec"),
@@ -35,33 +33,27 @@ POD_SPEC_PATHS = {
 }
 CONTAINER_LISTS = ("initContainers", "containers", "ephemeralContainers")
 
-# Oldest Kubernetes the chart supports (README); the profile tables match its
-# pod-security-admission policy, read from
-# https://raw.githubusercontent.com/kubernetes/kubernetes/v1.26.15/staging/src/k8s.io/pod-security-admission/policy/check_sysctls.go
-# and the check_*.go files beside it. Later releases only widen these
+# Oldest Kubernetes the chart supports (README). Later releases only widen these
 # allowlists, so a pod that passes the 1.26 tables passes every newer one.
 # Checks a later release adds, such as host probes and the appArmorProfile
 # field, stay in, because a newer cluster enforces them.
 KUBERNETES_MINIMUM = "1.26"
 
-# Baseline "Capabilities": what a container may add.
 BASELINE_CAPABILITIES = {
     "AUDIT_WRITE", "CHOWN", "DAC_OVERRIDE", "FOWNER", "FSETID", "KILL", "MKNOD",
     "NET_BIND_SERVICE", "SETFCAP", "SETGID", "SETPCAP", "SETUID", "SYS_CHROOT",
 }
-# Restricted "Capabilities": the only one a container may add back.
 RESTRICTED_CAPABILITIES = {"NET_BIND_SERVICE"}
-# Baseline "SELinux": the allowed types. user and role must stay unset.
 # container_engine_t joins the list only in Kubernetes 1.31.
 SELINUX_TYPES = {"", "container_t", "container_init_t", "container_kvm_t"}
-# Baseline "Sysctls": the safe set. The ip_local_reserved_ports, tcp keepalive
+# The ip_local_reserved_ports, tcp keepalive
 # and tcp_fin_timeout sysctls join it only in Kubernetes 1.27 and 1.29.
 SAFE_SYSCTLS = {
     "kernel.shm_rmid_forced", "net.ipv4.ip_local_port_range",
     "net.ipv4.ip_unprivileged_port_start", "net.ipv4.tcp_syncookies",
     "net.ipv4.ping_group_range",
 }
-# Restricted "Volume Types". A StatefulSet's volumeClaimTemplates become
+# A StatefulSet's volumeClaimTemplates become
 # persistentVolumeClaim volumes, which this list allows.
 RESTRICTED_VOLUMES = {
     "configMap", "csi", "downwardAPI", "emptyDir", "ephemeral",
@@ -83,8 +75,6 @@ def render(settings=None):
             for path in (chart / "templates").rglob("*.yaml")
             if not path.name.startswith("_")
         )
-        # include renders each template file by its registered name. The
-        # fixture splits the output into documents and decodes each one.
         (chart / "templates/pod-security-test.yaml").write_text(
             "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: pod-security-test\ndata:\n"
             "  objects: {{ $objects := list }}"
@@ -140,8 +130,6 @@ def pods(objects):
             if carries_containers(obj):
                 raise AssertionError(f"{label} carries containers but no pod spec path is known for it")
             continue
-        # The pod's own metadata sits beside its spec: the object's for a
-        # Pod, the pod template's for a controller.
         template = obj
         for key in path[:-1]:
             template = template[key]
@@ -167,22 +155,18 @@ def violations(metadata, spec):
     def bad(where, control, detail):
         found.append((where, control, detail))
 
-    # Baseline: Host Namespaces.
     for field in ("hostNetwork", "hostPID", "hostIPC"):
         if spec.get(field):
             bad("pod", "host namespaces", field)
-    # Baseline: HostPath Volumes. Restricted: Volume Types.
     for volume in spec.get("volumes") or []:
         sources = {key for key, value in volume.items() if key != "name" and value is not None}
         if "hostPath" in sources:
             bad(f"volume {volume['name']}", "hostPath volumes", "hostPath")
         if not sources & RESTRICTED_VOLUMES or sources - RESTRICTED_VOLUMES:
             bad(f"volume {volume['name']}", "volume types", sorted(sources))
-    # Baseline: Sysctls.
     for sysctl in pod_sc.get("sysctls") or []:
         if sysctl.get("name") not in SAFE_SYSCTLS:
             bad("pod", "sysctls", sysctl.get("name"))
-    # Baseline: AppArmor, the beta annotation form.
     for key, value in (metadata.get("annotations") or {}).items():
         if key.startswith(APPARMOR_ANNOTATION) and not (
             value == "runtime/default" or value.startswith("localhost/")
@@ -190,7 +174,6 @@ def violations(metadata, spec):
             bad("pod", "apparmor", f"{key}={value}")
 
     def common(where, sc):
-        # Rules that read the pod and each container's securityContext alike.
         if (sc.get("windowsOptions") or {}).get("hostProcess"):
             bad(where, "hostprocess", "windowsOptions.hostProcess")
         apparmor = (sc.get("appArmorProfile") or {}).get("type")
@@ -210,8 +193,6 @@ def violations(metadata, spec):
 
     common("pod", pod_sc)
     pod_seccomp = (pod_sc.get("seccompProfile") or {}).get("type") in SECCOMP_TYPES
-    # Restricted: Running as Non-root. The pod may leave it unset or set it
-    # true, never false, even when every container sets it true.
     pod_non_root = pod_sc.get("runAsNonRoot")
     if pod_non_root is False:
         bad("pod", "running as non-root", pod_non_root)
@@ -219,7 +200,6 @@ def violations(metadata, spec):
         where = f"{field}[{container['name']}]"
         sc = container.get("securityContext") or {}
         common(where, sc)
-        # Baseline: Privileged Containers, /proc Mount Type, Host Ports.
         if sc.get("privileged"):
             bad(where, "privileged", "privileged")
         if sc.get("procMount", "Default") != "Default":
@@ -227,14 +207,12 @@ def violations(metadata, spec):
         for port in container.get("ports") or []:
             if port.get("hostPort"):
                 bad(where, "host ports", port["hostPort"])
-        # Baseline: Host Probes / Lifecycle Hooks.
         handlers = [container.get(p) for p in ("livenessProbe", "readinessProbe", "startupProbe")]
         handlers += list((container.get("lifecycle") or {}).values())
         for handler in handlers:
             for action in HOOK_ACTIONS:
                 if ((handler or {}).get(action) or {}).get("host"):
                     bad(where, "host probes", f"{action}.host")
-        # Baseline and Restricted: Capabilities.
         capabilities = sc.get("capabilities") or {}
         for capability in capabilities.get("add") or []:
             if capability not in BASELINE_CAPABILITIES:
@@ -243,15 +221,11 @@ def violations(metadata, spec):
                 bad(where, "restricted capabilities", capability)
         if "ALL" not in (capabilities.get("drop") or []):
             bad(where, "restricted capabilities", "drop lacks ALL")
-        # Restricted: Privilege Escalation.
         if sc.get("allowPrivilegeEscalation") is not False:
             bad(where, "privilege escalation", sc.get("allowPrivilegeEscalation"))
-        # Restricted: Running as Non-root. A container may leave it unset
-        # only when the pod sets it true, and may never set it false.
         non_root = sc.get("runAsNonRoot")
         if non_root is False or (non_root is None and pod_non_root is not True):
             bad(where, "running as non-root", non_root)
-        # Restricted: Seccomp. Set at the pod, or on every container.
         if not pod_seccomp and (sc.get("seccompProfile") or {}).get("type") not in SECCOMP_TYPES:
             bad(where, "seccomp", "no RuntimeDefault or Localhost profile")
     return found
@@ -267,8 +241,6 @@ class PodSecurity(unittest.TestCase):
         }
 
     def test_every_rendered_pod_passes_restricted(self):
-        # The StatefulSet and the helm test hook are both inspected, with the
-        # containers each one is meant to run.
         names = {
             label: [c["name"] for _, c in containers(spec)]
             for label, (_, spec, _) in self.default.items()
@@ -282,7 +254,6 @@ class PodSecurity(unittest.TestCase):
                 self.assertEqual(violations(metadata, spec), [])
                 self.assertEqual(spec["securityContext"]["seccompProfile"], {"type": "RuntimeDefault"})
         self.assertEqual(self.default[f"StatefulSet/{FULLNAME}"][2], ["data"])
-        # The sidecar's own /tmp (ADR-0052) is among the volumes checked above.
         volumes = {v["name"]: v for v in self.default[f"StatefulSet/{FULLNAME}"][1]["volumes"]}
         self.assertIn("emptyDir", volumes["web-tmp"])
 
@@ -296,9 +267,7 @@ class PodSecurity(unittest.TestCase):
         ])
         self.assertEqual(violations(*self.crash[f"Pod/{FULLNAME}-test-connection"][:2]), [])
         self.assertEqual(claims, ["data", "cores"])
-        # Apart from that one capability, every pod's securityContext and every
-        # container's is the one the default render has, pod-level
-        # RuntimeDefault seccomp included. Outside that capability no
+        # Outside that capability no
         # container adds any, in either render. Restricted would allow
         # NET_BIND_SERVICE, so its check alone cannot hold the chart to this.
         self.assertEqual(spec["securityContext"]["seccompProfile"], {"type": "RuntimeDefault"})
@@ -329,9 +298,6 @@ class PodSecurity(unittest.TestCase):
         self.assertNotIn("volumes", spec)
 
     def test_checker_catches_each_rule(self):
-        # The default StatefulSet with one rule broken at a time. Each must
-        # produce exactly the named control, so a check that silently reads
-        # nothing cannot pass the tests above.
         base_metadata, base_spec, _ = self.default[f"StatefulSet/{FULLNAME}"]
 
         def trawld(spec):
@@ -367,15 +333,12 @@ class PodSecurity(unittest.TestCase):
             with self.subTest(control=control):
                 metadata, spec = copy.deepcopy(base_metadata), copy.deepcopy(base_spec)
                 mutate(metadata, spec)
-                # hostPath is also missing from Restricted's volume list.
                 expected = {control} | ({"volume types"} if control == "hostPath volumes" else set())
                 self.assertEqual({v[1] for v in violations(metadata, spec)}, expected)
 
-        # An explicit pod-level false is the pod's own violation.
         spec = copy.deepcopy(base_spec)
         spec["securityContext"]["runAsNonRoot"] = False
         self.assertEqual(violations(base_metadata, spec), [("pod", "running as non-root", False)])
-        # Seccomp: Unconfined anywhere, or no profile at either level.
         spec = copy.deepcopy(base_spec)
         sc(spec)["seccompProfile"] = {"type": "Unconfined"}
         self.assertEqual(violations(base_metadata, spec), [("containers[trawld]", "seccomp", "Unconfined")])
@@ -388,14 +351,12 @@ class PodSecurity(unittest.TestCase):
                 "containers[trawld]", "containers[trawl-web]",
             )},
         )
-        # Capabilities: an unlisted add, and a drop without ALL.
         spec = copy.deepcopy(base_spec)
         sc(spec)["capabilities"] = {"drop": ["NET_RAW"], "add": ["CHOWN"]}
         self.assertEqual(violations(base_metadata, spec), [
             ("containers[trawld]", "restricted capabilities", "CHOWN"),
             ("containers[trawld]", "restricted capabilities", "drop lacks ALL"),
         ])
-        # The beta AppArmor annotation on the pod template.
         metadata = copy.deepcopy(base_metadata)
         metadata.setdefault("annotations", {})[f"{APPARMOR_ANNOTATION}trawld"] = "unconfined"
         self.assertEqual({v[1] for v in violations(metadata, base_spec)}, {"apparmor"})

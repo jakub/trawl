@@ -40,17 +40,13 @@ import tomllib
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config/vector/debian"
 FIXTURES = ROOT / "target/vector-collector-tests"
-# The delivered events of the all-source run, which
-# crates/trawl-server/tests/ingest_preview.rs posts to a real trawld.
 CAPTURE = ROOT / "crates/trawl-server/tests/fixtures/vector-capture/debian.ndjson"
 REGENERATE = "--regenerate-capture"
-# The most diff text a capture mismatch prints.
 MAX_CAPTURE_DIFF = 20000
 VECTOR = os.environ.get("VECTOR_BIN", "vector")
 ENV = dict(os.environ, VECTOR_DANGEROUSLY_ALLOW_ENV_VAR_INTERPOLATION="true",
            TRAWL_URL="http://127.0.0.1:1", TRAWL_INGEST_TOKEN="fixture-token",
            TRAWL_ENV="prod")
-# Do not inherit another installation's configuration selection.
 ENV.pop("VECTOR_CONFIG", None)
 ENV.pop("VECTOR_CONFIG_DIR", None)
 ENV.pop("VAR", None)
@@ -61,7 +57,6 @@ GUIDE = ROOT / "docs/src/content/docs/getting-started/vector-integration.md"
 # The guide's capture recipe, and the host paths it reads, which the run below
 # points at fixture copies.
 CAPTURE_MARKER = "<!-- proof:capture-sample -->"
-# The guide's opt-in variant: a shell variable set before the capture block.
 CAPTURE_RECENT_MARKER = "<!-- proof:capture-recent -->"
 LIVE_CONFIG_DIR = "/etc/vector/vector.d"
 LIVE_ENV_FILE = "/etc/vector/trawl.env"
@@ -74,15 +69,13 @@ MAX_PREVIEW_EVENTS = 500
 MAX_PREVIEW_BODY_BYTES = 128 * 1024
 # A zone that is never UTC, for the postgresql drop-in's line times.
 POSTGRES_ZONE = "America/New_York"
-# The read time every stdin fixture carries.
 FIXTURE_TIME = "2026-09-28T10:30:45.123456Z"
 # The reserved fields trawld accepts from a producer as sent
 # (trawl-server ingest::envelope::is_proposable).
 PROPOSABLE = ("_time", "_raw")
-# A kept-field expectation: the delivered event has no such key.
 MISSING = object()
 # The journal identity fields and the names journal_enriched keeps them
-# under, verbatim, whenever the journal set them (ADR-0053).
+# under (ADR-0053).
 JOURNAL_KEPT = [("_SYSTEMD_UNIT", "systemd_unit"), ("_SYSTEMD_USER_UNIT", "systemd_user_unit"),
                 ("SYSLOG_IDENTIFIER", "syslog_identifier"), ("_COMM", "comm")]
 
@@ -132,7 +125,6 @@ def fixtures(suppress):
 
     add("journald", "journal-accepted", "sshd", _SYSTEMD_UNIT="sshd.service", PRIORITY="6")
     add("journald", "journal-warning", "sshd", "warn", SYSLOG_IDENTIFIER="sshd", PRIORITY="4")
-    # The noise policy drops only ttyS0's serial getty, by its unit.
     add("journald", "serial-console", None if suppress else "serial-getty",
         kept={"systemd_unit": "serial-getty@ttyS0.service"},
         _SYSTEMD_UNIT="serial-getty@ttyS0.service")
@@ -140,8 +132,6 @@ def fixtures(suppress):
         kept={"systemd_unit": "serial-getty@ttyS1.service"},
         _SYSTEMD_UNIT="serial-getty@ttyS1.service")
     add("journald", "serial-getty restart", None if suppress else "init", SYSLOG_IDENTIFIER="init")
-    # The journal service is the first candidate trawld accepts (ADR-0053):
-    # the unit, then SYSLOG_IDENTIFIER, then _COMM, else the marked fallback.
     # Backslashes are the journal's literal systemd escapes.
     add("journald", "template-postgresql", "postgresql",
         kept={"systemd_unit": "postgresql@17-main.service"},
@@ -165,8 +155,6 @@ def fixtures(suppress):
     add("journald", "sd-pam", "sd-pam",
         kept={"systemd_unit": MISSING, "syslog_identifier": "(sd-pam)", "comm": "(sd-pam)"},
         SYSLOG_IDENTIFIER="(sd-pam)", _COMM="(sd-pam)")
-    # These reach `service` only through the third candidate, _COMM: there is
-    # no unit and no accepted SYSLOG_IDENTIFIER to supply it.
     add("journald", "comm-only", "sd-pam",
         kept={"systemd_unit": MISSING, "syslog_identifier": MISSING, "comm": "(sd-pam)"},
         _COMM="(sd-pam)")
@@ -197,13 +185,10 @@ def fixtures(suppress):
         SYSLOG_IDENTIFIER="/usr/bin/x y", _COMM="(a b)")
     add("journald", "no-identity", "journal-unidentified",
         kept={k: MISSING for k in ("systemd_unit", "systemd_user_unit", "syslog_identifier", "comm")})
-    # PID1 reports on another unit in journald's own UNIT field, which stays
-    # beside the kept systemd_unit; trawld folds it to `unit`.
     add("journald", "journal-pid1", "init",
         kept={"UNIT": "foo.service", "systemd_unit": "init.scope", "unit": MISSING},
         _SYSTEMD_UNIT="init.scope", UNIT="foo.service", SYSLOG_IDENTIFIER="systemd",
         _COMM="systemd")
-    # A user-session entry carries trusted fields beyond the common set.
     # base.toml drops every underscore field, so none reaches trawld's
     # reserved prefix, under either spelling.
     session_fields = dict(_SYSTEMD_OWNER_UID="1000", _SYSTEMD_SESSION="4",
@@ -232,8 +217,6 @@ def fixtures(suppress):
     add("docker", "docker-image-digest", "redis", kept={"image": digest}, image=digest)
     add("docker", "docker-image-unusable", "docker-unidentified",
         kept={"image": "registry.example/"}, image="registry.example/")
-    # The priority does not fall through: a refused compose label is marked
-    # even beside a valid container name.
     add("docker", "docker-compose-invalid", "docker-unidentified",
         kept={"docker_compose_service": "my web", "container_name": "ok"},
         label={"com.docker.compose.service": "my web"}, container_name="/ok")
@@ -254,7 +237,6 @@ def fixtures(suppress):
         add(service, service, service)
     # run() sets TZ to a zone that is never UTC: a UTC line keeps its own
     # instant, and a line in that zone's abbreviation is read in that zone.
-    # postgresql_zones() covers the other zone cases.
     add("postgresql", "postgresql-utc", "postgresql",
         message="2026-09-28 10:30:45.123 UTC [4242] LOG:  checkpoint starting: time")
     add("postgresql", "postgresql-local", "postgresql", "error",
@@ -367,8 +349,6 @@ def run(tcp, suppress, tls="http"):
             config["sources"]["fixture"] = dict(type="stdin", decoding={"codec": "json"})
             path = Path(directory) / "vector.json"
             path.write_text(json.dumps(config))
-            # Ports are selected dynamically and scoped to loopback. Bind failure
-            # is a test failure, never permission to contact another listener.
             for reservation in reservations:
                 reservation.close()
             with (Path(directory) / "vector.log").open("w+") as log:
@@ -403,8 +383,6 @@ def run(tcp, suppress, tls="http"):
                     time.sleep(0.05)
                 process.stdin.write("".join(json.dumps(e) + "\n" for e in events))
                 process.stdin.flush()
-                # Each frame carries its own time and hostname. The message
-                # names the fixture.
                 frames = [("unifi-{}", "f492bfa1554cU6-Lite-6.7.4915634", "unifi-u6-lite"),
                           ("unifi-plain-{}", "sshd", "sshd"),
                           ("unifi-appname-{}", "foo/bar", "syslog-unidentified")]
@@ -441,9 +419,6 @@ def run(tcp, suppress, tls="http"):
                             assert key not in event, (key, event)
                         else:
                             assert event.get(key, MISSING) == value, (key, event)
-                    # No field reaches trawld's reserved prefix beyond the two
-                    # a producer may propose (_time, _raw), and no journal
-                    # identity field leaves under its journald name.
                     leaked = [k for k in event
                               if (k.startswith("_") and k not in PROPOSABLE)
                               or k == "SYSLOG_IDENTIFIER"]
@@ -543,8 +518,6 @@ def postgresql_zones():
                     continue
                 got = event.get("_time", read)
                 if got == read:
-                    # The read time the stdin source stamped, as for any line
-                    # without a time of its own.
                     stamped = datetime.datetime.fromisoformat(event["timestamp"]).timestamp()
                     assert started - 1 <= stamped <= time.time() + 1, event
                 if got != want:
@@ -717,8 +690,6 @@ def run_capture(directory, live, env_file, inputs, crash=False, full=False, noco
                                 timeout=90)
     assert result.stdout == b"", "the capture leaked events to the terminal"
     [capture] = directory.glob("tmp.*")
-    # The captured lines are root-readable logs: they stay in the operator's
-    # private directory, and nothing lands in the working directory.
     assert capture.stat().st_mode & 0o777 == 0o700, oct(capture.stat().st_mode)
     assert capture.stat().st_uid == os.getuid()
     assert not any(work.iterdir()), list(work.iterdir())
@@ -729,8 +700,6 @@ def capture_events(directory, live, env_file, inputs):
     """Run the capture block, assert it ran as the guide says, return its file."""
     result, capture, _work = run_capture(directory, live, env_file, inputs)
     assert result.returncode == 0, result.stderr.decode(errors="replace")
-    # The configuration the capture ran: the service's files less the sink
-    # and the syslog drop-in, with a console sink and its own data_dir.
     files = {path.name: tomllib.loads(path.read_text())
              for path in (capture / "config").glob("*.toml")}
     assert set(files) == {path.name for path in live.glob("*.toml")} - {"unifi-syslog.toml"}, files
@@ -772,7 +741,6 @@ def check_capture(received, regenerate):
     """
     text = "".join(line + "\n" for line in sorted(map(canonical, received)))
     raw = text.encode()
-    # The capture must fit one ingest preview.
     events = preview_input(raw)
     relative = CAPTURE.relative_to(ROOT)
     if regenerate:
@@ -829,7 +797,6 @@ def capture_recipe():
             assert not any(live_data.iterdir()), "the capture wrote the service's data_dir"
             captured = preview_input(raw)
 
-            # The same configuration and inputs, as the service runs them.
             env = clean_env(directory)
             for line in env_file.read_text().splitlines():
                 key, value = line.split("=", 1)
@@ -852,7 +819,6 @@ def capture_recipe():
                   f"{len(posted)} events the trawld sink posted; nothing posted or "
                   "checkpointed by the capture")
 
-        # A source that outruns the cut: the capture stops at the event limit.
         requests.clear()
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)
@@ -875,8 +841,7 @@ def capture_recipe():
             print(f"PASS capture recipe cut: {len(many)} inputs, {len(captured)} captured lines, "
                   f"{len(raw)} bytes")
 
-        # Lines long enough that the byte limit, not the event limit, ends the
-        # capture. Each message is mostly two-byte characters, so a cap that
+        # Each message is mostly two-byte characters, so a cap that
         # counted characters instead of bytes would pass the limit.
         requests.clear()
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
@@ -904,9 +869,7 @@ def capture_recipe():
             print(f"PASS capture recipe byte limit: {len(long)} inputs of about {longest} bytes, "
                   f"{len(captured)} captured lines, {len(raw)} bytes")
 
-        # The first event alone is larger than the limit: the capture is empty,
-        # and the block says so instead of leaving an empty sample. Every
-        # event takes the journald path, so none overtakes the first, and the
+        # Every event takes the journald path, so none overtakes the first, and the
         # events after it are more than a pipe buffer holds, so Vector is
         # still writing when the cap closes the pipe.
         requests.clear()
@@ -965,9 +928,8 @@ def capture_recipe():
             print(f"PASS capture refuses a Vector without vector config: exit {result.returncode}, "
                   f"names {PINNED_PACKAGE}, {len(requests)} requests, empty capture")
 
-        # The recent-window variant, as the guide prints it, on the shipped
-        # files with their sources: `sudo` runs nothing, so the block only
-        # prepares the copy, and no host journal is read.
+        # `sudo` runs nothing, so the block only prepares the copy, and no host
+        # journal is read.
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)
             live = directory / "vector.d"
@@ -992,7 +954,6 @@ def capture_recipe():
             env = dict(ENV, CAPTURE=str(capture))
             subprocess.run([VECTOR, "validate", "--no-environment", "--config-dir", str(copy)],
                            env=env, check=True, stdout=subprocess.DEVNULL)
-            # The block's own sink check accepts the copy.
             resolved = subprocess.run([VECTOR, "config", "--config-dir", str(copy)], env=env,
                                       check=True, stdout=subprocess.PIPE, text=True).stdout
             checked = subprocess.run([VECTOR, "vrl", "--input", "/dev/stdin", "--program",
@@ -1003,8 +964,6 @@ def capture_recipe():
                   f"extra_args = {journald['extra_args']} to the copy's journald source; "
                   "the copy validates and passes the sink check")
 
-        # A sink the awk filter misses: Vector's own reading of the copy
-        # refuses it before Vector starts, so nothing is posted or captured.
         for spelling in SINK_SPELLINGS:
             requests.clear()
             with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
@@ -1032,8 +991,6 @@ def capture_recipe():
                 print(f"PASS capture refuses {spelling} sink header: exit {result.returncode}, "
                       f"{len(requests)} requests, empty capture")
 
-        # Vector dies after it has written events: the capture holds lines,
-        # but the block fails instead of passing them off as a sample.
         requests.clear()
         with tempfile.TemporaryDirectory(prefix="trawl-capture-", dir=FIXTURES) as name:
             directory = Path(name)

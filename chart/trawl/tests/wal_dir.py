@@ -22,7 +22,6 @@ PLACEMENT = (
     "so the WAL lands on the data volume"
 )
 
-# The four cells render.sh's persistence matrix uses.
 MODES = {
     "auto, web on": WEB,
     "secret, web on": {**WEB, "tls": {

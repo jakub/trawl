@@ -16,7 +16,6 @@ CHART = Path(__file__).resolve().parents[1]
 
 def render(settings=None):
     # Use Helm's own YAML decoder, so these tests need no Python YAML package.
-    # Each fixture evaluates an exact copy of a production template.
     with tempfile.TemporaryDirectory(prefix="trawl-tls-") as directory:
         chart = Path(directory) / "chart"
         shutil.copytree(CHART, chart)
@@ -51,8 +50,6 @@ def managed(**overrides):
     return {"tls": value}
 
 
-# The sidecar's whole environment. ADR-0048 removed the upstream trust
-# switch, so an exact list is the assertion that nothing brings it back.
 SIDECAR_ENV = ["HOME", "RUST_LOG", "FLEET_SESSION_PUBLIC_ORIGINS"]
 
 
@@ -75,12 +72,10 @@ def init_container(objects, name):
 
 
 def effective_uid(objects, spec):
-    # A container's runAsUser wins over the pod's.
     return spec["securityContext"].get("runAsUser", pod(objects)["securityContext"].get("runAsUser"))
 
 
 def run_tls_dir_script(init, path):
-    # The rendered command itself, under the host's /bin/sh, as this uid.
     return subprocess.run(init["command"][:4] + [str(path)], capture_output=True, text=True)
 
 
@@ -118,24 +113,17 @@ class TLS(unittest.TestCase):
         self.assertEqual(server["tls_reload_interval_secs"], 300)
 
     def assert_sidecar_sees_only_tls(self, objects, state_dir):
-        # trawld keeps its generated key in <state_dir>/tls-key, beside tls/.
-        # The sidecar gets the tls directory of the data volume and nothing
-        # that covers the state directory or the key directory.
         mounts = container(objects, "trawl-web")["volumeMounts"]
         data = [m for m in mounts if m["name"] == "data"]
         self.assertEqual(len(data), 1, mounts)
         self.assertEqual(data[0]["mountPath"], f"{state_dir}/tls")
         self.assertEqual(f"/var/lib/trawl/{data[0]['subPath']}", f"{state_dir}/tls")
         key_dir = f"{state_dir}/tls-key"
-        # Nothing the sidecar can write is a volume trawld mounts too: a
-        # shared emptyDir /tmp would let this uid rename trawld's private
-        # query spill directory (ADR-0052).
         daemon_mounts = container(objects, "trawld")["volumeMounts"]
         daemon = {m["name"] for m in daemon_mounts}
         for mount in mounts:
             with self.subTest(shared=mount["name"]):
                 self.assertTrue(mount["name"] not in daemon or mount.get("readOnly"), mount)
-        # Both containers have a /tmp, each on a volume of its own.
         tmp = {
             name: [m["name"] for m in found if m["mountPath"] == "/tmp"]
             for name, found in (("trawld", daemon_mounts), ("trawl-web", mounts))
@@ -185,7 +173,6 @@ class TLS(unittest.TestCase):
         self.assertNotIn("namespace", issuer)
 
     def test_removed_config_raw_fails_the_render(self):
-        # A leftover would otherwise drop every setting it carried, silently.
         self.fails({"config": {"raw": "[server]\n"}}, "config.raw was removed")
 
     def test_required_and_typed_fields(self):
@@ -228,13 +215,8 @@ class TLS(unittest.TestCase):
         objects = self.objects(settings)
         self.assertEqual(objects["ingress"]["spec"]["tls"][0]["secretName"], "browser-tls")
         sidecar = container(objects, "trawl-web")
-        # trawl-web verifies trawld in every mode (ADR-0048): the environment
-        # carries no trust switch, and the sidecar never mounts the daemon's
-        # key-bearing Secret.
         self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
         self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])
-        # Sharing the generated certificate with browser ingress is valid
-        # only when its requested SANs also cover that browser hostname.
         settings["ingress"]["tls"][0]["secretName"] = "launch-trawl-tls"
         self.fails(settings, "ingress.tls.hosts")
         settings["tls"]["certManager"]["dnsNames"].append("browser.example.com")
@@ -244,13 +226,10 @@ class TLS(unittest.TestCase):
 
     def test_auto_mode_pins_generated_certificate(self):
         objects = self.objects({"web": web()})
-        # The upstream stays trawl-web's derived https://127.0.0.1:<port>,
-        # which the generated certificate covers.
         self.assertEqual(upstream(objects), {"upstream_ca_path": "/var/lib/trawl/tls/cert.pem"})
         sidecar = container(objects, "trawl-web")
         self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
-        # Only the tls/ directory of the data volume, read-only, and as a
-        # directory: a file subPath would pin the first certificate forever.
+        # As a directory: a file subPath would pin the first certificate forever.
         data = [m for m in sidecar["volumeMounts"] if m["name"] == "data"]
         self.assertEqual(data, [{"name": "data", "mountPath": "/var/lib/trawl/tls", "subPath": "tls", "readOnly": True}])
         self.assertNotIn("tls", [m["name"] for m in sidecar["volumeMounts"]])
@@ -267,7 +246,6 @@ class TLS(unittest.TestCase):
         self.assertEqual(pod(objects)["securityContext"]["fsGroup"], 1000)
         self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
 
-        # The pin follows the state directory: the parent of [data] path.
         for path, sub_path, mount_path in [
             ("/var/lib/trawl/data/", "tls", "/var/lib/trawl/tls"),
             ("/var/lib/trawl/nested/data", "nested/tls", "/var/lib/trawl/nested/tls"),
@@ -294,20 +272,16 @@ class TLS(unittest.TestCase):
         objects = self.objects({"web": web(), "config": {"data": {"path": "/var/lib//trawl/data"}}})
         self.assertEqual(web_config(objects)["upstream_ca_path"], "/var/lib/trawl/tls/cert.pem")
 
-        # auto pins the generated certificate; the other modes' values contradict it.
         for field, value in [("upstreamServerName", "api.example.com"), ("upstreamCa", "system")]:
             for web_values in [web(), {"enabled": False}]:
                 with self.subTest(field=field, web=web_values["enabled"]):
                     self.fails({"web": web_values, "tls": {field: value}}, f"tls.{field}")
         self.fails({"web": web(runAsUser=1000)}, "web.runAsUser")
         self.fails({"web": web(runAsUser=1234), "securityContext": {"runAsUser": 1234}}, "web.runAsUser")
-        # trawld's uid is the container's runAsUser when that key is set,
-        # even to 0, and the pod's otherwise.
         root = {"runAsUser": 0, "runAsNonRoot": False}
         objects = self.objects({"web": web(runAsUser=1000), "securityContext": root})
         self.assertEqual(effective_uid(objects, container(objects, "trawld")), 0)
         self.assertEqual(effective_uid(objects, container(objects, "trawl-web")), 1000)
-        # The pod's uid still applies when the container sets none.
         self.fails({"web": web(runAsUser=2000), "podSecurityContext": {"runAsUser": 2000}}, "web.runAsUser must differ from trawld's uid 2000")
 
     def test_auto_mode_generated_tls_dir_is_not_shadowed(self):
@@ -337,13 +311,11 @@ class TLS(unittest.TestCase):
                 self.fails({"web": web(), "config": {"data": {"path": data_path}},
                             "crashDump": {"enabled": True, "mountPath": mount_path}},
                            f'crashDump.mountPath "{mount_path}" must not be at, under, or above')
-        # Siblings of the tls directories are fine, prefix look-alikes included.
         for mount_path in ["/var/lib/trawl/cores", "/var/lib/trawl/tls-cores", "/var/lib/trawl/tlsx",
                            "/var/lib/trawl/tls-keys"]:
             with self.subTest(mount_path=mount_path):
                 objects = self.objects({"web": web(), "crashDump": {"enabled": True, "mountPath": mount_path}})
                 self.assert_sidecar_sees_only_tls(objects, "/var/lib/trawl")
-        # Nothing pins the generated certificate without the sidecar or the dump volume.
         self.objects({"crashDump": {"enabled": True, "mountPath": "/var/lib/trawl/tls"}})
         self.objects({"web": web(), "crashDump": {"enabled": False, "mountPath": "/var/lib/trawl/tls"}})
 
@@ -357,15 +329,11 @@ class TLS(unittest.TestCase):
         self.assertEqual(init["command"][:2], ["/bin/sh", "-c"])
         self.assertEqual(init["command"][3:], ["init-tls-dir", tls_dir])
         self.assertNotIn("args", init)
-        # Exactly the directory trawl-web mounts and pins.
         mount = next(m for m in container(objects, "trawl-web")["volumeMounts"] if m["name"] == "data")
         self.assertEqual(mount["mountPath"], tls_dir)
         self.assertEqual(web_config(objects)["upstream_ca_path"], f"{tls_dir}/cert.pem")
-        # Only the data volume, where trawld mounts it.
         self.assertEqual(init["volumeMounts"], [{"name": "data", "mountPath": "/var/lib/trawl"}])
         self.assertIn(init["volumeMounts"][0], daemon["volumeMounts"])
-        # The shared securityContext: trawld's uid, and none of its added
-        # capabilities or the sidecar's uid.
         self.assertEqual(init["securityContext"]["readOnlyRootFilesystem"], True)
         self.assertEqual(init["securityContext"]["allowPrivilegeEscalation"], False)
         self.assertEqual(init["securityContext"]["capabilities"], {"drop": ["ALL"]})
@@ -379,26 +347,20 @@ class TLS(unittest.TestCase):
         init = self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")
         self.assertEqual(effective_uid(objects, init), 1000)
         self.assertNotIn("runAsUser", init["securityContext"])
-        # Beside init-auth, which keeps its place.
         self.assertEqual([c["name"] for c in pod(objects)["initContainers"]], ["init-auth", "init-tls-dir"])
         objects = self.objects({"web": web(), "initAuth": {"enabled": False}})
         self.assertEqual([c["name"] for c in pod(objects)["initContainers"]], ["init-tls-dir"])
 
-        # It follows trawld's uid wherever that is set.
         objects = self.objects({"web": web(), "securityContext": {"runAsUser": 1234}})
         self.assertEqual(effective_uid(objects, self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")), 1234)
         objects = self.objects({"web": web(), "podSecurityContext": {"runAsUser": 2000}})
         self.assertEqual(effective_uid(objects, self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")), 2000)
-        # Crash dumps add a capability to trawld alone.
         objects = self.objects({"web": web(), "crashDump": {"enabled": True}})
         self.assert_creates_tls_dir(objects, "/var/lib/trawl/tls")
 
-        # It follows the state directory.
         objects = self.objects({"web": web(), "config": {"data": {"path": "/var/lib/trawl/nested/data"}}})
         self.assert_creates_tls_dir(objects, "/var/lib/trawl/nested/tls")
 
-        # Nothing mounts a subPath of the data volume without the sidecar in
-        # auto mode, so there is nothing to create.
         cases = [
             {},
             {"initAuth": {"enabled": False}},
@@ -421,14 +383,11 @@ class TLS(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="trawl-tls-dir-") as directory:
             state = Path(directory) / "nested"
             tls_dir = state / "tls"
-            # Creates the directory and any missing parent, 0755, as this uid.
             result = run_tls_dir_script(init, tls_dir)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertTrue(tls_dir.is_dir())
             self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
             self.assertEqual(tls_dir.stat().st_uid, os.getuid())
-            # Idempotent: a directory trawld already owns, with its
-            # certificate in it, keeps the certificate and is left 0755.
             (tls_dir / "cert.pem").write_text("certificate")
             (tls_dir / "cert.pem").chmod(0o644)
             tls_dir.chmod(0o750)
@@ -437,7 +396,6 @@ class TLS(unittest.TestCase):
             self.assertEqual((tls_dir / "cert.pem").read_text(), "certificate")
             self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
 
-            # Refusals name the path and the reason.
             file_path = Path(directory) / "file"
             file_path.write_text("")
             link = Path(directory) / "link"
@@ -448,7 +406,6 @@ class TLS(unittest.TestCase):
                 (file_path, "is not a directory"),
                 (link, "is not a directory"),
                 (read_only, "is not writable"),
-                # Owned by root: another uid, which this container cannot change.
                 (Path("/usr/share"), f"is owned by uid 0, not trawld's uid {os.getuid()}"),
             ]:
                 with self.subTest(path=path):
@@ -475,8 +432,6 @@ class TLS(unittest.TestCase):
             self.assertFalse(key.exists())
             self.assertEqual((tls_dir / "cert.pem").read_text(), "certificate")
 
-            # Anything else named key.pem is not trawld's: refuse, and never
-            # follow or remove it.
             target = Path(directory) / "target.pem"
             target.write_text("elsewhere")
             key.symlink_to(target)
@@ -486,7 +441,6 @@ class TLS(unittest.TestCase):
             self.assertTrue(key.is_symlink())
             self.assertEqual(target.read_text(), "elsewhere")
             key.unlink()
-            # A dangling link is refused the same way.
             key.symlink_to(Path(directory) / "missing.pem")
             result = run_tls_dir_script(init, tls_dir)
             self.assertNotEqual(result.returncode, 0)
@@ -517,7 +471,6 @@ class TLS(unittest.TestCase):
                 result = run_tls_dir_script(init, tls_dir)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(tls_dir.stat().st_mode & 0o7777, 0o755)
-                # trawld's own certificate, which only trawld can change, stays.
                 self.assertEqual(cert.read_text(), "certificate")
                 self.assertEqual(cert.stat().st_mode & 0o7777, 0o644)
 
@@ -540,8 +493,6 @@ class TLS(unittest.TestCase):
                     self.assertEqual(cert.stat().st_mode & 0o7777, 0o644)
             cert.unlink()
 
-            # A symlink or other non-regular file is not what trawld writes:
-            # the link itself goes, never its target.
             target = Path(directory) / "target.pem"
             target.write_text("elsewhere")
             target.chmod(0o644)
@@ -555,7 +506,6 @@ class TLS(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(cert.exists() or cert.is_symlink())
 
-            # A directory cannot be removed with its contents unseen: refuse.
             cert.mkdir()
             (cert / "inside").write_text("kept")
             result = run_tls_dir_script(init, tls_dir)
@@ -591,7 +541,6 @@ class TLS(unittest.TestCase):
             cert = tls_dir / "cert.pem"
             cert.write_text("certificate")
             cert.chmod(0o644)
-            # Owned by trawld (uid 0 in the namespace): kept.
             result = subprocess.run(userns + init["command"][:4] + [str(tls_dir)], capture_output=True, text=True, timeout=30)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(cert.read_text(), "certificate")
@@ -622,7 +571,6 @@ class TLS(unittest.TestCase):
         self.assertEqual([e["name"] for e in sidecar["env"]], SIDECAR_ENV)
         self.assert_mount(objects, "operator-api-tls")
 
-        # system: the platform roots, no pin and nothing mounted.
         objects = self.objects({"web": web(), "tls": {**secret, "upstreamCa": "system"},
                                 "config": {"server": {"httpAddr": "0.0.0.0:7443"}}})
         self.assertEqual(upstream(objects), {
@@ -632,7 +580,6 @@ class TLS(unittest.TestCase):
         self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
         self.assertNotIn("upstream-ca", [m["name"] for m in container(objects, "trawl-web")["volumeMounts"]])
 
-        # An absolute path pins a CA the operator mounts through the pass-throughs.
         extra = web(extraVolumes=[{"name": "operator-ca", "configMap": {"name": "operator-ca"}}],
                     extraVolumeMounts=[{"name": "operator-ca", "mountPath": "/etc/trawl/operator-ca", "readOnly": True}])
         objects = self.objects({"web": extra, "tls": {**secret, "upstreamCa": "/etc/trawl/operator-ca/ca.pem"}})
@@ -641,8 +588,6 @@ class TLS(unittest.TestCase):
         self.assertIn(extra["extraVolumeMounts"][0], container(objects, "trawl-web")["volumeMounts"])
         self.assertNotIn("upstream-ca", [v["name"] for v in pod(objects)["volumes"]])
 
-        # certManager defaults the name to the first dnsNames entry that is not
-        # a wildcard, and pins the generated Secret's ca.crt.
         settings = managed(upstreamCa="secret",
                            certManager={"issuerRef": {"name": "ca"}, "dnsNames": ["*.example.com", "api.example.com", "b.example.com"]})
         objects = self.objects({**settings, "web": web()})
@@ -653,12 +598,9 @@ class TLS(unittest.TestCase):
         })
         volume = next(v for v in pod(objects)["volumes"] if v["name"] == "upstream-ca")
         self.assertEqual(volume["secret"]["secretName"], "launch-trawl-tls")
-        # An explicit name is accepted when dnsNames covers it, wildcards included.
         settings["tls"]["upstreamServerName"] = "web.example.com"
         self.assertEqual(upstream(self.objects({**settings, "web": web()}))["upstream_url"], "https://web.example.com:5514")
 
-        # Daemon-only installs render as before: no [web], no sidecar, no
-        # upstream-trust values required.
         for tls in [{"mode": "secret", "secretName": "operator-api-tls"}, managed()["tls"]]:
             with self.subTest(tls=tls["mode"]):
                 objects = self.objects({"tls": tls})

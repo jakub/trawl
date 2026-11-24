@@ -21,7 +21,6 @@ class CrateClosure(unittest.TestCase):
 
     def test_the_server_follows_workspace_and_dev_dependencies(self):
         closure = scopes.crate_closure(ROOT, 'crates/trawl-server')
-        # trawl-client and trawl-cli arrive only as dev-dependencies.
         self.assertLessEqual(
             {'crates/trawl-server', 'crates/trawl-core', 'crates/trawl-engine',
              'crates/fleet-auth', 'crates/trawl-client', 'crates/trawl-cli'},
@@ -66,7 +65,6 @@ class Scopes(unittest.TestCase):
                                  {'web_mutations': False, 'server_mutations': True})
 
     def test_a_crate_name_prefix_is_not_the_crate(self):
-        # crates/trawl-web is the browser proxy, not crates/trawl-web-ui.
         self.assertFalse(self.scopes('crates/trawl-web/src/lib.rs')['web_mutations'])
 
 

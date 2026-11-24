@@ -1,8 +1,6 @@
 name: Linux distribution package
 
 on:
-  # Run the native checks before approving publication. This workflow never
-  # creates a tag or publishes a release, under either trigger.
   workflow_dispatch:
     inputs:
       source-sha:
@@ -35,8 +33,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   build:
     name: build (${{ matrix.target }})
@@ -44,10 +40,8 @@ jobs:
       RELEASE_TAG: ${{ inputs.release-tag }}
       SOURCE_SHA: ${{ inputs.source-sha }}
       TOOLING_SHA: ${{ inputs.tooling-sha }}
-    # Preflights run on GitHub-hosted runners, next to CI: pull requests,
-    # and the push to main that saves the caches they restore. Release
-    # builds (a tag push or a manual run) stay on k8s-big, where the release
-    # caches live.
+    # Release builds (a tag push or a manual run) stay on k8s-big, where the
+    # release caches live.
     runs-on: ${{ (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main')) && 'ubuntu-24.04' || 'k8s-big' }}
     timeout-minutes: 60
     strategy:
@@ -65,10 +59,7 @@ jobs:
     steps:
       # Both SHAs are free-form inputs, and this job saves default-branch
       # caches that later builds restore. Refuse any commit main does not
-      # contain before a checkout can run its code. Pull-request preflights
-      # build unmerged commits and save no cache: on a hosted runner a
-      # per-PR copy would only evict CI's main-branch entries. The preflight
-      # push to main saves the hosted caches pull requests restore.
+      # contain before a checkout can run its code.
       - name: Refuse source or tooling that is not on main
         if: github.event_name != 'pull_request'
         env:
@@ -123,7 +114,7 @@ jobs:
         uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2
         # No zig cache: its key contains the run id, so each job saved a new
         # ~20 MB entry every run that only crowded the rust caches out of the
-        # repository's 10 GB. The zig download is cached separately, by version.
+        # repository's 10 GB.
         with:
           use-cache: false
 
@@ -151,18 +142,13 @@ jobs:
           tool: cargo-zigbuild,cargo-deb,trunk,wasm-bindgen-cli
 
       # Build the leptos SPA first so rust-embed picks up a populated
-      # dist/ when trawl-web compiles. wasm toolchain is host-only, so
-      # this runs before either native-code distribution build.
+      # dist/ when trawl-web compiles.
       - name: Build web UI SPA
         working-directory: crates/trawl-web-ui
         run: trunk build --release
       - name: Precompress SPA + enforce wire-size budgets
         run: cargo xtask compress-web
 
-      # `cargo build --release` alone honors workspace default-members,
-      # which excludes trawl-web. `--workspace --exclude trawl-web-ui`
-      # builds every crate (including trawl-web) except the wasm32-only
-      # SPA crate — which was already built by the preceding trunk step.
       - name: Build
         run: |
           if [ "${{ matrix.cross }}" = true ]; then
@@ -198,9 +184,7 @@ jobs:
 
       # Harvest breakpad symbols from the FAT binaries (with .symtab + DWARF)
       # BEFORE stripping. --store writes <module>/<DEBUG_ID>/<module>.sym, the
-      # exact layout `minidump-stackwalk --symbols-url` expects. These symbols
-      # cover application modules and the separate DuckDB module. The official
-      # library provides public dynamic symbols, but no full C++ debug info.
+      # exact layout `minidump-stackwalk --symbols-url` expects.
       - name: Dump breakpad symbols
         run: |
           set -euo pipefail
@@ -214,17 +198,11 @@ jobs:
           grep -q '^PUBLIC ' symbols/libduckdb.so/*/libduckdb.so.sym
           find symbols -type f | sort
 
-      # Strip the shipped binaries now that symbols are captured, so the
-      # deb/tarball stay lean. llvm-strip keeps allocated notes (including
-      # .note.gnu.build-id) by default, so the shipped build-id still matches
-      # the .sym DEBUG_ID. Strip in place, before the deb/tarball steps.
-      #
-      # After each strip, ASSERT the build-id note actually survived: the entire
-      # symbolication chain hinges on the runtime minidump's module id matching
-      # the published .sym DEBUG_ID, and zig's lld defaults to --build-id=none,
-      # so a silent miss (here or on a future toolchain bump) would ship green
-      # builds whose crash dumps never resolve. Runs on both matrix legs, so it
-      # also covers the aarch64 cross binaries.
+      # llvm-strip keeps allocated notes (including .note.gnu.build-id) by
+      # default, so the shipped build-id still matches the .sym DEBUG_ID.
+      # ASSERT the build-id note actually survived: zig's lld defaults to
+      # --build-id=none, so a silent miss would ship green builds whose crash
+      # dumps never resolve.
       - name: Strip shipped binaries
         run: |
           set -euo pipefail
@@ -235,8 +213,7 @@ jobs:
           fi
           # llvm-tools ships llvm-objcopy but NOT llvm-readelf, so verify the
           # build-id by extracting the note section with objcopy and checking it
-          # is non-empty (an absent note extracts to a 0-byte file; verified on
-          # real ELF). objcopy writes a separate output, leaving the binary as-is.
+          # is non-empty (an absent note extracts to a 0-byte file).
           llvm_objcopy="${llvm_strip%/*}/llvm-objcopy"
           if [ ! -x "${llvm_objcopy}" ]; then
             echo "::error::llvm-objcopy not found next to llvm-strip -- cannot verify build-id" >&2
@@ -351,11 +328,7 @@ jobs:
       - name: Install the server package on a host running systemd
         run: bash scripts/release/test-host-debian.sh debs
 
-  # `trawl trial` (ADR-0045) from the release-built artifacts: the CLI from
-  # the tarball, and an image built from the same tarball the way release.yml's
-  # docker job builds one. The image is tagged with the exact default
-  # reference, so `trawl trial up` runs without --image. The tag exists only
-  # on this disposable runner's engine and is never pushed.
+  # `trawl trial` (ADR-0045) from the release-built artifacts.
   trial:
     name: trawl trial (${{ matrix.target }})
     needs: build
@@ -407,8 +380,6 @@ jobs:
             --label "org.opencontainers.image.revision=$SOURCE_SHA" \
             --tag "$image" .
           docker image inspect --format '{{.Id}} {{.Os}}/{{.Architecture}}' "$image"
-          # The image ships trawld, trawl-web and fleet-admin only. The retired
-          # trawl-admin must not come back, at its old path or on PATH.
           docker run --rm --entrypoint /bin/sh "$image" -c \
             'test ! -e /usr/bin/trawl-admin && ! command -v trawl-admin >/dev/null'
       - uses: actions/setup-node@39370e3970a6d050c480ffad4ff0ed4d3fdee5af # v4
@@ -423,8 +394,7 @@ jobs:
           npx playwright install --with-deps chromium
       - name: Prove the trial
         run: bash scripts/release/test-trial.sh installed/bin/trawl "$RUNNER_TEMP/trial-evidence" "$RUNNER_TEMP/trial-private"
-      # The script scans as it goes; this pass covers the finished log. The
-      # evidence is uploaded only when it passes.
+      # The script scans as it goes; this pass covers the finished log.
       - name: Scan every captured log and artifact for secret values
         id: scan
         if: always()

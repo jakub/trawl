@@ -40,8 +40,7 @@ def dependencies(job):
 
 def simulate(jobs, failed=None):
     # These release jobs use GitHub's default success() dependency condition.
-    # An explicit override or continue-on-error would invalidate that model,
-    # so refuse it instead of silently claiming the same failure behavior.
+    # An explicit override or continue-on-error would invalidate that model.
     for name, job in jobs.items():
         assert not job.get('if'), f'{name}: explicit job condition needs review'
         assert not job.get('continue-on-error'), f'{name}: failure cannot be ignored'
@@ -111,8 +110,6 @@ class PublicationOrder(unittest.TestCase):
             with self.subTest(failed=failed):
                 native_status = simulate(linux['jobs'], failed)
                 self.assertEqual(native_status[failed], 'failure')
-                # A failed job makes the workflow_call fail; there is no
-                # continue-on-error or condition bypass in the called graph.
                 release_status = simulate(jobs, 'build-linux')
                 for announcement in ANNOUNCEMENTS:
                     self.assertEqual(release_status[announcement], 'skipped')
@@ -155,8 +152,6 @@ class PublicationOrder(unittest.TestCase):
     def test_preflight_calls_both_native_checks_without_publication(self):
         workflow = parse_workflow(WORKFLOW.with_name('distribution-preflight.yml'))
         triggers = workflow.get('on') or workflow.get('true')
-        # Pull requests check the artifacts; the push to main runs the same
-        # checks and saves the hosted caches that pull requests restore.
         self.assertEqual(set(triggers), {'pull_request', 'push'})
         self.assertEqual(triggers['push']['branches'], ['main'])
         self.assertEqual(triggers['push']['paths'], triggers['pull_request']['paths'])

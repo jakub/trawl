@@ -1,8 +1,6 @@
 name: macOS CLI package
 
 on:
-  # Run the native checks before approving publication. This workflow never
-  # creates a tag or publishes a release, under either trigger.
   workflow_dispatch:
     inputs:
       source-sha:
@@ -32,8 +30,6 @@ on:
 permissions:
   contents: read
 
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   build:
     name: package (${{ matrix.target }})
@@ -135,8 +131,6 @@ jobs:
             target: aarch64-apple-darwin
           - runner: macos-15-intel
             target: x86_64-apple-darwin
-    # A separate fresh runner receives the archive and verification tooling.
-    # No Rust setup, source build, or DuckDB installation is performed here.
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 10
     env:

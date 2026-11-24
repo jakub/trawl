@@ -17,8 +17,6 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
 
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   resolve-source:
     name: resolve release source
@@ -86,7 +84,7 @@ jobs:
           if-no-files-found: error
 
       # Metadata normalization and chart construction finish before any
-      # registry write. Docker consumes these exact tags and labels later.
+      # registry write.
       - name: Docker metadata
         id: meta
         uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
@@ -269,9 +267,8 @@ jobs:
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           # Only the .deb artifacts — without this filter download-artifact
-          # also tries to fetch the buildx `.dockerbuild` build-record (and the
-          # dist tarballs), and the dockerbuild artifact reliably fails to
-          # download, wedging the whole APT publish.
+          # also tries to fetch the buildx `.dockerbuild` build-record, which
+          # reliably fails to download.
           pattern: deb-*
           path: incoming
           merge-multiple: true
@@ -334,8 +331,7 @@ jobs:
       # Publish the breakpad symbol store at the gh-pages root so it serves at
       # https://trawl.sh/symbols/<module>/<DEBUG_ID>/<module>.sym — the URL
       # `minidump-stackwalk --symbols-url https://trawl.sh/symbols/` resolves
-      # against. Merged into the existing tree (per-arch DEBUG_IDs don't clash);
-      # the shared `git add -A` + commit + push below picks it up.
+      # against.
       - name: Publish breakpad symbols
         run: |
           set -euo pipefail
@@ -427,8 +423,7 @@ jobs:
       - name: Publish the exact prebuilt chart
         run: helm push chart-artifact/trawl-*.tgz oci://ghcr.io/${{ github.repository_owner }}/charts
 
-  # An evaluator pulls with no GitHub account (ADR-0045). Check both channels
-  # the way they do before the release is announced.
+  # An evaluator pulls with no GitHub account (ADR-0045).
   anonymous-pull:
     needs: [resolve-source, docker, publish-helm]
     permissions:

@@ -37,7 +37,6 @@ class HarnessCleanup(unittest.TestCase):
             command += ["--label", "trawl-crashdump-harness-run=" + owner]
         command += [image, "sleep", "300"]
         container = subprocess.check_output(command, text=True).strip()
-        # Only IDs returned by this test's successful create/run are cleaned.
         self.addCleanup(self.remove_created, container)
         metadata = json.loads(subprocess.check_output(["docker", "inspect", container]))[0]
         volumes = [mount["Name"] for mount in metadata["Mounts"] if mount["Type"] == "volume"]

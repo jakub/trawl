@@ -1,16 +1,11 @@
 name: pg soak
 
-# Flake hunting for the pg-backed suites (ADR-0021). One run executes the
-# whole workspace twice, once per feature configuration, exactly as CI's
-# `test` job does. Evidence is gathered by pushing a soak branch repeatedly
-# and reading the run history, so nothing here counts attempts.
+# Flake hunting for the pg-backed suites (ADR-0021).
 on:
   workflow_dispatch:
   push:
     branches: ['soak/**']
 
-# Read-only, and the checkout keeps no credentials in .git/config: nothing
-# here writes to the repository.
 permissions:
   contents: read
 
@@ -21,19 +16,12 @@ env:
   # soak reads CI's warm `test` cache only while this matches.
   CARGO_PROFILE_DEV_SPLIT_DEBUGINFO: unpacked
 
-# Every job runs on a GitHub-hosted runner, set up as ci.yml's test jobs
-# are, so a soak reproduces CI's conditions.
-#
-# Each job's timeout-minutes is two to three times its slowest normal run,
-# so a hung job fails in minutes instead of GitHub's six-hour default.
 jobs:
   suite:
     name: ${{ matrix.suite }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     strategy:
-      # Both suites always run: a flake in one says nothing about the other,
-      # and cancelling the survivor halves the evidence.
       fail-fast: false
       matrix:
         include:
@@ -80,10 +68,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1; pinned via toolchain input
         with:
           toolchain: 1.98.0
-      # Read ci.yml's warm `test` cache, never write it: save-if false keeps
-      # ten soak runs from churning the key CI maintains. That key holds the
-      # no-default-features build only, so the default-features suite still
-      # compiles most of the workspace cold.
+      # save-if false keeps soak runs from churning the key CI maintains.
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           shared-key: test
@@ -96,8 +81,7 @@ jobs:
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
       # `--retries 0` on the command line overrides every retry setting in
-      # .config/nextest.toml, including its two named per-test overrides. A
-      # soak that retries measures the retry, not the flake.
+      # .config/nextest.toml, including its two named per-test overrides.
       # Build and run are separate steps so the step timings say which
       # phase a slow or dying run spent its time in.
       - name: Build test binaries
@@ -108,8 +92,6 @@ jobs:
         run: cargo nextest run --workspace ${{ matrix.features }} --retries 0
         env:
           DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgres
-          # A doctor test that needs a user namespace fails here instead of
-          # printing SKIPPED, as in ci.yml.
           TRAWL_TEST_REQUIRE_USERNS: "1"
       - name: Record suite outcome
         if: always()

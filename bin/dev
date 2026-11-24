@@ -1,12 +1,4 @@
 #!/usr/bin/env bash
-# Contributor entrypoint for the Trawl-owned Fleet development controller.
-#
-# Supported invocations:
-#   bin/dev                    -> fleet-dev dev trawl --app-root <trawl-root>
-#   bin/dev --with-coastwatch  -> fleet-dev all
-#   bin/dev --tailscale        -> add --exposure tailscale
-#   bin/dev --release-spa      -> add --release-spa
-
 set -euo pipefail
 
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"

@@ -12,7 +12,6 @@ license = "MPL-2.0"
 publish = false
 
 [workspace.dependencies]
-# internal crates
 trawl-core = { path = "crates/trawl-core" }
 trawl-engine = { path = "crates/trawl-engine", default-features = false }
 trawl-server = { path = "crates/trawl-server" }
@@ -29,7 +28,6 @@ fleet-dev = { path = "crates/fleet-dev" }
 fleet-auth = { path = "crates/fleet-auth", default-features = false }
 fleet-ui = { path = "crates/fleet-ui" }
 
-# external deps
 arboard = "3"
 argon2 = { version = "0.5", features = ["std"] }
 async-stream = "0.3"
@@ -39,8 +37,6 @@ blake3 = "1.8"
 brotli = "8"
 chacha20poly1305 = "0.11"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
-# Syslog reads zone-less time in an IANA zone (ADR-0050). The default
-# features compile the zone database in, so no host needs tzdata.
 chrono-tz = "0.10.4"
 cookie = "0.18"
 chumsky = "0.13"
@@ -48,9 +44,6 @@ clap = { version = "4", features = ["derive", "env"] }
 crossterm = { version = "0.29", features = ["bracketed-paste"] }
 dashmap = "6"
 comfy-table = "7"
-# duckdb-rs encodes DuckDB 1.5.x as 1.105xx.x. The version-sensitive probe
-# matrix is release-gating (ADR-0017 §5), so minor/major bumps require a
-# deliberate PR running the full probe and parity suites, never lockfile drift.
 duckdb = { version = ">=1.10500, <1.10600" }
 flate2 = "1"
 futures = "0.3"
@@ -63,7 +56,6 @@ insta = "1"
 # Test-only: validates the MCP tool schemas against the JSON Schema 2020-12
 # meta-schema. Defaults are off because they resolve remote and file
 # references over reqwest and aws-lc-rs; the meta-schemas are built in.
-# 0.59 because 0.60 is younger than the 3-day minimum publish age.
 jsonschema = { version = "0.59", default-features = false }
 libc = "0.2"
 log = "0.4"
@@ -77,10 +69,7 @@ metrics-process = "2.4"
 peak_alloc = "0.3"
 proptest = "1.12"
 rand = "0.8"
-# The feature set the regex crate turns on by default, less the bounded
-# backtracker, which trawl's regexes build without (`backtrack(false)`).
-# Another crate can still unify `dfa-build` in, so they build with
-# `dfa(false)` too (ADR-0063). The version is exact: a pattern's regex
+# The version is exact: a pattern's regex
 # charge follows this crate's internals (`crates/trawl-core/src/pattern/charge.rs`),
 # so a bump is a deliberate change that reruns `tests/regex_memory.rs`.
 regex-automata = { version = "=0.4.16", default-features = false, features = ["std", "syntax", "meta", "nfa-pikevm", "hybrid", "dfa-onepass", "perf-inline", "perf-literal", "unicode"] }
@@ -94,10 +83,6 @@ hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["tokio", "server-auto", "http1", "http2"] }
 rcgen = "0.14"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls-no-provider", "query", "stream"] }
-# The MCP server (ADR-0058) pins rmcp exactly, because any release can
-# change the protocol revisions it negotiates. Default features are off:
-# they pull base64 0.23 and the tool macros, and trawl uses neither.
-# `server` brings schemars and `transport-io` the stdio pipes.
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-io"] }
 rustix = { version = "1.1.4", features = ["fs"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
@@ -112,10 +97,6 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["float_roundtrip"] }
 serde_path_to_error = "0.1.20"
 sha2 = "0.10"
-# Umbrella sqlx: the rusqlite (links = "sqlite3") collision that forced the
-# direct sqlx-core/sqlx-postgres workaround died with the trawl-auth crate in
-# ADR-0004 slice 3, closing issue #12. tls-rustls-ring-webpki keeps the same
-# webpki root store the workspace shipped with (`_tls-rustls-ring-webpki`).
 sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls-ring-webpki",
@@ -152,26 +133,15 @@ syslog_loose = "0.23"
 zstd = "0.14"
 
 [profile.release]
-# Drops DWARF for normal/local release builds. This does NOT keep symbols
-# usable for crash dumps under the release CI: that build cross-links with
-# zig, whose lld strips .symtab regardless of this setting. So release CI
-# overrides strip to false, runs dump_syms to publish breakpad .sym files
-# for the application modules and public symbols for the separate libduckdb
-# module, then llvm-strips the application artifacts with the GNU
-# build-id note preserved. See .github/workflows/release.yml + trawl-crashdump.
 strip = "debuginfo"
 lto = "thin"
 
-# Selected only by the browser's Trunk development build. Keep dev assertions,
-# overflow checks and incremental compilation, but omit browser debug symbols.
-# Native builds keep their existing profiles.
 [profile.wasm-dev]
 inherits = "dev"
 opt-level = "z"
 debug = 0
 strip = "symbols"
 
-# Trunk selects this profile for size-oriented release WASM builds.
 [profile.wasm-release]
 inherits = "release"
 opt-level = "z"
@@ -186,7 +156,6 @@ rust_2018_idioms = { level = "warn", priority = -1 }
 
 [workspace.lints.clippy]
 pedantic = { level = "warn", priority = -1 }
-# see clippy.toml — the one padding owner (ADR-0014 ruling 4)
 disallowed_methods = "deny"
 module_name_repetitions = "allow"
 must_use_candidate = "allow"

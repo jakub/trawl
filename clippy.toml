@@ -1,39 +1,12 @@
-# `.padded()` is chumsky's built-in whitespace padding — it skips
-# whitespace and nothing else. trawl's comments are a grammar production
-# admitted wherever the grammar skips whitespace (ADR-0014 ruling 4), so a
-# `.padded()` site is by construction a place comments do not work. There
-# is exactly one padding owner, `parser::comment::Spaced::spaced`, and
-# this entry is what makes a missed site — or a new one added later — fail
-# the build instead of silently reopening the hole.
-#
-# Regex construction has one owner too, `trawl_core::pattern` (ADR-0063).
-# Its `Preparer` builds under the 1 MiB compiled-size limit, builds each
-# pattern once per ledger, and stops after a size failure. A builder called
-# anywhere else skips all three. `pattern/mod.rs` holds the one `#[expect]`.
 # This rule cannot ban a build through `FromStr` or `TryFrom`: clippy does
 # not resolve a path to a trait impl's method, and banning the trait
 # methods themselves would ban them for every type. So `disallowed-types`
 # below bans naming `regex::Regex` or `regex::bytes::Regex` outside the
-# owner, which a typed `.parse()`, a qualified `from_str` or `try_from`, a
-# return type and a struct field all do. The owner never lends out a
-# `regex::Regex`, so code elsewhere cannot reach the type by inference
-# either. `pattern::tests::construction_inventory`
-# also scans the sources for those spellings and lists every site it finds:
-# `Regex::from_str`, `Regex::try_from`, `parse::<…Regex…>`, a fully
-# qualified `<…Regex… as …>::from_str` or `::try_from`, and a `.parse()` in
-# a `let` whose type names `Regex`.
+# owner.
 #
-# The owner builds on regex-automata's meta engine, and each pattern owns
-# its one cache. So the rule bans every regex-automata builder outside the
-# owner too: meta, Thompson, PikeVM, backtracker, one-pass, dense, sparse
-# and lazy DFA. It bans the meta searches that take a cache from the
-# regex's own per-thread pool, which no budget charges, and the pool type
-# itself. Search through a `_with` method and an owned cache instead.
-# regex-automata has no trait-based build; the inventory lists every file
-# that names the crate and counts its builder calls. The backtracker and
-# the dense, sparse and DFA-regex modules exist only when a crate in the
-# build turns on their feature, as tracing-subscriber does for dense DFAs
-# in the workspace build. Their entries carry `allow-invalid`, so a build
+# The backtracker and the dense, sparse and DFA-regex modules exist only
+# when a crate in the build turns on their feature, as tracing-subscriber
+# does for dense DFAs in the workspace build. Their entries carry `allow-invalid`, so a build
 # without them, such as `cargo clippy -p trawl-core`, stays quiet.
 disallowed-methods = [
     { path = "chumsky::Parser::padded", reason = "use parser::comment::Spaced::spaced — .padded() skips whitespace only, so comments would not work there (ADR-0014 ruling 4)" },

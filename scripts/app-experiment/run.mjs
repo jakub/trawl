@@ -94,7 +94,7 @@ async function pacedWait(ms) {
 }
 for (const signal of ['SIGINT', 'SIGTERM']) process.on(signal, () => { interrupted = true; });
 
-// Every command has a deadline. stdout is private until the caller elects to
+// stdout is private until the caller elects to
 // use it; tokens emitted by fleet-admin never reach logs or terminal output.
 async function command(exe, argv, { cwd = root, env = {}, timeout = 120000, log } = {}) {
   // Always use the local daemon, even if the user's Docker context is remote.
@@ -227,8 +227,6 @@ async function prepare() {
       commit: await command('git', ['rev-parse', 'HEAD']), rustc: await command('rustc', ['--version']), node: process.version };
     await fs.mkdir(path.dirname(stampPath), { recursive: true });
   }
-  // Record the bytes actually served, including JS/Wasm, so SPA identity is
-  // checkable in every result and skip-build cannot silently reuse changed dist.
   const dist = path.join(root, 'crates/trawl-web-ui/dist');
   const preparedSpaHash = await spaHash(dist);
   if (args['skip-build']) assert.equal(report.build.spaHash, preparedSpaHash, 'SPA changed: run without --skip-build');
@@ -332,7 +330,7 @@ async function experiment() {
   await fs.writeFile(path.join(runDir, 'corpus.ndjson'), ndjson);
   report.corpusHash = createHash('sha256').update(ndjson).digest('hex');
   const queryText = `experiment_run="${runId}" earliest="2026-01-01T00:00:00Z" latest="2026-01-02T00:00:00Z" | fields experiment_seq, status | sort experiment_seq`;
-  // A live stream carries no time window (ADR-0027, amended 2026-09-21).
+  // A live stream carries no time window (ADR-0027).
   // The run filter ALONE, so the default 15m range is the thing under
   // test: the corpus is stamped 2026-01-01 (workload.mjs), so a folded
   // `last=15m` yields a healthy, permanently empty stream.
@@ -424,7 +422,6 @@ async function experiment() {
     assert.deepEqual(firstCells.slice(1).map(c => c.trim()), initialPage.rows[0].map(String), 'rendered cells differ from the query response');
     await page.screenshot({ path: path.join(runDir, 'search.png') });
     report.phases.push({ name: 'browser-login-search', verifiedEvents: initialPage.pagination.returned });
-    // Drive real UI controls to open live tail, then stream the remainder.
     await editor.click();
     await page.keyboard.press('Control+a');
     await page.keyboard.insertText(liveQueryText);
@@ -435,7 +432,6 @@ async function experiment() {
     // beside it. Same hook the browser suite pins as `SEL.liveTailButton`.
     await page.locator('.rt-hint + .foot .btn-pri').click();
     assert.equal((await streamReady).status(), 200);
-    // Live entry must leave the range out of the URL as well as the stream.
     await page.waitForURL(url => url.searchParams.get('mode') === 'live');
     {
       const live = new URL(page.url());
@@ -447,7 +443,6 @@ async function experiment() {
       const due = (Math.min(offset + batchSize, count) - firstCount) * 1000 / rate;
       await pacedWait(Math.max(0, due - (performance.now() - ingestStart)));
       await send(events.slice(offset, offset + batchSize));
-      // Concurrent query work checks the partial corpus while ingest continues.
       verifyWholeResult(await query(), events.slice(0, Math.min(offset + batchSize, count)));
     }
     report.ingest.durationMs = performance.now() - ingestStart;

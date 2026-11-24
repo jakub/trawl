@@ -46,7 +46,6 @@ python3 "$tooling/check-runtime.py" /usr/lib/trawl/libduckdb.so "$tooling/fixtur
 for binary in trawld fleet-admin trawl-web; do
   "/usr/bin/$binary" --help >/dev/null
 done
-# trawl-admin is retired: no package installs it and no package claims it.
 test ! -e /usr/bin/trawl-admin
 if dpkg -S /usr/bin/trawl-admin >/dev/null 2>&1; then
   echo '/usr/bin/trawl-admin is owned by an installed package' >&2

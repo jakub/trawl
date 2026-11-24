@@ -3,179 +3,8 @@
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
 //! `cargo xtask pg-admission-guard` — prove that every pg-touching test in
-//! the workspace runs inside the `postgres` nextest group.
-//!
-//! The group in `.config/nextest.toml` is what keeps the workspace from
-//! opening more postgres connections than the server allows (ADR-0021
-//! ruling 4). It is a hand-written list of binary names, so it rots the
-//! moment somebody adds a test file. This guard recomputes the pg-touching
-//! set from the sources and asks nextest whether those tests land in the
-//! group.
-//!
-//! Two independent sides, on purpose:
-//!
-//! 1. DERIVATION, from `cargo metadata` plus one item-bounded lexer pass
-//!    over each target's sources (see [`file_facts`]). A target is pg-touching if it carries an `#[sqlx::test]`
-//!    attribute, if it pulls in a `common` module that opens postgres pools
-//!    (`fixture_pool`), or if test code names one of the connection-opening
-//!    APIs itself (`KeyStore::connect`, `PgPool`, and friends). That third
-//!    class is what catches a plain `#[tokio::test]` that dials postgres by
-//!    hand, carrying neither marker. It reads a whole integration test
-//!    file, but only the TEST REGIONS of a `src/` tree, where the
-//!    surrounding production code is where those APIs are defined: the body
-//!    of a `#[cfg(test)]` item, and the body of any fn carrying a test
-//!    attribute.
-//! 2. MEMBERSHIP, from nextest itself: `cargo nextest list -E
-//!    'group(postgres)'`. cargo-nextest 0.9.143 supports `group()` as a
-//!    filterset predicate, so the authority on "is this test in the group"
-//!    is the same engine that will enforce it at run time. Re-parsing the
-//!    override filters out of the TOML was the alternative, and it would
-//!    have re-implemented nextest's filterset semantics (`kind(lib)`,
-//!    `test(/regex/)`, precedence) in the guard — a second implementation
-//!    to disagree with the first.
-//!
-//! The match is per TEST NAME only when EVERY finding for the target names
-//! tests (an `#[sqlx::test]` attribute names the function beneath it). Any
-//! target-level finding — the fixture module, a connection-opening API —
-//! dominates: the whole binary must be in the group, and the check is that
-//! every non-ignored testcase nextest listed for it carries
-//! `filter-match.status == "matches"`. Dominance matters because a target
-//! can carry both kinds of evidence (`trawl-server::auth_pg` has named
-//! `#[sqlx::test]` cases AND the fixture module), and checking only the
-//! named ones would let a narrowed group filter admit two tests out of
-//! twenty-six while the other twenty-four boot a whole server unbounded.
-//!
-//! Name granularity survives for the targets that only ever name tests: it
-//! is what lets the group filter narrow trawl-server's library target to
-//! `from_saved::` and `scheduler::` instead of dragging ~600 pure unit
-//! tests under an 8-thread cap.
-//!
-//! # What this guard defends against, and what it does not
-//!
-//! It is a CI tripwire for an ACCIDENTAL escape: a reasonable author adds
-//! a test that opens a postgres connection, the code passes `cargo fmt`
-//! and compiles in the feature set CI builds with, and nobody remembers to
-//! extend the group override. That is the whole threat model. It is NOT a
-//! security boundary. Anyone editing the workspace can also edit
-//! `.config/nextest.toml`, or write a test whose connection this lexer
-//! cannot see, and no amount of static reading closes that.
-//!
-//! The fail direction is fixed, and every judgement call below follows it:
-//!
-//! * Uncertain whether something is a pg test? Collect it. A test named
-//!   here that nextest never lists fails the guard by name, and a human
-//!   reads the sentence.
-//! * Uncertain which target owns a file? Charge it to both. Two loud
-//!   failures beat one silent pass.
-//! * A SILENT FALSE GREEN is the only defect class this module treats as a
-//!   bug. A false failure is noise; a pass over a live escape is the thing
-//!   the group exists to prevent.
-//!
-//! Accepted residuals, each of them loud or over-collecting:
-//!
-//! * CONDITIONAL COMPILATION is not statically resolvable. The guard does
-//!   not know which cfgs CI compiled under, so a `cfg_attr`-wrapped
-//!   `sqlx::test` counts as one, a `cfg_attr` whose expansion contains
-//!   `cfg(test)` opens a test span, a `cfg_attr`-wrapped `ignore` does not
-//!   ignore, and a `#[cfg(not(test))]` region is scanned like any other
-//!   attributed item. All of them over-collect.
-//! * A `#[cfg(test)]` region nested inside another one yields two spans
-//!   over the same code, so one connection can be reported twice. Two
-//!   findings for one call site, never zero.
-//! * An attributed item that ends at a `;` with no body spans its own
-//!   whole extent, first attribute line through the semicolon. That is
-//!   what covers a `#[cfg(test)] static POOL: LazyLock<PgPool> =
-//!   LazyLock::new(|| { .. });`, whose connection lives in a closure the
-//!   signature walk consumes as a group. It over-collects for an item with
-//!   nothing in it, `#[cfg(test)] use x;`, which is harmless.
-//! * A brace at the item's own depth that is not a body is still read as
-//!   one, so a `use a::{b, c};` opens a span ending at that brace's `}`
-//!   rather than at the semicolon. The span covers the item's own text and
-//!   stops there: it neither loses a line of the item nor reaches into the
-//!   next one. An initializer brace is not misread at all, since a `=` at
-//!   the item's own depth switches the walk to skipping brace groups
-//!   whole.
-//! * Token spacing inside an attribute is not read: `# [test]` is invisible
-//!   to the lexer. `cargo fmt` rejects that spelling at the pre-commit
-//!   hook and in CI, so the shape cannot reach a merge.
-//! * Raw identifiers lex whole (`r#mod` is one token), but nothing else
-//!   about raw keywords is modelled. A raw keyword used where the lexer
-//!   expects a real one is unsupported.
-//!
-//! Eight further shapes can hide a connection outright, or name the test
-//! that opens one wrongly. All eight stay open, because each needs a
-//! spelling nobody in this workspace writes by accident, and reading them
-//! buys nothing against an author who wants the connection unseen. That is
-//! the "NOT a security boundary" sentence above, spent.
-//!
-//! Which of the two it costs depends on the tree. Under `src/`,
-//! [`unit_files`] sweeps in every `.rs` file the module walk never reached,
-//! under every path that reaches it (a symlink can give one file two), so a
-//! file the walk misses is still SCANNED, under the module prefix its PATH
-//! implies. Where that is not the prefix rustc gave the file, the derived
-//! name is one nextest never lists and the guard fails loudly. An
-//! integration target has no sweep. `tests/` is the module walk and nothing
-//! else, so a file the walk misses there is a file nobody reads.
-//!
-//! * An `include!("cases.rs")` edge is invisible to the module walk, which
-//!   follows `mod` declarations and nothing else. In a `src/` tree the
-//!   sweep opens the file anyway, under the prefix its path implies rather
-//!   than the module the `include!` put it in, so the derived name fails
-//!   the guard on a test nextest never lists. Three places keep it silent:
-//!   an integration target, which has no sweep; a file reachable only
-//!   through a directory this target excludes, `src/bin` for a library;
-//!   and the test scope a file INHERITS from its inclusion site, which the
-//!   sweep cannot see. A `#[cfg(test)] mod cases { include!("cases.rs"); }`
-//!   makes all of `cases.rs` test code to rustc, but the sweep reads it as
-//!   production code, so a plain helper fn in it that opens a connection,
-//!   called from a `#[test]` beside it, is collected nowhere. No crate here
-//!   includes Rust source.
-//! * An identifier starting with a non-ASCII character is not lexed as a
-//!   word. On a FN that is loud rather than silent: the attribute block is
-//!   taken before the name is read, so `#[tokio::test] async fn 東京()`
-//!   still opens a span over its body, the connection inside is collected,
-//!   and a finding naming no test charges the whole binary. On an inline
-//!   `mod 東京 { .. }` the name stops [`ItemLexer::module`] before the body
-//!   brace, so a `#[cfg(test)]` above it opens nothing. A test fn inside
-//!   still spans its own body and is collected, under a name missing the
-//!   module, which fails loudly. A connection anywhere ELSE in that module,
-//!   a helper fn or a `LazyLock` pool a test acquires from, is production
-//!   code as far as the guard can see, and that is the silent half. Every
-//!   identifier in this workspace is ASCII.
-//! * A `#[cfg_attr(target_os = "linux", path = "linux.rs")] mod m;` path
-//!   override is not read. The guard probes `m.rs` and `m/mod.rs`, so it
-//!   scans the wrong file when one of them exists and fails loudly when
-//!   neither does. Under `src/` the sweep still opens the real file, under
-//!   a path-derived prefix. No crate here has a per-target module file.
-//! * A `#[cfg(test)]` macro INVOCATION (`db_test!();`) is a bodyless item,
-//!   so its span is its own line and the tests it expands to are neither
-//!   named nor scanned. Reading inside one means running macro expansion.
-//! * `#[::sqlx::test]`, with the leading `::`, is not the spelling
-//!   `is_sqlx_test` matches, so it names no test. The fn body is still
-//!   scanned (it carries a test attribute), and the injected `pool:
-//!   PgPool` argument on its signature line is evidence on its own, so
-//!   what the leading `::` actually costs is an sqlx test that takes NO
-//!   argument and opens nothing by hand.
-//! * `#[cfg(test)] if probe() { .. } else { .. }` as an attributed
-//!   STATEMENT spans the first arm only, so a connection in the `else` arm
-//!   falls outside it. It bites in production code alone: written inside a
-//!   test fn or a `#[cfg(test)]` region, the enclosing span already covers
-//!   both arms. An attribute on an `if` is exotic; the same attribute on an
-//!   ITEM is covered, initializer arms included.
-//! * In `skip_to_body`, a `>>` at angle depth 1 is consumed as two generic
-//!   closers, one more than the signature opened, so a `{` further along
-//!   can be taken for the body and the span ends in the wrong place. The
-//!   angle walk is textual by design (see that function's own note), and
-//!   provoking the miscount takes a right shift written at angle depth 1,
-//!   outside the braces a const-generic argument is written in, which the
-//!   walk skips whole.
-//! * `#[path = /* "decoy.rs" */ "real.rs"]` resolves to `decoy.rs`. The
-//!   `#[path]` value is the one thing read from the RAW text, comments and
-//!   all, because blanking eats the very string it names. The cost is the
-//!   wrong file scanned, or a loud failure when `decoy.rs` is not there.
-//!
-//! A future review that finds a new hole should adjudicate it against this
-//! section: does it produce a silent pass, or only noise?
+//! the workspace runs inside the `postgres` nextest group (ADR-0021
+//! ruling 4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -184,7 +13,6 @@ use std::process::ExitCode;
 
 use serde_json::Value;
 
-/// The nextest test group every pg-touching test must land in.
 const GROUP: &str = "postgres";
 
 /// Marker of a postgres fixture module: a `common` module that defines this
@@ -192,17 +20,9 @@ const GROUP: &str = "postgres";
 /// (fleet-ui and trawl-engine both have a non-pg one).
 const FIXTURE_MARKER: &str = "fn fixture_pool";
 
-/// Connection-opening APIs. A test naming one of these opens a postgres
-/// connection of its own, whatever attribute sits above it — a plain
-/// `#[tokio::test]` calling `KeyStore::connect` is exactly the escape the
-/// two marker-based classes miss.
-///
-/// Where they are scanned differs by tree. An integration test file is all
-/// test code, so the whole file counts. A package's `src/` tree is
-/// production code, where `PgPool` appears in every store module and
-/// `StorageState::connect` is DEFINED, so only the test regions count
-/// there: the body of a `#[cfg(test)]` item, and the body of a fn carrying
-/// a test attribute (see [`scan`]).
+/// A package's `src/` tree is production code, where `PgPool` appears in every
+/// store module and `StorageState::connect` is DEFINED, so only the test regions
+/// count there (see [`scan`]).
 const CONNECTION_APIS: &[&str] = &[
     "PgConnection::connect",
     "KeyStore::connect",
@@ -212,15 +32,12 @@ const CONNECTION_APIS: &[&str] = &[
     "fixture_pool",
 ];
 
-/// Why one target is pg-touching, in a form a failure message can print.
 struct Evidence {
-    /// File and line the finding came from.
     site: String,
     /// Test function names the evidence names, empty when it names none.
     tests: Vec<String>,
 }
 
-/// One test target and the evidence gathered for it.
 struct Derived {
     binary_id: String,
     evidence: Vec<Evidence>,
@@ -233,7 +50,6 @@ impl Derived {
         self.evidence.iter().any(|e| e.tests.is_empty())
     }
 
-    /// Every test name the evidence pins, across all findings.
     fn named_tests(&self) -> BTreeSet<&str> {
         self.evidence
             .iter()
@@ -308,15 +124,11 @@ struct Suite {
     matched: BTreeSet<String>,
 }
 
-/// How many escaped test names a failure message prints before it stops.
 const NAMES_SHOWN: usize = 5;
 
 /// Check one derived target against its nextest listing. `None` is a pass.
 fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
     if target.has_target_evidence() {
-        // The whole binary drives postgres, so the whole binary belongs in
-        // the group. Nothing here consults the named tests: target-level
-        // evidence dominates.
         let Some(suite) = suite.filter(|s| !s.all.is_empty()) else {
             return Some(format!(
                 "  {} is not in the `{GROUP}` group\n    evidence: {}",
@@ -347,9 +159,7 @@ fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
     let matched = &suite.unwrap_or(&default).matched;
     // Exact, not a trailing-segment match. Every derived name is rooted at
     // the target's crate root (see [`module_tree`]), so it is spelled the
-    // way nextest spells it. Suffix matching let an in-group
-    // `b::tests::connects` satisfy an out-of-group `a::tests::connects`,
-    // and the guard reported a pass while the pg test ran unbounded.
+    // way nextest spells it.
     let missing: Vec<&str> = target
         .named_tests()
         .into_iter()
@@ -367,8 +177,6 @@ fn check(target: &Derived, suite: Option<&Suite>) -> Option<String> {
     ))
 }
 
-/// Test names for a failure message, truncated so a whole 600-test binary
-/// does not bury the sentence that explains it.
 fn name_list(names: &[&str]) -> String {
     if names.len() <= NAMES_SHOWN {
         return names.join(", ");
@@ -380,7 +188,6 @@ fn name_list(names: &[&str]) -> String {
     )
 }
 
-/// Derive the pg-touching targets from `cargo metadata` and the sources.
 fn derive(root: &Path) -> Result<Vec<Derived>, String> {
     let out = crate::cargo()
         .args(["metadata", "--no-deps", "--format-version", "1"])
@@ -402,11 +209,8 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
         let package_name = package["name"].as_str().unwrap_or_default();
         let targets = package["targets"].as_array().map_or(&[][..], Vec::as_slice);
 
-        // The unit-test half. A package's `src/` tree is NOT one binary:
-        // nextest runs `src/lib.rs`'s tests in `pkg` and each
-        // `src/bin/tool.rs`'s in `pkg::bin/tool`, so scanning the whole
-        // tree and charging it to the lib let a bin's pg test be satisfied
-        // by a same-named lib test that was in the group.
+        // A package's `src/` tree is NOT one binary: nextest runs `src/lib.rs`'s tests
+        // in `pkg` and each `src/bin/tool.rs`'s in `pkg::bin/tool`.
         let mut lib_src = None;
         let mut bins = Vec::new();
         for target in targets {
@@ -443,8 +247,7 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
         };
 
         if let Some(src) = &lib_src {
-            // `src/bin/` is nobody's lib module. Sweeping it into the lib
-            // scan is what made a bin's test look like a lib test.
+            // `src/bin/` is nobody's lib module.
             let bin_dir = src.parent().map(|dir| dir.join("bin"));
             let files = unit_files(src, src.parent(), bin_dir.as_deref())?;
             charge(package_name.to_string(), files);
@@ -474,11 +277,6 @@ fn derive(root: &Path) -> Result<Vec<Derived>, String> {
 /// Every file of a unit-test tree: the module walk from the crate root,
 /// plus any other `.rs` under `net_root` the walk never reached, minus
 /// anything under `exclude`.
-///
-/// The walk is the authority on module paths; the leftovers are a safety
-/// net. A file no `mod` declaration reaches does not compile into the
-/// binary at all, so including it can only cost a false failure — loud,
-/// and preferable to trusting the walk to be complete.
 fn unit_files(
     src: &Path,
     net_root: Option<&Path>,
@@ -522,8 +320,6 @@ fn target_kinds(target: &Value) -> Vec<&str> {
         .collect()
 }
 
-/// One source file of a target, with the module path its contents live
-/// under.
 struct SourceFile {
     path: PathBuf,
     /// Module path from the crate root, `::`-terminated (`store::pg_tests::`),
@@ -536,12 +332,7 @@ struct SourceFile {
     all_test: bool,
 }
 
-/// Walk a target's module tree from its root file, following every
-/// out-of-line `mod x;` declaration.
-///
-/// Following only `mod common;` was a silent hole: a `tests/root.rs` that
-/// declared `mod cases;` put its postgres tests in a file the guard never
-/// opened. Resolution follows rustc's rules, each one probed against rustc
+/// Resolution follows rustc's rules, each one probed against rustc
 /// rather than assumed:
 ///
 /// * Children of the crate root file, and of a `mod.rs`, resolve in that
@@ -553,17 +344,6 @@ struct SourceFile {
 ///   the TOP level of a non-root `foo.rs` it resolves against the file's
 ///   own directory instead of `foo/`. Nested inside an inline `mod`, it
 ///   goes back to the nesting rule.
-///
-/// A file already visited is skipped, but the key is the pair (path,
-/// module prefix), not the path. One file can be mounted under two module
-/// names, `#[path = "shared.rs"] mod a;` beside `#[path = "shared.rs"] mod
-/// b;`, and rustc compiles its tests twice, once under each name. Keying on
-/// the path alone scanned the text once and derived only one of the two
-/// name sets.
-///
-/// A declaration that resolves to no file on disk is a hard error naming
-/// the module. Skipping it silently is the one outcome this guard may not
-/// have: the file it could not find is exactly where a pg test would hide.
 fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, FileFacts)>, String> {
     let mut out = Vec::new();
     let mut seen = BTreeSet::new();
@@ -578,14 +358,8 @@ fn module_tree(root_file: &Path, all_test: bool) -> Result<Vec<(SourceFile, File
     while let Some((file, is_root)) = queue.pop() {
         // Keyed on the module identity, not the file alone. `#[path =
         // "shared.rs"]` on two `mod` declarations compiles the same text
-        // twice, and nextest names the tests once per mounting, so a
-        // path-only key scans the file once and derives only whichever
-        // mounting came off the stack first. The other mounting's names are
-        // then never checked against the group. Test scope is part of the
-        // identity too: cfg-alternated mountings share a path AND a name
-        // (`#[cfg(test)] mod shared;` beside `#[cfg(feature = "x")] mod
-        // shared;`), and a key without `all_test` lets whichever mounting
-        // pops last discard the test-scoped scan of the other.
+        // twice, and nextest names the tests once per mounting. Test scope is part of
+        // the identity too: cfg-alternated mountings share a path AND a name.
         if !seen.insert((file.path.clone(), file.prefix.clone(), file.all_test)) {
             continue;
         }
@@ -676,11 +450,6 @@ fn child_dir(file: &Path, is_root: bool) -> PathBuf {
 /// The module prefix a file's PATH implies, for a `src/` file the module
 /// walk never reached: `src/foo.rs` is `foo::`, `src/foo/bar.rs` is
 /// `foo::bar::`, `src/foo/mod.rs` is `foo::`, the root file is empty.
-///
-/// This is the safety net under [`module_tree`], not a substitute for it:
-/// it cannot see `#[path]` or inline nesting. A file it names wrongly costs
-/// a false failure, which is loud. A file left out costs a silent escape,
-/// which is the one thing the guard may not do.
 fn path_prefix(source_root: &Path, file: &Path) -> String {
     let Ok(rest) = file.strip_prefix(source_root) else {
         return String::new();
@@ -702,32 +471,15 @@ fn path_prefix(source_root: &Path, file: &Path) -> String {
 }
 
 /// Every `.rs` file under `dir`, following directory symlinks, under EVERY
-/// path that reaches it.
-///
-/// The problem a symlink causes here is a CYCLE, not the symlink itself: a
-/// link pointing at one of its own ancestors is a directory forever and the
-/// walk descends it until the OS refuses a longer path. Refusing to follow
-/// links instead drops whatever lives behind one, and behind one is exactly
-/// where the safety net has to look. Rustc compiles
-/// `include!("linked/mod.rs")` through a symlinked directory, and the module
-/// walk cannot see an `include!` edge at all, so nobody else opens that file.
+/// path that reaches it. Refusing to follow links drops whatever lives behind
+/// one, and behind one is exactly where the safety net has to look.
 ///
 /// The cycle check is the ANCESTOR PATH, not a set of everything visited. A
 /// global set keeps whichever lexical path happened to reach a real directory
-/// first, and [`unit_files`] decides target ownership on the lexical path
-/// afterwards: a library excludes `src/bin`, so if `read_dir` yielded `bin`
-/// before the `src/shared -> bin/shared` link, the only recorded path was the
-/// excluded one and the file was scanned by nobody. Every acyclic alias is
-/// walked, and a file reachable two ways is collected twice, once per path.
-/// Duplicate lexical paths cost a duplicate finding at worst, which is loud;
-/// a dropped alias is a pg test nobody counted.
+/// first, and [`unit_files`] decides target ownership on the lexical path.
 ///
-/// A ROOT that does not exist is an empty sweep, by design: [`unit_files`]
-/// derives one sweep directory per target, and a bin whose source is a
-/// single file has none. Every other filesystem failure, at the root or
-/// below it, is an error, never an empty directory: a directory the walk
-/// cannot canonicalize or list is one whose tests nobody scans, and a
-/// silent skip is the one defect this module refuses.
+/// A ROOT that does not exist is an empty sweep, by design: a bin whose source
+/// is a single file has none.
 fn collect_rs(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
     match fs::symlink_metadata(dir) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -774,15 +526,12 @@ fn collect_rs_acyclic(
     Ok(())
 }
 
-/// Which tree the sources come from. The connection-API class applies to
-/// integration test files only (see [`CONNECTION_APIS`]).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Scope {
     Integration,
     UnitTree,
 }
 
-/// Scan a target's sources for pg evidence.
 fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evidence> {
     let mut evidence = Vec::new();
     for (source, facts) in files {
@@ -801,9 +550,6 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
             });
         }
 
-        // The fixture side: this file IS the pg harness (it defines the
-        // pool constructor), and the module walk only reached it because
-        // the target declares `mod common;`.
         if facts.code.contains(FIXTURE_MARKER) && source.path.ends_with(Path::new("common/mod.rs"))
         {
             evidence.push(Evidence {
@@ -812,10 +558,6 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
             });
         }
 
-        // The raw-connection side: no attribute, no fixture, just a test
-        // that dials postgres itself. An integration file is all test code
-        // and so is an out-of-line test module's file; a `src/` file is
-        // production code, where only the `#[cfg(test)]` bodies count.
         if source.all_test {
             // An integration target's finding stays target-level on
             // purpose: nothing there says WHICH tests the connection
@@ -832,10 +574,8 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
                 });
             }
         } else {
-            // A test fn's own body counts too. Without it a `#[test]` or
-            // `#[tokio::test]` written at a `src/` file's top level, under
-            // no `#[cfg(test)]` at all, had its connection read as
-            // production code and nothing was collected.
+            // A test fn's own body counts too: a `#[test]` or `#[tokio::test]` written
+            // at a `src/` file's top level, under no `#[cfg(test)]` at all.
             for span in facts.cfg_test_spans.iter().chain(&facts.test_fn_spans) {
                 if let Some((line, api)) = connection_site(facts, span.0, span.1) {
                     evidence.push(Evidence {
@@ -849,12 +589,8 @@ fn scan(files: &[(SourceFile, FileFacts)], root: &Path, scope: Scope) -> Vec<Evi
     evidence
 }
 
-/// Line numbers and names of every non-ignored `#[sqlx::test]` in a file.
-///
 /// An `#[ignore]`d test is skipped, and it has to be: `group_membership`
-/// drops ignored cases from both the `all` and the `matched` side, so a
-/// name collected here that nextest never lists reads as a test that
-/// escaped the group and fails the guard over a test that never runs. The
+/// drops ignored cases from both the `all` and the `matched` side. The
 /// two sides must agree on what counts as a test.
 fn sqlx_tests(facts: &FileFacts, prefix: &str) -> Vec<(usize, String)> {
     facts
@@ -865,11 +601,8 @@ fn sqlx_tests(facts: &FileFacts, prefix: &str) -> Vec<(usize, String)> {
         .collect()
 }
 
-/// Names of the non-ignored test functions of a file, or of one span of it.
-///
 /// Helper `fn`s are left out — they are not test ids, and asking nextest
 /// about one would fail the guard on a name that can never be in the group.
-/// Ignored ones are left out for the same reason `sqlx_tests` drops them.
 fn test_names(facts: &FileFacts, prefix: &str, span: Option<Span>) -> Vec<String> {
     facts
         .fns
@@ -880,13 +613,8 @@ fn test_names(facts: &FileFacts, prefix: &str, span: Option<Span>) -> Vec<String
         .collect()
 }
 
-/// The first line in the inclusive range `[start, end]` naming a
-/// connection-opening API, with the API it named.
-///
 /// Reads the blanked text, so prose about `fixture_pool` is not a
-/// connection and a DSN inside a string literal is not one either. Losing a
-/// detection that way is impossible: a call is code, and code survives
-/// blanking intact.
+/// connection and a DSN inside a string literal is not one either.
 fn connection_site(facts: &FileFacts, start: usize, end: usize) -> Option<(usize, &'static str)> {
     facts
         .code
@@ -902,8 +630,6 @@ fn connection_site(facts: &FileFacts, start: usize, end: usize) -> Option<(usize
         })
 }
 
-/// One `fn` item, with the facts derived from the attribute block rustc
-/// attaches to it.
 struct FnItem {
     /// Real 1-based line of the first attribute in the block, or of the
     /// signature itself when the function carries no attributes.
@@ -920,10 +646,8 @@ struct FnItem {
     ignored: bool,
 }
 
-/// An out-of-line `mod name;` declaration.
 struct ModDecl {
     name: String,
-    /// The `#[path = "..."]` override, when one is written.
     path: Option<String>,
     /// The inline `mod` names it is nested inside, outermost first. They
     /// are part of both the module path and the directory the child file
@@ -938,7 +662,6 @@ struct ModDecl {
 /// Inclusive 1-based line range.
 type Span = (usize, usize);
 
-/// One attribute, as the lexer read it.
 struct Attr {
     /// The path before any arguments, whitespace removed: `cfg`, `ignore`,
     /// `sqlx::test`.
@@ -950,7 +673,6 @@ struct Attr {
     raw_args: String,
 }
 
-/// Everything the guard reads out of one source file.
 struct FileFacts {
     /// The comment- and literal-blanked text: byte for byte as long as the
     /// original, with every newline in place.
@@ -962,28 +684,18 @@ struct FileFacts {
     /// report one connection twice for the ordinary `#[cfg(test)] mod tests`
     /// shape.
     test_fn_spans: Vec<Span>,
-    /// Every out-of-line `mod name;` in the file, test-only or not.
     mods: Vec<ModDecl>,
 }
 
-/// Read one source file with a single item-bounded pass over its blanked
-/// text.
-///
 /// Every per-test fact the guard uses — is this a test, what is it called,
 /// is it `#[ignore]`d — comes from here, because deriving them from
-/// adjacent lines gets all three wrong in ways that matter:
+/// adjacent lines gets all three wrong:
 ///
-/// * An `#[ignore]` written inside a `/* */` block comment is not an
-///   attribute. Blanking turns it into spaces before the lexer sees it, so
-///   it cannot be read as one.
-/// * An attribute block belongs to the NEXT ITEM and stops there. A scan
-///   that walks downward until it finds a `fn` reads the `#[ignore]` of the
-///   next test as this one's.
+/// * An attribute block belongs to the NEXT ITEM and stops there.
 /// * Blank lines, doc comments and multi-line attributes between the block
 ///   and its item change nothing. Probed with rustc: `#[test]`, a blank
 ///   line, `/// doc`, a blank line, `#[ignore]`, a blank line, then `fn
-///   t()` compiles to one IGNORED test. So the block accumulates across all
-///   of them and is discarded only when some other item takes it.
+///   t()` compiles to one IGNORED test.
 ///
 /// Line numbers stay the file's real ones: blanking preserves every byte
 /// position and newline.
@@ -1050,16 +762,12 @@ struct ItemLexer<'a> {
     decls: Vec<ModDecl>,
 }
 
-/// Which list a closed span belongs to.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SpanKind {
-    /// A `#[cfg(test)]` item's body.
     CfgTest,
-    /// The body of a fn carrying a test attribute.
     TestFn,
 }
 
-/// How [`ItemLexer::skip_to_body`] left an attributed item.
 enum ItemHead {
     /// A body brace was found and consumed. The item's extent is the block
     /// that now follows, and the main loop's depth bookkeeping closes it.
@@ -1192,8 +900,6 @@ impl ItemLexer<'_> {
             // of an inline `mod m { .. }` is how that module says its whole
             // body is test code, and the cursor is already inside that body:
             // open the span here, at the depth the body was entered on.
-            // Without it the module was scanned as production code and every
-            // connection in it was invisible.
             if self.depth > 0 && is_cfg_test(&self.parse_attr(from, to)) {
                 self.open_spans
                     .push((line, self.depth - 1, SpanKind::CfgTest));
@@ -1274,11 +980,7 @@ impl ItemLexer<'_> {
     ///
     /// The cursor sits inside the item's signature here (just past `fn
     /// name`, past `impl`, past `use`), so the body has to be found by
-    /// walking that signature. Letting the main loop do it lost spans two
-    /// ways, both of them silent: a comma or semicolon anywhere in the
-    /// signature (`fn helper(_: u8, _: u8)`, `fn f(x: [u8; 4])`) cleared
-    /// the remembered `cfg(test)`, and the first `{` was taken as the body
-    /// even when it was a const-generic argument (`fn f() -> Foo<{ 1 }>`).
+    /// walking that signature.
     fn take_pending(&mut self, line: usize) -> (usize, Vec<Attr>) {
         let (attr_line, attrs) = self.pending.take().unwrap_or((line, Vec::new()));
         // A test fn's body is test code wherever it is written, `#[cfg(test)]`
@@ -1300,9 +1002,7 @@ impl ItemLexer<'_> {
                 // is the span: first attribute line through the semicolon.
                 // A `#[cfg(test)] static POOL: LazyLock<PgPool> =
                 // LazyLock::new(|| { .. connect_lazy .. });` has its whole
-                // connection inside a closure the signature walk consumed
-                // as a group, and reporting no span at all made that pool
-                // invisible.
+                // connection inside a closure the signature walk consumed.
                 ItemHead::Bodyless(end) => self.record_span(kind, (attr_line, end)),
                 ItemHead::None => {}
             }
@@ -1310,7 +1010,6 @@ impl ItemLexer<'_> {
         (attr_line, attrs)
     }
 
-    /// File one closed span under the list its kind names.
     fn record_span(&mut self, kind: SpanKind, span: Span) {
         match kind {
             SpanKind::CfgTest => self.spans.push(span),
@@ -1318,10 +1017,6 @@ impl ItemLexer<'_> {
         }
     }
 
-    /// Walk an item's signature to its body brace, consuming it. An item
-    /// that ends at a `;` instead reports the line that semicolon sits on,
-    /// which is where its extent stops.
-    ///
     /// `(`/`[` depth is what keeps a signature comma or semicolon from
     /// reading as the end of the item. Angle depth is what keeps a
     /// const-generic brace from reading as the body: at angle depth > 0 a
@@ -1337,9 +1032,7 @@ impl ItemLexer<'_> {
     /// skipped as a balanced group rather than read as a body. No item
     /// with a real body carries such a `=` first: an `impl`, `struct`,
     /// `trait` or `fn` head has none, and an associated type's `=` sits at
-    /// angle depth 1 (`Iterator<Item = u8>`). Without the rule an
-    /// initializer like `= if c { a } else { connect_lazy(..) };` had its
-    /// span closed at the first `}`, leaving the second arm uncovered.
+    /// angle depth 1 (`Iterator<Item = u8>`).
     fn skip_to_body(&mut self) -> ItemHead {
         let mut group = 0usize;
         let mut angle = 0usize;
@@ -1414,10 +1107,7 @@ impl ItemLexer<'_> {
             is_sqlx_test: attrs.iter().any(is_sqlx_test),
             // `#[ignore]` and nothing else. A `#[cfg_attr(slow, ignore)]`
             // is ignored under some cfgs and not others, and no static
-            // reading can say which one CI compiled, so the test is KEPT:
-            // a name nextest never lists fails the guard loudly, while a
-            // name dropped here is a pg test running outside the group
-            // with nobody to say so.
+            // reading can say which one CI compiled, so the test is KEPT.
             ignored: attrs.iter().any(|attr| attr.path == "ignore"),
         });
     }
@@ -1466,27 +1156,17 @@ impl ItemLexer<'_> {
     }
 }
 
-/// `#[test]`, `#[tokio::test]`, `#[sqlx::test(...)]` — an attribute whose
-/// final path segment is exactly `test`.
 fn is_test_attr(attr: &Attr) -> bool {
     attr.path.rsplit("::").next() == Some("test")
 }
 
-/// Does this attribute install the sqlx test harness, which builds a
-/// postgres pool for the function beneath it?
-///
 /// Written directly, or wrapped in a `cfg_attr` at any depth. Textual
 /// containment is enough on purpose: the guard cannot know which cfgs CI
 /// compiled under, so it treats a conditional `sqlx::test` as a real one.
-/// That over-collects when the cfg is off, and over-collecting names a
-/// test nextest may not list, which fails the guard loudly. The reverse
-/// reading would be a pg pool nobody counted.
 fn is_sqlx_test(attr: &Attr) -> bool {
     attr.path == "sqlx::test" || despace(&attr.args).contains("sqlx::test")
 }
 
-/// The text with every whitespace byte removed, so `sqlx :: test` reads
-/// the same as `sqlx::test`.
 fn despace(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
@@ -1496,11 +1176,9 @@ fn despace(text: &str) -> String {
 /// left in it to find.
 ///
 /// A `cfg_attr` whose expansion contains `cfg(test)` counts as one, for the
-/// same reason [`is_sqlx_test`] reads a wrapped `sqlx::test`: the guard
-/// cannot know which cfgs CI compiled under, and the item is test code
-/// whenever the predicate holds. Reading it as production code is a
-/// connection nobody scanned. `#[cfg_attr(test, ignore)]` is untouched by
-/// this: its expansion is `ignore`, not `cfg(test)`.
+/// same reason [`is_sqlx_test`] reads a wrapped `sqlx::test`.
+/// `#[cfg_attr(test, ignore)]` is untouched by this: its expansion is
+/// `ignore`, not `cfg(test)`.
 fn is_cfg_test(attr: &Attr) -> bool {
     if attr.path == "cfg" {
         return has_ident(&attr.args, "test");
@@ -1508,7 +1186,6 @@ fn is_cfg_test(attr: &Attr) -> bool {
     attr.path == "cfg_attr" && despace(&attr.args).contains("cfg(test)")
 }
 
-/// Does `text` contain `word` as a whole identifier?
 fn has_ident(text: &str, word: &str) -> bool {
     let bytes = text.as_bytes();
     text.match_indices(word).any(|(at, _)| {
@@ -1522,8 +1199,6 @@ fn is_ident_byte(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
-/// The `#[path = "child.rs"]` value, read from the attribute AS WRITTEN
-/// (blanking eats the string it names).
 fn path_attr(attrs: &[Attr]) -> Option<String> {
     let attr = attrs.iter().find(|attr| attr.path == "path")?;
     let start = attr.raw_args.find('"')? + 1;
@@ -1532,12 +1207,9 @@ fn path_attr(attrs: &[Attr]) -> Option<String> {
 }
 
 /// Replace comment and literal CONTENT with spaces, keeping every byte
-/// position and newline. Handles `//`, `/* */` (nested, as rustc does),
-/// `"..."`, `r"..."`/`r#"..."#` and `'a'`.
-///
-/// Blanking rather than deleting is what keeps the reported line numbers
-/// honest, and it is what stops a `}` inside a string literal from closing
-/// a `#[cfg(test)] mod` twenty lines early.
+/// position and newline. Blanking rather than deleting is what keeps the
+/// reported line numbers honest, and it is what stops a `}` inside a string
+/// literal from closing a `#[cfg(test)] mod` twenty lines early.
 fn blank_comments_and_literals(text: &str) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
@@ -1619,7 +1291,6 @@ fn blank_comments_and_literals(text: &str) -> String {
     out
 }
 
-/// Is this `'` opening a char literal rather than a lifetime (`'a`)?
 fn is_char_literal(rest: &[u8]) -> bool {
     char_literal_len(rest) > 0
 }
@@ -1630,7 +1301,6 @@ fn char_literal_len(rest: &[u8]) -> usize {
         return 0;
     }
     if rest.get(1) == Some(&b'\\') {
-        // Escapes are at most `\u{10FFFF}`; find the closing quote.
         return rest[2..]
             .iter()
             .position(|c| *c == b'\'')
@@ -1648,8 +1318,6 @@ fn char_literal_len(rest: &[u8]) -> usize {
     }
 }
 
-/// Ask nextest what it would run: binary id → its testcases and which of
-/// them the group filterset matched.
 fn group_membership(root: &Path, extra: &[String]) -> Result<BTreeMap<String, Suite>, String> {
     let mut cmd = crate::cargo();
     cmd.args([
@@ -1719,13 +1387,10 @@ mod tests {
         format!("#[{}::test{args}]", "sqlx")
     }
 
-    /// Every `#[sqlx::test]` a file declares, unqualified.
     fn sqlx_names(text: &str) -> Vec<(usize, String)> {
         sqlx_tests(&file_facts(text), "")
     }
 
-    /// The span half of `scan`, as one call: the first connection each
-    /// `#[cfg(test)]` span opens, with the tests that span declares.
     fn cfg_test_sites(text: &str) -> Vec<(usize, &'static str, Vec<String>)> {
         let facts = file_facts(text);
         facts
@@ -1740,7 +1405,6 @@ mod tests {
 
     #[test]
     fn prose_about_sqlx_test_is_not_evidence() {
-        // Verbatim shapes from trawl-config and trawl-server's store modules.
         let text = format!(
             "// DATABASE_URL is ceded to the sqlx test harness ({a}\n    /// tests use `{a}`-migrated pools directly).\n",
             a = attr("")
@@ -1761,9 +1425,6 @@ mod tests {
         assert_eq!(found[1], (3, "nested".to_string()));
     }
 
-    /// An ignored test never runs, so `group_membership` leaves it out of
-    /// both its sets. Collecting it here would fail the guard on a name
-    /// nextest never lists.
     #[test]
     fn an_ignored_sqlx_test_is_not_collected() {
         let text = format!(
@@ -1774,9 +1435,6 @@ mod tests {
         assert_eq!(found, vec![(9, "runs".to_string())]);
     }
 
-    /// An `#[ignore]` inside a block comment is prose, and prose does not
-    /// ignore a test. The lexer reads the BLANKED text, where the whole
-    /// comment is spaces, so the live test below it stays collected.
     #[test]
     fn an_ignore_inside_a_block_comment_is_not_an_attribute() {
         let text = format!(
@@ -1786,11 +1444,6 @@ mod tests {
         assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
     }
 
-    /// The block ends at the item it attributes. Reading downward "until a
-    /// fn appears" walked past `live`'s signature and charged it with the
-    /// NEXT test's `#[ignore]`, dropping a live pg test from the derived
-    /// set. `pub(crate) async fn` is the shape that made the old scan miss
-    /// the signature in the first place.
     #[test]
     fn the_attribute_block_stops_at_the_fn_it_attributes() {
         let text = format!(
@@ -1800,8 +1453,6 @@ mod tests {
         assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
     }
 
-    /// Visibility and modifier spellings the old `strip_prefix("pub ")`
-    /// scan could not read.
     #[test]
     fn every_visibility_and_modifier_ordering_names_its_fn() {
         for signature in [
@@ -1823,9 +1474,7 @@ mod tests {
 
     /// rustc attaches an attribute across blank lines, doc comments and
     /// other attributes; probed with rustc, which reports exactly one
-    /// IGNORED test for this shape. The reverse line scan stopped at the
-    /// first line that was not an attribute, so the `#[ignore]` above the
-    /// doc comment was invisible and an ignored test was collected.
+    /// IGNORED test for this shape.
     #[test]
     fn an_attribute_block_carries_across_blank_lines_and_docs() {
         let text = format!(
@@ -1872,9 +1521,6 @@ mod tests {
 
     #[test]
     fn target_evidence_dominates_the_named_tests_beside_it() {
-        // auth_pg's shape: named `#[sqlx::test]` cases AND the fixture
-        // module. A narrowed filter that matches only the named ones leaves
-        // the rest of the binary booting servers unbounded.
         let mixed = target(vec![
             fixture_evidence(),
             named_evidence(&["ac1_key_roundtrip", "ac3_admin_cannot_ingest"]),
@@ -1887,7 +1533,6 @@ mod tests {
         assert!(failure.contains("1 of its 3 test(s)"), "{failure}");
         assert!(failure.contains("ac7_reload"), "{failure}");
 
-        // Same evidence, whole binary in the group: a pass.
         let whole = suite(
             &["ac1_key_roundtrip", "ac3_admin_cannot_ingest", "ac7_reload"],
             &["ac1_key_roundtrip", "ac3_admin_cannot_ingest", "ac7_reload"],
@@ -1910,10 +1555,6 @@ mod tests {
         assert!(!failure.contains("unrelated"), "{failure}");
     }
 
-    /// The masking escape, end to end through `check`: two files declare
-    /// the same `tests::connects`, only one of them opens a pool. A
-    /// trailing-segment match let the grouped one satisfy the ungrouped
-    /// one and the guard reported a pass.
     #[test]
     fn a_same_named_test_in_another_module_does_not_satisfy_this_one() {
         let masked = target(vec![named_evidence(&["a::tests::connects"])]);
@@ -1924,7 +1565,6 @@ mod tests {
         let failure = check(&masked, Some(&listing)).expect("a::tests::connects escaped");
         assert!(failure.contains("a::tests::connects"), "{failure}");
 
-        // The right one in the group is a pass.
         let listing = suite(
             &["a::tests::connects", "b::tests::connects"],
             &["a::tests::connects"],
@@ -1955,8 +1595,6 @@ mod tests {
         assert!(connection_site(&file_facts("fn pure() -> u8 { 1 }\n"), 1, usize::MAX).is_none());
     }
 
-    /// Production `src/` code that opens a pool is not test evidence: the
-    /// definition sites would flag every store module in the workspace.
     #[test]
     fn production_code_outside_cfg_test_is_not_evidence() {
         let text = format!(
@@ -1966,10 +1604,6 @@ mod tests {
         assert!(cfg_test_sites(&text).is_empty());
     }
 
-    /// The escape this class exists for: a plain `#[tokio::test]` under
-    /// `src/`, inside the crate's own test module, dialing postgres itself.
-    /// The name it reports carries the module, because a leaf name is
-    /// ambiguous across modules.
     #[test]
     fn a_connection_inside_a_cfg_test_module_is_evidence() {
         let text = format!(
@@ -1983,8 +1617,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
-    /// One `#[cfg(test)]` region per file was the old rule (`find_map`), so
-    /// a second test module in the same file opened connections unseen.
     #[test]
     fn every_cfg_test_span_is_scanned() {
         let text = format!(
@@ -1997,9 +1629,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
-    /// Two connecting regions in one file, both reported. The old
-    /// `find_map` stopped at the first, so a second test module could dial
-    /// postgres unseen behind a module that already had a finding.
     #[test]
     fn two_connecting_spans_are_two_findings() {
         let text = format!(
@@ -2015,9 +1644,6 @@ mod tests {
         assert_eq!(sites[1].2, vec!["second_tests::dials".to_string()]);
     }
 
-    /// An ignored test inside a connecting span is not named evidence
-    /// either: nextest lists no such case, so the guard would fail on a
-    /// name that can never be in the group.
     #[test]
     fn an_ignored_test_in_a_connecting_span_is_not_named() {
         let text = format!(
@@ -2029,8 +1655,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::live".to_string()]);
     }
 
-    /// Braces nested inside the test module, and a string literal carrying
-    /// an unbalanced `}`. Neither may end the region before the call.
     #[test]
     fn nested_braces_and_a_brace_in_a_string_do_not_end_the_region() {
         let text = format!(
@@ -2039,10 +1663,8 @@ mod tests {
         );
         let sites = cfg_test_sites(&text);
         assert_eq!((sites[0].0, sites[0].1), (9, "StorageState::connect"));
-        // `helper` carries no test attribute, so it is not a name to check.
         assert_eq!(sites[0].2, vec!["tests::boots".to_string()]);
 
-        // The same call AFTER the module closes is production code again.
         let outside = format!(
             "#[cfg(test)]\nmod tests {{\n    fn helper() {{}}\n}}\n\nasync fn boot() {{\n    let s = {}\"...\").await;\n}}\n",
             call("StorageState", "connect"),
@@ -2050,7 +1672,6 @@ mod tests {
         assert!(cfg_test_sites(&outside).is_empty());
     }
 
-    /// `#[cfg(test)]` on a single fn is one braced body like a module.
     #[test]
     fn a_cfg_test_fn_is_scanned_like_a_cfg_test_mod() {
         let text = format!(
@@ -2059,14 +1680,9 @@ mod tests {
         );
         let sites = cfg_test_sites(&text);
         assert_eq!((sites[0].0, sites[0].1), (3, "KeyStore::connect"));
-        // No test attribute inside: the finding is target-level.
         assert!(sites[0].2.is_empty());
     }
 
-    /// A comma in the attributed item's OWN signature used to clear the
-    /// remembered `#[cfg(test)]`, so the body never opened a span and a
-    /// helper that dials postgres was invisible. Any signature separator
-    /// does it: a comma between parameters, a `;` inside an array type.
     #[test]
     fn a_signature_separator_does_not_lose_the_cfg_test_span() {
         for signature in [
@@ -2089,9 +1705,6 @@ mod tests {
         }
     }
 
-    /// A const-generic argument in the return type is a `{` that is not the
-    /// body. Taking it as one ended the span before the real body, so the
-    /// connection below it was outside every span.
     #[test]
     fn a_const_generic_brace_is_not_the_body() {
         let text = format!(
@@ -2103,10 +1716,6 @@ mod tests {
         assert_eq!((sites[0].0, sites[0].1), (3, "KeyStore::connect"));
     }
 
-    /// A raw identifier is one token. Lexing `r#mod` as `r` then `#` fed
-    /// the `#` to the attribute reader and left a bare `mod` keyword behind
-    /// it, so the module never opened a span and the connection inside was
-    /// invisible.
     #[test]
     fn a_raw_identifier_module_name_still_opens_a_span() {
         let text = format!(
@@ -2119,8 +1728,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["r#mod::boots".to_string()]);
     }
 
-    /// A bodyless `#[cfg(test)]` item ends at its own `;`. It must not
-    /// swallow the span of the module that follows it.
     #[test]
     fn a_bodyless_cfg_test_item_does_not_eat_the_next_span() {
         let text = format!(
@@ -2133,12 +1740,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
-    /// A `LazyLock` pool is a bodyless item, and its whole connection sits
-    /// inside a closure the signature walk consumes as a balanced group.
-    /// The walk used to reach the terminating `;` and report no span at
-    /// all, so the pool was invisible: a test that acquires from it names
-    /// no connection API of its own, and nothing else in the file does
-    /// either.
     #[test]
     fn a_lazy_static_pool_is_covered_by_its_own_span() {
         let pool = format!("Pg{}", "Pool");
@@ -2147,7 +1748,6 @@ mod tests {
             "#[cfg(test)]\nstatic POOL: LazyLock<{pool}> = LazyLock::new(|| {{\n    {lazy}(\"postgres://x\")\n}});\n",
         );
         let facts = file_facts(&text);
-        // Attribute line through the semicolon, and no further.
         assert_eq!(facts.cfg_test_spans, vec![(1, 4)]);
         let span = facts.cfg_test_spans[0];
         // The type on line 2 names `PgPool`, so ask the span about the
@@ -2158,9 +1758,6 @@ mod tests {
         );
     }
 
-    /// An initializer can open more than one brace group at the item's own
-    /// depth. Reading the first one as a body closed the span at its `}`,
-    /// so the second arm fell outside every span.
     #[test]
     fn an_initializer_with_two_brace_groups_is_covered_whole() {
         let lazy = format!("connect{}", "_lazy");
@@ -2172,8 +1769,6 @@ mod tests {
         assert_eq!(cfg_test_sites(&text), vec![(5, "connect_lazy", Vec::new())]);
     }
 
-    /// `#[cfg(feature = "test")]` is not `#[cfg(test)]`. The argument text
-    /// is read blanked, so the string has no `test` token left in it.
     #[test]
     fn a_feature_named_test_does_not_open_a_span() {
         let text = format!(
@@ -2183,9 +1778,6 @@ mod tests {
         assert!(cfg_test_sites(&text).is_empty());
     }
 
-    /// An inline module can gate itself from the INSIDE. The attribute is
-    /// an inner one, so it never joins the pending block, and the module was
-    /// read as production code with every connection in it invisible.
     #[test]
     fn an_inner_cfg_test_attribute_opens_the_module_body_as_a_span() {
         let text = format!(
@@ -2199,11 +1791,6 @@ mod tests {
         assert_eq!(sites[0].2, vec!["pg_tests::boots".to_string()]);
     }
 
-    /// A `cfg_attr` that expands to `cfg(test)` gates its item as a written
-    /// `#[cfg(test)]` does whenever the predicate holds, and the guard cannot
-    /// know whether CI compiled with it. Over-collecting is the fail
-    /// direction; reading it as production code was a connection nobody
-    /// scanned.
     #[test]
     fn a_cfg_attr_expanding_to_cfg_test_opens_a_span() {
         for wrapper in [
@@ -2223,8 +1810,6 @@ mod tests {
             );
         }
 
-        // `#[cfg_attr(test, ignore)]` expands to `ignore`, not to
-        // `cfg(test)`, so it gates nothing and opens no span.
         let text = format!(
             "#[cfg_attr(test, ignore)]\nasync fn helper() {{\n    let s = {}\"...\").await;\n}}\n",
             call("StorageState", "connect"),
@@ -2232,11 +1817,6 @@ mod tests {
         assert!(cfg_test_sites(&text).is_empty());
     }
 
-    /// A non-ASCII fn name never lexes, so the guard cannot name the test.
-    /// The connection is still COLLECTED: the attribute block is taken
-    /// before the name is read, so the body opens a span, and a finding that
-    /// names no test charges the whole binary. Loud, which is the accepted
-    /// direction.
     #[test]
     fn a_non_ascii_test_fn_is_collected_without_a_name() {
         let text = format!(
@@ -2256,11 +1836,6 @@ mod tests {
         );
     }
 
-    /// The other half of the same residual, and this one IS silent: a
-    /// non-ASCII module name stops `module` before it can see the body
-    /// brace, so the `#[cfg(test)]` above it opens nothing and the
-    /// connection inside reads as production code. Pinned so a later fix
-    /// has to come here and delete this test.
     #[test]
     fn a_non_ascii_module_name_opens_no_span() {
         let text = format!(
@@ -2273,9 +1848,6 @@ mod tests {
             "{:?}",
             facts.cfg_test_spans
         );
-        // The inner `#[tokio::test]` fn is still a span of its own, so the
-        // connection is collected even here. What the module name costs is
-        // the `#[cfg(test)]` region, and the qualification of the name.
         assert_eq!(facts.test_fn_spans, vec![(3, 6)]);
         assert_eq!(
             facts
@@ -2286,8 +1858,6 @@ mod tests {
             vec!["boots"]
         );
 
-        // The silent half: a connection in that module that sits outside a
-        // test fn body is in no span at all, so nothing collects it.
         let helper = format!(
             "#[cfg(test)]\nmod \u{6771}\u{4eac} {{\n    async fn helper() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
             call("StorageState", "connect"),
@@ -2297,8 +1867,6 @@ mod tests {
         assert!(facts.test_fn_spans.is_empty());
     }
 
-    /// The path a file sits at is the module path its tests are named
-    /// under, and that is what makes an exact match possible.
     #[test]
     fn a_files_path_gives_its_module_prefix() {
         let src = Path::new("/w/src");
@@ -2311,8 +1879,6 @@ mod tests {
         );
     }
 
-    /// A scratch directory that removes itself. The out-of-line module
-    /// class resolves a declaration to a FILE, so it needs real ones.
     struct Scratch(PathBuf);
 
     impl Drop for Scratch {
@@ -2346,11 +1912,6 @@ mod tests {
         fs::write(path, text).expect("scratch file");
     }
 
-    /// `#[cfg(test)] mod pg_tests;` puts the tests in another file, and
-    /// that file carries no `#[cfg(test)]` of its own — so a span scan of
-    /// it finds nothing at all and the connection is invisible. The child
-    /// is all test code, so it is scanned whole, under the module name its
-    /// parent gave it.
     #[test]
     fn an_out_of_line_cfg_test_module_is_scanned_whole() {
         let dir = scratch("out-of-line");
@@ -2389,9 +1950,6 @@ mod tests {
         let _ = (parent, child);
     }
 
-    /// The `mod.rs` form of the same thing, and a `#[path]` override. The
-    /// child is discovered from the declaration, so it does not have to be
-    /// in the source list at all.
     #[test]
     fn an_out_of_line_module_resolves_mod_rs_and_path_overrides() {
         let dir = scratch("out-of-line-paths");
@@ -2430,9 +1988,6 @@ mod tests {
         assert_eq!(evidence[1].tests, vec!["pg_tests::connects".to_string()]);
     }
 
-    /// Two files, the same `tests::connects`, only one of them opening a
-    /// pool. The derived names have to differ, or the grouped one satisfies
-    /// the ungrouped one and the guard passes over a live escape.
     #[test]
     fn same_named_tests_in_two_files_derive_two_different_names() {
         let dir = scratch("same-name");
@@ -2456,9 +2011,6 @@ mod tests {
         assert_eq!(evidence[0].tests, vec!["a::tests::connects".to_string()]);
     }
 
-    /// An integration root declaring anything other than `mod common;` used
-    /// to be invisible: only the root file and a literal `mod common;` were
-    /// ever opened, so a postgres test one module down never existed.
     #[test]
     fn an_integration_root_follows_every_module_it_declares() {
         let dir = scratch("integration-mods");
@@ -2475,8 +2027,6 @@ mod tests {
         write(&tests.join("common").join("mod.rs"), "pub fn helper() {}\n");
 
         let files = module_tree(&tests.join("root.rs"), true).expect("module tree");
-        // rustc resolves a crate root's children in the root file's own
-        // directory, probed: `tests/cases.rs`, not `tests/root/cases.rs`.
         let paths: Vec<&Path> = files.iter().map(|(f, _)| f.path.as_path()).collect();
         assert!(
             paths.iter().any(|path| path.ends_with("cases.rs")),
@@ -2486,10 +2036,6 @@ mod tests {
         assert_eq!(sites(&evidence), vec!["tests/cases.rs:3 KeyStore::connect"]);
     }
 
-    /// An out-of-line module declared INSIDE an inline `#[cfg(test)] mod`
-    /// carries no attribute of its own, and its file sits one directory
-    /// deeper. Both halves have to be right or the child is either skipped
-    /// as production code or looked for in the wrong place.
     #[test]
     fn an_out_of_line_module_inside_an_inline_test_mod_is_followed() {
         let dir = scratch("nested-decl");
@@ -2519,10 +2065,6 @@ mod tests {
         );
     }
 
-    /// One file, two `#[path]` mountings. rustc compiles the text twice
-    /// and nextest lists `alias_a::connects` and `alias_b::connects`, so
-    /// deriving only one of them leaves the other unchecked: the group
-    /// filter can hold the derived name while the alias runs outside it.
     #[test]
     fn a_file_mounted_under_two_module_names_derives_both() {
         let dir = scratch("path-alias");
@@ -2559,11 +2101,6 @@ mod tests {
         );
     }
 
-    /// One file, one module name, two cfg-alternated mountings. Only one
-    /// exists per build, but the walk follows both declarations, and a
-    /// dedup key without the test scope lets the non-test mounting (popped
-    /// last off the LIFO) discard the `#[cfg(test)]` one -- the whole-file
-    /// scan that would have seen the connection never runs.
     #[test]
     fn a_cfg_alternated_mounting_keeps_the_test_scoped_scan() {
         let dir = scratch("cfg-alternated");
@@ -2583,9 +2120,6 @@ mod tests {
 
         let files = unit_files(&src.join("lib.rs"), None, None).expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);
-        // One call site, two findings: the test-scoped mounting is scanned
-        // whole, and the production-scoped one now reports the test fn's own
-        // body as a span. Twice is the fail direction; zero is not.
         assert_eq!(
             sites(&evidence),
             vec![
@@ -2597,8 +2131,6 @@ mod tests {
         assert_eq!(derived, vec!["shared::escapes".to_string(); 2]);
     }
 
-    /// A declaration the walk cannot resolve is the shape a pg test hides
-    /// behind, so it fails the guard by name rather than being skipped.
     #[test]
     fn an_unresolvable_module_declaration_is_a_loud_error() {
         let dir = scratch("unresolvable");
@@ -2610,11 +2142,6 @@ mod tests {
         assert!(error.contains("mod nowhere;"), "{error}");
     }
 
-    /// A bin's unit tests run in `pkg::bin/tool`, not in the lib binary.
-    /// Scanning all of `src/` and charging it to the lib let a pg test in
-    /// `src/bin/tool.rs` be satisfied by a same-named lib test that WAS in
-    /// the group. This one goes through `derive`, so `cargo metadata` gets
-    /// the last word on which target owns which file.
     #[test]
     fn a_bins_pg_test_is_charged_to_the_bin_not_the_lib() {
         let dir = scratch("bin-partition");
@@ -2623,7 +2150,6 @@ mod tests {
             &root.join("Cargo.toml"),
             "[package]\nname = \"probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
         );
-        // The lib carries a same-named test that never opens a pool.
         write(
             &root.join("src").join("lib.rs"),
             "#[cfg(test)]\nmod tests {\n    #[test]\n    fn connects() {}\n}\n",
@@ -2650,10 +2176,6 @@ mod tests {
         );
     }
 
-    /// A `cfg_attr`-wrapped `sqlx::test` builds a postgres pool whenever
-    /// its cfg holds, and the guard cannot know whether CI compiled with
-    /// it. Reading it as a real one over-collects; reading it as no
-    /// attribute at all is a pool nobody counted.
     #[test]
     fn a_cfg_attr_wrapped_sqlx_test_still_counts() {
         for wrapper in [
@@ -2673,9 +2195,6 @@ mod tests {
         }
     }
 
-    /// A `cfg_attr`-wrapped `ignore` runs under some cfgs and not others,
-    /// so the test is kept. Dropping it would take a real pg test out of
-    /// the derived set on a guess.
     #[test]
     fn a_cfg_attr_wrapped_ignore_does_not_drop_the_test() {
         let text = format!(
@@ -2685,11 +2204,6 @@ mod tests {
         assert_eq!(sqlx_names(&text), vec![(1, "live".to_string())]);
     }
 
-    /// Blanking has to be byte-for-byte length preserving and newline
-    /// exact, because every reported line number and every `#[path]` read
-    /// out of the raw text depends on the two texts lining up. A `\`
-    /// before a newline inside a string used to eat the newline, and every
-    /// line after it was reported one too low.
     #[test]
     fn blanking_preserves_length_and_line_numbers() {
         let text = "let s = \"a \\\n    b\";\nlet t = \"ünïcødé\";\nlet r = r#\"raw \" }\"#;\nlet c = '}';\n// tail ü\n";
@@ -2700,7 +2214,6 @@ mod tests {
             assert_eq!(before.len(), after.len(), "line {}", index + 1);
         }
 
-        // The line number a continuation escape used to shift.
         let code = format!(
             "fn a() {{\n    let msg = \"one \\\n        two\";\n}}\n\n#[cfg(test)]\nmod pg_tests {{\n    #[tokio::test]\n    async fn boots() {{\n        let s = {}\"...\").await;\n    }}\n}}\n",
             call("StorageState", "connect"),
@@ -2709,9 +2222,6 @@ mod tests {
         assert_eq!((sites[0].0, sites[0].1), (10, "StorageState::connect"));
     }
 
-    /// A test fn at a `src/` file's top level sits inside no `#[cfg(test)]`
-    /// region at all, so the span scan found nothing and the connection was
-    /// read as production code. Its own body is the span.
     #[test]
     fn a_test_fn_outside_any_cfg_test_region_is_scanned() {
         for marker in ["#[test]", "#[tokio::test]", "#[::tokio::test]", &attr("")] {
@@ -2740,9 +2250,6 @@ mod tests {
         assert_eq!(evidence[0].tests, vec!["boots".to_string()]);
     }
 
-    /// The ordinary shape stays ONE finding: a test fn body inside a
-    /// `#[cfg(test)]` region is already covered by that region's span, and
-    /// reporting it twice would print the same connection twice.
     #[test]
     fn a_test_fn_inside_a_cfg_test_region_is_not_a_second_span() {
         let text = format!(
@@ -2754,14 +2261,6 @@ mod tests {
         assert!(facts.test_fn_spans.is_empty(), "{:?}", facts.test_fn_spans);
     }
 
-    /// Three halves of the symlink rule, and they pull against each other. A
-    /// link pointing at its own ancestor is a cycle, and the walk used to
-    /// descend it once per path component the OS still allowed. A link
-    /// pointing anywhere else is a real subtree that only the safety net
-    /// reaches, since `module_tree` follows `mod` declarations and cannot see
-    /// an `include!` edge. And two links to ONE directory are two aliases,
-    /// both of which have to come out: which lexical path a file is recorded
-    /// under is what decides, later, whether a target owns it.
     #[cfg(unix)]
     #[test]
     fn a_symlink_cycle_terminates_and_every_alias_is_collected() {
@@ -2787,19 +2286,6 @@ mod tests {
         );
     }
 
-    /// The alias rule with the ownership rule behind it, which is where a
-    /// global visited set turns into a silent pass. `src/shared` and
-    /// `src/bin/shared` are one directory, the library target excludes
-    /// `src/bin`, and `module_tree` cannot follow the `include!` that mounts
-    /// the file. Record only the `src/bin` alias, whichever `read_dir`
-    /// happens to yield first, and `unit_files` drops it as another target's
-    /// file. Nothing is scanned, and rustc still runs `cases::escapes`
-    /// against a postgres pool.
-    ///
-    /// The derived name is `shared::cases::escapes`, not the `cases::escapes`
-    /// rustc gives it: the sweep names a file by its PATH. That mismatch
-    /// fails the guard loudly, which is the documented cost of an `include!`
-    /// edge. Loud is not what this test is about. Evidence at all is.
     #[cfg(unix)]
     #[test]
     fn an_unreadable_directory_fails_the_walk_instead_of_reading_as_empty() {
@@ -2854,7 +2340,6 @@ mod tests {
             ]
         );
 
-        // The library's own view: net root `src/`, `src/bin` excluded.
         let files = unit_files(&src.join("lib.rs"), Some(&src), Some(&src.join("bin")))
             .expect("module tree");
         let evidence = scan(&files, root, Scope::UnitTree);

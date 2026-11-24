@@ -26,8 +26,6 @@ test('the oracle detects loss, duplication, value corruption, and a cut result',
     r => r.rows.push(r.rows[0]),
     r => { r.rows[0][0] = '999'; },
     r => { r.pagination.total = r.rows.length + 1; },
-    // The typed wire: a JSON number under `integer`, a non-canonical
-    // spelling, and an untyped column are wire faults, not values.
     r => { r.rows[0][0] = Number(r.rows[0][0]); },
     r => { r.rows[0][1] = `0${r.rows[0][1]}`; },
     r => { delete r.columns[1].type; },

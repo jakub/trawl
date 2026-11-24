@@ -59,8 +59,6 @@ class EmbeddedProvenance(unittest.TestCase):
                 "target": "x86_64-unknown-linux-gnu", "platform_floor": "Debian 12",
                 "source_sha": self.sha, "tooling_sha": self.sha,
             }))
-            # Loader inspection/runtime execution have their own real package
-            # checks; this fixture verifies the source-provenance handoff.
             dynamic = "(RUNPATH) [$ORIGIN/../lib/trawl]\n(NEEDED) [libduckdb.so]"
             with patch.object(verifier, "output", return_value=dynamic), patch.object(verifier.subprocess, "run") as run:
                 verifier.verify(package, "x86_64-unknown-linux-gnu", self.sha, self.sha, "0.4.0")
